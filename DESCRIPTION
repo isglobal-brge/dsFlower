@@ -1,0 +1,45 @@
+Package: dsFlower
+Type: Package
+Title: DataSHIELD Server-Side Integration for Flower Federated Learning
+Version: 0.1.0
+Authors@R: c(
+    person("David", "Sarrat González", role = c("aut", "cre"), email = "david.sarrat@isglobal.org"),
+    person("Ramón", "Mateo Navarro", role = "aut", email = "ramon.mateo@isglobal.org"),
+    person("Juan R", "González", role = "aut", email = "juanr.gonzalez@isglobal.org"))
+Description: Server-side DataSHIELD package that bridges DataSHIELD's governance
+    and privacy model with the Flower federated learning framework. Manages
+    Flower SuperNode processes, training data preparation, and disclosure-controlled
+    metric reporting. Model weights flow exclusively through Flower's gRPC channels,
+    never through DataSHIELD, while only sanitized metrics and status information
+    pass through DataSHIELD aggregate methods.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.1.0)
+Imports:
+    R6,
+    resourcer,
+    jsonlite,
+    processx,
+    utils
+Suggests:
+    arrow,
+    testthat (>= 3.0.0),
+    withr,
+    DSLite
+AggregateMethods:
+    flowerPingDS,
+    flowerGetCapabilitiesDS,
+    flowerStatusDS,
+    flowerMetricsDS,
+    flowerLogDS,
+    c=base::c,
+    list=base::list
+AssignMethods:
+    flowerInitDS,
+    flowerPrepareRunDS,
+    flowerEnsureSuperNodeDS,
+    flowerCleanupRunDS,
+    flowerDestroyDS
+Config/testthat/edition: 3
+RoxygenNote: 7.3.3

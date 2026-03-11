@@ -1,0 +1,18 @@
+AssignMethods:
+  flowerInitDS,
+  flowerPrepareRunDS,
+  flowerEnsureSuperNodeDS,
+  flowerCleanupRunDS,
+  flowerDestroyDS
+AggregateMethods:
+  flowerPingDS,
+  flowerGetCapabilitiesDS,
+  flowerStatusDS,
+  flowerMetricsDS,
+  flowerLogDS
+Options:
+  nfilter.subset=3,
+  dsflower.max_rounds=500,
+  dsflower.allow_custom_config=FALSE,
+  dsflower.allow_supernode_spawn=TRUE,
+  dsflower.max_concurrent_runs=5
