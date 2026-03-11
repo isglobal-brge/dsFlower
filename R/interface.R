@@ -318,6 +318,14 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
   # SuperNode status
   node_list <- .supernode_list()
 
+  # Environment detection for SuperLink auto-discovery
+  is_docker <- file.exists("/.dockerenv") ||
+    tryCatch({
+      any(grepl("docker|containerd",
+                readLines("/proc/1/cgroup", warn = FALSE)))
+    }, warning = function(w) FALSE,
+       error = function(e) FALSE)
+
   caps <- list(
     dsflower_version    = as.character(utils::packageVersion("dsFlower")),
     python_version      = python_version,
@@ -326,7 +334,9 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     max_rounds          = settings$max_rounds,
     allow_custom_config = settings$allow_custom_config,
     min_samples         = settings$nfilter_subset,
-    active_supernodes   = nrow(node_list[node_list$alive, , drop = FALSE])
+    active_supernodes   = nrow(node_list[node_list$alive, , drop = FALSE]),
+    is_docker           = is_docker,
+    hostname            = Sys.info()[["nodename"]]
   )
 
   # Add handle-specific info if symbol provided

@@ -154,6 +154,15 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("min_samples" %in% names(caps))
 })
 
+test_that("flowerGetCapabilitiesDS includes is_docker and hostname", {
+  caps <- flowerGetCapabilitiesDS()
+  expect_true("is_docker" %in% names(caps))
+  expect_true("hostname" %in% names(caps))
+  expect_type(caps$is_docker, "logical")
+  expect_type(caps$hostname, "character")
+  expect_true(nchar(caps$hostname) > 0)
+})
+
 test_that("flowerStatusDS returns status info", {
   handle <- mock_handle()
   dsFlower:::.setHandle("test_status", handle)
