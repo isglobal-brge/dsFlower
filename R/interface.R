@@ -319,12 +319,7 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
   node_list <- .supernode_list()
 
   # Environment detection for SuperLink auto-discovery
-  is_docker <- file.exists("/.dockerenv") ||
-    tryCatch({
-      any(grepl("docker|containerd",
-                readLines("/proc/1/cgroup", warn = FALSE)))
-    }, warning = function(w) FALSE,
-       error = function(e) FALSE)
+  is_docker <- .detect_container_env()
 
   caps <- list(
     dsflower_version    = as.character(utils::packageVersion("dsFlower")),
@@ -518,5 +513,84 @@ flowerLogDS <- function(handle_symbol, last_n = 50L) {
 
   result <- do.call(rbind, rows)
   rownames(result) <- NULL
+  result
+}
+
+# --- Container/environment detection ---
+
+#' Detect whether the current process runs inside a container
+#'
+#' Checks multiple signals: \code{/.dockerenv}, \code{/run/.containerenv}
+#' (Podman), cgroup v1/v2, and the \code{container} environment variable
+#' (set by systemd-nspawn, Kubernetes, etc.).
+#'
+#' @return Logical; TRUE if a container environment is detected.
+#' @keywords internal
+.detect_container_env <- function() {
+  # Signal 1: Docker creates this file
+  if (file.exists("/.dockerenv")) return(TRUE)
+
+  # Signal 2: Podman creates this file
+  if (file.exists("/run/.containerenv")) return(TRUE)
+
+  # Signal 3: $container env var (systemd-nspawn, some K8s setups)
+  ctr_env <- Sys.getenv("container", unset = "")
+  if (nzchar(ctr_env)) return(TRUE)
+
+  # Signal 4: cgroup v1 — /proc/1/cgroup mentions docker/containerd/kubepods
+  cg <- tryCatch(
+    readLines("/proc/1/cgroup", warn = FALSE),
+    warning = function(w) character(0),
+    error   = function(e) character(0)
+  )
+  if (length(cg) > 0 &&
+      any(grepl("docker|containerd|kubepods|lxc|podman", cg,
+                ignore.case = TRUE))) {
+    return(TRUE)
+  }
+
+  # Signal 5: cgroup v2 — /proc/self/mountinfo with overlay/cgroup hints
+  mi <- tryCatch(
+    readLines("/proc/self/mountinfo", warn = FALSE),
+    warning = function(w) character(0),
+    error   = function(e) character(0)
+  )
+  if (length(mi) > 0 &&
+      any(grepl("/docker/|/kubepods/|/containerd/", mi))) {
+    return(TRUE)
+  }
+
+  FALSE
+}
+
+#' Check TCP connectivity from this node to a given address
+#'
+#' DataSHIELD AGGREGATE method. Attempts a TCP connection to the specified
+#' host:port to verify the SuperLink is reachable from this Opal/Rock.
+#'
+#' @param address Character; "host:port" to test.
+#' @param timeout_secs Numeric; connection timeout in seconds (default 5).
+#' @return Named list with \code{reachable} (logical) and \code{error} (char).
+#' @export
+flowerCheckConnectivityDS <- function(address, timeout_secs = 5) {
+  parts <- strsplit(address, ":", fixed = TRUE)[[1]]
+  if (length(parts) != 2) {
+    return(list(reachable = FALSE,
+                error = "Invalid address format, expected host:port"))
+  }
+  host <- parts[1]
+  port <- as.integer(parts[2])
+
+  result <- tryCatch({
+    con <- socketConnection(host = host, port = port,
+                            open = "r", blocking = TRUE,
+                            timeout = timeout_secs)
+    close(con)
+    list(reachable = TRUE, error = NULL)
+  }, error = function(e) {
+    list(reachable = FALSE, error = conditionMessage(e))
+  }, warning = function(w) {
+    list(reachable = FALSE, error = conditionMessage(w))
+  })
   result
 }

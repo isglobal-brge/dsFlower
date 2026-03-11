@@ -163,6 +163,24 @@ test_that("flowerGetCapabilitiesDS includes is_docker and hostname", {
   expect_true(nchar(caps$hostname) > 0)
 })
 
+test_that(".detect_container_env returns logical", {
+  result <- dsFlower:::.detect_container_env()
+  expect_type(result, "logical")
+  expect_length(result, 1)
+})
+
+test_that("flowerCheckConnectivityDS detects unreachable address", {
+  result <- flowerCheckConnectivityDS("192.0.2.1:99999", timeout_secs = 1)
+  expect_type(result, "list")
+  expect_false(result$reachable)
+})
+
+test_that("flowerCheckConnectivityDS rejects bad format", {
+  result <- flowerCheckConnectivityDS("not-a-valid-address")
+  expect_false(result$reachable)
+  expect_true(grepl("Invalid", result$error))
+})
+
 test_that("flowerStatusDS returns status info", {
   handle <- mock_handle()
   dsFlower:::.setHandle("test_status", handle)

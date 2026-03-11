@@ -9,7 +9,8 @@ AggregateMethods:
   flowerGetCapabilitiesDS,
   flowerStatusDS,
   flowerMetricsDS,
-  flowerLogDS
+  flowerLogDS,
+  flowerCheckConnectivityDS
 Options:
   nfilter.subset=3,
   dsflower.max_rounds=500,
