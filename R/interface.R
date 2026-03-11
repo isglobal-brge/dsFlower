@@ -98,6 +98,7 @@
     run_token          = NULL,
     staging_dir        = NULL,
     superlink_address  = NULL,
+    federation_id      = NULL,
     target_column      = NULL,
     feature_columns    = NULL,
     prepared           = FALSE,
@@ -197,9 +198,13 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @param superlink_address Character; the SuperLink address (host:port).
+#' @param federation_id Character or NULL; unique token identifying the
+#'   SuperLink instance. Used by the client to verify all nodes joined the
+#'   same federation.
 #' @return Updated handle with SuperNode information.
 #' @export
-flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address) {
+flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
+                                     federation_id = NULL) {
   handle <- .getHandle(handle_symbol)
 
   if (!handle$prepared) {
@@ -214,6 +219,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address) {
   )
 
   handle$superlink_address <- superlink_address
+  handle$federation_id     <- federation_id
   handle$node_ensured      <- TRUE
 
   handle
@@ -372,6 +378,7 @@ flowerStatusDS <- function(handle_symbol) {
     node_ensured       = handle$node_ensured,
     supernode_running  = supernode_running,
     superlink_address  = handle$superlink_address,
+    federation_id      = handle$federation_id,
     run_token          = handle$run_token,
     staging_dir        = handle$staging_dir,
     target_column      = handle$target_column,

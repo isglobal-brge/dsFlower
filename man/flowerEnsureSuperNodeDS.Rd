@@ -4,12 +4,16 @@
 \alias{flowerEnsureSuperNodeDS}
 \title{Ensure SuperNode is Running}
 \usage{
-flowerEnsureSuperNodeDS(handle_symbol, superlink_address)
+flowerEnsureSuperNodeDS(handle_symbol, superlink_address, federation_id = NULL)
 }
 \arguments{
 \item{handle_symbol}{Character; symbol of the handle.}
 
 \item{superlink_address}{Character; the SuperLink address (host:port).}
+
+\item{federation_id}{Character or NULL; unique token identifying the
+SuperLink instance. Used by the client to verify all nodes joined the
+same federation.}
 }
 \value{
 Updated handle with SuperNode information.
