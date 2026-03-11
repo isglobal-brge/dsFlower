@@ -14,7 +14,6 @@
 #' @keywords internal
 .getHandle <- function(symbol) {
   # Try DSLite session workspace: the handle is stored at `symbol` in the
-
   # eval environment, which is parent.frame(2) from here (one frame for
   # the calling DS method, one frame for .getHandle itself).
   for (depth in 1:3) {
@@ -27,7 +26,16 @@
     }
   }
 
-  # Fallback: global package environment (works for Opal single-process)
+  # Opal/Rock stores session variables in the global environment.
+  # The handle was assigned there by a previous datashield.assign call.
+  if (exists(symbol, envir = .GlobalEnv, inherits = FALSE)) {
+    obj <- get(symbol, envir = .GlobalEnv, inherits = FALSE)
+    if (is.list(obj) && "data_path" %in% names(obj)) {
+      return(obj)
+    }
+  }
+
+  # Fallback: package-level environment
   key <- paste0("handle_", symbol)
   if (exists(key, envir = .dsflower_env)) {
     return(get(key, envir = .dsflower_env))
