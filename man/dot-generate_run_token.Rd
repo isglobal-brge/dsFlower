@@ -10,7 +10,9 @@
 Character; the run token string.
 }
 \description{
-Creates a token in the format \code{run_YYYYMMDD_HHMMSS_XXXX} where
-XXXX is a random 4-character hex suffix.
+Creates a token in the format \code{run_YYYYMMDD_HHMMSS_PID_XXXXXXXXXXXX}
+where PID is the R process ID and X is a 12-character random hex suffix.
+This provides sufficient uniqueness even when multiple users on the
+same server create runs at the same second.
 }
 \keyword{internal}

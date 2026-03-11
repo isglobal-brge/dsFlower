@@ -3,8 +3,38 @@
 # SuperNodes are keyed by manifest_dir (unique per run token) in a global registry.
 # This allows multiple SuperNodes in the same process (e.g. DSLite testing).
 
-# Base port for clientappio — incremented per SuperNode on the same machine
-.CLIENTAPPIO_BASE_PORT <- 9094L
+# Port range for clientappio — a random port is chosen from this range
+# to avoid collisions between concurrent SuperNodes (even across sessions).
+.CLIENTAPPIO_PORT_MIN <- 10000L
+.CLIENTAPPIO_PORT_MAX <- 60000L
+
+#' Pick a random available TCP port
+#'
+#' Selects a random port from the configured range, checking that it is
+#' not already in use by another registered SuperNode. Falls back to
+#' retries (up to 20) if the port is taken.
+#'
+#' @return Integer; an available port number.
+#' @keywords internal
+.random_available_port <- function() {
+  # Collect ports already used by registered SuperNodes
+  used_ports <- integer(0)
+  for (key in ls(.supernode_registry)) {
+    entry <- tryCatch(get(key, envir = .supernode_registry), error = function(e) NULL)
+    if (!is.null(entry) && !is.null(entry$clientappio_port) &&
+        !is.null(entry$process) && entry$process$is_alive()) {
+      used_ports <- c(used_ports, entry$clientappio_port)
+    }
+  }
+
+  for (i in seq_len(20)) {
+    port <- sample(.CLIENTAPPIO_PORT_MIN:.CLIENTAPPIO_PORT_MAX, 1)
+    if (!port %in% used_ports) return(port)
+  }
+
+  # Extremely unlikely fallback — just return the last sampled port
+  port
+}
 
 #' Look up a SuperNode in the registry
 #'
@@ -75,8 +105,9 @@
   log_name <- gsub("[^a-zA-Z0-9._-]", "_", superlink_address)
   log_path <- file.path(log_dir, paste0(log_name, ".log"))
 
-  # Assign a unique clientappio port (needed when multiple SuperNodes run locally)
-  clientappio_port <- .CLIENTAPPIO_BASE_PORT + alive_count
+  # Pick a random available port for clientappio (avoids collisions between
+  # concurrent users/sessions sharing the same Rock process)
+  clientappio_port <- .random_available_port()
 
   # Build command for flower-supernode
   args <- c(

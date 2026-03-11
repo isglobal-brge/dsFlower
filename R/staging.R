@@ -4,14 +4,16 @@
 
 #' Generate a unique run token
 #'
-#' Creates a token in the format \code{run_YYYYMMDD_HHMMSS_XXXX} where
-#' XXXX is a random 4-character hex suffix.
+#' Creates a token in the format \code{run_YYYYMMDD_HHMMSS_PID_XXXXXXXXXXXX}
+#' where PID is the R process ID and X is a 12-character random hex suffix.
+#' This provides sufficient uniqueness even when multiple users on the
+#' same server create runs at the same second.
 #'
 #' @return Character; the run token string.
 #' @keywords internal
 .generate_run_token <- function() {
-  hex <- paste(sample(c(0:9, letters[1:6]), 4, replace = TRUE), collapse = "")
-  paste0("run_", format(Sys.time(), "%Y%m%d_%H%M%S"), "_", hex)
+  hex <- paste(sample(c(0:9, letters[1:6]), 12, replace = TRUE), collapse = "")
+  paste0("run_", format(Sys.time(), "%Y%m%d_%H%M%S"), "_", Sys.getpid(), "_", hex)
 }
 
 #' Load training data from a file path

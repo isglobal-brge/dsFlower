@@ -97,6 +97,43 @@ test_that("Registry removes dead processes on lookup", {
   expect_false(exists(dead_manifest, envir = reg))
 })
 
+test_that(".random_available_port returns port in valid range", {
+  reg <- dsFlower:::.supernode_registry
+  rm(list = ls(reg), envir = reg)
+
+  port <- dsFlower:::.random_available_port()
+  expect_true(port >= 10000L && port <= 60000L)
+})
+
+test_that(".random_available_port avoids ports used by live SuperNodes", {
+  reg <- dsFlower:::.supernode_registry
+  rm(list = ls(reg), envir = reg)
+
+  # Register a mock SuperNode using port 12345
+  mock_manifest <- file.path(tempdir(), "port_test_manifest")
+  mock_proc <- list(
+    is_alive = function() TRUE,
+    get_pid = function() 77777L
+  )
+  entry <- list(
+    process = mock_proc,
+    clientappio_port = 12345L,
+    superlink_address = "mock:9092",
+    manifest_dir = mock_manifest,
+    log_path = file.path(tempdir(), "mock.log"),
+    pid = 77777L,
+    started_at = Sys.time()
+  )
+  assign(mock_manifest, entry, envir = reg)
+
+  # Generate 50 ports — none should be 12345
+  ports <- replicate(50, dsFlower:::.random_available_port())
+  expect_true(all(ports != 12345L))
+
+  # Clean up
+  rm(list = ls(reg), envir = reg)
+})
+
 test_that(".supernode_ensure blocks when policy disables spawning", {
   withr::with_options(list(dsflower.allow_supernode_spawn = FALSE), {
     expect_error(

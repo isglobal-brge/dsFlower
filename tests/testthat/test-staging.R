@@ -3,7 +3,8 @@
 test_that(".generate_run_token produces expected format", {
   token <- dsFlower:::.generate_run_token()
   expect_type(token, "character")
-  expect_true(grepl("^run_\\d{8}_\\d{6}_[0-9a-f]{4}$", token))
+  # Format: run_YYYYMMDD_HHMMSS_PID_XXXXXXXXXXXX (12 hex chars)
+  expect_true(grepl("^run_\\d{8}_\\d{6}_\\d+_[0-9a-f]{12}$", token))
 })
 
 test_that(".generate_run_token produces unique tokens", {
