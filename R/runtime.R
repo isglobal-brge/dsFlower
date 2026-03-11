@@ -72,7 +72,8 @@
 #' @param python_path Character; path to the Python executable.
 #' @return The registry entry (list).
 #' @keywords internal
-.supernode_ensure <- function(superlink_address, manifest_dir, python_path = "python3") {
+.supernode_ensure <- function(superlink_address, manifest_dir,
+                              python_path = "python3", ca_cert_path = NULL) {
   # Policy check
   settings <- .flowerDisclosureSettings()
   if (!settings$allow_supernode_spawn) {
@@ -109,9 +110,16 @@
   # concurrent users/sessions sharing the same Rock process)
   clientappio_port <- .random_available_port()
 
+  # TLS or insecure mode
+  tls_args <- if (!is.null(ca_cert_path) && file.exists(ca_cert_path)) {
+    c("--root-certificates", ca_cert_path)
+  } else {
+    "--insecure"
+  }
+
   # Build command for flower-supernode
   args <- c(
-    "--insecure",
+    tls_args,
     "--superlink", superlink_address,
     "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
     "--clientappio-api-address", paste0("0.0.0.0:", clientappio_port)
@@ -131,6 +139,7 @@
     process           = proc,
     superlink_address = superlink_address,
     manifest_dir      = manifest_dir,
+    ca_cert_path      = ca_cert_path,
     clientappio_port  = clientappio_port,
     log_path          = log_path,
     pid               = proc$get_pid(),

@@ -4,7 +4,12 @@
 \alias{flowerEnsureSuperNodeDS}
 \title{Ensure SuperNode is Running}
 \usage{
-flowerEnsureSuperNodeDS(handle_symbol, superlink_address, federation_id = NULL)
+flowerEnsureSuperNodeDS(
+  handle_symbol,
+  superlink_address,
+  federation_id = NULL,
+  ca_cert_pem = NULL
+)
 }
 \arguments{
 \item{handle_symbol}{Character; symbol of the handle.}
@@ -14,6 +19,10 @@ flowerEnsureSuperNodeDS(handle_symbol, superlink_address, federation_id = NULL)
 \item{federation_id}{Character or NULL; unique token identifying the
 SuperLink instance. Used by the client to verify all nodes joined the
 same federation.}
+
+\item{ca_cert_pem}{Character or NULL; B64-encoded CA certificate PEM for
+TLS verification. When provided, the SuperNode uses
+\code{--root-certificates} instead of \code{--insecure}.}
 }
 \value{
 Updated handle with SuperNode information.

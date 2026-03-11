@@ -143,6 +143,94 @@ test_that(".supernode_ensure blocks when policy disables spawning", {
   })
 })
 
+test_that(".supernode_ensure uses --root-certificates when ca_cert_path provided", {
+  reg <- dsFlower:::.supernode_registry
+  rm(list = ls(reg), envir = reg)
+
+  # Create a temporary ca.pem file
+  ca_pem_path <- tempfile(fileext = ".pem")
+  writeLines("-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----",
+             ca_pem_path)
+  on.exit(unlink(ca_pem_path))
+
+  captured_args <- NULL
+  # Mock processx::process$new to capture args
+  mock_proc <- list(
+    is_alive = function() TRUE,
+    get_pid = function() 55555L,
+    signal = function(sig) invisible(NULL),
+    wait = function(timeout = 5000) invisible(NULL),
+    kill = function() invisible(NULL)
+  )
+
+  local_mocked_bindings(
+    .random_available_port = function() 11111L
+  )
+
+  mock_manifest <- file.path(tempdir(), "tls_test_manifest")
+  dir.create(mock_manifest, showWarnings = FALSE)
+
+  # We need to mock processx::process$new — use a different approach:
+  # intercept at the registry level by checking args after the fact
+  local_mocked_bindings(
+    process = list(new = function(command, args, ...) {
+      captured_args <<- args
+      mock_proc
+    }),
+    .package = "processx"
+  )
+
+  entry <- dsFlower:::.supernode_ensure(
+    "test:9092", mock_manifest, "python3", ca_cert_path = ca_pem_path
+  )
+
+  expect_true("--root-certificates" %in% captured_args)
+  expect_true(ca_pem_path %in% captured_args)
+  expect_false("--insecure" %in% captured_args)
+  expect_equal(entry$ca_cert_path, ca_pem_path)
+
+  rm(list = ls(reg), envir = reg)
+})
+
+test_that(".supernode_ensure uses --insecure when no ca_cert_path", {
+  reg <- dsFlower:::.supernode_registry
+  rm(list = ls(reg), envir = reg)
+
+  captured_args <- NULL
+  mock_proc <- list(
+    is_alive = function() TRUE,
+    get_pid = function() 55556L,
+    signal = function(sig) invisible(NULL),
+    wait = function(timeout = 5000) invisible(NULL),
+    kill = function() invisible(NULL)
+  )
+
+  local_mocked_bindings(
+    .random_available_port = function() 11112L
+  )
+
+  mock_manifest <- file.path(tempdir(), "insecure_test_manifest")
+  dir.create(mock_manifest, showWarnings = FALSE)
+
+  local_mocked_bindings(
+    process = list(new = function(command, args, ...) {
+      captured_args <<- args
+      mock_proc
+    }),
+    .package = "processx"
+  )
+
+  entry <- dsFlower:::.supernode_ensure(
+    "test:9092", mock_manifest, "python3"
+  )
+
+  expect_true("--insecure" %in% captured_args)
+  expect_false("--root-certificates" %in% captured_args)
+  expect_null(entry$ca_cert_path)
+
+  rm(list = ls(reg), envir = reg)
+})
+
 test_that(".supernode_read_log returns empty for unknown manifest_dir", {
   result <- dsFlower:::.supernode_read_log("/nonexistent/path")
   expect_type(result, "character")

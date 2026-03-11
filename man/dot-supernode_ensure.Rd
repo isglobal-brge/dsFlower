@@ -4,7 +4,12 @@
 \alias{.supernode_ensure}
 \title{Ensure a SuperNode is running (idempotent)}
 \usage{
-.supernode_ensure(superlink_address, manifest_dir, python_path = "python3")
+.supernode_ensure(
+  superlink_address,
+  manifest_dir,
+  python_path = "python3",
+  ca_cert_path = NULL
+)
 }
 \arguments{
 \item{superlink_address}{Character; the SuperLink Fleet API address (host:port).}

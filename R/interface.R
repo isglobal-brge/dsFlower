@@ -99,6 +99,7 @@
     staging_dir        = NULL,
     superlink_address  = NULL,
     federation_id      = NULL,
+    ca_cert_path       = NULL,
     target_column      = NULL,
     feature_columns    = NULL,
     prepared           = FALSE,
@@ -201,25 +202,44 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #' @param federation_id Character or NULL; unique token identifying the
 #'   SuperLink instance. Used by the client to verify all nodes joined the
 #'   same federation.
+#' @param ca_cert_pem Character or NULL; B64-encoded CA certificate PEM for
+#'   TLS verification. When provided, the SuperNode uses
+#'   \code{--root-certificates} instead of \code{--insecure}.
 #' @return Updated handle with SuperNode information.
 #' @export
 flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
-                                     federation_id = NULL) {
+                                     federation_id = NULL,
+                                     ca_cert_pem = NULL) {
   handle <- .getHandle(handle_symbol)
 
   if (!handle$prepared) {
     stop("Handle is not prepared. Call flowerPrepareRunDS first.", call. = FALSE)
   }
 
+  # Decode ca_cert_pem if B64-encoded from DSI transport
+  ca_cert_pem <- .ds_arg(ca_cert_pem)
+  ca_cert_path <- NULL
+
+  if (!is.null(ca_cert_pem)) {
+    # .ds_arg decodes the B64 wrapper to list(pem = "...") or a plain string
+    pem_text <- if (is.list(ca_cert_pem)) ca_cert_pem$pem else ca_cert_pem
+    if (!is.null(pem_text) && nzchar(pem_text)) {
+      ca_cert_path <- file.path(handle$staging_dir, "ca.pem")
+      writeLines(pem_text, ca_cert_path)
+    }
+  }
+
   # Ensure SuperNode via singleton registry
   entry <- .supernode_ensure(
     superlink_address = superlink_address,
     manifest_dir      = handle$staging_dir,
-    python_path       = handle$python_path
+    python_path       = handle$python_path,
+    ca_cert_path      = ca_cert_path
   )
 
   handle$superlink_address <- superlink_address
   handle$federation_id     <- federation_id
+  handle$ca_cert_path      <- ca_cert_path
   handle$node_ensured      <- TRUE
 
   handle
