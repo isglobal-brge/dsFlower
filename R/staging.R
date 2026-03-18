@@ -195,18 +195,18 @@
 
 #' Stage an image manifest for a training run
 #'
-#' Copies the small metadata file (samples.parquet/csv) to staging and
-#' writes a manifest pointing to the approved data root. Images are NOT
+#' Writes the samples metadata (data.frame or file) to staging and
+#' creates a manifest pointing to the approved data root. Images are NOT
 #' copied -- they stay in place (zero-copy).
 #'
 #' @param run_token Character; the unique run token.
-#' @param target_column Character; label column name in samples file.
-#' @param samples_file Character; path to samples metadata file.
+#' @param target_column Character; label column name in samples data.
+#' @param samples_data Data.frame of samples metadata, or character path to file.
 #' @param extra_config Named list of additional manifest entries.
 #' @return Character; path to the staging directory.
 #' @keywords internal
 .stage_image_manifest <- function(run_token, target_column,
-                                   samples_file, extra_config = list()) {
+                                   samples_data, extra_config = list()) {
   data_root <- .resolve_image_data_root()
 
   # Create staging directory
@@ -215,21 +215,29 @@
   dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
   Sys.chmod(staging_dir, "0700")
 
-  # Copy samples metadata to staging
-  samples_basename <- basename(samples_file)
-  staged_samples <- file.path(staging_dir, samples_basename)
-  file.copy(samples_file, staged_samples)
-  Sys.chmod(staged_samples, "0600")
-
-  # Count samples
-  if (grepl("\\.parquet$", samples_basename, ignore.case = TRUE)) {
-    if (!requireNamespace("arrow", quietly = TRUE)) {
-      stop("arrow package required for Parquet support.", call. = FALSE)
+  # Write samples metadata to staging
+  if (is.data.frame(samples_data)) {
+    samples_basename <- "samples.csv"
+    staged_samples <- file.path(staging_dir, samples_basename)
+    utils::write.csv(samples_data, staged_samples, row.names = FALSE)
+    n_samples <- nrow(samples_data)
+  } else if (is.character(samples_data) && file.exists(samples_data)) {
+    samples_basename <- basename(samples_data)
+    staged_samples <- file.path(staging_dir, samples_basename)
+    file.copy(samples_data, staged_samples)
+    if (grepl("\\.parquet$", samples_basename, ignore.case = TRUE)) {
+      if (!requireNamespace("arrow", quietly = TRUE)) {
+        stop("arrow package required for Parquet support.", call. = FALSE)
+      }
+      n_samples <- nrow(arrow::read_parquet(staged_samples))
+    } else {
+      n_samples <- nrow(utils::read.csv(staged_samples))
     }
-    n_samples <- nrow(arrow::read_parquet(staged_samples))
   } else {
-    n_samples <- nrow(utils::read.csv(staged_samples))
+    stop("samples_data must be a data.frame or a path to an existing file.",
+         call. = FALSE)
   }
+  Sys.chmod(staged_samples, "0600")
 
   # Build manifest
   manifest <- list(

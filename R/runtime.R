@@ -170,6 +170,17 @@
     hook_dir
   }
 
+  # Build environment: prepend venv bin to PATH so subprocess
+  # (flwr-clientapp) also uses the venv Python, not the system Python.
+  spawn_env <- c("current",
+                 PYTHONPATH = new_pypath,
+                 DSFLOWER_MANIFEST_DIR = manifest_dir)
+  if (!is.null(env_info) && identical(env_info$source, "venv")) {
+    venv_bin <- dirname(env_info$python)
+    current_path <- Sys.getenv("PATH", "")
+    spawn_env <- c(spawn_env, PATH = paste0(venv_bin, ":", current_path))
+  }
+
   # Spawn via processx
   proc <- processx::process$new(
     command = supernode_cmd,
@@ -178,9 +189,7 @@
     stderr = "2>&1",
     cleanup = TRUE,
     cleanup_tree = TRUE,
-    env = c("current",
-            PYTHONPATH = new_pypath,
-            DSFLOWER_MANIFEST_DIR = manifest_dir)
+    env = spawn_env
   )
 
   entry <- list(

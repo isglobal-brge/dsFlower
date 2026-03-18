@@ -20,6 +20,72 @@ _STRATEGY_MAP = {
 _ADAPTIVE_STRATEGIES = {FedAdam, FedAdagrad}
 
 
+def _xgboost_bagging_aggregate(results):
+    """Aggregate XGBoost models by merging their trees (bagging).
+
+    Each client sends a single numpy array containing the raw JSON bytes of
+    its XGBoost Booster model.  Standard FedAvg cannot work here because
+    averaging raw bytes is meaningless and the arrays may have different
+    lengths.
+
+    Instead we parse each client's JSON model, collect all trees, and
+    combine them into a single model.  The resulting global model contains
+    every tree from every client.
+    """
+    if not results:
+        return None
+
+    all_trees = []
+    base_model = None
+
+    for fit_res_parameters, _num_examples in results:
+        ndarrays = parameters_to_ndarrays(fit_res_parameters)
+        if len(ndarrays) == 0 or len(ndarrays[0]) == 0:
+            continue
+        model_bytes = ndarrays[0].tobytes()
+        model_json = json.loads(model_bytes)
+
+        if base_model is None:
+            base_model = model_json
+
+        # XGBoost JSON format: model_json["learner"]["gradient_booster"]
+        #   ["model"]["trees"] is a list of tree dicts.
+        try:
+            trees = (
+                model_json["learner"]["gradient_booster"]["model"]["trees"]
+            )
+            all_trees.extend(trees)
+        except (KeyError, TypeError):
+            # Fallback: if the JSON structure is unexpected, just use the
+            # first valid model as-is.
+            if base_model is None:
+                base_model = model_json
+            continue
+
+    if base_model is None:
+        return None
+
+    # Merge all trees into the base model and update tree count metadata.
+    try:
+        gbtree = base_model["learner"]["gradient_booster"]["model"]
+        gbtree["trees"] = all_trees
+        # Renumber tree IDs sequentially
+        for idx, tree in enumerate(all_trees):
+            tree["id"] = idx
+        gbtree["gbtree_model_param"]["num_trees"] = str(len(all_trees))
+
+        # Also update iteration_indptr which tracks trees per boosting
+        # iteration. After bagging we treat every tree as one iteration.
+        gbtree["tree_info"] = [0] * len(all_trees)
+        gbtree["iteration_indptr"] = list(range(len(all_trees) + 1))
+    except (KeyError, TypeError):
+        pass
+
+    merged_bytes = json.dumps(base_model).encode("utf-8")
+    merged_array = np.frombuffer(merged_bytes, dtype=np.uint8).copy()
+    return ndarrays_to_parameters([merged_array])
+
+
 def _make_save_strategy(base_cls, results_dir, num_rounds,
                          allow_per_node_metrics=True, **kwargs):
     """Create a SaveModelStrategy that subclasses the given Flower strategy."""
@@ -55,21 +121,29 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
             return super().initialize_parameters(client_manager)
 
         def aggregate_fit(self, server_round, results, failures):
-            # Lazy-init current_weights for adaptive strategies: the dummy
-            # initial_parameters left current_weights empty. On round 1,
-            # reconstruct from a FedAvg pass so delta computation works.
-            if (self._needs_client_init and
-                    hasattr(self, 'current_weights') and
-                    len(self.current_weights) == 0):
-                fedavg_agg, _ = FedAvg.aggregate_fit(
-                    self, server_round, results, failures
-                )
-                if fedavg_agg is not None:
-                    self.current_weights = parameters_to_ndarrays(fedavg_agg)
+            """Aggregate XGBoost models via tree bagging instead of FedAvg.
 
-            aggregated_parameters, aggregated_metrics = super().aggregate_fit(
-                server_round, results, failures
+            XGBoost models are serialized as raw JSON bytes.  Averaging
+            those bytes (as FedAvg does) is invalid -- the arrays may differ
+            in length and byte-level averaging destroys the JSON structure.
+
+            Instead we parse each client's model, merge their trees, and
+            return a single combined model.
+            """
+            if not results:
+                return None, {}
+
+            # Extract (Parameters, num_examples) pairs from results.
+            params_and_counts = [
+                (fit_res.parameters, fit_res.num_examples)
+                for _, fit_res in results
+            ]
+
+            aggregated_parameters = _xgboost_bagging_aggregate(
+                params_and_counts
             )
+
+            aggregated_metrics = {}
             if aggregated_parameters is not None:
                 weights = parameters_to_ndarrays(aggregated_parameters)
                 self._save_weights(weights, server_round)

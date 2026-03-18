@@ -228,14 +228,15 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   data_type <- run_config[["data_type"]] %||% "tabular"
 
   if (identical(data_type, "image")) {
-    # Image pipeline: stage manifest only, images stay in place
-    samples_file <- run_config[["samples_file"]]
-    if (is.null(samples_file)) {
-      stop("Image data_type requires 'samples_file' in run_config.",
+    # Image pipeline: the handle's data.frame is the samples metadata
+    # (sample_id, relative_path, label). Images stay on disk (zero-copy).
+    if (!("relative_path" %in% names(data))) {
+      stop("Image data requires a 'relative_path' column in the data. ",
+           "The data.frame should contain sample metadata, not pixel data.",
            call. = FALSE)
     }
     staging_dir <- .stage_image_manifest(run_token, target_column,
-                                          samples_file, run_config)
+                                          data, run_config)
   } else {
     staging_dir <- .stageData(data, run_token, target_column,
                               feature_columns, run_config)

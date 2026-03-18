@@ -75,25 +75,15 @@
   python <- file.path(venv_path, "bin", "python")
   if (!file.exists(python)) return(FALSE)
 
-  # Check ready marker
-
+  # Check ready marker (written by configure script or by .ensure_python_env)
   marker <- file.path(venv_path, ".dsflower_ready")
   if (!file.exists(marker)) return(FALSE)
 
-  # Verify marker hash matches current deps
-  deps <- .python_deps_for_framework(framework)
-  expected_hash <- .deps_hash(deps)
-  actual_hash <- tryCatch(readLines(marker, warn = FALSE)[1],
-                           error = function(e) "")
-  if (!identical(actual_hash, expected_hash)) return(FALSE)
-
-  # Quick import check
+  # Quick import check -- the definitive test of health
   check_mod <- .FRAMEWORK_HEALTH_IMPORT[[framework]]
   if (is.null(check_mod)) check_mod <- "flwr"
-  rc <- suppressWarnings(
-    system2(python, c("-c", paste0("import ", check_mod)),
-            stdout = FALSE, stderr = FALSE)
-  )
+  cmd <- paste0(shQuote(python), " -c ", shQuote(paste0("import ", check_mod)))
+  rc <- suppressWarnings(system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE))
   rc == 0L
 }
 
@@ -111,10 +101,8 @@
   check_mod <- .FRAMEWORK_HEALTH_IMPORT[[framework]]
   if (is.null(check_mod)) return(TRUE)
 
-  rc <- suppressWarnings(
-    system2(python, c("-c", paste0("import ", check_mod)),
-            stdout = FALSE, stderr = FALSE)
-  )
+  cmd <- paste0(shQuote(python), " -c ", shQuote(paste0("import ", check_mod)))
+  rc <- suppressWarnings(system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE))
   rc == 0L
 }
 
@@ -233,19 +221,28 @@
            ". Check that python3-venv is installed.", call. = FALSE)
     }
 
-    # Install framework-specific deps
+    # Install framework-specific deps -- prefer uv (17x faster), fall back to pip
     deps <- .python_deps_for_framework(framework)
-    pip <- file.path(venv_path, "bin", "pip")
-
     message("  Installing: ", paste(deps, collapse = ", "))
 
-    # Use --no-cache-dir to save disk, --quiet for clean output
-    pip_args <- c("install", "--quiet", "--no-cache-dir", deps)
-    result <- processx::run(
-      command = pip, args = pip_args,
-      error_on_status = FALSE,
-      timeout = timeout_secs
-    )
+    uv <- Sys.which("uv")
+    if (nzchar(uv)) {
+      venv_python <- file.path(venv_path, "bin", "python")
+      install_args <- c("pip", "install", "--python", venv_python, "--quiet", deps)
+      result <- processx::run(
+        command = uv, args = install_args,
+        error_on_status = FALSE,
+        timeout = timeout_secs
+      )
+    } else {
+      pip <- file.path(venv_path, "bin", "pip")
+      pip_args <- c("install", "--quiet", "--no-cache-dir", deps)
+      result <- processx::run(
+        command = pip, args = pip_args,
+        error_on_status = FALSE,
+        timeout = timeout_secs
+      )
+    }
 
     if (result$status != 0L) {
       # Clean up broken venv
@@ -257,10 +254,8 @@
     # Verify the install worked
     check_mod <- .FRAMEWORK_HEALTH_IMPORT[[framework]] %||% "flwr"
     venv_python <- file.path(venv_path, "bin", "python")
-    rc <- suppressWarnings(
-      system2(venv_python, c("-c", paste0("import ", check_mod)),
-              stdout = FALSE, stderr = FALSE)
-    )
+    cmd <- paste0(shQuote(venv_python), " -c ", shQuote(paste0("import ", check_mod)))
+    rc <- suppressWarnings(system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE))
     if (rc != 0L) {
       unlink(venv_path, recursive = TRUE)
       stop("Python environment created but '", check_mod,

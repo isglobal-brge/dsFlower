@@ -1,0 +1,219 @@
+#!/bin/sh
+# dsFlower post-install configuration script
+# Runs automatically during R CMD INSTALL on Unix systems.
+#
+# Creates Python virtual environments for each ML framework so that
+# SuperNodes have all dependencies ready at runtime. This runs ONCE
+# at package install time, not on every session.
+#
+# Requires: python3 (already in Rock/DataSHIELD base image)
+# Installs: uv (fast Python package installer) + framework deps
+
+set -e
+
+VENV_ROOT="${DSFLOWER_VENV_ROOT:-/var/lib/dsflower/venvs}"
+PYTHON="${PYTHON3:-$(command -v python3 2>/dev/null || true)}"
+LOG_PREFIX="[dsFlower configure]"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+log_info() {
+  echo "${LOG_PREFIX} $*"
+}
+
+log_warn() {
+  echo "${LOG_PREFIX} WARNING: $*" >&2
+}
+
+log_error() {
+  echo "${LOG_PREFIX} ERROR: $*" >&2
+}
+
+check_import() {
+  # Check if a Python module is importable
+  "$1" -c "import $2" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Pre-checks
+# ---------------------------------------------------------------------------
+
+if [ -z "${PYTHON}" ] || [ ! -x "${PYTHON}" ]; then
+  log_warn "python3 not found. Skipping Python environment setup."
+  log_warn "ML template dependencies must be installed manually."
+  exit 0
+fi
+
+PYTHON_VERSION=$("${PYTHON}" --version 2>&1 | head -1)
+log_info "Python: ${PYTHON} (${PYTHON_VERSION})"
+
+# Check if we can create venvs
+if ! "${PYTHON}" -m venv --help >/dev/null 2>&1; then
+  log_warn "python3-venv not available. Skipping environment setup."
+  log_warn "Install python3-venv and re-install dsFlower, or install deps manually."
+  exit 0
+fi
+
+# Check if we have write access to venv root
+mkdir -p "${VENV_ROOT}" 2>/dev/null || {
+  log_warn "Cannot create ${VENV_ROOT}. Skipping environment setup."
+  log_warn "Create this directory with appropriate permissions, or set DSFLOWER_VENV_ROOT."
+  exit 0
+}
+
+log_info "Venv root: ${VENV_ROOT}"
+
+# ---------------------------------------------------------------------------
+# Install uv for fast package management
+# ---------------------------------------------------------------------------
+
+UV="$(command -v uv 2>/dev/null || true)"
+
+if [ -z "${UV}" ]; then
+  log_info "Installing uv (fast Python package manager)..."
+  if "${PYTHON}" -m pip install --break-system-packages -q uv 2>/dev/null || \
+     "${PYTHON}" -m pip install -q uv 2>/dev/null; then
+    UV="$(command -v uv 2>/dev/null || true)"
+    if [ -n "${UV}" ]; then
+      log_info "uv installed: $(${UV} --version)"
+    fi
+  fi
+fi
+
+# Fallback: use pip if uv is not available
+if [ -z "${UV}" ]; then
+  log_warn "uv not available, falling back to pip (slower)."
+  USE_UV=false
+else
+  USE_UV=true
+fi
+
+# ---------------------------------------------------------------------------
+# Installer functions
+# ---------------------------------------------------------------------------
+
+create_venv() {
+  local name="$1"
+  local venv_path="${VENV_ROOT}/${name}"
+
+  if [ -d "${venv_path}" ] && [ -f "${venv_path}/.dsflower_ready" ]; then
+    log_info "  ${name}: already provisioned, skipping."
+    return 0
+  fi
+
+  log_info "  ${name}: creating venv..."
+  rm -rf "${venv_path}"
+
+  if [ "${USE_UV}" = true ]; then
+    "${UV}" venv --python "${PYTHON}" --seed "${venv_path}" >/dev/null 2>&1
+  else
+    "${PYTHON}" -m venv --system-site-packages "${venv_path}"
+  fi
+}
+
+install_deps() {
+  local name="$1"
+  shift
+  local venv_path="${VENV_ROOT}/${name}"
+  local venv_python="${venv_path}/bin/python"
+
+  log_info "  ${name}: installing $*"
+
+  if [ "${USE_UV}" = true ]; then
+    "${UV}" pip install --python "${venv_python}" --quiet "$@" 2>&1 | tail -5
+  else
+    "${venv_path}/bin/pip" install --quiet --no-cache-dir "$@" 2>&1 | tail -5
+  fi
+}
+
+mark_ready() {
+  local name="$1"
+  local venv_path="${VENV_ROOT}/${name}"
+  # Write a marker with the dependency list hash
+  echo "$2" > "${venv_path}/.dsflower_ready"
+}
+
+provision_framework() {
+  local name="$1"
+  local check_module="$2"
+  shift 2
+  local deps="$*"
+  local venv_path="${VENV_ROOT}/${name}"
+
+  # Skip if already ready
+  if [ -f "${venv_path}/.dsflower_ready" ]; then
+    # Quick health check
+    if check_import "${venv_path}/bin/python" "${check_module}" 2>/dev/null; then
+      log_info "  ${name}: OK (cached)"
+      return 0
+    fi
+    log_info "  ${name}: cached but unhealthy, rebuilding..."
+  fi
+
+  # Check if system Python already has everything
+  if check_import "${PYTHON}" "${check_module}" 2>/dev/null; then
+    log_info "  ${name}: system Python already has ${check_module}, skipping venv."
+    return 0
+  fi
+
+  create_venv "${name}" || {
+    log_warn "  ${name}: failed to create venv, skipping."
+    return 0
+  }
+
+  # Always install base deps + framework deps
+  # shellcheck disable=SC2086
+  install_deps "${name}" "flwr>=1.13.0" "numpy>=1.21.0" "pandas>=1.3.0" ${deps} || {
+    log_warn "  ${name}: pip install failed, removing broken venv."
+    rm -rf "${venv_path}"
+    return 0
+  }
+
+  # Verify
+  if check_import "${venv_path}/bin/python" "${check_module}"; then
+    # Compute simple hash of dep list for staleness detection
+    dep_hash=$(echo "${deps}" | sha256sum 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+    mark_ready "${name}" "${dep_hash}"
+    log_info "  ${name}: ready."
+  else
+    log_warn "  ${name}: install succeeded but import ${check_module} failed."
+    rm -rf "${venv_path}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Provision all frameworks
+# ---------------------------------------------------------------------------
+
+log_info "Provisioning Python environments for ML frameworks..."
+log_info "(This runs once at install time. Subsequent installs reuse cached venvs.)"
+echo ""
+
+provision_framework "sklearn" "sklearn" \
+  "scikit-learn>=1.0.0"
+
+provision_framework "pytorch" "torch" \
+  "torch>=2.0.0"
+
+provision_framework "pytorch_vision" "torchvision" \
+  "torch>=2.0.0" "torchvision>=0.15.0" "Pillow>=9.0.0"
+
+provision_framework "xgboost" "xgboost" \
+  "xgboost>=1.7.0"
+
+echo ""
+log_info "Python environment setup complete."
+log_info "Venvs stored in: ${VENV_ROOT}"
+
+# List what's ready
+for fw in sklearn pytorch pytorch_vision xgboost; do
+  venv="${VENV_ROOT}/${fw}"
+  if [ -f "${venv}/.dsflower_ready" ]; then
+    size=$(du -sh "${venv}" 2>/dev/null | cut -f1)
+    log_info "  ${fw}: ${size}"
+  fi
+done
+
+exit 0
