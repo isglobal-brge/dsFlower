@@ -230,19 +230,12 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     template_name <- .ds_arg(template_name)
     if (is.list(template_name)) template_name <- template_name[[1]]
 
-    # Compute expected hash from server's own template copy
+    # Compute expected hash from server's own template copy and write
+    # to staging directory. The sitecustomize.py hook (injected via
+    # PYTHONPATH) reads this file to verify code integrity at runtime.
     template_hash <- .compute_template_hash(template_name)
     writeLines(template_hash,
                file.path(handle$staging_dir, "expected_hash.txt"))
-
-    # Copy trusted verification module to staging directory
-    verify_src <- system.file("python", "_dsflower_verify.py",
-                               package = "dsFlower")
-    if (nzchar(verify_src) && file.exists(verify_src)) {
-      file.copy(verify_src,
-                file.path(handle$staging_dir, "_dsflower_verify.py"),
-                overwrite = TRUE)
-    }
   }
 
   # Decode ca_cert_pem if B64-encoded from DSI transport

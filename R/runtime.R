@@ -125,6 +125,28 @@
     "--clientappio-api-address", paste0("0.0.0.0:", clientappio_port)
   )
 
+  # Inject code integrity hook via PYTHONPATH + sitecustomize.py
+  # The sitecustomize.py lives in dsFlower's inst/python/ (server filesystem)
+  # and is copied to a private directory in the staging area. Python loads
+  # it automatically before any application code, including Flower's
+  # ClientApp subprocesses.
+  hook_src <- system.file("python", "sitecustomize.py", package = "dsFlower")
+  hook_dir <- file.path(manifest_dir, ".dsflower_hook")
+  dir.create(hook_dir, showWarnings = FALSE)
+  if (nzchar(hook_src) && file.exists(hook_src)) {
+    file.copy(hook_src, file.path(hook_dir, "sitecustomize.py"),
+              overwrite = TRUE)
+  }
+
+  # Set PYTHONPATH so sitecustomize.py is auto-loaded, and pass the
+  # manifest dir so the hook can find expected_hash.txt
+  existing_pypath <- Sys.getenv("PYTHONPATH", "")
+  new_pypath <- if (nzchar(existing_pypath)) {
+    paste0(hook_dir, ":", existing_pypath)
+  } else {
+    hook_dir
+  }
+
   # Spawn via processx
   proc <- processx::process$new(
     command = "flower-supernode",
@@ -132,7 +154,10 @@
     stdout = log_path,
     stderr = "2>&1",
     cleanup = TRUE,
-    cleanup_tree = TRUE
+    cleanup_tree = TRUE,
+    env = c("current",
+            PYTHONPATH = new_pypath,
+            DSFLOWER_MANIFEST_DIR = manifest_dir)
   )
 
   entry <- list(
