@@ -73,7 +73,8 @@
 #' @return The registry entry (list).
 #' @keywords internal
 .supernode_ensure <- function(superlink_address, manifest_dir,
-                              python_path = "python3", ca_cert_path = NULL) {
+                              python_path = "python3", ca_cert_path = NULL,
+                              template_name = NULL) {
   # Policy check
   settings <- .flowerDisclosureSettings()
   if (!settings$allow_supernode_spawn) {
@@ -97,6 +98,28 @@
     stop("Maximum concurrent SuperNode limit reached (",
          settings$max_concurrent_runs, "). Stop an existing SuperNode first.",
          call. = FALSE)
+  }
+
+  # Resolve Python environment for this template's framework.
+  # If the template is known, ensure the correct venv is ready.
+  supernode_cmd <- "flower-supernode"
+  env_info <- NULL
+  if (!is.null(template_name)) {
+    caps <- .TEMPLATE_CAPABILITIES[[template_name]]
+    if (!is.null(caps) && !is.null(caps$framework)) {
+      env_info <- tryCatch(
+        .ensure_python_env(caps$framework),
+        error = function(e) {
+          warning("Could not provision Python env for '", caps$framework,
+                  "': ", e$message, ". Falling back to system Python.",
+                  call. = FALSE)
+          NULL
+        }
+      )
+      if (!is.null(env_info)) {
+        supernode_cmd <- env_info$flower_supernode
+      }
+    }
   }
 
   # Create log directory
@@ -149,7 +172,7 @@
 
   # Spawn via processx
   proc <- processx::process$new(
-    command = "flower-supernode",
+    command = supernode_cmd,
     args = args,
     stdout = log_path,
     stderr = "2>&1",

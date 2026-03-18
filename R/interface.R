@@ -246,6 +246,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   handle$staging_dir     <- staging_dir
   handle$target_column   <- target_column
   handle$feature_columns <- feature_columns
+  handle$template_name   <- template_name
   handle$prepared        <- TRUE
 
   handle
@@ -276,10 +277,16 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     stop("Handle is not prepared. Call flowerPrepareRunDS first.", call. = FALSE)
   }
 
-  # Write code verification artifacts to staging directory
+  # Resolve template_name: explicit arg > handle > NULL
   if (!is.null(template_name) && nzchar(template_name %||% "")) {
     template_name <- .ds_arg(template_name)
     if (is.list(template_name)) template_name <- template_name[[1]]
+  } else if (!is.null(handle$template_name)) {
+    template_name <- handle$template_name
+  }
+
+  # Write code verification artifacts to staging directory
+  if (!is.null(template_name) && nzchar(template_name %||% "")) {
 
     # Compute expected hash from server's own template copy and write
     # to staging directory. The sitecustomize.py hook (injected via
@@ -306,7 +313,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     superlink_address = superlink_address,
     manifest_dir      = handle$staging_dir,
     python_path       = handle$python_path,
-    ca_cert_path      = ca_cert_path
+    ca_cert_path      = ca_cert_path,
+    template_name     = template_name
   )
 
   handle$superlink_address <- superlink_address

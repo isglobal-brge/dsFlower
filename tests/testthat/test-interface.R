@@ -148,7 +148,8 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
   # Mock .supernode_ensure to avoid spawning real process
   local_mocked_bindings(
     .supernode_ensure = function(superlink_address, manifest_dir,
-                                 python_path, ca_cert_path = NULL) {
+                                 python_path, ca_cert_path = NULL,
+                                 template_name = NULL) {
       list(process = NULL, superlink_address = superlink_address,
            ca_cert_path = ca_cert_path)
     }
@@ -181,7 +182,8 @@ test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)"
 
   local_mocked_bindings(
     .supernode_ensure = function(superlink_address, manifest_dir,
-                                 python_path, ca_cert_path = NULL) {
+                                 python_path, ca_cert_path = NULL,
+                                 template_name = NULL) {
       list(process = NULL, superlink_address = superlink_address,
            ca_cert_path = ca_cert_path)
     }
