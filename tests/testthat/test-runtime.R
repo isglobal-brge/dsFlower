@@ -186,47 +186,22 @@ test_that(".supernode_ensure uses --root-certificates when ca_cert_path provided
 
   expect_true("--root-certificates" %in% captured_args)
   expect_true(ca_pem_path %in% captured_args)
-  expect_false("--insecure" %in% captured_args)
   expect_equal(entry$ca_cert_path, ca_pem_path)
 
   rm(list = ls(reg), envir = reg)
 })
 
-test_that(".supernode_ensure uses --insecure when no ca_cert_path", {
+test_that(".supernode_ensure errors when no ca_cert_path", {
   reg <- dsFlower:::.supernode_registry
   rm(list = ls(reg), envir = reg)
 
-  captured_args <- NULL
-  mock_proc <- list(
-    is_alive = function() TRUE,
-    get_pid = function() 55556L,
-    signal = function(sig) invisible(NULL),
-    wait = function(timeout = 5000) invisible(NULL),
-    kill = function() invisible(NULL)
-  )
-
-  local_mocked_bindings(
-    .random_available_port = function() 11112L
-  )
-
-  mock_manifest <- file.path(tempdir(), "insecure_test_manifest")
+  mock_manifest <- file.path(tempdir(), "no_cert_test_manifest")
   dir.create(mock_manifest, showWarnings = FALSE)
 
-  local_mocked_bindings(
-    process = list(new = function(command, args, ...) {
-      captured_args <<- args
-      mock_proc
-    }),
-    .package = "processx"
+  expect_error(
+    dsFlower:::.supernode_ensure("test:9092", mock_manifest, "python3"),
+    "CA certificate not found"
   )
-
-  entry <- dsFlower:::.supernode_ensure(
-    "test:9092", mock_manifest, "python3"
-  )
-
-  expect_true("--insecure" %in% captured_args)
-  expect_false("--root-certificates" %in% captured_args)
-  expect_null(entry$ca_cert_path)
 
   rm(list = ls(reg), envir = reg)
 })

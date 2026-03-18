@@ -110,12 +110,12 @@
   # concurrent users/sessions sharing the same Rock process)
   clientappio_port <- .random_available_port()
 
-  # TLS or insecure mode
-  tls_args <- if (!is.null(ca_cert_path) && file.exists(ca_cert_path)) {
-    c("--root-certificates", ca_cert_path)
-  } else {
-    "--insecure"
+  # TLS mode (always required)
+  if (is.null(ca_cert_path) || !file.exists(ca_cert_path)) {
+    stop("CA certificate not found. The SuperLink must provide a TLS certificate.",
+         call. = FALSE)
   }
+  tls_args <- c("--root-certificates", ca_cert_path)
 
   # Build command for flower-supernode
   args <- c(

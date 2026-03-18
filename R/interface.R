@@ -203,8 +203,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #'   SuperLink instance. Used by the client to verify all nodes joined the
 #'   same federation.
 #' @param ca_cert_pem Character or NULL; B64-encoded CA certificate PEM for
-#'   TLS verification. When provided, the SuperNode uses
-#'   \code{--root-certificates} instead of \code{--insecure}.
+#'   TLS verification. The SuperNode uses \code{--root-certificates} to
+#'   verify the SuperLink's identity.
 #' @return Updated handle with SuperNode information.
 #' @export
 flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
