@@ -4,7 +4,7 @@
 \alias{flowerCheckConnectivityDS}
 \title{Check TCP connectivity from this node to a given address}
 \usage{
-flowerCheckConnectivityDS(address, timeout_secs = 5)
+flowerCheckConnectivityDS(address, timeout_secs = 3)
 }
 \arguments{
 \item{address}{Character; "host:port" to test.}

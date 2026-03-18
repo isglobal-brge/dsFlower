@@ -643,3 +643,53 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
   })
   result
 }
+
+# --- Template serving methods ---
+
+#' List Available Templates
+#'
+#' DataSHIELD AGGREGATE method. Returns the names of all Flower app
+#' templates installed on this server.
+#'
+#' @return Character vector of template names.
+#' @export
+flowerListTemplatesDS <- function() {
+  templates_dir <- system.file("flower_templates", package = "dsFlower")
+  if (!nzchar(templates_dir) || !dir.exists(templates_dir)) {
+    return(character(0))
+  }
+  list.dirs(templates_dir, full.names = FALSE, recursive = FALSE)
+}
+
+#' Get a Template
+#'
+#' DataSHIELD AGGREGATE method. Returns the Python source files for a
+#' specific Flower app template. The server controls which templates are
+#' available -- if a template is not installed, the request is denied.
+#'
+#' @param template_name Character; name of the template (e.g. "sklearn_logreg").
+#' @return Named list with \code{name} and \code{files} (a named list mapping
+#'   relative file paths to their contents as character strings).
+#' @export
+flowerGetTemplateDS <- function(template_name) {
+  # Validate template exists
+  available <- flowerListTemplatesDS()
+  if (!template_name %in% available) {
+    stop("Template '", template_name, "' is not available on this server. ",
+         "Available: ", paste(available, collapse = ", "), ".",
+         call. = FALSE)
+  }
+
+  # Read all files from the template
+  template_dir <- system.file("flower_templates", template_name,
+                               package = "dsFlower")
+  all_files <- list.files(template_dir, recursive = TRUE, full.names = FALSE)
+
+  files <- list()
+  for (f in all_files) {
+    full_path <- file.path(template_dir, f)
+    files[[f]] <- paste(readLines(full_path, warn = FALSE), collapse = "\n")
+  }
+
+  list(name = template_name, files = files)
+}

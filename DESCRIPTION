@@ -32,6 +32,8 @@ AggregateMethods:
     flowerMetricsDS,
     flowerLogDS,
     flowerCheckConnectivityDS,
+    flowerListTemplatesDS,
+    flowerGetTemplateDS,
     c=base::c,
     list=base::list
 AssignMethods:
