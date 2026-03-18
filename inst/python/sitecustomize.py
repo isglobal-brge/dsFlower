@@ -57,13 +57,23 @@ def _check_module(module):
         return
 
     if not EXPECTED_HASH_FILE or not os.path.exists(EXPECTED_HASH_FILE):
-        return
+        print(
+            "\nDSFLOWER SECURITY: No expected_hash.txt found.\n"
+            "  A known template was imported but no hash verification is "
+            "possible.\n  Aborting.\n",
+            file=sys.stderr, flush=True,
+        )
+        os._exit(99)
 
     with open(EXPECTED_HASH_FILE) as f:
         expected = f.read().strip()
 
     if not expected:
-        return
+        print(
+            "\nDSFLOWER SECURITY: expected_hash.txt is empty.\n  Aborting.\n",
+            file=sys.stderr, flush=True,
+        )
+        os._exit(99)
 
     pkg_dir = os.path.dirname(os.path.abspath(module.__file__))
     # If this is a submodule, go up to the package root
