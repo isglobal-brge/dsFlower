@@ -135,3 +135,80 @@ test_that(".validateTemplate allows custom when enabled", {
     expect_true(dsFlower:::.validateTemplate("anything_goes"))
   })
 })
+
+# --- Trust Profile tests ---
+
+test_that(".flowerTrustProfile returns research profile by default", {
+  withr::with_options(list(dsflower.privacy_profile = NULL), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "research")
+    expect_equal(profile$min_train_rows, 3)
+    expect_true(profile$allow_per_node_metrics)
+    expect_true(profile$allow_exact_num_examples)
+    expect_false(profile$require_secure_aggregation)
+    expect_false(profile$dp_required)
+    expect_equal(profile$model_release, "allowed")
+  })
+})
+
+test_that(".flowerTrustProfile returns secure profile", {
+  withr::with_options(list(dsflower.privacy_profile = "secure"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "secure")
+    expect_equal(profile$min_train_rows, 100)
+    expect_false(profile$allow_per_node_metrics)
+    expect_false(profile$allow_exact_num_examples)
+    expect_true(profile$require_secure_aggregation)
+    expect_false(profile$dp_required)
+    expect_equal(profile$model_release, "gated")
+  })
+})
+
+test_that(".flowerTrustProfile returns secure_dp profile", {
+  withr::with_options(list(dsflower.privacy_profile = "secure_dp"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "secure_dp")
+    expect_equal(profile$min_train_rows, 200)
+    expect_true(profile$dp_required)
+  })
+})
+
+test_that(".flowerTrustProfile errors on unknown profile", {
+  withr::with_options(list(dsflower.privacy_profile = "invalid"), {
+    expect_error(dsFlower:::.flowerTrustProfile(), "Unknown privacy profile")
+  })
+})
+
+test_that(".flowerTrustProfile overrides can only strengthen", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "research",
+    dsflower.min_train_rows = 50,
+    dsflower.allow_per_node_metrics = FALSE
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    # min_train_rows should be max(3, 50) = 50
+    expect_equal(profile$min_train_rows, 50)
+    # allow_per_node_metrics should be FALSE (strengthened)
+    expect_false(profile$allow_per_node_metrics)
+  })
+})
+
+test_that(".flowerTrustProfile overrides cannot weaken secure profile", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "secure",
+    dsflower.min_train_rows = 10
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    # min_train_rows should stay 100 (profile floor is higher)
+    expect_equal(profile$min_train_rows, 100)
+  })
+})
+
+test_that(".bucket_count returns correct values", {
+  expect_equal(dsFlower:::.bucket_count(0), 0L)
+  expect_equal(dsFlower:::.bucket_count(1), 1L)
+  expect_equal(dsFlower:::.bucket_count(3), 3L)
+  expect_equal(dsFlower:::.bucket_count(100), 128L)
+  expect_equal(dsFlower:::.bucket_count(1000), 1024L)
+  expect_equal(dsFlower:::.bucket_count(50), 64L)
+})

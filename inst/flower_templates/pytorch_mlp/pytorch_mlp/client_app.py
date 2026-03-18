@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .task import load_data
+from .task import load_data, load_privacy_config
+from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count
 
 
 def _build_mlp(input_dim, hidden_layers, output_dim=1):
@@ -26,10 +27,11 @@ def _build_mlp(input_dim, hidden_layers, output_dim=1):
 
 
 class FlowerClient(NumPyClient):
-    def __init__(self, model, trainloader, learning_rate=0.01,
-                 local_epochs=1, device="cpu"):
+    def __init__(self, model, trainloader, privacy_config,
+                 learning_rate=0.01, local_epochs=1, device="cpu"):
         self.model = model.to(device)
         self.trainloader = trainloader
+        self.privacy_config = privacy_config
         self.device = device
         self.local_epochs = local_epochs
         self.criterion = nn.BCEWithLogitsLoss()
@@ -48,6 +50,8 @@ class FlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
+        old_weights = [p.copy() for p in parameters]
+
         self.model.train()
         for _ in range(self.local_epochs):
             for X_batch, y_batch in self.trainloader:
@@ -58,10 +62,35 @@ class FlowerClient(NumPyClient):
                 loss = self.criterion(output, y_batch)
                 loss.backward()
                 self.optimizer.step()
-        return self.get_parameters(config), len(self.trainloader.dataset), {}
+
+        new_weights = self.get_parameters(config)
+
+        # Apply local DP if required
+        if self.privacy_config.get("privacy_mode") == "dp":
+            cn = self.privacy_config["clipping_norm"]
+            eps = self.privacy_config["epsilon"]
+            delta = self.privacy_config["delta"]
+            n = self.privacy_config["n_samples"]
+
+            new_weights = clip_weights(new_weights, old_weights, cn)
+            sigma = compute_sigma(eps, delta, cn, n)
+            new_weights = add_gaussian_noise(new_weights, old_weights, sigma, cn)
+
+        n_examples = len(self.trainloader.dataset)
+        if not self.privacy_config.get("allow_exact_num_examples", True):
+            n_examples = bucket_count(n_examples)
+
+        return new_weights, n_examples, {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
+
+        if not self.privacy_config.get("allow_per_node_metrics", True):
+            n_examples = len(self.trainloader.dataset)
+            if not self.privacy_config.get("allow_exact_num_examples", True):
+                n_examples = bucket_count(n_examples)
+            return 0.0, n_examples, {}
+
         self.model.eval()
         total_loss = 0.0
         correct = 0
@@ -77,13 +106,19 @@ class FlowerClient(NumPyClient):
                 total += len(X_batch)
         avg_loss = total_loss / max(total, 1)
         accuracy = correct / max(total, 1)
-        return avg_loss, total, {"accuracy": accuracy}
+
+        n_examples = total
+        if not self.privacy_config.get("allow_exact_num_examples", True):
+            n_examples = bucket_count(n_examples)
+
+        return avg_loss, n_examples, {"accuracy": accuracy}
 
 
 def client_fn(context: Context) -> FlowerClient:
     """Create a Flower client."""
     cfg = context.run_config
     X, y = load_data(context)
+    privacy_config = load_privacy_config(context)
 
     hidden_str = cfg.get("hidden_layers", "64,32")
     if isinstance(hidden_str, str):
@@ -105,7 +140,7 @@ def client_fn(context: Context) -> FlowerClient:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return FlowerClient(
-        model, trainloader,
+        model, trainloader, privacy_config,
         learning_rate=learning_rate,
         local_epochs=local_epochs,
         device=device

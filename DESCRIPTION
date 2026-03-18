@@ -20,6 +20,7 @@ Imports:
     digest,
     jsonlite,
     processx,
+    rappdirs,
     utils
 Suggests:
     arrow,
@@ -36,6 +37,7 @@ AggregateMethods:
     flowerListTemplatesDS,
     flowerGetTemplateDS,
     flowerVerifyAppHashDS,
+    flowerPrivacyBudgetDS,
     c=base::c,
     list=base::list
 AssignMethods:

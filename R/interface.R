@@ -182,7 +182,34 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     data <- .loadTrainingData(handle$data_path, handle$data_format)
   }
   .validateDataSchema(data, target_column, feature_columns)
-  .assertMinSamples(nrow(data))
+
+  # Enforce trust profile min_train_rows (uses the higher of nfilter + profile)
+  trust <- .flowerTrustProfile()
+  effective_min <- max(trust$min_train_rows,
+                       .flowerDisclosureSettings()$nfilter_subset)
+  .assertMinSamples(nrow(data), min_n = effective_min)
+
+  # Enforce DP requirement from trust profile
+  requested_mode <- run_config[["privacy-mode"]] %||% "research"
+  if (trust$dp_required && !identical(requested_mode, "dp")) {
+    stop("Trust profile '", trust$name, "' requires differential privacy. ",
+         "Set privacy mode to 'dp'.", call. = FALSE)
+  }
+
+  # Check privacy budget before staging when DP is required
+  if (identical(requested_mode, "dp")) {
+    dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
+    dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
+    dataset_key <- paste0(handle$source, ":", target_column)
+    .check_budget(dataset_key, dp_epsilon, dp_delta)
+  }
+
+  # Write privacy config into run_config for manifest
+  run_config[["privacy_profile"]]          <- trust$name
+  run_config[["allow_per_node_metrics"]]   <- trust$allow_per_node_metrics
+  run_config[["allow_exact_num_examples"]] <- trust$allow_exact_num_examples
+  run_config[["require_secure_aggregation"]] <- trust$require_secure_aggregation
+  run_config[["dp_required"]]              <- trust$dp_required
 
   # Stage data with manifest
 
@@ -277,6 +304,28 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 flowerCleanupRunDS <- function(handle_symbol) {
   handle <- .getHandle(handle_symbol)
 
+  # Record privacy spend if this was a DP run
+  if (!is.null(handle$staging_dir) && dir.exists(handle$staging_dir)) {
+    manifest_path <- file.path(handle$staging_dir, "manifest.json")
+    if (file.exists(manifest_path)) {
+      manifest <- tryCatch(
+        jsonlite::fromJSON(manifest_path, simplifyVector = TRUE),
+        error = function(e) NULL
+      )
+      if (!is.null(manifest) &&
+          identical(manifest[["privacy-mode"]], "dp")) {
+        dataset_key <- paste0(handle$source %||% "table", ":",
+                              manifest$target_column)
+        .record_spend(
+          dataset_key  = dataset_key,
+          epsilon      = as.numeric(manifest[["privacy-epsilon"]] %||% 1.0),
+          delta        = as.numeric(manifest[["privacy-delta"]] %||% 1e-5),
+          run_token    = handle$run_token
+        )
+      }
+    }
+  }
+
   # Clean up staging
   if (!is.null(handle$run_token)) {
     .cleanupStaging(handle$run_token)
@@ -362,6 +411,9 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
   # Disclosure settings
   settings <- .flowerDisclosureSettings()
 
+  # Trust profile
+  trust <- .flowerTrustProfile()
+
   # SuperNode status
   node_list <- .supernode_list()
 
@@ -378,7 +430,9 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     min_samples         = settings$nfilter_subset,
     active_supernodes   = nrow(node_list[node_list$alive, , drop = FALSE]),
     is_docker           = is_docker,
-    hostname            = Sys.info()[["nodename"]]
+    hostname            = Sys.info()[["nodename"]],
+    privacy_profile     = trust$name,
+    trust_profile       = trust
   )
 
   # Add handle-specific info if symbol provided
@@ -473,7 +527,33 @@ flowerMetricsDS <- function(handle_symbol, since_round = 0L) {
   }
 
   # Apply disclosure controls
-  .sanitizeMetrics(metrics)
+  metrics <- .sanitizeMetrics(metrics)
+
+  # Apply trust profile metric suppression (defense in depth)
+  trust <- .flowerTrustProfile()
+  if (!trust$allow_per_node_metrics && nrow(metrics) > 0) {
+    # Keep only aggregated metrics (loss, num_clients), strip per-node detail
+    per_node_metrics <- c("accuracy", "f1", "f1_score", "precision",
+                          "recall", "auc", "roc_auc", "mse", "mae",
+                          "rmse", "r2")
+    if ("metric" %in% names(metrics)) {
+      metrics <- metrics[!tolower(metrics$metric) %in% per_node_metrics,
+                         , drop = FALSE]
+    }
+  }
+  if (!trust$allow_exact_num_examples && nrow(metrics) > 0) {
+    if ("metric" %in% names(metrics) && "value" %in% names(metrics)) {
+      ne_idx <- tolower(metrics$metric) == "num_examples"
+      if (any(ne_idx)) {
+        metrics$value[ne_idx] <- vapply(
+          metrics$value[ne_idx], .bucket_count, integer(1)
+        )
+      }
+    }
+  }
+
+  rownames(metrics) <- NULL
+  metrics
 }
 
 #' Get Sanitized Log Output
@@ -494,6 +574,21 @@ flowerLogDS <- function(handle_symbol, last_n = 50L) {
   }
 
   .supernode_read_log(handle$staging_dir, last_n)
+}
+
+#' Query Privacy Budget
+#'
+#' DataSHIELD AGGREGATE method. Returns the remaining privacy budget
+#' for the dataset associated with the handle.
+#'
+#' @param handle_symbol Character; symbol of the handle.
+#' @return Named list with spent/remaining epsilon and delta.
+#' @export
+flowerPrivacyBudgetDS <- function(handle_symbol) {
+  handle <- .getHandle(handle_symbol)
+  target <- handle$target_column %||% "unknown"
+  dataset_key <- paste0(handle$source %||% "table", ":", target)
+  .get_budget(dataset_key)
 }
 
 # --- Internal metric parsing ---

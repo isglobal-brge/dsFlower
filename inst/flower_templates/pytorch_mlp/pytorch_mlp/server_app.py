@@ -1,4 +1,4 @@
-"""Flower ServerApp with weight saving."""
+"""Flower ServerApp with weight saving and privacy-aware aggregation."""
 
 import json
 import os
@@ -13,11 +13,13 @@ from flwr.server.strategy import FedAvg
 class SaveModelStrategy(FedAvg):
     """FedAvg that saves global model weights and metrics after each round."""
 
-    def __init__(self, results_dir, num_rounds, **kwargs):
+    def __init__(self, results_dir, num_rounds, allow_per_node_metrics=True,
+                 **kwargs):
         super().__init__(**kwargs)
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.num_rounds = num_rounds
+        self.allow_per_node_metrics = allow_per_node_metrics
         self.history = []
 
     def aggregate_fit(self, server_round, results, failures):
@@ -33,6 +35,7 @@ class SaveModelStrategy(FedAvg):
         loss, metrics = super().aggregate_evaluate(
             server_round, results, failures
         )
+        # Only save aggregated loss to history, no per-node breakdown
         self.history.append({
             "round": server_round,
             "loss": float(loss) if loss is not None else None,
@@ -41,6 +44,11 @@ class SaveModelStrategy(FedAvg):
         })
         if server_round == self.num_rounds:
             self._save_history()
+
+        # Strip per-node metrics if not allowed
+        if not self.allow_per_node_metrics:
+            metrics = {}
+
         return loss, metrics
 
     def _save_weights(self, weights, server_round):
@@ -63,10 +71,13 @@ def server_fn(context: Context) -> ServerAppComponents:
 
     num_rounds = int(cfg.get("num-server-rounds", 5))
     results_dir = cfg.get("results-dir", "/tmp/dsflower_results")
+    require_secagg = str(cfg.get("require-secure-aggregation", "false")).lower() == "true"
+    allow_per_node_metrics = str(cfg.get("allow-per-node-metrics", "true")).lower() == "true"
 
     strategy = SaveModelStrategy(
         results_dir=results_dir,
         num_rounds=num_rounds,
+        allow_per_node_metrics=allow_per_node_metrics,
         fraction_fit=float(cfg.get("strategy-fraction_fit", 1.0)),
         fraction_evaluate=float(cfg.get("strategy-fraction_evaluate", 1.0)),
         min_fit_clients=int(cfg.get("strategy-min_fit_clients", 2)),
@@ -74,6 +85,15 @@ def server_fn(context: Context) -> ServerAppComponents:
     )
 
     config = ServerConfig(num_rounds=num_rounds)
+
+    # Use SecAgg+ workflow if required
+    if require_secagg:
+        from flwr.server.workflow import SecAggPlusWorkflow, DefaultWorkflow
+        return ServerAppComponents(
+            strategy=strategy, config=config,
+            workflow=SecAggPlusWorkflow()
+        )
+
     return ServerAppComponents(strategy=strategy, config=config)
 
 

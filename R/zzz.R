@@ -18,6 +18,26 @@
   packageStartupMessage(
     "dsFlower v", utils::packageVersion("dsFlower"), " loaded."
   )
+
+  # Stale staging janitor: remove staging directories older than 24 hours
+  .cleanup_stale_staging()
+}
+
+#' Remove stale staging directories older than 24 hours
+#' @keywords internal
+.cleanup_stale_staging <- function(max_age_hours = 24) {
+  for (base in c("/dev/shm", tempdir())) {
+    dsflower_dir <- file.path(base, "dsflower")
+    if (!dir.exists(dsflower_dir)) next
+    subdirs <- list.dirs(dsflower_dir, full.names = TRUE, recursive = FALSE)
+    for (d in subdirs) {
+      info <- file.info(d)
+      if (!is.na(info$mtime) &&
+          difftime(Sys.time(), info$mtime, units = "hours") > max_age_hours) {
+        tryCatch(unlink(d, recursive = TRUE), error = function(e) NULL)
+      }
+    }
+  }
 }
 
 #' Package detach hook

@@ -5,6 +5,113 @@
 # following the DataSHIELD convention of double-fallback:
 #   getOption("dsflower.X", getOption("default.dsflower.X", hardcoded_default))
 
+# --- Trust Profiles ---
+# Server-controlled profiles that determine what privacy guarantees are
+# enforced. The client can request a profile but the server enforces the floor.
+
+.TRUST_PROFILES <- list(
+  research = list(
+    min_train_rows          = 3,
+    allow_per_node_metrics  = TRUE,
+    allow_exact_num_examples = TRUE,
+    require_secure_aggregation = FALSE,
+    dp_required             = FALSE,
+    model_release           = "allowed"
+  ),
+  secure = list(
+    min_train_rows          = 100,
+    allow_per_node_metrics  = FALSE,
+    allow_exact_num_examples = FALSE,
+    require_secure_aggregation = TRUE,
+    dp_required             = FALSE,
+    model_release           = "gated"
+  ),
+  secure_dp = list(
+    min_train_rows          = 200,
+    allow_per_node_metrics  = FALSE,
+    allow_exact_num_examples = FALSE,
+    require_secure_aggregation = TRUE,
+    dp_required             = TRUE,
+    model_release           = "gated"
+  )
+)
+
+#' Get the effective trust profile
+#'
+#' Reads the \code{dsflower.privacy_profile} option (default "research")
+#' and returns the effective settings. Individual option overrides
+#' (e.g. \code{dsflower.min_train_rows}) can only strengthen (never weaken)
+#' the profile.
+#'
+#' @return Named list of trust profile settings.
+#' @keywords internal
+.flowerTrustProfile <- function() {
+  profile_name <- .dsf_option("privacy_profile", "research")
+  if (!profile_name %in% names(.TRUST_PROFILES)) {
+    stop("Unknown privacy profile: '", profile_name,
+         "'. Valid profiles: ", paste(names(.TRUST_PROFILES), collapse = ", "),
+         call. = FALSE)
+  }
+  profile <- .TRUST_PROFILES[[profile_name]]
+  profile$name <- profile_name
+
+  # Allow individual overrides that can only strengthen the profile
+  raw_min_rows <- .dsf_option("min_train_rows", NULL)
+  if (!is.null(raw_min_rows)) {
+    override_min_rows <- as.numeric(raw_min_rows)
+    if (!is.na(override_min_rows)) {
+      profile$min_train_rows <- max(profile$min_train_rows, override_min_rows)
+    }
+  }
+
+  raw_per_node <- .dsf_option("allow_per_node_metrics", NULL)
+  if (!is.null(raw_per_node)) {
+    # Can only disable, not enable
+    if (!as.logical(raw_per_node)) {
+      profile$allow_per_node_metrics <- FALSE
+    }
+  }
+
+  raw_exact <- .dsf_option("allow_exact_num_examples", NULL)
+  if (!is.null(raw_exact)) {
+    if (!as.logical(raw_exact)) {
+      profile$allow_exact_num_examples <- FALSE
+    }
+  }
+
+  raw_secagg <- .dsf_option("require_secure_aggregation", NULL)
+  if (!is.null(raw_secagg)) {
+    # Can only require, not disable
+    if (as.logical(raw_secagg)) {
+      profile$require_secure_aggregation <- TRUE
+    }
+  }
+
+  raw_dp <- .dsf_option("dp_required", NULL)
+  if (!is.null(raw_dp)) {
+    if (as.logical(raw_dp)) {
+      profile$dp_required <- TRUE
+    }
+  }
+
+  profile
+}
+
+#' Bucket a count to prevent exact sample sizes from leaking
+#'
+#' Uses power-of-two bucketing: \code{2^round(log2(n))}, with a minimum
+#' bucket of 1 and a floor for small counts.
+#'
+#' @param n Integer; the exact count.
+#' @return Integer; the bucketed count.
+#' @keywords internal
+.bucket_count <- function(n) {
+  n <- as.integer(n)
+  if (is.na(n) || n <= 0) return(0L)
+  if (n < 4) return(as.integer(n))
+  as.integer(2^round(log2(n)))
+}
+
 #' Read all disclosure settings from DataSHIELD server options
 #'
 #' Returns a named list of all disclosure thresholds and server-gated
@@ -37,9 +144,9 @@
 #' @param n_samples Numeric; number of training samples
 #' @return TRUE invisibly, or stops with an error
 #' @keywords internal
-.assertMinSamples <- function(n_samples) {
+.assertMinSamples <- function(n_samples, min_n = NULL) {
   settings <- .flowerDisclosureSettings()
-  threshold <- settings$nfilter_subset
+  threshold <- if (!is.null(min_n)) min_n else settings$nfilter_subset
 
   n <- as.numeric(n_samples)
   if (is.na(n) || n < threshold) {

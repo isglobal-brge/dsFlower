@@ -74,7 +74,7 @@ test_that(".validateDataSchema errors on missing features", {
   )
 })
 
-test_that(".stageData creates directory, CSV, and manifest", {
+test_that(".stageData creates directory, data file, and manifest", {
   data <- data.frame(f1 = 1:10, f2 = 11:20, target = rep(0:1, 5))
   token <- "run_test_staging_001"
 
@@ -85,21 +85,46 @@ test_that(".stageData creates directory, CSV, and manifest", {
   on.exit(unlink(staging_dir, recursive = TRUE))
 
   expect_true(dir.exists(staging_dir))
-  expect_true(file.exists(file.path(staging_dir, "train.csv")))
   expect_true(file.exists(file.path(staging_dir, "manifest.json")))
-
-  # Verify CSV
-  loaded <- utils::read.csv(file.path(staging_dir, "train.csv"))
-  expect_equal(nrow(loaded), 10)
 
   # Verify manifest
   manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
   expect_equal(manifest$run_token, token)
-  expect_equal(manifest$data_file, "train.csv")
   expect_equal(manifest$n_samples, 10)
   expect_equal(manifest$target_column, "target")
   expect_equal(manifest$feature_columns, c("f1", "f2"))
   expect_equal(manifest$num_rounds, 5L)
+
+  # Data file should be either parquet or csv depending on arrow availability
+  expect_true(manifest$data_format %in% c("csv", "parquet"))
+  expect_true(file.exists(file.path(staging_dir, manifest$data_file)))
+
+  # Verify directory permissions are strict (0700)
+  dir_info <- file.info(staging_dir)
+  dir_mode <- as.character(dir_info$mode)
+  expect_true(dir_mode %in% c("700", "0700"))
+})
+
+test_that(".stageData writes privacy settings from extra_config", {
+  data <- data.frame(f1 = 1:10, target = rep(0:1, 5))
+  token <- "run_test_staging_privacy"
+
+  staging_dir <- dsFlower:::.stageData(
+    data, token, "target", c("f1"),
+    extra_config = list(
+      allow_per_node_metrics = FALSE,
+      allow_exact_num_examples = FALSE,
+      require_secure_aggregation = TRUE,
+      privacy_profile = "secure"
+    )
+  )
+  on.exit(unlink(staging_dir, recursive = TRUE))
+
+  manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  expect_false(manifest$allow_per_node_metrics)
+  expect_false(manifest$allow_exact_num_examples)
+  expect_true(manifest$require_secure_aggregation)
+  expect_equal(manifest$privacy_profile, "secure")
 })
 
 test_that(".cleanupStaging removes the directory", {

@@ -101,32 +101,50 @@
 #' @keywords internal
 .stageData <- function(data, run_token, target_column,
                        feature_columns = NULL, extra_config = list()) {
-  staging_dir <- file.path(tempdir(), "dsflower", run_token)
+  # Prefer tmpfs (/dev/shm) when available for ephemeral staging
+  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
+  staging_dir <- file.path(base_dir, "dsflower", run_token)
   dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
 
-  # Write training data
-  data_file <- "train.csv"
-  utils::write.csv(data, file.path(staging_dir, data_file), row.names = FALSE)
+  # Strict directory permissions (owner-only)
+  Sys.chmod(staging_dir, "0700")
+
+  # Write training data -- prefer Parquet when arrow is available
+  use_parquet <- requireNamespace("arrow", quietly = TRUE)
+  if (use_parquet) {
+    data_file <- "train.parquet"
+    data_format <- "parquet"
+    arrow::write_parquet(data, file.path(staging_dir, data_file))
+  } else {
+    data_file <- "train.csv"
+    data_format <- "csv"
+    utils::write.csv(data, file.path(staging_dir, data_file), row.names = FALSE)
+  }
+
+  # Strict file permissions
+  Sys.chmod(file.path(staging_dir, data_file), "0600")
 
   # Build manifest
   manifest <- list(
     run_token       = run_token,
     data_file       = data_file,
-    data_format     = "csv",
+    data_format     = data_format,
     n_samples       = nrow(data),
     target_column   = target_column,
     feature_columns = feature_columns,
     staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
-  # Merge extra config
+  # Merge extra config (includes privacy settings from trust profile)
   if (length(extra_config) > 0) {
     manifest <- c(manifest, extra_config)
   }
 
   # Write manifest
-  jsonlite::write_json(manifest, file.path(staging_dir, "manifest.json"),
+  manifest_path <- file.path(staging_dir, "manifest.json")
+  jsonlite::write_json(manifest, manifest_path,
                        auto_unbox = TRUE, pretty = TRUE, null = "null")
+  Sys.chmod(manifest_path, "0600")
 
   staging_dir
 }
@@ -140,9 +158,13 @@
 #' @keywords internal
 .cleanupStaging <- function(run_token) {
   if (is.null(run_token)) return(invisible(TRUE))
-  staging_dir <- file.path(tempdir(), "dsflower", run_token)
-  if (dir.exists(staging_dir)) {
-    unlink(staging_dir, recursive = TRUE)
+
+  # Check both possible base directories (tmpfs and tempdir)
+  for (base in c("/dev/shm", tempdir())) {
+    staging_dir <- file.path(base, "dsflower", run_token)
+    if (dir.exists(staging_dir)) {
+      unlink(staging_dir, recursive = TRUE)
+    }
   }
   invisible(TRUE)
 }
