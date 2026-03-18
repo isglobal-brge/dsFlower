@@ -614,7 +614,7 @@ flowerLogDS <- function(handle_symbol, last_n = 50L) {
 #' @param timeout_secs Numeric; connection timeout in seconds (default 5).
 #' @return Named list with \code{reachable} (logical) and \code{error} (char).
 #' @export
-flowerCheckConnectivityDS <- function(address, timeout_secs = 5) {
+flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
   parts <- strsplit(address, ":", fixed = TRUE)[[1]]
   if (length(parts) != 2) {
     return(list(reachable = FALSE,
@@ -623,18 +623,23 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 5) {
   host <- parts[1]
   port <- as.integer(parts[2])
 
+  # Use socketConnection with open="wb" and immediately close.
+  # For TLS ports the TCP handshake succeeds even though the TLS
+  # handshake won't complete -- that's fine, we only need to verify
+  # the port is reachable.
   result <- tryCatch({
-    con <- socketConnection(host = host, port = port,
-                            open = "", blocking = TRUE,
-                            timeout = timeout_secs)
+    con <- suppressWarnings(
+      socketConnection(host = host, port = port,
+                       open = "wb", blocking = TRUE,
+                       timeout = timeout_secs)
+    )
     close(con)
     list(reachable = TRUE, error = NULL)
+  }, warning = function(w) {
+    # socketConnection emits a warning when connect fails
+    list(reachable = FALSE, error = conditionMessage(w))
   }, error = function(e) {
     list(reachable = FALSE, error = conditionMessage(e))
-  }, warning = function(w) {
-    # Warnings during socket connect often indicate partial success
-    # (e.g. TLS handshake not completed but TCP connect succeeded)
-    list(reachable = TRUE, error = NULL)
   })
   result
 }
