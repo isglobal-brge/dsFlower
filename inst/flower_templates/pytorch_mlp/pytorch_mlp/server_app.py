@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 import numpy as np
-from flwr.common import Context, parameters_to_ndarrays
+from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 from flwr.server.strategy import FedAvg, FedProx, FedAdam, FedAdagrad
 
@@ -17,6 +17,9 @@ _STRATEGY_MAP = {
 }
 
 
+_ADAPTIVE_STRATEGIES = {FedAdam, FedAdagrad}
+
+
 def _make_save_strategy(base_cls, results_dir, num_rounds,
                          allow_per_node_metrics=True, **kwargs):
     """Create a SaveModelStrategy that subclasses the given Flower strategy."""
@@ -26,6 +29,14 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
 
         def __init__(self, results_dir, num_rounds, allow_per_node_metrics=True,
                      **kw):
+            # FedAdam/FedAdagrad require initial_parameters but we don't
+            # have model params at server init time. Pass a dummy value and
+            # override initialize_parameters to fetch from a real client.
+            if base_cls in _ADAPTIVE_STRATEGIES and "initial_parameters" not in kw:
+                kw["initial_parameters"] = ndarrays_to_parameters([])
+                self._needs_client_init = True
+            else:
+                self._needs_client_init = False
             super().__init__(**kw)
             self.results_dir = Path(results_dir)
             self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -33,7 +44,29 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
             self.allow_per_node_metrics = allow_per_node_metrics
             self.history = []
 
+        def initialize_parameters(self, client_manager):
+            """Override to request real params from a client for adaptive strategies."""
+            if self._needs_client_init:
+                # Clear the dummy initial_parameters so Flower requests from a client.
+                # This also forces FedAdam/FedAdagrad to initialize their internal
+                # state (current_weights, m_t, v_t) from the real client params.
+                self.initial_parameters = None
+                return None
+            return super().initialize_parameters(client_manager)
+
         def aggregate_fit(self, server_round, results, failures):
+            # Lazy-init current_weights for adaptive strategies: the dummy
+            # initial_parameters left current_weights empty. On round 1,
+            # reconstruct from a FedAvg pass so delta computation works.
+            if (self._needs_client_init and
+                    hasattr(self, 'current_weights') and
+                    len(self.current_weights) == 0):
+                fedavg_agg, _ = FedAvg.aggregate_fit(
+                    self, server_round, results, failures
+                )
+                if fedavg_agg is not None:
+                    self.current_weights = parameters_to_ndarrays(fedavg_agg)
+
             aggregated_parameters, aggregated_metrics = super().aggregate_fit(
                 server_round, results, failures
             )
