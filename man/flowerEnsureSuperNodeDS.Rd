@@ -8,7 +8,8 @@ flowerEnsureSuperNodeDS(
   handle_symbol,
   superlink_address,
   federation_id = NULL,
-  ca_cert_pem = NULL
+  ca_cert_pem = NULL,
+  template_name = NULL
 )
 }
 \arguments{

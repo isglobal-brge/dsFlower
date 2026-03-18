@@ -17,6 +17,7 @@ Encoding: UTF-8
 Depends:
     R (>= 4.1.0)
 Imports:
+    digest,
     jsonlite,
     processx,
     utils
@@ -34,6 +35,7 @@ AggregateMethods:
     flowerCheckConnectivityDS,
     flowerListTemplatesDS,
     flowerGetTemplateDS,
+    flowerVerifyAppHashDS,
     c=base::c,
     list=base::list
 AssignMethods:

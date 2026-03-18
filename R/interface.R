@@ -217,11 +217,32 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #' @export
 flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
                                      federation_id = NULL,
-                                     ca_cert_pem = NULL) {
+                                     ca_cert_pem = NULL,
+                                     template_name = NULL) {
   handle <- .getHandle(handle_symbol)
 
   if (!handle$prepared) {
     stop("Handle is not prepared. Call flowerPrepareRunDS first.", call. = FALSE)
+  }
+
+  # Write code verification artifacts to staging directory
+  if (!is.null(template_name) && nzchar(template_name %||% "")) {
+    template_name <- .ds_arg(template_name)
+    if (is.list(template_name)) template_name <- template_name[[1]]
+
+    # Compute expected hash from server's own template copy
+    template_hash <- .compute_template_hash(template_name)
+    writeLines(template_hash,
+               file.path(handle$staging_dir, "expected_hash.txt"))
+
+    # Copy trusted verification module to staging directory
+    verify_src <- system.file("python", "_dsflower_verify.py",
+                               package = "dsFlower")
+    if (nzchar(verify_src) && file.exists(verify_src)) {
+      file.copy(verify_src,
+                file.path(handle$staging_dir, "_dsflower_verify.py"),
+                overwrite = TRUE)
+    }
   }
 
   # Decode ca_cert_pem if B64-encoded from DSI transport
@@ -229,7 +250,6 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   ca_cert_path <- NULL
 
   if (!is.null(ca_cert_pem)) {
-    # .ds_arg decodes the B64 wrapper to list(pem = "...") or a plain string
     pem_text <- if (is.list(ca_cert_pem)) ca_cert_pem$pem else ca_cert_pem
     if (!is.null(pem_text) && nzchar(pem_text)) {
       ca_cert_path <- file.path(handle$staging_dir, "ca.pem")
@@ -691,5 +711,68 @@ flowerGetTemplateDS <- function(template_name) {
     files[[f]] <- paste(readLines(full_path, warn = FALSE), collapse = "\n")
   }
 
-  list(name = template_name, files = files)
+  hash <- .compute_template_hash(template_name)
+  list(name = template_name, files = files, hash = hash)
+}
+
+#' Verify App Hash
+#'
+#' DataSHIELD AGGREGATE method. Compares the hash of the Flower app built
+#' by the client against the server's expected hash for that template.
+#' If the hashes do not match, the staging directory is destroyed so that
+#' the SuperNode cannot access any training data.
+#'
+#' @param handle_symbol Character; symbol of the handle.
+#' @param app_hash Character; SHA-256 hash of the app computed by the client.
+#' @param template_name Character; name of the template.
+#' @return Named list with \code{verified}, \code{expected}, \code{received}.
+#' @export
+flowerVerifyAppHashDS <- function(handle_symbol, app_hash, template_name) {
+  handle <- .getHandle(handle_symbol)
+
+  if (is.null(handle$staging_dir) || !dir.exists(handle$staging_dir)) {
+    return(list(verified = FALSE, error = "No staging directory"))
+  }
+
+  expected <- .compute_template_hash(template_name)
+  verified <- identical(app_hash, expected)
+
+  if (!verified) {
+    # Destroy staging data -- no training possible with tampered code
+    unlink(handle$staging_dir, recursive = TRUE)
+    warning("CODE VERIFICATION FAILED. Staging data destroyed. ",
+            "Expected: ", expected, ", received: ", app_hash,
+            call. = FALSE)
+  }
+
+  list(verified = verified, expected = expected, received = app_hash)
+}
+
+#' Compute SHA-256 hash of a template's Python files
+#'
+#' Reads all .py files from the template package directory, sorts by
+#' filename, and computes a deterministic SHA-256 hash. This must match
+#' the Python-side algorithm in \code{_dsflower_verify.py}.
+#'
+#' @param template_name Character; template name.
+#' @return Character; hex-encoded SHA-256 hash.
+#' @keywords internal
+.compute_template_hash <- function(template_name) {
+  template_dir <- system.file("flower_templates", template_name,
+                               package = "dsFlower")
+  pkg_dir <- file.path(template_dir, template_name)
+
+  py_files <- sort(list.files(pkg_dir, pattern = "\\.py$",
+                               full.names = FALSE))
+
+  # Build binary blob matching Python's algorithm:
+  # for each file: filename + "\n" + content + "\x00"
+  blob <- raw(0)
+  for (fname in py_files) {
+    content <- readBin(file.path(pkg_dir, fname), "raw",
+                       file.info(file.path(pkg_dir, fname))$size)
+    blob <- c(blob, charToRaw(fname), charToRaw("\n"), content, as.raw(0x00))
+  }
+
+  digest::digest(blob, algo = "sha256", serialize = FALSE)
 }

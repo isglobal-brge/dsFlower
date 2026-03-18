@@ -8,7 +8,12 @@ import pandas as pd
 
 
 def load_data(context=None):
-    """Load training data from manifest directory."""
+    """Load training data from manifest directory.
+
+    Reads the manifest.json from either context.node_config["manifest-dir"]
+    or the DSFLOWER_MANIFEST_DIR environment variable, then loads the
+    data file specified in the manifest.
+    """
     manifest_dir = None
     if context is not None:
         manifest_dir = context.node_config.get("manifest-dir")
