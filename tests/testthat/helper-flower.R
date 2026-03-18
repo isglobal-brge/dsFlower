@@ -1,10 +1,11 @@
 # Test helpers for dsFlower
 
-#' Create a mock Flower handle with new structure
+#' Create a mock Flower handle
 #'
 #' @param data_path Character; path to test data file
 #' @param data_format Character; data format
 #' @param python_path Character; Python executable path
+#' @param table_data data.frame or NULL; in-memory data
 #' @param run_token Character; run token or NULL
 #' @param staging_dir Character; staging directory or NULL
 #' @param superlink_address Character; SuperLink address or NULL
@@ -16,6 +17,7 @@
 mock_handle <- function(data_path = NULL,
                         data_format = "csv",
                         python_path = "python3",
+                        table_data = NULL,
                         run_token = NULL,
                         staging_dir = NULL,
                         superlink_address = NULL,
@@ -25,11 +27,13 @@ mock_handle <- function(data_path = NULL,
                         feature_columns = NULL,
                         prepared = FALSE,
                         node_ensured = FALSE) {
+  source <- if (!is.null(table_data)) "table" else "resource"
   list(
-    resource_client    = NULL,
+    source             = source,
     data_path          = data_path,
     data_format        = data_format,
     python_path        = python_path,
+    table_data         = table_data,
     run_token          = run_token,
     staging_dir        = staging_dir,
     superlink_address  = superlink_address,

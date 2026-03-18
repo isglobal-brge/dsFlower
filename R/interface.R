@@ -80,35 +80,6 @@
   }
 }
 
-#' Create a Flower handle from a resource client
-#'
-#' Builds the internal handle structure from a resolved FlowerResourceClient.
-#'
-#' @param resource_client A FlowerResourceClient object.
-#' @return A list representing the Flower handle.
-#' @keywords internal
-.createHandle <- function(resource_client) {
-  parsed <- resource_client$getParsed()
-
-  list(
-    source             = "resource",
-    resource_client    = resource_client,
-    data_path          = parsed$data_path,
-    data_format        = parsed$data_format,
-    python_path        = parsed$python_path,
-    table_data         = NULL,
-    run_token          = NULL,
-    staging_dir        = NULL,
-    superlink_address  = NULL,
-    federation_id      = NULL,
-    ca_cert_path       = NULL,
-    target_column      = NULL,
-    feature_columns    = NULL,
-    prepared           = FALSE,
-    node_ensured       = FALSE
-  )
-}
-
 #' Create a Flower handle from a data.frame
 #'
 #' Builds the internal handle structure from an in-session data.frame.
@@ -145,40 +116,27 @@
 
 #' Initialize Flower Handle
 #'
-#' DataSHIELD ASSIGN method. Creates a Flower federation handle from either
-#' a DataSHIELD resource or a data.frame/matrix already in the R session.
-#' Auto-detects the type of the symbol.
+#' DataSHIELD ASSIGN method. Creates a Flower federation handle from
+#' a data.frame or matrix already assigned in the R session. The data
+#' can come from any DataSHIELD operation: \code{datashield.assign.table},
+#' \code{datashield.assign.resource} + \code{as.resource.data.frame},
+#' or any transformation via \code{datashield.assign.expr}.
 #'
-#' @param data_symbol Character; symbol name of the data source. Can be:
-#'   \itemize{
-#'     \item A resource (from \code{datashield.assign.resource})
-#'     \item A data.frame or matrix (from \code{datashield.assign.table},
-#'       \code{datashield.assign.expr}, or any DataSHIELD operation)
-#'   }
+#' @param data_symbol Character; symbol name of the data object.
 #' @return A Flower handle object (assigned server-side).
 #' @export
 flowerInitDS <- function(data_symbol) {
   obj <- get(data_symbol, envir = parent.frame())
 
-  # Case 1: ResourceClient (DSLite resolves resources automatically)
-  if (inherits(obj, "ResourceClient")) {
-    return(.createHandle(obj))
+  if (is.matrix(obj)) obj <- as.data.frame(obj)
+
+  if (!is.data.frame(obj)) {
+    stop("Symbol '", data_symbol, "' is not a data.frame or matrix. ",
+         "Assign your data first with datashield.assign.table() or similar.",
+         call. = FALSE)
   }
 
-  # Case 2: data.frame or matrix (already loaded in session)
-  if (is.data.frame(obj) || is.matrix(obj)) {
-    if (is.matrix(obj)) obj <- as.data.frame(obj)
-    return(.createHandleFromTable(obj))
-  }
-
-  # Case 3: raw resource descriptor (Opal passes these before resolution)
-  tryCatch({
-    resource_client <- resourcer::newResourceClient(obj)
-    return(.createHandle(resource_client))
-  }, error = function(e) NULL)
-
-  stop("Symbol '", data_symbol, "' is not a recognized data source. ",
-       "Expected a resource, data.frame, or matrix.", call. = FALSE)
+  .createHandleFromTable(obj)
 }
 
 #' Prepare a Training Run

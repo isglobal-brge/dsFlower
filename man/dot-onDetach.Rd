@@ -13,7 +13,6 @@
 Invisible NULL; called for its side effect.
 }
 \description{
-Iterates the SuperNode registry, kills all SuperNodes, and
-unregisters the resource resolver.
+Kills all registered SuperNodes.
 }
 \keyword{internal}

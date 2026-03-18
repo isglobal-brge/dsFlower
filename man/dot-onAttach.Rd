@@ -12,7 +12,6 @@
 \item{pkg}{Package name.}
 }
 \description{
-Registers the Flower federation resource resolver and displays a startup
-message with the package version.
+Package attach hook
 }
 \keyword{internal}

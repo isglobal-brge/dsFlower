@@ -7,18 +7,15 @@
 flowerInitDS(data_symbol)
 }
 \arguments{
-\item{data_symbol}{Character; symbol name of the data source. Can be:
-\itemize{
-  \item A resource (from \code{datashield.assign.resource})
-  \item A data.frame or matrix (from \code{datashield.assign.table},
-    \code{datashield.assign.expr}, or any DataSHIELD operation)
-}}
+\item{data_symbol}{Character; symbol name of the data object.}
 }
 \value{
 A Flower handle object (assigned server-side).
 }
 \description{
-DataSHIELD ASSIGN method. Creates a Flower federation handle from either
-a DataSHIELD resource or a data.frame/matrix already in the R session.
-Auto-detects the type of the symbol.
+DataSHIELD ASSIGN method. Creates a Flower federation handle from
+a data.frame or matrix already assigned in the R session. The data
+can come from any DataSHIELD operation: \code{datashield.assign.table},
+\code{datashield.assign.resource} + \code{as.resource.data.frame},
+or any transformation via \code{datashield.assign.expr}.
 }
