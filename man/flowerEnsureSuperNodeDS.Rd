@@ -21,8 +21,8 @@ SuperLink instance. Used by the client to verify all nodes joined the
 same federation.}
 
 \item{ca_cert_pem}{Character or NULL; B64-encoded CA certificate PEM for
-TLS verification. When provided, the SuperNode uses
-\code{--root-certificates} instead of \code{--insecure}.}
+TLS verification. The SuperNode uses \code{--root-certificates} to
+verify the SuperLink's identity.}
 }
 \value{
 Updated handle with SuperNode information.

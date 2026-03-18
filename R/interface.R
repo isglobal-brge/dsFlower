@@ -91,10 +91,44 @@
   parsed <- resource_client$getParsed()
 
   list(
+    source             = "resource",
     resource_client    = resource_client,
     data_path          = parsed$data_path,
     data_format        = parsed$data_format,
     python_path        = parsed$python_path,
+    table_data         = NULL,
+    run_token          = NULL,
+    staging_dir        = NULL,
+    superlink_address  = NULL,
+    federation_id      = NULL,
+    ca_cert_path       = NULL,
+    target_column      = NULL,
+    feature_columns    = NULL,
+    prepared           = FALSE,
+    node_ensured       = FALSE
+  )
+}
+
+#' Create a Flower handle from a data.frame
+#'
+#' Builds the internal handle structure from an in-session data.frame.
+#' The data is stored directly in the handle instead of referencing a file.
+#'
+#' @param df A data.frame.
+#' @return A list representing the Flower handle.
+#' @keywords internal
+.createHandleFromTable <- function(df) {
+  python_path <- Sys.which("python3")
+  if (!nzchar(python_path)) python_path <- Sys.which("python")
+  if (!nzchar(python_path)) python_path <- "python3"
+
+  list(
+    source             = "table",
+    resource_client    = NULL,
+    data_path          = NULL,
+    data_format        = "table",
+    python_path        = python_path,
+    table_data         = df,
     run_token          = NULL,
     staging_dir        = NULL,
     superlink_address  = NULL,
@@ -109,30 +143,42 @@
 
 # --- ASSIGN methods ---
 
-#' Initialize Flower Handle from Resource
+#' Initialize Flower Handle
 #'
-#' DataSHIELD ASSIGN method. Creates a Flower federation handle from
-#' a DataSHIELD resource. Handles both DSLite (where the resource is
-#' already resolved to a ResourceClient) and Opal (raw resource descriptor).
+#' DataSHIELD ASSIGN method. Creates a Flower federation handle from either
+#' a DataSHIELD resource or a data.frame/matrix already in the R session.
+#' Auto-detects the type of the symbol.
 #'
-#' @param resource_symbol Character; symbol name of the assigned resource.
+#' @param data_symbol Character; symbol name of the data source. Can be:
+#'   \itemize{
+#'     \item A resource (from \code{datashield.assign.resource})
+#'     \item A data.frame or matrix (from \code{datashield.assign.table},
+#'       \code{datashield.assign.expr}, or any DataSHIELD operation)
+#'   }
 #' @return A Flower handle object (assigned server-side).
 #' @export
-flowerInitDS <- function(resource_symbol) {
-  # Get the resource object from the session workspace
-  res_obj <- get(resource_symbol, envir = parent.frame())
+flowerInitDS <- function(data_symbol) {
+  obj <- get(data_symbol, envir = parent.frame())
 
-  # DSLite resolves resources to ResourceClient objects automatically.
-  # Opal passes raw resource descriptors that need resolution.
-  if (inherits(res_obj, "ResourceClient")) {
-    resource_client <- res_obj
-  } else {
-    resource_client <- resourcer::newResourceClient(res_obj)
+  # Case 1: ResourceClient (DSLite resolves resources automatically)
+  if (inherits(obj, "ResourceClient")) {
+    return(.createHandle(obj))
   }
 
-  # Create the handle
-  handle <- .createHandle(resource_client)
-  handle
+  # Case 2: data.frame or matrix (already loaded in session)
+  if (is.data.frame(obj) || is.matrix(obj)) {
+    if (is.matrix(obj)) obj <- as.data.frame(obj)
+    return(.createHandleFromTable(obj))
+  }
+
+  # Case 3: raw resource descriptor (Opal passes these before resolution)
+  tryCatch({
+    resource_client <- resourcer::newResourceClient(obj)
+    return(.createHandle(resource_client))
+  }, error = function(e) NULL)
+
+  stop("Symbol '", data_symbol, "' is not a recognized data source. ",
+       "Expected a resource, data.frame, or matrix.", call. = FALSE)
 }
 
 #' Prepare a Training Run
@@ -171,8 +217,12 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     .validateMaxRounds(run_config$num_rounds)
   }
 
-  # Load and validate data
-  data <- .loadTrainingData(handle$data_path, handle$data_format)
+  # Load data: from file (resource) or from in-memory table
+  if (identical(handle$source, "table") && !is.null(handle$table_data)) {
+    data <- handle$table_data
+  } else {
+    data <- .loadTrainingData(handle$data_path, handle$data_format)
+  }
   .validateDataSchema(data, target_column, feature_columns)
   .assertMinSamples(nrow(data))
 
@@ -364,10 +414,17 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
   if (!is.null(handle_symbol)) {
     tryCatch({
       handle <- .getHandle(handle_symbol)
-      data_summary <- .getDataSummary(handle$data_path, handle$data_format)
-      caps$data_n_rows <- data_summary$n_rows
-      caps$data_n_cols <- data_summary$n_cols
-      caps$data_columns <- data_summary$columns
+      if (identical(handle$source, "table") && !is.null(handle$table_data)) {
+        caps$data_n_rows <- nrow(handle$table_data)
+        caps$data_n_cols <- ncol(handle$table_data)
+        caps$data_columns <- names(handle$table_data)
+      } else {
+        data_summary <- .getDataSummary(handle$data_path, handle$data_format)
+        caps$data_n_rows <- data_summary$n_rows
+        caps$data_n_cols <- data_summary$n_cols
+        caps$data_columns <- data_summary$columns
+      }
+      caps$data_source <- handle$source %||% "resource"
       caps$prepared <- handle$prepared
       caps$node_ensured <- handle$node_ensured
     }, error = function(e) NULL)

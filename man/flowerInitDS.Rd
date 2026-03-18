@@ -2,18 +2,23 @@
 % Please edit documentation in R/interface.R
 \name{flowerInitDS}
 \alias{flowerInitDS}
-\title{Initialize Flower Handle from Resource}
+\title{Initialize Flower Handle}
 \usage{
-flowerInitDS(resource_symbol)
+flowerInitDS(data_symbol)
 }
 \arguments{
-\item{resource_symbol}{Character; symbol name of the assigned resource.}
+\item{data_symbol}{Character; symbol name of the data source. Can be:
+\itemize{
+  \item A resource (from \code{datashield.assign.resource})
+  \item A data.frame or matrix (from \code{datashield.assign.table},
+    \code{datashield.assign.expr}, or any DataSHIELD operation)
+}}
 }
 \value{
 A Flower handle object (assigned server-side).
 }
 \description{
-DataSHIELD ASSIGN method. Creates a Flower federation handle from
-a DataSHIELD resource. Handles both DSLite (where the resource is
-already resolved to a ResourceClient) and Opal (raw resource descriptor).
+DataSHIELD ASSIGN method. Creates a Flower federation handle from either
+a DataSHIELD resource or a data.frame/matrix already in the R session.
+Auto-detects the type of the symbol.
 }
