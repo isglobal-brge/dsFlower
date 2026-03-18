@@ -78,6 +78,86 @@
     min_rows_secure    = 100,
     min_rows_secure_dp = 500,
     framework          = "pytorch"
+  ),
+  pytorch_logreg = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = TRUE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 100,
+    min_rows_secure_dp = 200,
+    framework          = "pytorch"
+  ),
+  pytorch_linear_regression = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = TRUE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 100,
+    min_rows_secure_dp = 200,
+    framework          = "pytorch"
+  ),
+  pytorch_coxph = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = TRUE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 200,
+    min_rows_secure_dp = 500,
+    framework          = "pytorch"
+  ),
+  pytorch_multiclass = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = TRUE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 200,
+    min_rows_secure_dp = 500,
+    framework          = "pytorch"
+  ),
+  xgboost_tabular = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,  # tree privacy not designed
+    requires_secagg    = FALSE,
+    min_rows_secure    = 200,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "xgboost"
+  ),
+  pytorch_resnet18 = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,  # deferred
+    requires_secagg    = FALSE,
+    min_rows_secure    = 1000,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "pytorch_vision"
+  ),
+  pytorch_densenet121 = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,  # deferred
+    requires_secagg    = FALSE,
+    min_rows_secure    = 1000,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "pytorch_vision"
+  ),
+  pytorch_unet2d = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 500,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "pytorch_vision"
+  ),
+  pytorch_tcn = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = TRUE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 200,
+    min_rows_secure_dp = 500,
+    framework          = "pytorch"
+  ),
+  pytorch_lstm = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = TRUE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 200,
+    min_rows_secure_dp = 500,
+    framework          = "pytorch"
   )
 )
 
@@ -231,7 +311,12 @@
     max_rounds = as.numeric(.dsf_option("max_rounds", 500)),
     allow_custom_config = as.logical(.dsf_option("allow_custom_config", FALSE)),
     allowed_templates = c("sklearn_logreg", "sklearn_ridge",
-                          "sklearn_sgd", "pytorch_mlp"),
+                          "sklearn_sgd", "pytorch_mlp",
+                          "pytorch_logreg", "pytorch_linear_regression",
+                          "pytorch_coxph", "pytorch_multiclass",
+                          "xgboost_tabular", "pytorch_resnet18",
+                          "pytorch_densenet121", "pytorch_unet2d",
+                          "pytorch_tcn", "pytorch_lstm"),
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
     max_concurrent_runs = as.integer(.dsf_option("max_concurrent_runs", 5))
   )

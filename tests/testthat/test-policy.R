@@ -20,6 +20,17 @@ test_that(".flowerDisclosureSettings returns correct defaults", {
   expect_equal(settings$max_concurrent_runs, 5L)
   expect_true("sklearn_logreg" %in% settings$allowed_templates)
   expect_true("pytorch_mlp" %in% settings$allowed_templates)
+  expect_true("pytorch_logreg" %in% settings$allowed_templates)
+  expect_true("pytorch_linear_regression" %in% settings$allowed_templates)
+  expect_true("pytorch_coxph" %in% settings$allowed_templates)
+  expect_true("pytorch_multiclass" %in% settings$allowed_templates)
+  expect_true("xgboost_tabular" %in% settings$allowed_templates)
+  expect_true("pytorch_resnet18" %in% settings$allowed_templates)
+  expect_true("pytorch_densenet121" %in% settings$allowed_templates)
+  expect_true("pytorch_unet2d" %in% settings$allowed_templates)
+  expect_true("pytorch_tcn" %in% settings$allowed_templates)
+  expect_true("pytorch_lstm" %in% settings$allowed_templates)
+  expect_equal(length(settings$allowed_templates), 14)
 })
 
 test_that(".flowerDisclosureSettings respects option overrides", {
@@ -121,6 +132,16 @@ test_that(".validateTemplate allows built-in templates", {
   expect_true(dsFlower:::.validateTemplate("sklearn_ridge"))
   expect_true(dsFlower:::.validateTemplate("sklearn_sgd"))
   expect_true(dsFlower:::.validateTemplate("pytorch_mlp"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_logreg"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_linear_regression"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_coxph"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_multiclass"))
+  expect_true(dsFlower:::.validateTemplate("xgboost_tabular"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_resnet18"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_densenet121"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_unet2d"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_tcn"))
+  expect_true(dsFlower:::.validateTemplate("pytorch_lstm"))
 })
 
 test_that(".validateTemplate blocks unknown templates", {
@@ -217,10 +238,15 @@ test_that(".bucket_count returns correct values", {
 
 test_that(".TEMPLATE_CAPABILITIES has entries for all built-in templates", {
   caps <- dsFlower:::.TEMPLATE_CAPABILITIES
-  expect_true("sklearn_logreg" %in% names(caps))
-  expect_true("sklearn_ridge" %in% names(caps))
-  expect_true("sklearn_sgd" %in% names(caps))
-  expect_true("pytorch_mlp" %in% names(caps))
+  expected <- c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd",
+                "pytorch_mlp", "pytorch_logreg", "pytorch_linear_regression",
+                "pytorch_coxph", "pytorch_multiclass", "xgboost_tabular",
+                "pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d",
+                "pytorch_tcn", "pytorch_lstm")
+  for (tmpl in expected) {
+    expect_true(tmpl %in% names(caps), label = paste(tmpl, "in capabilities"))
+  }
+  expect_equal(length(caps), 14)
 })
 
 test_that("sklearn templates do not support secure_dp", {
@@ -238,6 +264,29 @@ test_that("pytorch_mlp supports secure_dp", {
   expect_true(caps$supports_secure_dp)
   expect_true(caps$supports_secure)
   expect_equal(caps$min_rows_secure_dp, 500)
+})
+
+test_that("new pytorch tabular templates support secure_dp", {
+  for (tmpl in c("pytorch_logreg", "pytorch_linear_regression",
+                 "pytorch_coxph", "pytorch_multiclass",
+                 "pytorch_tcn", "pytorch_lstm")) {
+    caps <- dsFlower:::.TEMPLATE_CAPABILITIES[[tmpl]]
+    expect_true(caps$supports_secure_dp,
+                label = paste(tmpl, "should support secure_dp"))
+    expect_true(caps$supports_secure,
+                label = paste(tmpl, "should support secure"))
+  }
+})
+
+test_that("xgboost and image templates do not support secure_dp", {
+  for (tmpl in c("xgboost_tabular", "pytorch_resnet18",
+                 "pytorch_densenet121", "pytorch_unet2d")) {
+    caps <- dsFlower:::.TEMPLATE_CAPABILITIES[[tmpl]]
+    expect_false(caps$supports_secure_dp,
+                 label = paste(tmpl, "should not support secure_dp"))
+    expect_true(caps$supports_secure,
+                label = paste(tmpl, "should support secure"))
+  }
 })
 
 test_that(".validateTemplateProfile rejects sklearn in secure_dp", {
@@ -259,9 +308,31 @@ test_that(".validateTemplateProfile allows pytorch_mlp in secure_dp", {
   expect_true(dsFlower:::.validateTemplateProfile("pytorch_mlp", "secure_dp"))
 })
 
+test_that(".validateTemplateProfile rejects non-DP templates in secure_dp", {
+  for (tmpl in c("xgboost_tabular", "pytorch_resnet18",
+                 "pytorch_densenet121", "pytorch_unet2d")) {
+    expect_error(
+      dsFlower:::.validateTemplateProfile(tmpl, "secure_dp"),
+      "does not support.*secure_dp",
+      label = paste(tmpl, "should be rejected in secure_dp")
+    )
+  }
+})
+
+test_that(".validateTemplateProfile allows new DP templates in secure_dp", {
+  for (tmpl in c("pytorch_logreg", "pytorch_linear_regression",
+                 "pytorch_coxph", "pytorch_multiclass",
+                 "pytorch_tcn", "pytorch_lstm")) {
+    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "secure_dp"),
+                label = paste(tmpl, "should be allowed in secure_dp"))
+  }
+})
+
 test_that(".validateTemplateProfile allows all templates in research", {
-  for (tmpl in c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd", "pytorch_mlp")) {
-    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "research"))
+  all_templates <- names(dsFlower:::.TEMPLATE_CAPABILITIES)
+  for (tmpl in all_templates) {
+    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "research"),
+                label = paste(tmpl, "should be allowed in research"))
   }
 })
 
@@ -275,6 +346,10 @@ test_that(".validateTemplateProfile rejects unknown template in secure_dp", {
 test_that(".templateMinRows returns per-template minimums", {
   expect_equal(dsFlower:::.templateMinRows("pytorch_mlp", "secure_dp"), 500)
   expect_equal(dsFlower:::.templateMinRows("sklearn_sgd", "secure"), 200)
+  expect_equal(dsFlower:::.templateMinRows("pytorch_logreg", "secure_dp"), 200)
+  expect_equal(dsFlower:::.templateMinRows("pytorch_coxph", "secure_dp"), 500)
+  expect_equal(dsFlower:::.templateMinRows("pytorch_resnet18", "secure"), 1000)
+  expect_equal(dsFlower:::.templateMinRows("pytorch_unet2d", "secure"), 500)
   expect_null(dsFlower:::.templateMinRows("unknown_template", "secure"))
 })
 

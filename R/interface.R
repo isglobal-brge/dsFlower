@@ -224,10 +224,22 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   run_config[["dp_required"]]              <- trust$dp_required
 
   # Stage data with manifest
-
   run_token <- .generate_run_token()
-  staging_dir <- .stageData(data, run_token, target_column,
-                            feature_columns, run_config)
+  data_type <- run_config[["data_type"]] %||% "tabular"
+
+  if (identical(data_type, "image")) {
+    # Image pipeline: stage manifest only, images stay in place
+    samples_file <- run_config[["samples_file"]]
+    if (is.null(samples_file)) {
+      stop("Image data_type requires 'samples_file' in run_config.",
+           call. = FALSE)
+    }
+    staging_dir <- .stage_image_manifest(run_token, target_column,
+                                          samples_file, run_config)
+  } else {
+    staging_dir <- .stageData(data, run_token, target_column,
+                              feature_columns, run_config)
+  }
 
   # Update handle
   handle$run_token       <- run_token

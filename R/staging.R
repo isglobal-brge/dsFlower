@@ -69,10 +69,15 @@
     stop("Training data is empty.", call. = FALSE)
   }
 
-  if (!is.null(target_column) && !target_column %in% names(data)) {
-    stop("Target column '", target_column, "' not found in training data. ",
-         "Available columns: ", paste(names(data), collapse = ", "),
-         call. = FALSE)
+  # Support vector target_column for survival models (e.g. c("time", "event"))
+  if (!is.null(target_column)) {
+    missing_targets <- setdiff(target_column, names(data))
+    if (length(missing_targets) > 0) {
+      stop("Target column(s) '", paste(missing_targets, collapse = "', '"),
+           "' not found in training data. ",
+           "Available columns: ", paste(names(data), collapse = ", "),
+           call. = FALSE)
+    }
   }
 
   if (!is.null(feature_columns) && length(feature_columns) > 0) {
@@ -167,6 +172,86 @@
     }
   }
   invisible(TRUE)
+}
+
+#' Resolve the approved image data root from server-side option
+#'
+#' Reads \code{dsflower.image_data_root} server option. This is NEVER
+#' supplied by the researcher -- only the server admin sets it.
+#'
+#' @return Character; absolute path to the image data root.
+#' @keywords internal
+.resolve_image_data_root <- function() {
+  data_root <- .dsf_option("image_data_root", NULL)
+  if (is.null(data_root) || !nzchar(data_root)) {
+    stop("dsflower.image_data_root server option is not configured. ",
+         "Contact your server administrator.", call. = FALSE)
+  }
+  if (!dir.exists(data_root)) {
+    stop("Image data root does not exist: ", data_root, call. = FALSE)
+  }
+  normalizePath(data_root, mustWork = TRUE)
+}
+
+#' Stage an image manifest for a training run
+#'
+#' Copies the small metadata file (samples.parquet/csv) to staging and
+#' writes a manifest pointing to the approved data root. Images are NOT
+#' copied -- they stay in place (zero-copy).
+#'
+#' @param run_token Character; the unique run token.
+#' @param target_column Character; label column name in samples file.
+#' @param samples_file Character; path to samples metadata file.
+#' @param extra_config Named list of additional manifest entries.
+#' @return Character; path to the staging directory.
+#' @keywords internal
+.stage_image_manifest <- function(run_token, target_column,
+                                   samples_file, extra_config = list()) {
+  data_root <- .resolve_image_data_root()
+
+  # Create staging directory
+  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
+  staging_dir <- file.path(base_dir, "dsflower", run_token)
+  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
+  Sys.chmod(staging_dir, "0700")
+
+  # Copy samples metadata to staging
+  samples_basename <- basename(samples_file)
+  staged_samples <- file.path(staging_dir, samples_basename)
+  file.copy(samples_file, staged_samples)
+  Sys.chmod(staged_samples, "0600")
+
+  # Count samples
+  if (grepl("\\.parquet$", samples_basename, ignore.case = TRUE)) {
+    if (!requireNamespace("arrow", quietly = TRUE)) {
+      stop("arrow package required for Parquet support.", call. = FALSE)
+    }
+    n_samples <- nrow(arrow::read_parquet(staged_samples))
+  } else {
+    n_samples <- nrow(utils::read.csv(staged_samples))
+  }
+
+  # Build manifest
+  manifest <- list(
+    run_token    = run_token,
+    data_type    = "image",
+    data_root    = data_root,
+    samples_file = samples_basename,
+    n_samples    = n_samples,
+    target_column = target_column,
+    staged_at    = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
+  )
+
+  if (length(extra_config) > 0) {
+    manifest <- c(manifest, extra_config)
+  }
+
+  manifest_path <- file.path(staging_dir, "manifest.json")
+  jsonlite::write_json(manifest, manifest_path,
+                       auto_unbox = TRUE, pretty = TRUE, null = "null")
+  Sys.chmod(manifest_path, "0600")
+
+  staging_dir
 }
 
 #' Get a disclosure-safe summary of training data
