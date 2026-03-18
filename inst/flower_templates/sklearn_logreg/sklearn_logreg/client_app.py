@@ -1,5 +1,8 @@
 """Flower ClientApp for Federated Logistic Regression."""
 
+import json
+import os
+
 from flwr.client import ClientApp, NumPyClient
 from flwr.common import Context
 
@@ -38,7 +41,9 @@ class FlowerClient(NumPyClient):
         self.model.fit(self.X, self.y)
         new_weights = self.get_parameters(config)
 
-        # Apply local DP if required
+        # Apply update-level clipping/noise if DP mode is requested.
+        # NOTE: This is update-level obfuscation, NOT patient-level DP-SGD.
+        # For patient-level DP claims, use a pytorch_* template with Opacus.
         if self.privacy_config.get("privacy_mode") == "dp":
             cn = self.privacy_config["clipping_norm"]
             eps = self.privacy_config["epsilon"]
@@ -91,16 +96,30 @@ def client_fn(context: Context) -> FlowerClient:
                         penalty=penalty, C=C, max_iter=max_iter)
 
 
-# Build app with optional SecAgg+ mod
-def _build_app():
+def _needs_secagg():
+    """Check if secure aggregation is required by reading manifest at module load.
+
+    Reads from DSFLOWER_MANIFEST_DIR env var (set by the server before
+    launching the SuperNode). This runs at import time so the ClientApp
+    is constructed with the correct mods before any Flower communication.
+    """
+    manifest_dir = os.environ.get("DSFLOWER_MANIFEST_DIR", "")
+    if not manifest_dir:
+        return False
+    manifest_path = os.path.join(manifest_dir, "manifest.json")
     try:
-        from .task import load_privacy_config as _lpc
-        # We cannot call load_privacy_config at module level (no context),
-        # so SecAgg is enabled via run_config instead
-        pass
-    except Exception:
-        pass
-    return ClientApp(client_fn=client_fn)
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        return manifest.get("require_secure_aggregation", False) is True
+    except (OSError, json.JSONDecodeError, KeyError):
+        return False
 
 
-app = ClientApp(client_fn=client_fn)
+# Build ClientApp with SecAgg+ client mod when required.
+# Both server-side (SecAggPlusWorkflow) AND client-side (secaggplus_mod)
+# must be enabled for secure aggregation to function.
+if _needs_secagg():
+    from flwr.client.mod import secaggplus_mod
+    app = ClientApp(client_fn=client_fn, mods=[secaggplus_mod])
+else:
+    app = ClientApp(client_fn=client_fn)

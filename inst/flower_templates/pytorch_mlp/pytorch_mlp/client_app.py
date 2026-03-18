@@ -1,5 +1,7 @@
 """Flower ClientApp for Federated PyTorch MLP."""
 
+import json
+import os
 from collections import OrderedDict
 
 from flwr.client import ClientApp, NumPyClient
@@ -65,7 +67,10 @@ class FlowerClient(NumPyClient):
 
         new_weights = self.get_parameters(config)
 
-        # Apply local DP if required
+        # Apply update-level clipping/noise if DP mode is requested.
+        # NOTE: This is update-level obfuscation. For patient-level DP,
+        # this template should be extended with Opacus DP-SGD (per-example
+        # gradient clipping + noise + RDP accountant).
         if self.privacy_config.get("privacy_mode") == "dp":
             cn = self.privacy_config["clipping_norm"]
             eps = self.privacy_config["epsilon"]
@@ -147,4 +152,19 @@ def client_fn(context: Context) -> FlowerClient:
     )
 
 
-app = ClientApp(client_fn=client_fn)
+def _needs_secagg():
+    manifest_dir = os.environ.get("DSFLOWER_MANIFEST_DIR", "")
+    if not manifest_dir:
+        return False
+    try:
+        with open(os.path.join(manifest_dir, "manifest.json")) as f:
+            return json.load(f).get("require_secure_aggregation", False) is True
+    except (OSError, json.JSONDecodeError, KeyError):
+        return False
+
+
+if _needs_secagg():
+    from flwr.client.mod import secaggplus_mod
+    app = ClientApp(client_fn=client_fn, mods=[secaggplus_mod])
+else:
+    app = ClientApp(client_fn=client_fn)

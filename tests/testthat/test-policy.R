@@ -160,7 +160,7 @@ test_that(".flowerTrustProfile returns secure profile", {
     expect_false(profile$allow_exact_num_examples)
     expect_true(profile$require_secure_aggregation)
     expect_false(profile$dp_required)
-    expect_equal(profile$model_release, "gated")
+    expect_equal(profile$model_release, "advisory_gated")
   })
 })
 
@@ -211,4 +211,77 @@ test_that(".bucket_count returns correct values", {
   expect_equal(dsFlower:::.bucket_count(100), 128L)
   expect_equal(dsFlower:::.bucket_count(1000), 1024L)
   expect_equal(dsFlower:::.bucket_count(50), 64L)
+})
+
+# --- Template Capability Matrix tests ---
+
+test_that(".TEMPLATE_CAPABILITIES has entries for all built-in templates", {
+  caps <- dsFlower:::.TEMPLATE_CAPABILITIES
+  expect_true("sklearn_logreg" %in% names(caps))
+  expect_true("sklearn_ridge" %in% names(caps))
+  expect_true("sklearn_sgd" %in% names(caps))
+  expect_true("pytorch_mlp" %in% names(caps))
+})
+
+test_that("sklearn templates do not support secure_dp", {
+  for (tmpl in c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd")) {
+    caps <- dsFlower:::.TEMPLATE_CAPABILITIES[[tmpl]]
+    expect_false(caps$supports_secure_dp,
+                 label = paste(tmpl, "should not support secure_dp"))
+    expect_true(caps$supports_secure,
+                label = paste(tmpl, "should support secure"))
+  }
+})
+
+test_that("pytorch_mlp supports secure_dp", {
+  caps <- dsFlower:::.TEMPLATE_CAPABILITIES[["pytorch_mlp"]]
+  expect_true(caps$supports_secure_dp)
+  expect_true(caps$supports_secure)
+  expect_equal(caps$min_rows_secure_dp, 500)
+})
+
+test_that(".validateTemplateProfile rejects sklearn in secure_dp", {
+  expect_error(
+    dsFlower:::.validateTemplateProfile("sklearn_logreg", "secure_dp"),
+    "does not support.*secure_dp"
+  )
+  expect_error(
+    dsFlower:::.validateTemplateProfile("sklearn_ridge", "secure_dp"),
+    "does not support.*secure_dp"
+  )
+  expect_error(
+    dsFlower:::.validateTemplateProfile("sklearn_sgd", "secure_dp"),
+    "does not support.*secure_dp"
+  )
+})
+
+test_that(".validateTemplateProfile allows pytorch_mlp in secure_dp", {
+  expect_true(dsFlower:::.validateTemplateProfile("pytorch_mlp", "secure_dp"))
+})
+
+test_that(".validateTemplateProfile allows all templates in research", {
+  for (tmpl in c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd", "pytorch_mlp")) {
+    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "research"))
+  }
+})
+
+test_that(".validateTemplateProfile rejects unknown template in secure_dp", {
+  expect_error(
+    dsFlower:::.validateTemplateProfile("unknown_model", "secure_dp"),
+    "no registered capability"
+  )
+})
+
+test_that(".templateMinRows returns per-template minimums", {
+  expect_equal(dsFlower:::.templateMinRows("pytorch_mlp", "secure_dp"), 500)
+  expect_equal(dsFlower:::.templateMinRows("sklearn_sgd", "secure"), 200)
+  expect_null(dsFlower:::.templateMinRows("unknown_template", "secure"))
+})
+
+test_that("model_release is advisory_gated not gated in secure profiles", {
+  for (profile in c("secure", "secure_dp")) {
+    p <- dsFlower:::.TRUST_PROFILES[[profile]]
+    expect_equal(p$model_release, "advisory_gated",
+                 label = paste(profile, "model_release"))
+  }
 })

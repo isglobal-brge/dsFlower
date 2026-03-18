@@ -187,6 +187,18 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   trust <- .flowerTrustProfile()
   effective_min <- max(trust$min_train_rows,
                        .flowerDisclosureSettings()$nfilter_subset)
+
+  # Apply per-template minimum row count if stricter than profile default
+  template_name <- run_config[["template_name"]] %||% NULL
+  if (!is.null(template_name)) {
+    template_min <- .templateMinRows(template_name, trust$name)
+    if (!is.null(template_min)) {
+      effective_min <- max(effective_min, template_min)
+    }
+    # Enforce template/profile compatibility
+    .validateTemplateProfile(template_name, trust$name)
+  }
+
   .assertMinSamples(nrow(data), min_n = effective_min)
 
   # Enforce DP requirement from trust profile

@@ -1,5 +1,8 @@
 """Flower ClientApp for Federated Ridge Classifier."""
 
+import json
+import os
+
 from flwr.client import ClientApp, NumPyClient
 from flwr.common import Context
 
@@ -35,7 +38,7 @@ class FlowerClient(NumPyClient):
         self.model.fit(self.X, self.y)
         new_weights = self.get_parameters(config)
 
-        # Apply local DP if required
+        # Update-level clipping/noise (NOT patient-level DP-SGD)
         if self.privacy_config.get("privacy_mode") == "dp":
             cn = self.privacy_config["clipping_norm"]
             eps = self.privacy_config["epsilon"]
@@ -82,4 +85,19 @@ def client_fn(context: Context) -> FlowerClient:
     return FlowerClient(X, y, privacy_config, alpha=alpha)
 
 
-app = ClientApp(client_fn=client_fn)
+def _needs_secagg():
+    manifest_dir = os.environ.get("DSFLOWER_MANIFEST_DIR", "")
+    if not manifest_dir:
+        return False
+    try:
+        with open(os.path.join(manifest_dir, "manifest.json")) as f:
+            return json.load(f).get("require_secure_aggregation", False) is True
+    except (OSError, json.JSONDecodeError, KeyError):
+        return False
+
+
+if _needs_secagg():
+    from flwr.client.mod import secaggplus_mod
+    app = ClientApp(client_fn=client_fn, mods=[secaggplus_mod])
+else:
+    app = ClientApp(client_fn=client_fn)

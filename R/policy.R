@@ -16,6 +16,10 @@
     allow_exact_num_examples = TRUE,
     require_secure_aggregation = FALSE,
     dp_required             = FALSE,
+    # model_release is advisory only -- not enforceable when the
+    # researcher controls the SuperLink (the final model lives on
+    # their machine by design). To truly gate model release, the
+    # SuperLink must run on a trusted neutral host or TEE.
     model_release           = "allowed"
   ),
   secure = list(
@@ -24,7 +28,7 @@
     allow_exact_num_examples = FALSE,
     require_secure_aggregation = TRUE,
     dp_required             = FALSE,
-    model_release           = "gated"
+    model_release           = "advisory_gated"
   ),
   secure_dp = list(
     min_train_rows          = 200,
@@ -32,9 +36,107 @@
     allow_exact_num_examples = FALSE,
     require_secure_aggregation = TRUE,
     dp_required             = TRUE,
-    model_release           = "gated"
+    model_release           = "advisory_gated"
   )
 )
+
+# --- Template Capability Matrix ---
+# Defines which templates support which privacy profiles.
+# secure_dp requires a real DP training loop (per-example clipping + noise),
+# which only PyTorch templates with DP-SGD support can provide.
+# sklearn templates use closed-form solvers that cannot do per-example clipping.
+
+.TEMPLATE_CAPABILITIES <- list(
+  sklearn_logreg = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,  # closed-form solver, no per-example clipping
+    requires_secagg    = FALSE,
+    min_rows_secure    = 100,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "sklearn"
+  ),
+  sklearn_ridge = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,
+    requires_secagg    = FALSE,
+    min_rows_secure    = 100,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "sklearn"
+  ),
+  sklearn_sgd = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,  # more leakage-prone with small batches
+    requires_secagg    = FALSE,
+    min_rows_secure    = 200,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "sklearn"
+  ),
+  pytorch_mlp = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = TRUE,  # DP-SGD capable
+    requires_secagg    = FALSE,
+    min_rows_secure    = 100,
+    min_rows_secure_dp = 500,
+    framework          = "pytorch"
+  )
+)
+
+#' Validate template compatibility with the active trust profile
+#'
+#' Rejects templates that do not support the active privacy profile.
+#' For example, sklearn templates are rejected under secure_dp because
+#' they cannot do per-example gradient clipping (DP-SGD).
+#'
+#' @param template_name Character; the template name.
+#' @param profile_name Character; the active trust profile name.
+#' @return TRUE invisibly, or stops with an error.
+#' @keywords internal
+.validateTemplateProfile <- function(template_name, profile_name) {
+  caps <- .TEMPLATE_CAPABILITIES[[template_name]]
+  if (is.null(caps)) {
+    # Unknown template -- allow if custom config is enabled, but
+    # block secure_dp for safety (unknown DP capability)
+    if (profile_name == "secure_dp") {
+      stop("Template '", template_name, "' has no registered capability ",
+           "matrix. Cannot use with secure_dp profile (requires verified ",
+           "DP-SGD support).", call. = FALSE)
+    }
+    return(invisible(TRUE))
+  }
+
+  if (profile_name == "secure" && !isTRUE(caps$supports_secure)) {
+    stop("Template '", template_name, "' does not support the 'secure' ",
+         "profile.", call. = FALSE)
+  }
+
+  if (profile_name == "secure_dp" && !isTRUE(caps$supports_secure_dp)) {
+    stop("Template '", template_name, "' does not support the 'secure_dp' ",
+         "profile. secure_dp requires DP-SGD with per-example clipping, ",
+         "which is only available in PyTorch templates. ",
+         "Use a pytorch_* template instead.", call. = FALSE)
+  }
+
+  invisible(TRUE)
+}
+
+#' Get the minimum row count for a template under a given profile
+#'
+#' @param template_name Character; the template name.
+#' @param profile_name Character; the active trust profile name.
+#' @return Integer; the minimum row count, or the profile default.
+#' @keywords internal
+.templateMinRows <- function(template_name, profile_name) {
+  caps <- .TEMPLATE_CAPABILITIES[[template_name]]
+  if (is.null(caps)) return(NULL)
+
+  if (profile_name == "secure_dp" && !is.na(caps$min_rows_secure_dp)) {
+    return(caps$min_rows_secure_dp)
+  }
+  if (profile_name %in% c("secure", "secure_dp") && !is.na(caps$min_rows_secure)) {
+    return(caps$min_rows_secure)
+  }
+  NULL
+}
 
 #' Get the effective trust profile
 #'
