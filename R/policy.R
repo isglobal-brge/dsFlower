@@ -286,16 +286,22 @@
          call. = FALSE)
   }
 
-  # The 'research' profile is permanently disabled. It bypasses all
-  # privacy protections (no SecAgg, per-node metrics exposed, exact counts
-  # revealed) and is incompatible with the DataSHIELD threat model where
-  # the researcher must not access individual-level information.
+  # The 'research' profile disables all privacy protections (no SecAgg,
+  # per-node metrics exposed, exact counts revealed). It is NOT the default
+  # and requires explicit admin opt-in because it is disclosive:
+  #   - allow_per_node_metrics = TRUE: researcher sees per-hospital accuracy/loss
+  #   - allow_exact_num_examples = TRUE: researcher sees exact patient counts
+  #   - require_secure_aggregation = FALSE: researcher sees individual weight updates
   if (identical(profile_name, "research")) {
-    stop("The 'research' privacy profile is not available. ",
-         "This profile disables secure aggregation and exposes per-node ",
-         "information, which is incompatible with DataSHIELD's privacy model. ",
-         "Use the 'secure' or 'secure_dp' profile instead.",
-         call. = FALSE)
+    allow_research <- as.logical(.dsf_option("allow_research_profile", FALSE))
+    if (!isTRUE(allow_research)) {
+      stop("The 'research' privacy profile requires explicit admin opt-in. ",
+           "It disables secure aggregation, exposes per-node metrics, and reveals ",
+           "exact sample counts -- all of which are disclosive under the DataSHIELD ",
+           "threat model. To enable, set: options(dsflower.allow_research_profile = TRUE). ",
+           "Default profile is 'secure'.",
+           call. = FALSE)
+    }
   }
 
   profile <- .TRUST_PROFILES[[profile_name]]
@@ -327,9 +333,16 @@
 
   raw_secagg <- .dsf_option("require_secure_aggregation", NULL)
   if (!is.null(raw_secagg)) {
-    # Can only require, not disable
-    if (as.logical(raw_secagg)) {
+    val <- as.logical(raw_secagg)
+    if (isTRUE(val)) {
       profile$require_secure_aggregation <- TRUE
+    } else if (identical(val, FALSE)) {
+      # Admin can disable SecAgg for deployments with < 3 nodes, where
+      # Flower SecAgg+ cannot operate (requires num_shares > 2).
+      # This weakens the security model: the SuperLink will see individual
+      # weight updates. Only acceptable when the SuperLink is trusted or
+      # when the deployment has fewer than 3 participating nodes.
+      profile$require_secure_aggregation <- FALSE
     }
   }
 

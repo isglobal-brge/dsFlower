@@ -171,10 +171,22 @@ test_that(".flowerTrustProfile defaults to secure (not research)", {
   })
 })
 
-test_that(".flowerTrustProfile permanently blocks research profile", {
+test_that(".flowerTrustProfile blocks research without admin opt-in", {
   withr::with_options(list(dsflower.privacy_profile = "research"), {
     expect_error(dsFlower:::.flowerTrustProfile(),
-                 "research.*not available")
+                 "research.*requires explicit admin opt-in")
+  })
+})
+
+test_that(".flowerTrustProfile allows research with admin opt-in", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "research",
+    dsflower.allow_research_profile = TRUE
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "research")
+    expect_true(profile$allow_per_node_metrics)
+    expect_false(profile$require_secure_aggregation)
   })
 })
 

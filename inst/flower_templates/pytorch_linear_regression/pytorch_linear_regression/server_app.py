@@ -156,9 +156,13 @@ def server_fn(context: Context) -> ServerAppComponents:
 
     if require_secagg:
         from flwr.server.workflow import SecAggPlusWorkflow, DefaultWorkflow
+        num_clients = int(cfg.get("strategy-min_available_clients", 2))
         return ServerAppComponents(
             strategy=strategy, config=config,
-            workflow=SecAggPlusWorkflow()
+            workflow=SecAggPlusWorkflow(
+                num_shares=num_clients,
+                reconstruction_threshold=num_clients,
+            )
         )
 
     return ServerAppComponents(strategy=strategy, config=config)
