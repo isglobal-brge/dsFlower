@@ -145,7 +145,7 @@ def _load_dicom_as_pil(path):
     """Load a single-frame DICOM file as a PIL RGB image."""
     try:
         import pydicom
-        ds = pydicom.dcmread(path)
+        ds = pydicom.dcmread(path, force=True)
         arr = ds.pixel_array.astype(np.float32)
         if arr.max() > 0:
             arr = (arr - arr.min()) / (arr.max() - arr.min()) * 255.0
