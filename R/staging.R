@@ -433,25 +433,36 @@
   }
 
   # Validate and collect asset roots
+  dir_asset_types <- c("image_root", "wsi_root", "dicom_series_root",
+                        "rt_struct_root")
+  file_asset_types <- c("feature_table", "rt_dose_file", "rt_plan_file")
+
   validated_assets <- list()
   for (asset_name in names(assets)) {
     asset <- assets[[asset_name]]
     asset_type <- asset$type %||% "unknown"
 
-    if (identical(asset_type, "image_root")) {
+    if (asset_type %in% dir_asset_types) {
       root <- asset$root
       if (is.null(root) || !dir.exists(root)) {
         stop("Asset '", asset_name, "' root directory does not exist: ",
              root %||% "(NULL)", call. = FALSE)
       }
-      # Security: ensure root is absolute and resolve symlinks
       resolved_root <- normalizePath(root, mustWork = TRUE)
-      validated_assets[[asset_name]] <- list(
+      va <- list(
         type      = asset_type,
         root      = resolved_root,
         path_col  = asset$path_col %||% "relative_path"
       )
-    } else if (identical(asset_type, "feature_table")) {
+      # WSI-specific metadata
+      if (identical(asset_type, "wsi_root")) {
+        va$tile_size     <- asset$tile_size %||% 256L
+        va$magnification <- asset$magnification %||% NULL
+        va$overlap       <- asset$overlap %||% 0L
+      }
+      validated_assets[[asset_name]] <- va
+
+    } else if (asset_type %in% file_asset_types) {
       feat_file <- asset$file
       if (is.null(feat_file) || !file.exists(feat_file)) {
         stop("Asset '", asset_name, "' file does not exist: ",
@@ -461,6 +472,18 @@
         type     = asset_type,
         file     = normalizePath(feat_file, mustWork = TRUE),
         join_key = asset$join_key %||% NULL
+      )
+
+    } else if (identical(asset_type, "multimodal_ref")) {
+      mpath <- asset$manifest
+      if (is.null(mpath) || !file.exists(mpath)) {
+        stop("Asset '", asset_name, "' manifest does not exist: ",
+             mpath %||% "(NULL)", call. = FALSE)
+      }
+      validated_assets[[asset_name]] <- list(
+        type     = asset_type,
+        manifest = normalizePath(mpath, mustWork = TRUE),
+        modality = asset$modality %||% NULL
       )
     }
   }

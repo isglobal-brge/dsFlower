@@ -183,10 +183,49 @@ flowerInitDS <- function(data_symbol) {
     return(.createHandleFromDescriptor(desc))
   }
 
+  # Imaging handle path: list with descriptor field (from imagingInitDS)
+  # Note: S3 classes may be lost during Opal serialization, so we check
+  # structurally rather than by class.
+  if (is.list(obj) && !is.null(obj$descriptor)) {
+    desc <- obj$descriptor
+    if (inherits(desc, "FlowerDatasetDescriptor")) {
+      return(.createHandleFromDescriptor(desc))
+    }
+    # Reconstruct descriptor if class was lost during serialization
+    if (is.list(desc) && !is.null(desc$dataset_id) &&
+        !is.null(desc$source_kind)) {
+      desc <- flower_dataset_descriptor(
+        dataset_id  = desc$dataset_id,
+        source_kind = desc$source_kind,
+        metadata    = desc$metadata,
+        assets      = desc$assets %||% list(),
+        manifest    = desc$manifest,
+        table_data  = desc$table_data
+      )
+      return(.createHandleFromDescriptor(desc))
+    }
+  }
+
+  # Raw Resource path: list with imaging+dataset:// URL (from datashield.assign.resource)
+  if (is.list(obj) && !is.null(obj$url) &&
+      grepl("^imaging\\+dataset://", obj$url %||% "")) {
+    if (requireNamespace("dsImaging", quietly = TRUE)) {
+      parsed <- dsImaging:::.parse_imaging_url(obj$url)
+      if (!is.null(parsed$manifest_path)) {
+        manifest <- dsImaging:::parse_manifest(parsed$manifest_path)
+      } else {
+        manifest_path <- dsImaging:::resolve_dataset(parsed$dataset_id)
+        manifest <- dsImaging:::parse_manifest(manifest_path)
+      }
+      desc <- dsImaging::imaging_dataset_descriptor(manifest)
+      return(.createHandleFromDescriptor(desc))
+    }
+  }
+
   stop("Symbol '", data_symbol, "' is not a data.frame, matrix, ",
-       "FlowerDatasetDescriptor, or ResourceClient. ",
+       "FlowerDatasetDescriptor, ResourceClient, or imaging handle. ",
        "Assign your data first with datashield.assign.table(), ",
-       "datashield.assign.resource(), or similar.",
+       "imagingInitDS(), or similar.",
        call. = FALSE)
 }
 
