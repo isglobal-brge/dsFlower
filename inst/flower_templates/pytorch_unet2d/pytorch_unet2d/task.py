@@ -65,11 +65,22 @@ class SegmentationDataset(Dataset):
 
 
 def load_image_data(context=None):
-    """Load image manifest and return (data_root, samples_df, target_col)."""
+    """Load image manifest and return (data_root, samples_df, target_col).
+
+    Supports both old format (data_root at top level) and new format
+    (assets.images.root from dsImaging manifests). For segmentation,
+    mask roots are available via assets.masks.root.
+    """
     manifest = _load_manifest(context)
     manifest_dir = _get_manifest_dir(context)
 
-    data_root = manifest["data_root"]
+    # New format: assets.images.root (dsImaging descriptor)
+    if "assets" in manifest and "images" in manifest["assets"]:
+        data_root = manifest["assets"]["images"]["root"]
+    else:
+        # Backward compat: data_root at top level
+        data_root = manifest["data_root"]
+
     target_col = manifest.get("target_column", "mask_path")
 
     samples_file = os.path.join(manifest_dir, manifest["samples_file"])

@@ -262,6 +262,251 @@
   staging_dir
 }
 
+#' Stage data from a FlowerDatasetDescriptor
+#'
+#' Dispatches on \code{source_kind} to stage data appropriately:
+#' \itemize{
+#'   \item \code{in_memory_df}: wraps \code{.stageData()} with the descriptor's
+#'     \code{table_data}.
+#'   \item \code{staged_parquet}: exports selected columns via arrow without
+#'     loading the full table into R memory.
+#'   \item \code{image_bundle}: stages metadata + manifest; images stay on disk
+#'     (zero-copy). Supports multiple asset roots from the descriptor.
+#' }
+#'
+#' @param desc A \code{FlowerDatasetDescriptor}.
+#' @param run_token Character; unique run token.
+#' @param target_column Character; target column name.
+#' @param feature_columns Character vector or NULL.
+#' @param extra_config Named list of additional manifest entries.
+#' @return Character; path to the staging directory.
+#' @keywords internal
+.stageFromDescriptor <- function(desc, run_token, target_column,
+                                  feature_columns = NULL,
+                                  extra_config = list()) {
+  kind <- desc$source_kind
+
+  if (identical(kind, "in_memory_df")) {
+    return(.stageFromDescriptor_df(desc, run_token, target_column,
+                                    feature_columns, extra_config))
+  }
+
+  if (identical(kind, "staged_parquet")) {
+    return(.stageFromDescriptor_parquet(desc, run_token, target_column,
+                                         feature_columns, extra_config))
+  }
+
+  if (identical(kind, "image_bundle")) {
+    return(.stageFromDescriptor_image(desc, run_token, target_column,
+                                       feature_columns, extra_config))
+  }
+
+  stop("Unknown descriptor source_kind: '", kind, "'.", call. = FALSE)
+}
+
+#' Stage from an in-memory data.frame descriptor
+#' @keywords internal
+.stageFromDescriptor_df <- function(desc, run_token, target_column,
+                                     feature_columns, extra_config) {
+  df <- desc$table_data
+  if (is.null(df) || !is.data.frame(df)) {
+    stop("Descriptor source_kind='in_memory_df' but no table_data found.",
+         call. = FALSE)
+  }
+  .validateDataSchema(df, target_column, feature_columns)
+  .stageData(df, run_token, target_column, feature_columns, extra_config)
+}
+
+#' Stage from a staged Parquet descriptor
+#'
+#' Reads only the required columns from a Parquet file via arrow::open_dataset
+#' or arrow::read_parquet with column selection. The full table is never loaded
+#' into R memory.
+#'
+#' @keywords internal
+.stageFromDescriptor_parquet <- function(desc, run_token, target_column,
+                                          feature_columns, extra_config) {
+  if (!requireNamespace("arrow", quietly = TRUE)) {
+    stop("Package 'arrow' is required for staged_parquet descriptors.",
+         call. = FALSE)
+  }
+
+  meta <- desc$metadata
+  if (is.null(meta) || is.null(meta$file)) {
+    stop("Descriptor source_kind='staged_parquet' requires metadata$file.",
+         call. = FALSE)
+  }
+
+  src_path <- meta$file
+  if (!file.exists(src_path)) {
+    stop("Parquet file not found: ", src_path, call. = FALSE)
+  }
+
+  # Determine columns to select
+  cols_needed <- target_column
+  if (!is.null(feature_columns) && length(feature_columns) > 0) {
+    cols_needed <- unique(c(cols_needed, feature_columns))
+  }
+
+  # Create staging directory
+  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
+  staging_dir <- file.path(base_dir, "dsflower", run_token)
+  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
+  Sys.chmod(staging_dir, "0700")
+
+  # Read with column selection and write to staging
+  tbl <- arrow::read_parquet(src_path, col_select = cols_needed)
+  data_file <- "train.parquet"
+  arrow::write_parquet(tbl, file.path(staging_dir, data_file))
+  Sys.chmod(file.path(staging_dir, data_file), "0600")
+
+  n_samples <- nrow(tbl)
+
+  # Build manifest
+  manifest <- list(
+    run_token       = run_token,
+    data_file       = data_file,
+    data_format     = "parquet",
+    n_samples       = n_samples,
+    target_column   = target_column,
+    feature_columns = feature_columns,
+    dataset_id      = desc$dataset_id,
+    source_kind     = "staged_parquet",
+    staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
+  )
+  if (length(extra_config) > 0) {
+    manifest <- c(manifest, extra_config)
+  }
+
+  manifest_path <- file.path(staging_dir, "manifest.json")
+  jsonlite::write_json(manifest, manifest_path,
+                       auto_unbox = TRUE, pretty = TRUE, null = "null")
+  Sys.chmod(manifest_path, "0600")
+
+  staging_dir
+}
+
+#' Stage from an image bundle descriptor
+#'
+#' Handles multi-root image assets from the descriptor. Metadata is staged
+#' (CSV/Parquet), images remain on disk (zero-copy). The manifest includes
+#' an \code{assets} key mapping asset names to their validated root paths.
+#'
+#' @keywords internal
+.stageFromDescriptor_image <- function(desc, run_token, target_column,
+                                        feature_columns, extra_config) {
+  meta <- desc$metadata
+  assets <- desc$assets
+
+  # Create staging directory
+  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
+  staging_dir <- file.path(base_dir, "dsflower", run_token)
+  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
+  Sys.chmod(staging_dir, "0700")
+
+  # Stage metadata table
+  n_samples <- 0L
+  if (!is.null(meta$file) && file.exists(meta$file)) {
+    # Copy or re-export metadata file
+    samples_basename <- basename(meta$file)
+    staged_samples <- file.path(staging_dir, samples_basename)
+    file.copy(meta$file, staged_samples)
+    Sys.chmod(staged_samples, "0600")
+
+    # Count rows
+    if (grepl("\\.parquet$", samples_basename, ignore.case = TRUE)) {
+      if (requireNamespace("arrow", quietly = TRUE)) {
+        n_samples <- nrow(arrow::read_parquet(staged_samples))
+      }
+    } else {
+      n_samples <- nrow(utils::read.csv(staged_samples, nrows = .Machine$integer.max))
+    }
+  } else if (!is.null(desc$table_data) && is.data.frame(desc$table_data)) {
+    samples_basename <- "samples.csv"
+    staged_samples <- file.path(staging_dir, samples_basename)
+    utils::write.csv(desc$table_data, staged_samples, row.names = FALSE)
+    Sys.chmod(staged_samples, "0600")
+    n_samples <- nrow(desc$table_data)
+  } else {
+    stop("Image bundle descriptor requires metadata$file or table_data.",
+         call. = FALSE)
+  }
+
+  # Validate and collect asset roots
+  validated_assets <- list()
+  for (asset_name in names(assets)) {
+    asset <- assets[[asset_name]]
+    asset_type <- asset$type %||% "unknown"
+
+    if (identical(asset_type, "image_root")) {
+      root <- asset$root
+      if (is.null(root) || !dir.exists(root)) {
+        stop("Asset '", asset_name, "' root directory does not exist: ",
+             root %||% "(NULL)", call. = FALSE)
+      }
+      # Security: ensure root is absolute and resolve symlinks
+      resolved_root <- normalizePath(root, mustWork = TRUE)
+      validated_assets[[asset_name]] <- list(
+        type      = asset_type,
+        root      = resolved_root,
+        path_col  = asset$path_col %||% "relative_path"
+      )
+    } else if (identical(asset_type, "feature_table")) {
+      feat_file <- asset$file
+      if (is.null(feat_file) || !file.exists(feat_file)) {
+        stop("Asset '", asset_name, "' file does not exist: ",
+             feat_file %||% "(NULL)", call. = FALSE)
+      }
+      validated_assets[[asset_name]] <- list(
+        type     = asset_type,
+        file     = normalizePath(feat_file, mustWork = TRUE),
+        join_key = asset$join_key %||% NULL
+      )
+    }
+  }
+
+  # For backward compat: set data_root from primary image asset
+  data_root <- NULL
+  if (!is.null(validated_assets$images)) {
+    data_root <- validated_assets$images$root
+  }
+
+  # Build manifest
+  manifest <- list(
+    run_token     = run_token,
+    data_type     = "image",
+    data_root     = data_root,
+    samples_file  = samples_basename,
+    n_samples     = n_samples,
+    target_column = target_column,
+    dataset_id    = desc$dataset_id,
+    source_kind   = "image_bundle",
+    assets        = validated_assets,
+    staged_at     = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
+  )
+
+  if (length(extra_config) > 0) {
+    manifest <- c(manifest, extra_config)
+  }
+
+  # Write privacy config into manifest
+  trust <- tryCatch(.flowerTrustProfile(), error = function(e) NULL)
+  if (!is.null(trust)) {
+    manifest[["privacy_profile"]]          <- trust$name
+    manifest[["allow_per_node_metrics"]]   <- trust$allow_per_node_metrics
+    manifest[["allow_exact_num_examples"]] <- trust$allow_exact_num_examples
+    manifest[["require_secure_aggregation"]] <- trust$require_secure_aggregation
+    manifest[["dp_required"]]              <- trust$dp_required
+  }
+
+  manifest_path <- file.path(staging_dir, "manifest.json")
+  jsonlite::write_json(manifest, manifest_path,
+                       auto_unbox = TRUE, pretty = TRUE, null = "null")
+  Sys.chmod(manifest_path, "0600")
+
+  staging_dir
+}
+
 #' Get a disclosure-safe summary of training data
 #'
 #' Returns row count, column count, and column names without exposing

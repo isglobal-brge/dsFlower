@@ -24,6 +24,9 @@ Imports:
     utils
 Suggests:
     arrow,
+    resourcer,
+    yaml,
+    dsImaging,
     testthat (>= 3.0.0),
     withr,
     DSLite

@@ -112,6 +112,44 @@
   )
 }
 
+#' Create a Flower handle from a FlowerDatasetDescriptor
+#'
+#' Builds the internal handle from a descriptor. The descriptor carries
+#' metadata, assets, and staging hints. Actual data is NOT loaded here --
+#' that happens in \code{flowerPrepareRunDS} via \code{.stageFromDescriptor}.
+#'
+#' @param desc A \code{FlowerDatasetDescriptor}.
+#' @return A list representing the Flower handle.
+#' @keywords internal
+.createHandleFromDescriptor <- function(desc) {
+  stopifnot(inherits(desc, "FlowerDatasetDescriptor"))
+
+  python_path <- Sys.which("python3")
+  if (!nzchar(python_path)) python_path <- Sys.which("python")
+  if (!nzchar(python_path)) python_path <- "python3"
+
+  list(
+    source             = "descriptor",
+    source_kind        = desc$source_kind,
+    dataset_id         = desc$dataset_id,
+    descriptor         = desc,
+    resource_client    = NULL,
+    data_path          = NULL,
+    data_format        = "descriptor",
+    python_path        = python_path,
+    table_data         = desc$table_data,
+    run_token          = NULL,
+    staging_dir        = NULL,
+    superlink_address  = NULL,
+    federation_id      = NULL,
+    ca_cert_path       = NULL,
+    target_column      = NULL,
+    feature_columns    = NULL,
+    prepared           = FALSE,
+    node_ensured       = FALSE
+  )
+}
+
 # --- ASSIGN methods ---
 
 #' Initialize Flower Handle
@@ -130,13 +168,26 @@ flowerInitDS <- function(data_symbol) {
 
   if (is.matrix(obj)) obj <- as.data.frame(obj)
 
-  if (!is.data.frame(obj)) {
-    stop("Symbol '", data_symbol, "' is not a data.frame or matrix. ",
-         "Assign your data first with datashield.assign.table() or similar.",
-         call. = FALSE)
+  # Existing path: data.frame
+  if (is.data.frame(obj)) {
+    return(.createHandleFromTable(obj))
   }
 
-  .createHandleFromTable(obj)
+  # Descriptor path: FlowerDatasetDescriptor or ResourceClient
+  if (inherits(obj, "FlowerDatasetDescriptor")) {
+    return(.createHandleFromDescriptor(obj))
+  }
+
+  if (inherits(obj, "ResourceClient")) {
+    desc <- as_flower_dataset(obj)
+    return(.createHandleFromDescriptor(desc))
+  }
+
+  stop("Symbol '", data_symbol, "' is not a data.frame, matrix, ",
+       "FlowerDatasetDescriptor, or ResourceClient. ",
+       "Assign your data first with datashield.assign.table(), ",
+       "datashield.assign.resource(), or similar.",
+       call. = FALSE)
 }
 
 #' Prepare a Training Run
@@ -175,7 +226,56 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     .validateMaxRounds(run_config$num_rounds)
   }
 
-  # Load data: from file (resource) or from in-memory table
+  # Load data: from descriptor, in-memory table, or file
+  if (identical(handle$source, "descriptor") && !is.null(handle$descriptor)) {
+    # Descriptor path: delegate staging entirely to .stageFromDescriptor
+    # which handles in_memory_df, staged_parquet, and image_bundle
+    desc <- handle$descriptor
+    run_token <- .generate_run_token()
+    staging_dir <- .stageFromDescriptor(desc, run_token, target_column,
+                                         feature_columns, run_config)
+
+    # Read n_samples from staged manifest for policy checks
+    manifest_path <- file.path(staging_dir, "manifest.json")
+    staged_manifest <- jsonlite::fromJSON(manifest_path, simplifyVector = TRUE)
+    n_samples <- staged_manifest$n_samples
+
+    # Enforce trust profile min_train_rows
+    trust <- .flowerTrustProfile()
+    effective_min <- max(trust$min_train_rows,
+                         .flowerDisclosureSettings()$nfilter_subset)
+    template_name <- run_config[["template_name"]] %||% NULL
+    if (!is.null(template_name)) {
+      template_min <- .templateMinRows(template_name, trust$name)
+      if (!is.null(template_min)) {
+        effective_min <- max(effective_min, template_min)
+      }
+      .validateTemplateProfile(template_name, trust$name)
+    }
+    .assertMinSamples(n_samples, min_n = effective_min)
+
+    # DP enforcement
+    requested_mode <- run_config[["privacy-mode"]] %||% "research"
+    if (trust$dp_required && !identical(requested_mode, "dp")) {
+      stop("Trust profile '", trust$name, "' requires differential privacy. ",
+           "Set privacy mode to 'dp'.", call. = FALSE)
+    }
+    if (identical(requested_mode, "dp")) {
+      dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
+      dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
+      dataset_key <- paste0("descriptor:", desc$dataset_id, ":", target_column)
+      .check_budget(dataset_key, dp_epsilon, dp_delta)
+    }
+
+    handle$run_token       <- run_token
+    handle$staging_dir     <- staging_dir
+    handle$target_column   <- target_column
+    handle$feature_columns <- feature_columns
+    handle$template_name   <- template_name
+    handle$prepared        <- TRUE
+    return(handle)
+  }
+
   if (identical(handle$source, "table") && !is.null(handle$table_data)) {
     data <- handle$table_data
   } else {
