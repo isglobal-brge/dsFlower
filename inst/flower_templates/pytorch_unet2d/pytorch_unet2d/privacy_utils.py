@@ -1,8 +1,16 @@
-"""Privacy utilities for local differential privacy in federated learning.
+"""Privacy utilities for update-level noise in federated learning.
 
-Provides weight clipping, Gaussian noise addition, and sigma computation
-via the Gaussian mechanism. All privacy enforcement reads from manifest.json
-(server-written, tamper-proof), NOT from pyproject.toml.
+WARNING: This implements UPDATE-LEVEL obfuscation (weight delta clipping +
+Gaussian noise), NOT patient-level DP-SGD. This provides meaningful
+protection of individual node weight updates but does NOT constitute
+formal per-example differential privacy.
+
+For formal patient-level DP, templates should use Opacus DP-SGD with
+per-example gradient clipping. That is a planned upgrade (see secure_dp
+profile documentation in policy.R).
+
+All privacy enforcement reads from manifest.json (server-written,
+tamper-proof), NOT from pyproject.toml.
 """
 
 import math

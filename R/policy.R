@@ -8,6 +8,28 @@
 # --- Trust Profiles ---
 # Server-controlled profiles that determine what privacy guarantees are
 # enforced. The client can request a profile but the server enforces the floor.
+#
+# IMPORTANT SECURITY NOTES:
+#
+# 1. model_release is "advisory_gated" (not "gated") in secure profiles
+#    because it is NOT enforceable when the researcher controls the SuperLink.
+#    The final global model lives on the researcher's machine by design.
+#    For truly gated model release, the SuperLink must run on a trusted
+#    neutral host or TEE.
+#
+# 2. secure_dp currently implements UPDATE-LEVEL noise (weight delta
+#    clipping + Gaussian noise), NOT patient-level DP-SGD with per-example
+#    gradient clipping. This provides meaningful obfuscation of individual
+#    node updates but does NOT constitute formal patient-level differential
+#    privacy. For formal DP guarantees, templates must be upgraded to use
+#    Opacus DP-SGD with per-example gradient clipping.
+#    The profile is named secure_dp to indicate DP intent; the actual
+#    guarantee level depends on the template implementation.
+#
+# 3. Secure aggregation (SecAgg+) protects individual weight updates from
+#    the SuperLink, but the final aggregated model is still visible to the
+#    researcher. SecAgg+ is implemented both server-side (SecAggPlusWorkflow)
+#    and client-side (secaggplus_mod) in all templates.
 
 .TRUST_PROFILES <- list(
   research = list(
@@ -16,10 +38,6 @@
     allow_exact_num_examples = TRUE,
     require_secure_aggregation = FALSE,
     dp_required             = FALSE,
-    # model_release is advisory only -- not enforceable when the
-    # researcher controls the SuperLink (the final model lives on
-    # their machine by design). To truly gate model release, the
-    # SuperLink must run on a trusted neutral host or TEE.
     model_release           = "allowed"
   ),
   secure = list(
@@ -42,9 +60,20 @@
 
 # --- Template Capability Matrix ---
 # Defines which templates support which privacy profiles.
-# secure_dp requires a real DP training loop (per-example clipping + noise),
-# which only PyTorch templates with DP-SGD support can provide.
-# sklearn templates use closed-form solvers that cannot do per-example clipping.
+#
+# supports_secure: can run under the "secure" profile (SecAgg+ enforced,
+#   metrics suppressed, count bucketing). Requires that weight aggregation
+#   works under SecAgg+ and the SuperLink only sees aggregated weights.
+#
+# supports_secure_dp: can run under the "secure_dp" profile. Currently
+#   this means UPDATE-LEVEL noise (weight delta clipping + Gaussian noise),
+#   NOT per-example DP-SGD. Templates marked TRUE here have a training loop
+#   that supports clipping/noise on the weight update. Future: upgrade to
+#   Opacus DP-SGD for formal patient-level DP.
+#
+# Templates that do NOT support secure (e.g. xgboost_tabular): their
+# aggregation protocol requires the SuperLink to see individual model
+# updates in cleartext, which breaks the secure aggregation guarantee.
 
 .TEMPLATE_CAPABILITIES <- list(
   sklearn_logreg = list(
@@ -112,10 +141,10 @@
     framework          = "pytorch"
   ),
   xgboost_tabular = list(
-    supports_secure    = TRUE,
+    supports_secure    = FALSE,  # bagging aggregation exposes individual trees to SuperLink
     supports_secure_dp = FALSE,  # tree privacy not designed
     requires_secagg    = FALSE,
-    min_rows_secure    = 200,
+    min_rows_secure    = NA_integer_,
     min_rows_secure_dp = NA_integer_,
     framework          = "xgboost"
   ),

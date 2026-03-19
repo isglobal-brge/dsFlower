@@ -278,15 +278,22 @@ test_that("new pytorch tabular templates support secure_dp", {
   }
 })
 
-test_that("xgboost and image templates do not support secure_dp", {
-  for (tmpl in c("xgboost_tabular", "pytorch_resnet18",
-                 "pytorch_densenet121", "pytorch_unet2d")) {
+test_that("image templates support secure but not secure_dp", {
+  for (tmpl in c("pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d")) {
     caps <- dsFlower:::.TEMPLATE_CAPABILITIES[[tmpl]]
     expect_false(caps$supports_secure_dp,
                  label = paste(tmpl, "should not support secure_dp"))
     expect_true(caps$supports_secure,
                 label = paste(tmpl, "should support secure"))
   }
+})
+
+test_that("xgboost does not support secure or secure_dp", {
+  caps <- dsFlower:::.TEMPLATE_CAPABILITIES[["xgboost_tabular"]]
+  expect_false(caps$supports_secure,
+               label = "xgboost should not support secure (bagging exposes trees)")
+  expect_false(caps$supports_secure_dp,
+               label = "xgboost should not support secure_dp")
 })
 
 test_that(".validateTemplateProfile rejects sklearn in secure_dp", {
@@ -309,14 +316,27 @@ test_that(".validateTemplateProfile allows pytorch_mlp in secure_dp", {
 })
 
 test_that(".validateTemplateProfile rejects non-DP templates in secure_dp", {
-  for (tmpl in c("xgboost_tabular", "pytorch_resnet18",
-                 "pytorch_densenet121", "pytorch_unet2d")) {
+  for (tmpl in c("pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d")) {
     expect_error(
       dsFlower:::.validateTemplateProfile(tmpl, "secure_dp"),
       "does not support.*secure_dp",
       label = paste(tmpl, "should be rejected in secure_dp")
     )
   }
+})
+
+test_that(".validateTemplateProfile rejects xgboost in secure", {
+  expect_error(
+    dsFlower:::.validateTemplateProfile("xgboost_tabular", "secure"),
+    "does not support.*secure"
+  )
+})
+
+test_that(".validateTemplateProfile rejects xgboost in secure_dp", {
+  expect_error(
+    dsFlower:::.validateTemplateProfile("xgboost_tabular", "secure_dp"),
+    "does not support.*secure_dp"
+  )
 })
 
 test_that(".validateTemplateProfile allows new DP templates in secure_dp", {
