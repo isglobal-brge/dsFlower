@@ -343,6 +343,8 @@
   }
 
   # Determine columns to select
+  # Ensure character vector (JSON deserialization may produce a list)
+  if (is.list(feature_columns)) feature_columns <- unlist(feature_columns)
   cols_needed <- target_column
   if (!is.null(feature_columns) && length(feature_columns) > 0) {
     cols_needed <- unique(c(cols_needed, feature_columns))
