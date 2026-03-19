@@ -11,9 +11,10 @@
 
 # --- Framework dependency map ---
 # Maps framework names to their pip requirements. Base deps (flwr, numpy,
-# pandas) are always included.
+# pandas, pyarrow) are always included.
 
-.BASE_PYTHON_DEPS <- c("flwr>=1.13.0", "numpy>=1.21.0", "pandas>=1.3.0")
+.BASE_PYTHON_DEPS <- c("flwr>=1.13.0", "numpy>=1.21.0", "pandas>=1.3.0",
+                        "pyarrow>=10.0.0")
 
 .FRAMEWORK_PYTHON_DEPS <- list(
   sklearn = c("scikit-learn>=1.0.0"),
