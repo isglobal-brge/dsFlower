@@ -20,7 +20,8 @@ EXPECTED_HASH_FILE = os.path.join(MANIFEST_DIR, "expected_hash.txt") if MANIFEST
 _KNOWN_TEMPLATES = {
     "sklearn_logreg", "sklearn_sgd", "sklearn_ridge", "pytorch_mlp",
     "pytorch_logreg", "pytorch_linear_regression", "pytorch_coxph",
-    "pytorch_multiclass", "xgboost_tabular", "pytorch_resnet18",
+    "pytorch_multiclass", "xgboost_tabular", "xgboost_secure_horizontal",
+    "pytorch_resnet18",
     "pytorch_densenet121", "pytorch_unet2d", "pytorch_tcn", "pytorch_lstm",
 }
 

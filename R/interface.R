@@ -799,7 +799,23 @@ flowerListTemplatesDS <- function() {
   if (!nzchar(templates_dir) || !dir.exists(templates_dir)) {
     return(character(0))
   }
-  list.dirs(templates_dir, full.names = FALSE, recursive = FALSE)
+  all_templates <- list.dirs(templates_dir, full.names = FALSE, recursive = FALSE)
+
+  # Filter: only return templates that support the active trust profile.
+  # Templates that only work under 'research' (e.g. xgboost_tabular) are
+  # hidden from the catalog because the research profile is not available.
+  profile <- tryCatch(.flowerTrustProfile(), error = function(e) {
+    list(name = "secure")
+  })
+  caps <- .TEMPLATE_CAPABILITIES
+
+  Filter(function(t) {
+    tcap <- caps[[t]]
+    if (is.null(tcap)) return(FALSE)  # unknown templates hidden by default
+    if (profile$name == "secure_dp") return(isTRUE(tcap$supports_secure_dp))
+    if (profile$name == "secure") return(isTRUE(tcap$supports_secure))
+    TRUE
+  }, all_templates)
 }
 
 #' Get a Template

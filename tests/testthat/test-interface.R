@@ -73,7 +73,7 @@ test_that(".dsf_option follows option chain", {
 })
 
 test_that("flowerPrepareRunDS stages data correctly", {
-  csv_path <- create_test_csv(n = 50)
+  csv_path <- create_test_csv(n = 200)
   on.exit(unlink(csv_path))
 
   # Create a handle manually
@@ -96,7 +96,7 @@ test_that("flowerPrepareRunDS stages data correctly", {
   expect_true(file.exists(manifest_path))
 
   manifest <- jsonlite::fromJSON(manifest_path)
-  expect_equal(manifest$n_samples, 50)
+  expect_equal(manifest$n_samples, 200)
   expect_equal(manifest$target_column, "target")
 
   # Clean up staging
@@ -123,7 +123,7 @@ test_that("flowerPrepareRunDS blocks on insufficient samples", {
 # --- TLS ca.pem handling ---
 
 test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
-  csv_path <- create_test_csv(n = 50)
+  csv_path <- create_test_csv(n = 200)
   on.exit(unlink(csv_path))
 
   handle <- mock_handle(data_path = csv_path, data_format = "csv")
@@ -170,7 +170,7 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
 })
 
 test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)", {
-  csv_path <- create_test_csv(n = 50)
+  csv_path <- create_test_csv(n = 200)
   on.exit(unlink(csv_path))
 
   handle <- mock_handle(data_path = csv_path, data_format = "csv")

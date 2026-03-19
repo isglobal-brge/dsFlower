@@ -140,9 +140,19 @@
     min_rows_secure_dp = 500,
     framework          = "pytorch"
   ),
+  # RESEARCH-ONLY: xgboost_tabular is NOT available in production.
+  # Reason: Uses tree bagging aggregation where each client sends its
+  # complete local trees to the SuperLink. The researcher controlling
+  # the SuperLink can inspect individual client tree structures, which
+  # reveals information about individual node training data (split
+  # thresholds, leaf values, tree topology). This is fundamentally
+  # incompatible with secure aggregation, which requires the server
+  # to see only aggregated results. For secure XGBoost, use
+  # xgboost_secure_horizontal instead, which uses histogram-based
+  # aggregation with SecAgg+ so the server only sees summed histograms.
   xgboost_tabular = list(
-    supports_secure    = FALSE,  # bagging aggregation exposes individual trees to SuperLink
-    supports_secure_dp = FALSE,  # tree privacy not designed
+    supports_secure    = FALSE,
+    supports_secure_dp = FALSE,
     requires_secagg    = FALSE,
     min_rows_secure    = NA_integer_,
     min_rows_secure_dp = NA_integer_,
@@ -187,6 +197,14 @@
     min_rows_secure    = 200,
     min_rows_secure_dp = 500,
     framework          = "pytorch"
+  ),
+  xgboost_secure_horizontal = list(
+    supports_secure    = TRUE,
+    supports_secure_dp = FALSE,
+    requires_secagg    = TRUE,
+    min_rows_secure    = 200,
+    min_rows_secure_dp = NA_integer_,
+    framework          = "xgboost"
   )
 )
 
@@ -249,20 +267,37 @@
 
 #' Get the effective trust profile
 #'
-#' Reads the \code{dsflower.privacy_profile} option (default "research")
+#' Reads the \code{dsflower.privacy_profile} option (default "secure")
 #' and returns the effective settings. Individual option overrides
 #' (e.g. \code{dsflower.min_train_rows}) can only strengthen (never weaken)
 #' the profile.
 #'
+#' The "research" profile is disabled by default. To enable it, the server
+#' admin must explicitly set \code{dsflower.allow_research_profile = TRUE}.
+#' This follows the DataSHIELD principle that the default must be safe.
+#'
 #' @return Named list of trust profile settings.
 #' @keywords internal
 .flowerTrustProfile <- function() {
-  profile_name <- .dsf_option("privacy_profile", "research")
+  profile_name <- .dsf_option("privacy_profile", "secure")
   if (!profile_name %in% names(.TRUST_PROFILES)) {
     stop("Unknown privacy profile: '", profile_name,
          "'. Valid profiles: ", paste(names(.TRUST_PROFILES), collapse = ", "),
          call. = FALSE)
   }
+
+  # The 'research' profile is permanently disabled. It bypasses all
+  # privacy protections (no SecAgg, per-node metrics exposed, exact counts
+  # revealed) and is incompatible with the DataSHIELD threat model where
+  # the researcher must not access individual-level information.
+  if (identical(profile_name, "research")) {
+    stop("The 'research' privacy profile is not available. ",
+         "This profile disables secure aggregation and exposes per-node ",
+         "information, which is incompatible with DataSHIELD's privacy model. ",
+         "Use the 'secure' or 'secure_dp' profile instead.",
+         call. = FALSE)
+  }
+
   profile <- .TRUST_PROFILES[[profile_name]]
   profile$name <- profile_name
 
@@ -345,7 +380,8 @@
                           "pytorch_coxph", "pytorch_multiclass",
                           "xgboost_tabular", "pytorch_resnet18",
                           "pytorch_densenet121", "pytorch_unet2d",
-                          "pytorch_tcn", "pytorch_lstm"),
+                          "pytorch_tcn", "pytorch_lstm",
+                          "xgboost_secure_horizontal"),
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
     max_concurrent_runs = as.integer(.dsf_option("max_concurrent_runs", 5))
   )

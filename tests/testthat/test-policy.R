@@ -30,7 +30,7 @@ test_that(".flowerDisclosureSettings returns correct defaults", {
   expect_true("pytorch_unet2d" %in% settings$allowed_templates)
   expect_true("pytorch_tcn" %in% settings$allowed_templates)
   expect_true("pytorch_lstm" %in% settings$allowed_templates)
-  expect_equal(length(settings$allowed_templates), 14)
+  expect_equal(length(settings$allowed_templates), 15)
 })
 
 test_that(".flowerDisclosureSettings respects option overrides", {
@@ -159,16 +159,22 @@ test_that(".validateTemplate allows custom when enabled", {
 
 # --- Trust Profile tests ---
 
-test_that(".flowerTrustProfile returns research profile by default", {
+test_that(".flowerTrustProfile defaults to secure (not research)", {
   withr::with_options(list(dsflower.privacy_profile = NULL), {
     profile <- dsFlower:::.flowerTrustProfile()
-    expect_equal(profile$name, "research")
-    expect_equal(profile$min_train_rows, 3)
-    expect_true(profile$allow_per_node_metrics)
-    expect_true(profile$allow_exact_num_examples)
-    expect_false(profile$require_secure_aggregation)
+    expect_equal(profile$name, "secure")
+    expect_equal(profile$min_train_rows, 100)
+    expect_false(profile$allow_per_node_metrics)
+    expect_false(profile$allow_exact_num_examples)
+    expect_true(profile$require_secure_aggregation)
     expect_false(profile$dp_required)
-    expect_equal(profile$model_release, "allowed")
+  })
+})
+
+test_that(".flowerTrustProfile permanently blocks research profile", {
+  withr::with_options(list(dsflower.privacy_profile = "research"), {
+    expect_error(dsFlower:::.flowerTrustProfile(),
+                 "research.*not available")
   })
 })
 
@@ -200,17 +206,17 @@ test_that(".flowerTrustProfile errors on unknown profile", {
   })
 })
 
-test_that(".flowerTrustProfile overrides can only strengthen", {
+test_that(".flowerTrustProfile overrides can only strengthen secure profile", {
   withr::with_options(list(
-    dsflower.privacy_profile = "research",
-    dsflower.min_train_rows = 50,
-    dsflower.allow_per_node_metrics = FALSE
+    dsflower.privacy_profile = "secure",
+    dsflower.min_train_rows = 500
   ), {
     profile <- dsFlower:::.flowerTrustProfile()
-    # min_train_rows should be max(3, 50) = 50
-    expect_equal(profile$min_train_rows, 50)
-    # allow_per_node_metrics should be FALSE (strengthened)
+    # min_train_rows should be max(100, 500) = 500
+    expect_equal(profile$min_train_rows, 500)
+    # Other secure defaults unchanged
     expect_false(profile$allow_per_node_metrics)
+    expect_true(profile$require_secure_aggregation)
   })
 })
 
@@ -246,7 +252,7 @@ test_that(".TEMPLATE_CAPABILITIES has entries for all built-in templates", {
   for (tmpl in expected) {
     expect_true(tmpl %in% names(caps), label = paste(tmpl, "in capabilities"))
   }
-  expect_equal(length(caps), 14)
+  expect_equal(length(caps), 15)
 })
 
 test_that("sklearn templates do not support secure_dp", {

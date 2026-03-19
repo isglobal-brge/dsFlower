@@ -51,7 +51,7 @@ mock_handle <- function(data_path = NULL,
 #' @param n Integer; number of rows
 #' @param dir Character; directory to write to (default tempdir)
 #' @return Character; path to the CSV file
-create_test_csv <- function(n = 50, dir = tempdir()) {
+create_test_csv <- function(n = 200, dir = tempdir()) {
   set.seed(42)
   data <- data.frame(
     f1 = rnorm(n),

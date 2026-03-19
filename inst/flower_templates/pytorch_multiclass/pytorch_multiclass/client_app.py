@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .task import load_data, load_privacy_config
-from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count
+from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count, make_private_opacus
 
 
 def _build_classifier(input_dim, hidden_layers, n_classes):
@@ -32,7 +32,8 @@ def _build_classifier(input_dim, hidden_layers, n_classes):
 
 class FlowerClient(NumPyClient):
     def __init__(self, model, trainloader, n_classes, privacy_config,
-                 learning_rate=0.01, local_epochs=1, device="cpu"):
+                 learning_rate=0.01, local_epochs=1, device="cpu",
+                 optimizer=None, privacy_engine=None):
         self.model = model.to(device)
         self.trainloader = trainloader
         self.n_classes = n_classes
@@ -40,22 +41,29 @@ class FlowerClient(NumPyClient):
         self.device = device
         self.local_epochs = local_epochs
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.Adam(
-            model.parameters(), lr=learning_rate
-        )
+        self.privacy_engine = privacy_engine
+        if optimizer is not None:
+            self.optimizer = optimizer
+        else:
+            self.optimizer = torch.optim.Adam(
+                model.parameters(), lr=learning_rate
+            )
 
     def get_parameters(self, config):
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        module = getattr(self.model, '_module', self.model)
+        return [val.cpu().numpy() for val in module.state_dict().values()]
 
     def set_parameters(self, parameters):
+        module = getattr(self.model, '_module', self.model)
         state_dict = OrderedDict()
-        for key, val in zip(self.model.state_dict().keys(), parameters):
+        for key, val in zip(module.state_dict().keys(), parameters):
             state_dict[key] = torch.tensor(val)
-        self.model.load_state_dict(state_dict, strict=True)
+        module.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        old_weights = [p.copy() for p in parameters]
+        privacy_mode = self.privacy_config.get("privacy_mode")
+        old_weights = [p.copy() for p in parameters] if privacy_mode == "dp_update_level" else None
 
         self.model.train()
         for _ in range(self.local_epochs):
@@ -69,8 +77,14 @@ class FlowerClient(NumPyClient):
                 self.optimizer.step()
 
         new_weights = self.get_parameters(config)
+        fit_metrics = {}
 
-        if self.privacy_config.get("privacy_mode") == "dp":
+        if privacy_mode == "dp" and self.privacy_engine is not None:
+            dp_delta = self.privacy_config["delta"]
+            actual_epsilon = self.privacy_engine.get_epsilon(dp_delta)
+            fit_metrics["dp_epsilon"] = actual_epsilon
+
+        elif privacy_mode == "dp_update_level":
             cn = self.privacy_config["clipping_norm"]
             eps = self.privacy_config["epsilon"]
             delta = self.privacy_config["delta"]
@@ -84,7 +98,7 @@ class FlowerClient(NumPyClient):
         if not self.privacy_config.get("allow_exact_num_examples", True):
             n_examples = bucket_count(n_examples)
 
-        return new_weights, n_examples, {}
+        return new_weights, n_examples, fit_metrics
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
@@ -146,11 +160,25 @@ def client_fn(context: Context) -> FlowerClient:
     trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    privacy_engine = None
+
+    if privacy_config.get("privacy_mode") == "dp":
+        model, optimizer, trainloader, privacy_engine = make_private_opacus(
+            model, optimizer, trainloader,
+            clipping_norm=privacy_config["clipping_norm"],
+            epsilon=privacy_config["epsilon"],
+            delta=privacy_config["delta"],
+            epochs=local_epochs,
+        )
+
     return FlowerClient(
         model, trainloader, n_classes, privacy_config,
         learning_rate=learning_rate,
         local_epochs=local_epochs,
-        device=device
+        device=device,
+        optimizer=optimizer,
+        privacy_engine=privacy_engine,
     )
 
 

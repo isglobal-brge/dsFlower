@@ -17,7 +17,7 @@
 
 .FRAMEWORK_PYTHON_DEPS <- list(
   sklearn = c("scikit-learn>=1.0.0"),
-  pytorch = c("torch>=2.0.0"),
+  pytorch = c("torch>=2.0.0", "opacus>=1.4.0"),
   pytorch_vision = c("torch>=2.0.0", "torchvision>=0.15.0", "Pillow>=9.0.0"),
   xgboost = c("xgboost>=1.7.0")
 )
