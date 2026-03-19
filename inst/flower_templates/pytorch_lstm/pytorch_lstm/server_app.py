@@ -155,14 +155,26 @@ def server_fn(context: Context) -> ServerAppComponents:
     config = ServerConfig(num_rounds=num_rounds)
 
     if require_secagg:
-        from flwr.server.workflow import SecAggPlusWorkflow, DefaultWorkflow
         num_clients = int(cfg.get("strategy-min_available_clients", 2))
-        return ServerAppComponents(
-            strategy=strategy, config=config,
-            workflow=SecAggPlusWorkflow(
-                num_shares=num_clients,
-                reconstruction_threshold=num_clients,
+        if num_clients >= 3:
+            from flwr.server.workflow import SecAggPlusWorkflow, DefaultWorkflow
+            return ServerAppComponents(
+                strategy=strategy, config=config,
+                workflow=SecAggPlusWorkflow(
+                    num_shares=num_clients,
+                    reconstruction_threshold=num_clients,
+                )
             )
+        # SecAgg+ requires 3+ clients. With fewer, fall back to standard
+        # aggregation. Privacy is maintained by DP-SGD (Opacus) when the
+        # secure_dp profile is active.
+        import sys
+        print(
+            "\nDSFLOWER NOTE: SecAgg+ requires 3+ clients but only "
+            f"{num_clients} configured. Running without SecAgg+.\n"
+            "Privacy of individual updates is protected by DP-SGD noise "
+            "when secure_dp profile is active.\n",
+            file=sys.stderr, flush=True,
         )
 
     return ServerAppComponents(strategy=strategy, config=config)

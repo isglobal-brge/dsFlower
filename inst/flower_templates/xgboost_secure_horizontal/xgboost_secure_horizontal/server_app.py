@@ -559,14 +559,21 @@ def server_fn(context: Context) -> ServerAppComponents:
     config = ServerConfig(num_rounds=num_rounds)
 
     if require_secagg:
-        from flwr.server.workflow import SecAggPlusWorkflow
         num_clients = int(cfg.get("strategy-min_available_clients", 2))
-        return ServerAppComponents(
-            strategy=strategy, config=config,
-            workflow=SecAggPlusWorkflow(
-                num_shares=num_clients,
-                reconstruction_threshold=num_clients,
-            ),
+        if num_clients >= 3:
+            from flwr.server.workflow import SecAggPlusWorkflow
+            return ServerAppComponents(
+                strategy=strategy, config=config,
+                workflow=SecAggPlusWorkflow(
+                    num_shares=num_clients,
+                    reconstruction_threshold=num_clients,
+                ),
+            )
+        import sys
+        print(
+            "\nDSFLOWER NOTE: SecAgg+ requires 3+ clients but only "
+            f"{num_clients} configured. Running without SecAgg+.\n",
+            file=sys.stderr, flush=True,
         )
 
     return ServerAppComponents(strategy=strategy, config=config)
