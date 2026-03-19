@@ -63,6 +63,7 @@ class SecureXGBoostStrategy(Strategy):
         min_available_clients: int = 2,
         min_fit_clients: int = 2,
         allow_per_node_metrics: bool = True,
+        evaluation_only: bool = False,
     ):
         super().__init__()
         self.n_trees = n_trees
@@ -78,6 +79,7 @@ class SecureXGBoostStrategy(Strategy):
         self.min_available_clients = min_available_clients
         self.min_fit_clients = min_fit_clients
         self.allow_per_node_metrics = allow_per_node_metrics
+        self.evaluation_only = evaluation_only
 
         # State machine
         self.current_tree = 0
@@ -422,6 +424,8 @@ class SecureXGBoostStrategy(Strategy):
 
     def _save_model(self):
         """Save the completed model as JSON."""
+        if self.evaluation_only:
+            return
         model = {
             "model_type": "xgboost_secure_horizontal",
             "n_trees": len(self.completed_trees),
@@ -538,8 +542,15 @@ def server_fn(context: Context) -> ServerAppComponents:
     allow_per_node_metrics = str(
         cfg.get("allow-per-node-metrics", "true")
     ).lower() == "true"
+    fixed_client_sampling = str(cfg.get("fixed-client-sampling", "false")).lower() == "true"
+    evaluation_only = str(cfg.get("evaluation-only", "false")).lower() == "true"
 
     num_rounds = _compute_num_rounds(n_trees, max_depth)
+
+    min_available = int(cfg.get("strategy-min_available_clients", 2))
+    min_fit = int(cfg.get("strategy-min_fit_clients", 2))
+    if fixed_client_sampling:
+        min_fit = min_available
 
     strategy = SecureXGBoostStrategy(
         n_trees=n_trees,
@@ -551,9 +562,10 @@ def server_fn(context: Context) -> ServerAppComponents:
         objective=objective,
         n_features=n_features,
         results_dir=results_dir,
-        min_available_clients=int(cfg.get("strategy-min_available_clients", 2)),
-        min_fit_clients=int(cfg.get("strategy-min_fit_clients", 2)),
+        min_available_clients=min_available,
+        min_fit_clients=min_fit,
         allow_per_node_metrics=allow_per_node_metrics,
+        evaluation_only=evaluation_only,
     )
 
     config = ServerConfig(num_rounds=num_rounds)

@@ -517,11 +517,15 @@
   # Write privacy config into manifest
   trust <- tryCatch(.flowerTrustProfile(), error = function(e) NULL)
   if (!is.null(trust)) {
-    manifest[["privacy_profile"]]          <- trust$name
-    manifest[["allow_per_node_metrics"]]   <- trust$allow_per_node_metrics
-    manifest[["allow_exact_num_examples"]] <- trust$allow_exact_num_examples
+    manifest[["privacy_profile"]]            <- trust$name
+    manifest[["allow_per_node_metrics"]]     <- trust$allow_per_node_metrics
+    manifest[["allow_exact_num_examples"]]   <- trust$allow_exact_num_examples
     manifest[["require_secure_aggregation"]] <- trust$require_secure_aggregation
-    manifest[["dp_required"]]              <- trust$dp_required
+    manifest[["dp_required"]]                <- trust$dp_required
+    manifest[["min_clients_per_round"]]      <- trust$min_clients_per_round
+    manifest[["fixed_client_sampling"]]      <- trust$fixed_client_sampling
+    manifest[["dp_scope"]]                   <- trust$dp_scope
+    manifest[["evaluation_only"]]            <- trust$evaluation_only
   }
 
   manifest_path <- file.path(staging_dir, "manifest.json")

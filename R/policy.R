@@ -5,26 +5,35 @@
 # following the DataSHIELD convention of double-fallback:
 #   getOption("dsflower.X", getOption("default.dsflower.X", hardcoded_default))
 
+# --- Profile Order ---
+# Canonical ordering of privacy profiles, from least to most restrictive.
+.PROFILE_ORDER <- c(
+  "sandbox_open",
+  "trusted_internal",
+  "consortium_internal",
+  "clinical_default",
+  "clinical_hardened",
+  "clinical_dp",
+  "high_sensitivity_dp"
+)
+
 # --- Trust Profiles ---
 # Server-controlled profiles that determine what privacy guarantees are
-# enforced. The client can request a profile but the server enforces the floor.
+# enforced. The client requests a profile and the server enforces it.
 #
 # IMPORTANT SECURITY NOTES:
 #
-# 1. model_release is "advisory_gated" (not "gated") in secure profiles
+# 1. model_release is "advisory_gated" (not "gated") in clinical profiles
 #    because it is NOT enforceable when the researcher controls the SuperLink.
 #    The final global model lives on the researcher's machine by design.
 #    For truly gated model release, the SuperLink must run on a trusted
 #    neutral host or TEE.
 #
-# 2. secure_dp currently implements UPDATE-LEVEL noise (weight delta
-#    clipping + Gaussian noise), NOT patient-level DP-SGD with per-example
-#    gradient clipping. This provides meaningful obfuscation of individual
-#    node updates but does NOT constitute formal patient-level differential
-#    privacy. For formal DP guarantees, templates must be upgraded to use
-#    Opacus DP-SGD with per-example gradient clipping.
-#    The profile is named secure_dp to indicate DP intent; the actual
-#    guarantee level depends on the template implementation.
+# 2. dp_scope has two levels:
+#    - "update_noise_only": weight delta clipping + Gaussian noise on updates.
+#      Provides meaningful obfuscation but NOT formal patient-level DP.
+#    - "patient_level_dp_sgd": per-example gradient clipping via Opacus.
+#      Provides formal patient-level differential privacy guarantees.
 #
 # 3. Secure aggregation (SecAgg+) protects individual weight updates from
 #    the SuperLink, but the final aggregated model is still visible to the
@@ -32,215 +41,191 @@
 #    and client-side (secaggplus_mod) in all templates.
 
 .TRUST_PROFILES <- list(
-  research = list(
-    min_train_rows          = 3,
-    allow_per_node_metrics  = TRUE,
-    allow_exact_num_examples = TRUE,
+  sandbox_open = list(
+    min_train_rows             = 3,
+    allow_per_node_metrics     = TRUE,
+    allow_exact_num_examples   = TRUE,
     require_secure_aggregation = FALSE,
-    dp_required             = FALSE,
-    model_release           = "allowed"
+    dp_required                = FALSE,
+    model_release              = "allowed",
+    min_clients_per_round      = 1L,
+    fixed_client_sampling      = FALSE,
+    dp_scope                   = "none",
+    min_positive_examples      = 0L,
+    min_per_class              = 0L,
+    min_events                 = 0L
   ),
-  secure = list(
-    min_train_rows          = 100,
-    allow_per_node_metrics  = FALSE,
-    allow_exact_num_examples = FALSE,
-    require_secure_aggregation = TRUE,
-    dp_required             = FALSE,
-    model_release           = "advisory_gated"
+  trusted_internal = list(
+    min_train_rows             = 50,
+    allow_per_node_metrics     = TRUE,
+    allow_exact_num_examples   = FALSE,
+    require_secure_aggregation = FALSE,
+    dp_required                = FALSE,
+    model_release              = "allowed",
+    min_clients_per_round      = 1L,
+    fixed_client_sampling      = FALSE,
+    dp_scope                   = "none",
+    min_positive_examples      = 5L,
+    min_per_class              = 5L,
+    min_events                 = 5L
   ),
-  secure_dp = list(
-    min_train_rows          = 200,
-    allow_per_node_metrics  = FALSE,
-    allow_exact_num_examples = FALSE,
+  consortium_internal = list(
+    min_train_rows             = 50,
+    allow_per_node_metrics     = FALSE,
+    allow_exact_num_examples   = FALSE,
+    require_secure_aggregation = FALSE,
+    dp_required                = FALSE,
+    model_release              = "advisory_gated",
+    min_clients_per_round      = 2L,
+    fixed_client_sampling      = TRUE,
+    dp_scope                   = "none",
+    min_positive_examples      = 10L,
+    min_per_class              = 10L,
+    min_events                 = 10L
+  ),
+  clinical_default = list(
+    min_train_rows             = 100,
+    allow_per_node_metrics     = FALSE,
+    allow_exact_num_examples   = FALSE,
     require_secure_aggregation = TRUE,
-    dp_required             = TRUE,
-    model_release           = "advisory_gated"
+    dp_required                = FALSE,
+    model_release              = "advisory_gated",
+    min_clients_per_round      = 2L,
+    fixed_client_sampling      = TRUE,
+    dp_scope                   = "none",
+    min_positive_examples      = 20L,
+    min_per_class              = 20L,
+    min_events                 = 20L
+  ),
+  clinical_hardened = list(
+    min_train_rows             = 200,
+    allow_per_node_metrics     = FALSE,
+    allow_exact_num_examples   = FALSE,
+    require_secure_aggregation = TRUE,
+    dp_required                = FALSE,
+    model_release              = "advisory_gated",
+    min_clients_per_round      = 3L,
+    fixed_client_sampling      = TRUE,
+    dp_scope                   = "none",
+    min_positive_examples      = 30L,
+    min_per_class              = 30L,
+    min_events                 = 30L
+  ),
+  clinical_dp = list(
+    min_train_rows             = 200,
+    allow_per_node_metrics     = FALSE,
+    allow_exact_num_examples   = FALSE,
+    require_secure_aggregation = TRUE,
+    dp_required                = TRUE,
+    model_release              = "advisory_gated",
+    min_clients_per_round      = 2L,
+    fixed_client_sampling      = TRUE,
+    dp_scope                   = "update_noise_only",
+    min_positive_examples      = 30L,
+    min_per_class              = 30L,
+    min_events                 = 30L
+  ),
+  high_sensitivity_dp = list(
+    min_train_rows             = 500,
+    allow_per_node_metrics     = FALSE,
+    allow_exact_num_examples   = FALSE,
+    require_secure_aggregation = TRUE,
+    dp_required                = TRUE,
+    model_release              = "advisory_gated",
+    min_clients_per_round      = 3L,
+    fixed_client_sampling      = TRUE,
+    dp_scope                   = "patient_level_dp_sgd",
+    min_positive_examples      = 50L,
+    min_per_class              = 50L,
+    min_events                 = 50L
   )
 )
 
-# --- Template Capability Matrix ---
-# Defines which templates support which privacy profiles.
-#
-# supports_secure: can run under the "secure" profile (SecAgg+ enforced,
-#   metrics suppressed, count bucketing). Requires that weight aggregation
-#   works under SecAgg+ and the SuperLink only sees aggregated weights.
-#
-# supports_secure_dp: can run under the "secure_dp" profile. Currently
-#   this means UPDATE-LEVEL noise (weight delta clipping + Gaussian noise),
-#   NOT per-example DP-SGD. Templates marked TRUE here have a training loop
-#   that supports clipping/noise on the weight update. Future: upgrade to
-#   Opacus DP-SGD for formal patient-level DP.
-#
-# Templates that do NOT support secure (e.g. xgboost_tabular): their
-# aggregation protocol requires the SuperLink to see individual model
-# updates in cleartext, which breaks the secure aggregation guarantee.
+# --- Template Family Matrix ---
+# Maps each template to a family, and each family to per-profile minimum
+# row counts. NA means the template is NOT supported under that profile.
 
-.TEMPLATE_CAPABILITIES <- list(
-  sklearn_logreg = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = FALSE,  # closed-form solver, no per-example clipping
-    requires_secagg    = FALSE,
-    min_rows_secure    = 100,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "sklearn"
-  ),
-  sklearn_ridge = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = FALSE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 100,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "sklearn"
-  ),
-  sklearn_sgd = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = FALSE,  # more leakage-prone with small batches
-    requires_secagg    = FALSE,
-    min_rows_secure    = 200,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "sklearn"
-  ),
-  pytorch_mlp = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = TRUE,  # DP-SGD capable
-    requires_secagg    = FALSE,
-    min_rows_secure    = 100,
-    min_rows_secure_dp = 500,
-    framework          = "pytorch"
-  ),
-  pytorch_logreg = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = TRUE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 100,
-    min_rows_secure_dp = 200,
-    framework          = "pytorch"
-  ),
-  pytorch_linear_regression = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = TRUE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 100,
-    min_rows_secure_dp = 200,
-    framework          = "pytorch"
-  ),
-  pytorch_coxph = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = TRUE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 200,
-    min_rows_secure_dp = 500,
-    framework          = "pytorch"
-  ),
-  pytorch_multiclass = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = TRUE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 200,
-    min_rows_secure_dp = 500,
-    framework          = "pytorch"
-  ),
-  # RESEARCH-ONLY: xgboost_tabular is NOT available in production.
-  # Reason: Uses tree bagging aggregation where each client sends its
-  # complete local trees to the SuperLink. The researcher controlling
-  # the SuperLink can inspect individual client tree structures, which
-  # reveals information about individual node training data (split
-  # thresholds, leaf values, tree topology). This is fundamentally
-  # incompatible with secure aggregation, which requires the server
-  # to see only aggregated results. For secure XGBoost, use
-  # xgboost_secure_horizontal instead, which uses histogram-based
-  # aggregation with SecAgg+ so the server only sees summed histograms.
-  xgboost_tabular = list(
-    supports_secure    = FALSE,
-    supports_secure_dp = FALSE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = NA_integer_,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "xgboost"
-  ),
-  pytorch_resnet18 = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = FALSE,  # deferred
-    requires_secagg    = FALSE,
-    min_rows_secure    = 1000,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "pytorch_vision"
-  ),
-  pytorch_densenet121 = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = FALSE,  # deferred
-    requires_secagg    = FALSE,
-    min_rows_secure    = 1000,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "pytorch_vision"
-  ),
-  pytorch_unet2d = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = FALSE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 500,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "pytorch_vision"
-  ),
-  pytorch_tcn = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = TRUE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 200,
-    min_rows_secure_dp = 500,
-    framework          = "pytorch"
-  ),
-  pytorch_lstm = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = TRUE,
-    requires_secagg    = FALSE,
-    min_rows_secure    = 200,
-    min_rows_secure_dp = 500,
-    framework          = "pytorch"
-  ),
-  xgboost_secure_horizontal = list(
-    supports_secure    = TRUE,
-    supports_secure_dp = FALSE,
-    requires_secagg    = TRUE,
-    min_rows_secure    = 200,
-    min_rows_secure_dp = NA_integer_,
-    framework          = "xgboost"
-  )
+.TEMPLATE_FAMILIES <- list(
+  sklearn_logreg             = "closed_form_linear",
+  sklearn_ridge              = "closed_form_linear",
+  sklearn_sgd                = "iterative_linear",
+  pytorch_logreg             = "iterative_linear",
+  pytorch_linear_regression  = "iterative_linear",
+  pytorch_multiclass         = "iterative_linear",
+  pytorch_coxph              = "iterative_linear",
+  pytorch_mlp                = "tabular_deep",
+  pytorch_tcn                = "tabular_deep",
+  pytorch_lstm               = "tabular_deep",
+  pytorch_resnet18           = "vision",
+  pytorch_densenet121        = "vision",
+  pytorch_unet2d             = "segmentation",
+  xgboost_secure_horizontal  = "xgboost_secure",
+  xgboost_tabular            = "xgboost_research"
+)
+
+# Per-family minimum rows indexed by .PROFILE_ORDER.
+# NA = template family not supported under that profile.
+.FAMILY_MIN_ROWS <- list(
+  closed_form_linear = c(3L, 50L, 50L, 100L, 200L, NA_integer_, NA_integer_),
+  iterative_linear   = c(3L, 100L, 100L, 200L, 300L, 200L, 500L),
+  tabular_deep       = c(3L, 250L, 250L, 500L, 750L, 500L, 1000L),
+  vision             = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
+  segmentation       = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
+  xgboost_secure     = c(NA_integer_, 100L, 100L, 200L, 300L, NA_integer_, NA_integer_),
+  xgboost_research   = c(3L, 100L, NA_integer_, NA_integer_, NA_integer_, NA_integer_, NA_integer_)
+)
+
+# --- Template Metadata ---
+# Per-template metadata that does NOT vary by profile (framework, SecAgg requirement).
+.TEMPLATE_METADATA <- list(
+  sklearn_logreg            = list(framework = "sklearn",        requires_secagg = FALSE),
+  sklearn_ridge             = list(framework = "sklearn",        requires_secagg = FALSE),
+  sklearn_sgd               = list(framework = "sklearn",        requires_secagg = FALSE),
+  pytorch_mlp               = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_logreg            = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_linear_regression = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_coxph             = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_multiclass        = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_resnet18          = list(framework = "pytorch_vision", requires_secagg = FALSE),
+  pytorch_densenet121       = list(framework = "pytorch_vision", requires_secagg = FALSE),
+  pytorch_unet2d            = list(framework = "pytorch_vision", requires_secagg = FALSE),
+  pytorch_tcn               = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_lstm              = list(framework = "pytorch",        requires_secagg = FALSE),
+  xgboost_secure_horizontal = list(framework = "xgboost",       requires_secagg = TRUE),
+  xgboost_tabular           = list(framework = "xgboost",       requires_secagg = FALSE)
 )
 
 #' Validate template compatibility with the active trust profile
 #'
-#' Rejects templates that do not support the active privacy profile.
-#' For example, sklearn templates are rejected under secure_dp because
-#' they cannot do per-example gradient clipping (DP-SGD).
+#' Rejects templates whose family has NA for the given profile index.
 #'
 #' @param template_name Character; the template name.
 #' @param profile_name Character; the active trust profile name.
 #' @return TRUE invisibly, or stops with an error.
 #' @keywords internal
 .validateTemplateProfile <- function(template_name, profile_name) {
-  caps <- .TEMPLATE_CAPABILITIES[[template_name]]
-  if (is.null(caps)) {
-    # Unknown template -- allow if custom config is enabled, but
-    # block secure_dp for safety (unknown DP capability)
-    if (profile_name == "secure_dp") {
-      stop("Template '", template_name, "' has no registered capability ",
-           "matrix. Cannot use with secure_dp profile (requires verified ",
-           "DP-SGD support).", call. = FALSE)
+  family <- .TEMPLATE_FAMILIES[[template_name]]
+  if (is.null(family)) {
+    # Unknown template -- block DP profiles for safety
+    if (profile_name %in% c("clinical_dp", "high_sensitivity_dp")) {
+      stop("Template '", template_name, "' has no registered family. ",
+           "Cannot use with '", profile_name, "' profile (requires verified ",
+           "DP support).", call. = FALSE)
     }
     return(invisible(TRUE))
   }
 
-  if (profile_name == "secure" && !isTRUE(caps$supports_secure)) {
-    stop("Template '", template_name, "' does not support the 'secure' ",
-         "profile.", call. = FALSE)
+  profile_idx <- match(profile_name, .PROFILE_ORDER)
+  if (is.na(profile_idx)) {
+    stop("Unknown profile '", profile_name, "' for template validation.",
+         call. = FALSE)
   }
 
-  if (profile_name == "secure_dp" && !isTRUE(caps$supports_secure_dp)) {
-    stop("Template '", template_name, "' does not support the 'secure_dp' ",
-         "profile. secure_dp requires DP-SGD with per-example clipping, ",
-         "which is only available in PyTorch templates. ",
-         "Use a pytorch_* template instead.", call. = FALSE)
+  min_rows_vec <- .FAMILY_MIN_ROWS[[family]]
+  if (is.null(min_rows_vec) || is.na(min_rows_vec[profile_idx])) {
+    stop("Template '", template_name, "' (family '", family,
+         "') is not supported under the '", profile_name, "' profile.",
+         call. = FALSE)
   }
 
   invisible(TRUE)
@@ -250,56 +235,69 @@
 #'
 #' @param template_name Character; the template name.
 #' @param profile_name Character; the active trust profile name.
-#' @return Integer; the minimum row count, or the profile default.
+#' @return Integer; the minimum row count, or NULL if unknown template.
 #' @keywords internal
 .templateMinRows <- function(template_name, profile_name) {
-  caps <- .TEMPLATE_CAPABILITIES[[template_name]]
-  if (is.null(caps)) return(NULL)
+  family <- .TEMPLATE_FAMILIES[[template_name]]
+  if (is.null(family)) return(NULL)
 
-  if (profile_name == "secure_dp" && !is.na(caps$min_rows_secure_dp)) {
-    return(caps$min_rows_secure_dp)
-  }
-  if (profile_name %in% c("secure", "secure_dp") && !is.na(caps$min_rows_secure)) {
-    return(caps$min_rows_secure)
-  }
-  NULL
+  profile_idx <- match(profile_name, .PROFILE_ORDER)
+  if (is.na(profile_idx)) return(NULL)
+
+  min_rows_vec <- .FAMILY_MIN_ROWS[[family]]
+  if (is.null(min_rows_vec)) return(NULL)
+
+  val <- min_rows_vec[profile_idx]
+  if (is.na(val)) return(NULL)
+  val
+}
+
+#' Enforce absolute floors on a trust profile
+#'
+#' These floors cannot be violated regardless of admin overrides:
+#' - min_train_rows >= 3
+#' - min_clients_per_round >= 1
+#'
+#' @param profile Named list; the trust profile settings.
+#' @return The profile with floors enforced.
+#' @keywords internal
+.enforce_absolute_floors <- function(profile) {
+  profile$min_train_rows <- max(profile$min_train_rows, 3)
+  profile$min_clients_per_round <- max(profile$min_clients_per_round, 1L)
+  profile
 }
 
 #' Get the effective trust profile
 #'
-#' Reads the \code{dsflower.privacy_profile} option (default "secure")
-#' and returns the effective settings. Individual option overrides
-#' (e.g. \code{dsflower.min_train_rows}) can only strengthen (never weaken)
-#' the profile.
+#' Reads the \code{dsflower.privacy_profile} option (default "clinical_default")
+#' and returns the effective settings. Admin overrides via Opal options are
+#' authoritative (can both raise AND lower), with absolute floors enforced after.
 #'
-#' The "research" profile is disabled by default. To enable it, the server
-#' admin must explicitly set \code{dsflower.allow_research_profile = TRUE}.
-#' This follows the DataSHIELD principle that the default must be safe.
+#' The "sandbox_open" profile requires explicit admin opt-in via
+#' \code{dsflower.allow_sandbox = TRUE}.
+#'
+#' DP-locked profiles (clinical_dp, high_sensitivity_dp) cannot have
+#' require_secure_aggregation or dp_required disabled via overrides.
 #'
 #' @return Named list of trust profile settings.
 #' @keywords internal
 .flowerTrustProfile <- function() {
-  profile_name <- .dsf_option("privacy_profile", "secure")
+  profile_name <- .dsf_option("privacy_profile", "clinical_default")
   if (!profile_name %in% names(.TRUST_PROFILES)) {
     stop("Unknown privacy profile: '", profile_name,
          "'. Valid profiles: ", paste(names(.TRUST_PROFILES), collapse = ", "),
          call. = FALSE)
   }
 
-  # The 'research' profile disables all privacy protections (no SecAgg,
-  # per-node metrics exposed, exact counts revealed). It is NOT the default
-  # and requires explicit admin opt-in because it is disclosive:
-  #   - allow_per_node_metrics = TRUE: researcher sees per-hospital accuracy/loss
-  #   - allow_exact_num_examples = TRUE: researcher sees exact patient counts
-  #   - require_secure_aggregation = FALSE: researcher sees individual weight updates
-  if (identical(profile_name, "research")) {
-    allow_research <- as.logical(.dsf_option("allow_research_profile", FALSE))
-    if (!isTRUE(allow_research)) {
-      stop("The 'research' privacy profile requires explicit admin opt-in. ",
+  # sandbox_open requires explicit admin opt-in
+  if (identical(profile_name, "sandbox_open")) {
+    allow_sandbox <- as.logical(.dsf_option("allow_sandbox", FALSE))
+    if (!isTRUE(allow_sandbox)) {
+      stop("The 'sandbox_open' privacy profile requires explicit admin opt-in. ",
            "It disables secure aggregation, exposes per-node metrics, and reveals ",
            "exact sample counts -- all of which are disclosive under the DataSHIELD ",
-           "threat model. To enable, set: options(dsflower.allow_research_profile = TRUE). ",
-           "Default profile is 'secure'.",
+           "threat model. To enable, set: options(dsflower.allow_sandbox = TRUE). ",
+           "Default profile is 'clinical_default'.",
            call. = FALSE)
     }
   }
@@ -307,53 +305,203 @@
   profile <- .TRUST_PROFILES[[profile_name]]
   profile$name <- profile_name
 
-  # Allow individual overrides that can only strengthen the profile
+  dp_locked <- profile_name %in% c("clinical_dp", "high_sensitivity_dp")
+
+  # --- Authoritative overrides (can raise AND lower) ---
+
   raw_min_rows <- .dsf_option("min_train_rows", NULL)
   if (!is.null(raw_min_rows)) {
-    override_min_rows <- as.numeric(raw_min_rows)
-    if (!is.na(override_min_rows)) {
-      profile$min_train_rows <- max(profile$min_train_rows, override_min_rows)
+    override_val <- as.numeric(raw_min_rows)
+    if (!is.na(override_val)) {
+      profile$min_train_rows <- override_val
     }
   }
 
   raw_per_node <- .dsf_option("allow_per_node_metrics", NULL)
   if (!is.null(raw_per_node)) {
-    # Can only disable, not enable
-    if (!as.logical(raw_per_node)) {
-      profile$allow_per_node_metrics <- FALSE
-    }
+    profile$allow_per_node_metrics <- as.logical(raw_per_node)
   }
 
   raw_exact <- .dsf_option("allow_exact_num_examples", NULL)
   if (!is.null(raw_exact)) {
-    if (!as.logical(raw_exact)) {
-      profile$allow_exact_num_examples <- FALSE
-    }
+    profile$allow_exact_num_examples <- as.logical(raw_exact)
   }
 
   raw_secagg <- .dsf_option("require_secure_aggregation", NULL)
   if (!is.null(raw_secagg)) {
     val <- as.logical(raw_secagg)
-    if (isTRUE(val)) {
+    if (dp_locked && identical(val, FALSE)) {
+      warning("Cannot disable secure aggregation for DP-locked profile '",
+              profile_name, "'. Forcing require_secure_aggregation = TRUE.",
+              call. = FALSE)
       profile$require_secure_aggregation <- TRUE
-    } else if (identical(val, FALSE)) {
-      # Admin can disable SecAgg for deployments with < 3 nodes, where
-      # Flower SecAgg+ cannot operate (requires num_shares > 2).
-      # This weakens the security model: the SuperLink will see individual
-      # weight updates. Only acceptable when the SuperLink is trusted or
-      # when the deployment has fewer than 3 participating nodes.
-      profile$require_secure_aggregation <- FALSE
+    } else {
+      profile$require_secure_aggregation <- val
     }
   }
 
   raw_dp <- .dsf_option("dp_required", NULL)
   if (!is.null(raw_dp)) {
-    if (as.logical(raw_dp)) {
+    val <- as.logical(raw_dp)
+    if (dp_locked && identical(val, FALSE)) {
+      warning("Cannot disable DP for DP-locked profile '",
+              profile_name, "'. Forcing dp_required = TRUE.",
+              call. = FALSE)
       profile$dp_required <- TRUE
+    } else {
+      profile$dp_required <- val
     }
   }
 
+  raw_min_clients <- .dsf_option("min_clients_per_round", NULL)
+  if (!is.null(raw_min_clients)) {
+    override_val <- as.integer(raw_min_clients)
+    if (!is.na(override_val)) {
+      profile$min_clients_per_round <- override_val
+    }
+  }
+
+  raw_fixed <- .dsf_option("fixed_client_sampling", NULL)
+  if (!is.null(raw_fixed)) {
+    profile$fixed_client_sampling <- as.logical(raw_fixed)
+  }
+
+  raw_dp_scope <- .dsf_option("dp_scope", NULL)
+  if (!is.null(raw_dp_scope)) {
+    profile$dp_scope <- as.character(raw_dp_scope)
+  }
+
+  raw_min_pos <- .dsf_option("min_positive_examples", NULL)
+  if (!is.null(raw_min_pos)) {
+    override_val <- as.integer(raw_min_pos)
+    if (!is.na(override_val)) {
+      profile$min_positive_examples <- override_val
+    }
+  }
+
+  raw_min_class <- .dsf_option("min_per_class", NULL)
+  if (!is.null(raw_min_class)) {
+    override_val <- as.integer(raw_min_class)
+    if (!is.na(override_val)) {
+      profile$min_per_class <- override_val
+    }
+  }
+
+  raw_min_ev <- .dsf_option("min_events", NULL)
+  if (!is.null(raw_min_ev)) {
+    override_val <- as.integer(raw_min_ev)
+    if (!is.na(override_val)) {
+      profile$min_events <- override_val
+    }
+  }
+
+  # evaluation_only modifier
+  raw_eval_only <- .dsf_option("evaluation_only", NULL)
+  if (!is.null(raw_eval_only) && isTRUE(as.logical(raw_eval_only))) {
+    profile$model_release <- "blocked"
+    profile$allow_per_node_metrics <- FALSE
+    profile$evaluation_only <- TRUE
+  } else {
+    profile$evaluation_only <- FALSE
+  }
+
+  # Enforce absolute floors
+  profile <- .enforce_absolute_floors(profile)
+
   profile
+}
+
+#' Validate class distribution against trust profile thresholds
+#'
+#' Infers task type from the target column and validates:
+#' - Binary (2 unique values): min(table(target)) >= trust$min_positive_examples
+#' - Multiclass (>2 unique): all(table(target) >= trust$min_per_class)
+#' - Survival (2-column target or event/status column): sum(events==1) >= trust$min_events
+#'
+#' Error messages are deliberately generic to avoid leaking counts.
+#'
+#' @param data Data.frame or Arrow Table; the training data.
+#' @param target_column Character; name(s) of the target column(s).
+#' @param trust Named list; the trust profile settings.
+#' @return TRUE invisibly, or stops with an error.
+#' @keywords internal
+.validateClassDistribution <- function(data, target_column, trust) {
+  if (is.null(target_column) || length(target_column) == 0) {
+    return(invisible(TRUE))
+  }
+
+  # Survival detection: 2-column target or column named "event"/"status"
+  is_survival <- FALSE
+  if (length(target_column) == 2) {
+    is_survival <- TRUE
+    # Look for the event/status column (not the time column)
+    event_col <- NULL
+    for (tc in target_column) {
+      if (tc %in% names(data) &&
+          tolower(tc) %in% c("event", "status", "dead", "died",
+                              "censored", "censor")) {
+        event_col <- tc
+        break
+      }
+    }
+    if (is.null(event_col)) {
+      # Default: second column is the event indicator
+      event_col <- target_column[2]
+    }
+    if (event_col %in% names(data)) {
+      events <- data[[event_col]]
+      n_events <- sum(events == 1, na.rm = TRUE)
+      if (n_events < trust$min_events) {
+        stop("Disclosive: operation blocked -- insufficient event counts to ",
+             "meet disclosure threshold. No further details available.",
+             call. = FALSE)
+      }
+    }
+    return(invisible(TRUE))
+  }
+
+  # Single target column
+  tc <- target_column[1]
+  if (!tc %in% names(data)) return(invisible(TRUE))
+
+  target_vals <- data[[tc]]
+  unique_vals <- unique(target_vals[!is.na(target_vals)])
+  n_unique <- length(unique_vals)
+
+  if (n_unique <= 1) {
+    return(invisible(TRUE))
+  }
+
+  # Check for survival-like single column (named event/status)
+  if (tolower(tc) %in% c("event", "status", "dead", "died")) {
+    n_events <- sum(target_vals == 1, na.rm = TRUE)
+    if (n_events < trust$min_events) {
+      stop("Disclosive: operation blocked -- insufficient event counts to ",
+           "meet disclosure threshold. No further details available.",
+           call. = FALSE)
+    }
+    return(invisible(TRUE))
+  }
+
+  if (n_unique == 2) {
+    # Binary classification
+    counts <- table(target_vals)
+    if (min(counts) < trust$min_positive_examples) {
+      stop("Disclosive: operation blocked -- insufficient class counts to ",
+           "meet disclosure threshold. No further details available.",
+           call. = FALSE)
+    }
+  } else {
+    # Multiclass
+    counts <- table(target_vals)
+    if (any(counts < trust$min_per_class)) {
+      stop("Disclosive: operation blocked -- insufficient class counts to ",
+           "meet disclosure threshold. No further details available.",
+           call. = FALSE)
+    }
+  }
+
+  invisible(TRUE)
 }
 
 #' Bucket a count to prevent exact sample sizes from leaking

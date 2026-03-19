@@ -115,7 +115,7 @@ test_that(".stageData writes privacy settings from extra_config", {
       allow_per_node_metrics = FALSE,
       allow_exact_num_examples = FALSE,
       require_secure_aggregation = TRUE,
-      privacy_profile = "secure"
+      privacy_profile = "clinical_default"
     )
   )
   on.exit(unlink(staging_dir, recursive = TRUE))
@@ -124,7 +124,7 @@ test_that(".stageData writes privacy settings from extra_config", {
   expect_false(manifest$allow_per_node_metrics)
   expect_false(manifest$allow_exact_num_examples)
   expect_true(manifest$require_secure_aggregation)
-  expect_equal(manifest$privacy_profile, "secure")
+  expect_equal(manifest$privacy_profile, "clinical_default")
 })
 
 test_that(".cleanupStaging removes the directory", {

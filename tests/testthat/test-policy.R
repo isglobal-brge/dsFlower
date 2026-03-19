@@ -1,4 +1,6 @@
-# Tests for R/policy.R — Disclosure Controls
+# Tests for R/policy.R -- Disclosure Controls
+
+# --- Disclosure Settings ---
 
 test_that(".flowerDisclosureSettings returns all expected fields", {
   settings <- dsFlower:::.flowerDisclosureSettings()
@@ -40,21 +42,19 @@ test_that(".flowerDisclosureSettings respects option overrides", {
   })
 })
 
+# --- Assert Min Samples ---
+
 test_that(".assertMinSamples passes for sufficient samples", {
   expect_true(dsFlower:::.assertMinSamples(10))
   expect_true(dsFlower:::.assertMinSamples(3))
 })
 
 test_that(".assertMinSamples blocks insufficient samples", {
-  expect_error(
-    dsFlower:::.assertMinSamples(2),
-    "Disclosive"
-  )
-  expect_error(
-    dsFlower:::.assertMinSamples(0),
-    "Disclosive"
-  )
+  expect_error(dsFlower:::.assertMinSamples(2), "Disclosive")
+  expect_error(dsFlower:::.assertMinSamples(0), "Disclosive")
 })
+
+# --- Sanitize Metrics ---
 
 test_that(".sanitizeMetrics returns empty df for NULL input", {
   result <- dsFlower:::.sanitizeMetrics(NULL)
@@ -86,6 +86,8 @@ test_that(".sanitizeMetrics strips unsafe columns", {
   expect_false("ip_address" %in% names(result))
 })
 
+# --- Validate Max Rounds ---
+
 test_that(".validateMaxRounds allows valid rounds", {
   expect_equal(dsFlower:::.validateMaxRounds(10), 10L)
   expect_equal(dsFlower:::.validateMaxRounds(500), 500L)
@@ -99,6 +101,8 @@ test_that(".validateMaxRounds rejects non-positive values", {
   expect_error(dsFlower:::.validateMaxRounds(0), "positive integer")
   expect_error(dsFlower:::.validateMaxRounds(-1), "positive integer")
 })
+
+# --- Sanitize Logs ---
 
 test_that(".sanitizeLogs removes paths and IPs", {
   lines <- c(
@@ -126,6 +130,8 @@ test_that(".sanitizeLogs caps at 200 lines", {
   result <- dsFlower:::.sanitizeLogs(lines, last_n = 300L)
   expect_equal(length(result), 200)
 })
+
+# --- Validate Template ---
 
 test_that(".validateTemplate allows built-in templates", {
   expect_true(dsFlower:::.validateTemplate("sklearn_logreg"))
@@ -157,91 +163,7 @@ test_that(".validateTemplate allows custom when enabled", {
   })
 })
 
-# --- Trust Profile tests ---
-
-test_that(".flowerTrustProfile defaults to secure (not research)", {
-  withr::with_options(list(dsflower.privacy_profile = NULL), {
-    profile <- dsFlower:::.flowerTrustProfile()
-    expect_equal(profile$name, "secure")
-    expect_equal(profile$min_train_rows, 100)
-    expect_false(profile$allow_per_node_metrics)
-    expect_false(profile$allow_exact_num_examples)
-    expect_true(profile$require_secure_aggregation)
-    expect_false(profile$dp_required)
-  })
-})
-
-test_that(".flowerTrustProfile blocks research without admin opt-in", {
-  withr::with_options(list(dsflower.privacy_profile = "research"), {
-    expect_error(dsFlower:::.flowerTrustProfile(),
-                 "research.*requires explicit admin opt-in")
-  })
-})
-
-test_that(".flowerTrustProfile allows research with admin opt-in", {
-  withr::with_options(list(
-    dsflower.privacy_profile = "research",
-    dsflower.allow_research_profile = TRUE
-  ), {
-    profile <- dsFlower:::.flowerTrustProfile()
-    expect_equal(profile$name, "research")
-    expect_true(profile$allow_per_node_metrics)
-    expect_false(profile$require_secure_aggregation)
-  })
-})
-
-test_that(".flowerTrustProfile returns secure profile", {
-  withr::with_options(list(dsflower.privacy_profile = "secure"), {
-    profile <- dsFlower:::.flowerTrustProfile()
-    expect_equal(profile$name, "secure")
-    expect_equal(profile$min_train_rows, 100)
-    expect_false(profile$allow_per_node_metrics)
-    expect_false(profile$allow_exact_num_examples)
-    expect_true(profile$require_secure_aggregation)
-    expect_false(profile$dp_required)
-    expect_equal(profile$model_release, "advisory_gated")
-  })
-})
-
-test_that(".flowerTrustProfile returns secure_dp profile", {
-  withr::with_options(list(dsflower.privacy_profile = "secure_dp"), {
-    profile <- dsFlower:::.flowerTrustProfile()
-    expect_equal(profile$name, "secure_dp")
-    expect_equal(profile$min_train_rows, 200)
-    expect_true(profile$dp_required)
-  })
-})
-
-test_that(".flowerTrustProfile errors on unknown profile", {
-  withr::with_options(list(dsflower.privacy_profile = "invalid"), {
-    expect_error(dsFlower:::.flowerTrustProfile(), "Unknown privacy profile")
-  })
-})
-
-test_that(".flowerTrustProfile overrides can only strengthen secure profile", {
-  withr::with_options(list(
-    dsflower.privacy_profile = "secure",
-    dsflower.min_train_rows = 500
-  ), {
-    profile <- dsFlower:::.flowerTrustProfile()
-    # min_train_rows should be max(100, 500) = 500
-    expect_equal(profile$min_train_rows, 500)
-    # Other secure defaults unchanged
-    expect_false(profile$allow_per_node_metrics)
-    expect_true(profile$require_secure_aggregation)
-  })
-})
-
-test_that(".flowerTrustProfile overrides cannot weaken secure profile", {
-  withr::with_options(list(
-    dsflower.privacy_profile = "secure",
-    dsflower.min_train_rows = 10
-  ), {
-    profile <- dsFlower:::.flowerTrustProfile()
-    # min_train_rows should stay 100 (profile floor is higher)
-    expect_equal(profile$min_train_rows, 100)
-  })
-})
+# --- Bucket Count ---
 
 test_that(".bucket_count returns correct values", {
   expect_equal(dsFlower:::.bucket_count(0), 0L)
@@ -252,149 +174,553 @@ test_that(".bucket_count returns correct values", {
   expect_equal(dsFlower:::.bucket_count(50), 64L)
 })
 
-# --- Template Capability Matrix tests ---
+# --- Profile Order ---
 
-test_that(".TEMPLATE_CAPABILITIES has entries for all built-in templates", {
-  caps <- dsFlower:::.TEMPLATE_CAPABILITIES
+test_that(".PROFILE_ORDER has 7 entries matching .TRUST_PROFILES", {
+  expect_equal(length(dsFlower:::.PROFILE_ORDER), 7)
+  expect_equal(sort(dsFlower:::.PROFILE_ORDER),
+               sort(names(dsFlower:::.TRUST_PROFILES)))
+})
+
+# --- Trust Profile: All 7 Profiles ---
+
+test_that(".flowerTrustProfile defaults to clinical_default", {
+  withr::with_options(list(dsflower.privacy_profile = NULL), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "clinical_default")
+    expect_equal(profile$min_train_rows, 100)
+    expect_false(profile$allow_per_node_metrics)
+    expect_false(profile$allow_exact_num_examples)
+    expect_true(profile$require_secure_aggregation)
+    expect_false(profile$dp_required)
+    expect_equal(profile$model_release, "advisory_gated")
+    expect_equal(profile$min_clients_per_round, 2L)
+    expect_true(profile$fixed_client_sampling)
+    expect_equal(profile$dp_scope, "none")
+    expect_equal(profile$min_positive_examples, 20L)
+    expect_equal(profile$min_per_class, 20L)
+    expect_equal(profile$min_events, 20L)
+    expect_false(profile$evaluation_only)
+  })
+})
+
+test_that(".flowerTrustProfile blocks sandbox_open without admin opt-in", {
+  withr::with_options(list(dsflower.privacy_profile = "sandbox_open"), {
+    expect_error(dsFlower:::.flowerTrustProfile(),
+                 "sandbox_open.*requires explicit admin opt-in")
+  })
+})
+
+test_that(".flowerTrustProfile allows sandbox_open with admin opt-in", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "sandbox_open",
+    dsflower.allow_sandbox = TRUE
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "sandbox_open")
+    expect_equal(profile$min_train_rows, 3)
+    expect_true(profile$allow_per_node_metrics)
+    expect_true(profile$allow_exact_num_examples)
+    expect_false(profile$require_secure_aggregation)
+    expect_false(profile$dp_required)
+    expect_equal(profile$model_release, "allowed")
+    expect_equal(profile$min_clients_per_round, 1L)
+    expect_false(profile$fixed_client_sampling)
+    expect_equal(profile$dp_scope, "none")
+    expect_equal(profile$min_positive_examples, 0L)
+  })
+})
+
+test_that(".flowerTrustProfile returns trusted_internal", {
+  withr::with_options(list(dsflower.privacy_profile = "trusted_internal"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "trusted_internal")
+    expect_equal(profile$min_train_rows, 50)
+    expect_true(profile$allow_per_node_metrics)
+    expect_false(profile$allow_exact_num_examples)
+    expect_false(profile$require_secure_aggregation)
+    expect_equal(profile$min_clients_per_round, 1L)
+    expect_equal(profile$min_positive_examples, 5L)
+    expect_equal(profile$min_per_class, 5L)
+    expect_equal(profile$min_events, 5L)
+  })
+})
+
+test_that(".flowerTrustProfile returns consortium_internal", {
+  withr::with_options(list(dsflower.privacy_profile = "consortium_internal"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "consortium_internal")
+    expect_equal(profile$min_train_rows, 50)
+    expect_false(profile$allow_per_node_metrics)
+    expect_false(profile$require_secure_aggregation)
+    expect_equal(profile$min_clients_per_round, 2L)
+    expect_true(profile$fixed_client_sampling)
+    expect_equal(profile$min_positive_examples, 10L)
+  })
+})
+
+test_that(".flowerTrustProfile returns clinical_hardened", {
+  withr::with_options(list(dsflower.privacy_profile = "clinical_hardened"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "clinical_hardened")
+    expect_equal(profile$min_train_rows, 200)
+    expect_true(profile$require_secure_aggregation)
+    expect_false(profile$dp_required)
+    expect_equal(profile$min_clients_per_round, 3L)
+    expect_equal(profile$min_positive_examples, 30L)
+  })
+})
+
+test_that(".flowerTrustProfile returns clinical_dp", {
+  withr::with_options(list(dsflower.privacy_profile = "clinical_dp"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "clinical_dp")
+    expect_equal(profile$min_train_rows, 200)
+    expect_true(profile$require_secure_aggregation)
+    expect_true(profile$dp_required)
+    expect_equal(profile$dp_scope, "update_noise_only")
+    expect_equal(profile$min_clients_per_round, 2L)
+  })
+})
+
+test_that(".flowerTrustProfile returns high_sensitivity_dp", {
+  withr::with_options(list(dsflower.privacy_profile = "high_sensitivity_dp"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$name, "high_sensitivity_dp")
+    expect_equal(profile$min_train_rows, 500)
+    expect_true(profile$require_secure_aggregation)
+    expect_true(profile$dp_required)
+    expect_equal(profile$dp_scope, "patient_level_dp_sgd")
+    expect_equal(profile$min_clients_per_round, 3L)
+    expect_equal(profile$min_positive_examples, 50L)
+  })
+})
+
+test_that(".flowerTrustProfile errors on unknown profile", {
+  withr::with_options(list(dsflower.privacy_profile = "invalid"), {
+    expect_error(dsFlower:::.flowerTrustProfile(), "Unknown privacy profile")
+  })
+})
+
+# --- Authoritative Override System ---
+
+test_that("overrides can raise values (authoritative)", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_default",
+    dsflower.min_train_rows = 500
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$min_train_rows, 500)
+  })
+})
+
+test_that("overrides can lower values (authoritative)", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_default",
+    dsflower.min_train_rows = 10
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    # Authoritative override sets to 10, but absolute floor is 3
+    expect_equal(profile$min_train_rows, 10)
+  })
+})
+
+test_that("overrides can enable per_node_metrics on clinical_default", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_default",
+    dsflower.allow_per_node_metrics = TRUE
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_true(profile$allow_per_node_metrics)
+  })
+})
+
+test_that("overrides can disable SecAgg on clinical_default", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_default",
+    dsflower.require_secure_aggregation = FALSE
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_false(profile$require_secure_aggregation)
+  })
+})
+
+test_that("absolute floor: min_train_rows never below 3", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_default",
+    dsflower.min_train_rows = 1
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$min_train_rows, 3)
+  })
+})
+
+test_that("absolute floor: min_clients_per_round never below 1", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_default",
+    dsflower.min_clients_per_round = 0
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_equal(profile$min_clients_per_round, 1L)
+  })
+})
+
+# --- DP-Locked Profile Protections ---
+
+test_that("cannot disable SecAgg on clinical_dp (DP-locked)", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_dp",
+    dsflower.require_secure_aggregation = FALSE
+  ), {
+    expect_warning(
+      profile <- dsFlower:::.flowerTrustProfile(),
+      "Cannot disable secure aggregation"
+    )
+    expect_true(profile$require_secure_aggregation)
+  })
+})
+
+test_that("cannot disable DP on clinical_dp (DP-locked)", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_dp",
+    dsflower.dp_required = FALSE
+  ), {
+    expect_warning(
+      profile <- dsFlower:::.flowerTrustProfile(),
+      "Cannot disable DP"
+    )
+    expect_true(profile$dp_required)
+  })
+})
+
+test_that("cannot disable SecAgg on high_sensitivity_dp (DP-locked)", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "high_sensitivity_dp",
+    dsflower.require_secure_aggregation = FALSE
+  ), {
+    expect_warning(
+      profile <- dsFlower:::.flowerTrustProfile(),
+      "Cannot disable secure aggregation"
+    )
+    expect_true(profile$require_secure_aggregation)
+  })
+})
+
+test_that("cannot disable DP on high_sensitivity_dp (DP-locked)", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "high_sensitivity_dp",
+    dsflower.dp_required = FALSE
+  ), {
+    expect_warning(
+      profile <- dsFlower:::.flowerTrustProfile(),
+      "Cannot disable DP"
+    )
+    expect_true(profile$dp_required)
+  })
+})
+
+# --- Evaluation Only Modifier ---
+
+test_that("evaluation_only forces model_release=blocked and metrics=FALSE", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "clinical_default",
+    dsflower.evaluation_only = TRUE
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_true(profile$evaluation_only)
+    expect_equal(profile$model_release, "blocked")
+    expect_false(profile$allow_per_node_metrics)
+  })
+})
+
+test_that("evaluation_only defaults to FALSE", {
+  withr::with_options(list(dsflower.privacy_profile = "clinical_default"), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_false(profile$evaluation_only)
+  })
+})
+
+# --- All override fields ---
+
+test_that("all overrideable fields work", {
+  withr::with_options(list(
+    dsflower.privacy_profile = "trusted_internal",
+    dsflower.fixed_client_sampling = TRUE,
+    dsflower.dp_scope = "update_noise_only",
+    dsflower.min_positive_examples = 99,
+    dsflower.min_per_class = 88,
+    dsflower.min_events = 77
+  ), {
+    profile <- dsFlower:::.flowerTrustProfile()
+    expect_true(profile$fixed_client_sampling)
+    expect_equal(profile$dp_scope, "update_noise_only")
+    expect_equal(profile$min_positive_examples, 99L)
+    expect_equal(profile$min_per_class, 88L)
+    expect_equal(profile$min_events, 77L)
+  })
+})
+
+# --- Template Family Matrix ---
+
+test_that(".TEMPLATE_FAMILIES has entries for all built-in templates", {
+  families <- dsFlower:::.TEMPLATE_FAMILIES
   expected <- c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd",
                 "pytorch_mlp", "pytorch_logreg", "pytorch_linear_regression",
                 "pytorch_coxph", "pytorch_multiclass", "xgboost_tabular",
                 "pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d",
-                "pytorch_tcn", "pytorch_lstm")
+                "pytorch_tcn", "pytorch_lstm", "xgboost_secure_horizontal")
   for (tmpl in expected) {
-    expect_true(tmpl %in% names(caps), label = paste(tmpl, "in capabilities"))
+    expect_true(tmpl %in% names(families), label = paste(tmpl, "in families"))
   }
-  expect_equal(length(caps), 15)
+  expect_equal(length(families), 15)
 })
 
-test_that("sklearn templates do not support secure_dp", {
-  for (tmpl in c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd")) {
-    caps <- dsFlower:::.TEMPLATE_CAPABILITIES[[tmpl]]
-    expect_false(caps$supports_secure_dp,
-                 label = paste(tmpl, "should not support secure_dp"))
-    expect_true(caps$supports_secure,
-                label = paste(tmpl, "should support secure"))
+test_that(".FAMILY_MIN_ROWS has correct families", {
+  fmr <- dsFlower:::.FAMILY_MIN_ROWS
+  expect_true("closed_form_linear" %in% names(fmr))
+  expect_true("iterative_linear" %in% names(fmr))
+  expect_true("tabular_deep" %in% names(fmr))
+  expect_true("vision" %in% names(fmr))
+  expect_true("segmentation" %in% names(fmr))
+  expect_true("xgboost_secure" %in% names(fmr))
+  expect_true("xgboost_research" %in% names(fmr))
+  expect_equal(length(fmr), 7)
+  # Each vector has 7 entries (one per profile)
+  for (nm in names(fmr)) {
+    expect_equal(length(fmr[[nm]]), 7, label = paste(nm, "length"))
   }
 })
 
-test_that("pytorch_mlp supports secure_dp", {
-  caps <- dsFlower:::.TEMPLATE_CAPABILITIES[["pytorch_mlp"]]
-  expect_true(caps$supports_secure_dp)
-  expect_true(caps$supports_secure)
-  expect_equal(caps$min_rows_secure_dp, 500)
+test_that("closed_form_linear has NA for DP profiles", {
+  fmr <- dsFlower:::.FAMILY_MIN_ROWS[["closed_form_linear"]]
+  # clinical_dp is index 6, high_sensitivity_dp is index 7
+  expect_true(is.na(fmr[6]))
+  expect_true(is.na(fmr[7]))
 })
 
-test_that("new pytorch tabular templates support secure_dp", {
+test_that("xgboost_research only supports sandbox and trusted", {
+  fmr <- dsFlower:::.FAMILY_MIN_ROWS[["xgboost_research"]]
+  expect_equal(fmr[1], 3L)   # sandbox_open
+  expect_equal(fmr[2], 100L) # trusted_internal
+  for (i in 3:7) {
+    expect_true(is.na(fmr[i]), label = paste("index", i, "should be NA"))
+  }
+})
+
+test_that("xgboost_secure has NA for DP profiles", {
+  fmr <- dsFlower:::.FAMILY_MIN_ROWS[["xgboost_secure"]]
+  expect_true(is.na(fmr[1]))  # sandbox
+  expect_true(is.na(fmr[6]))  # clinical_dp
+  expect_true(is.na(fmr[7]))  # high_sensitivity_dp
+  expect_equal(fmr[2], 100L)  # trusted
+  expect_equal(fmr[4], 200L)  # clinical_default
+})
+
+# --- Template Validation ---
+
+test_that(".validateTemplateProfile rejects sklearn in clinical_dp", {
+  expect_error(
+    dsFlower:::.validateTemplateProfile("sklearn_logreg", "clinical_dp"),
+    "not supported"
+  )
+  expect_error(
+    dsFlower:::.validateTemplateProfile("sklearn_ridge", "clinical_dp"),
+    "not supported"
+  )
+})
+
+test_that(".validateTemplateProfile allows pytorch_mlp in clinical_dp", {
+  # tabular_deep supports clinical_dp
+  expect_true(dsFlower:::.validateTemplateProfile("pytorch_mlp", "clinical_dp"))
+})
+
+test_that(".validateTemplateProfile rejects xgboost_tabular in clinical_default", {
+  expect_error(
+    dsFlower:::.validateTemplateProfile("xgboost_tabular", "clinical_default"),
+    "not supported"
+  )
+})
+
+test_that(".validateTemplateProfile allows xgboost_tabular in sandbox_open", {
+  expect_true(dsFlower:::.validateTemplateProfile("xgboost_tabular", "sandbox_open"))
+})
+
+test_that(".validateTemplateProfile allows xgboost_secure_horizontal in clinical_default", {
+  expect_true(dsFlower:::.validateTemplateProfile("xgboost_secure_horizontal", "clinical_default"))
+})
+
+test_that(".validateTemplateProfile rejects xgboost_secure_horizontal in sandbox_open", {
+  # xgboost_secure has NA for sandbox
+  expect_error(
+    dsFlower:::.validateTemplateProfile("xgboost_secure_horizontal", "sandbox_open"),
+    "not supported"
+  )
+})
+
+test_that(".validateTemplateProfile allows all iterative_linear in high_sensitivity_dp", {
   for (tmpl in c("pytorch_logreg", "pytorch_linear_regression",
-                 "pytorch_coxph", "pytorch_multiclass",
-                 "pytorch_tcn", "pytorch_lstm")) {
-    caps <- dsFlower:::.TEMPLATE_CAPABILITIES[[tmpl]]
-    expect_true(caps$supports_secure_dp,
-                label = paste(tmpl, "should support secure_dp"))
-    expect_true(caps$supports_secure,
-                label = paste(tmpl, "should support secure"))
+                 "pytorch_coxph", "pytorch_multiclass", "sklearn_sgd")) {
+    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "high_sensitivity_dp"),
+                label = paste(tmpl, "should be allowed in high_sensitivity_dp"))
   }
 })
 
-test_that("image templates support secure but not secure_dp", {
-  for (tmpl in c("pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d")) {
-    caps <- dsFlower:::.TEMPLATE_CAPABILITIES[[tmpl]]
-    expect_false(caps$supports_secure_dp,
-                 label = paste(tmpl, "should not support secure_dp"))
-    expect_true(caps$supports_secure,
-                label = paste(tmpl, "should support secure"))
+test_that(".validateTemplateProfile allows all templates in sandbox_open (except xgboost_secure)", {
+  allowed_in_sandbox <- c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd",
+                          "pytorch_mlp", "pytorch_logreg",
+                          "pytorch_linear_regression", "pytorch_coxph",
+                          "pytorch_multiclass", "pytorch_resnet18",
+                          "pytorch_densenet121", "pytorch_unet2d",
+                          "pytorch_tcn", "pytorch_lstm", "xgboost_tabular")
+  for (tmpl in allowed_in_sandbox) {
+    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "sandbox_open"),
+                label = paste(tmpl, "should be allowed in sandbox_open"))
   }
 })
 
-test_that("xgboost does not support secure or secure_dp", {
-  caps <- dsFlower:::.TEMPLATE_CAPABILITIES[["xgboost_tabular"]]
-  expect_false(caps$supports_secure,
-               label = "xgboost should not support secure (bagging exposes trees)")
-  expect_false(caps$supports_secure_dp,
-               label = "xgboost should not support secure_dp")
-})
-
-test_that(".validateTemplateProfile rejects sklearn in secure_dp", {
+test_that(".validateTemplateProfile rejects unknown template in clinical_dp", {
   expect_error(
-    dsFlower:::.validateTemplateProfile("sklearn_logreg", "secure_dp"),
-    "does not support.*secure_dp"
-  )
-  expect_error(
-    dsFlower:::.validateTemplateProfile("sklearn_ridge", "secure_dp"),
-    "does not support.*secure_dp"
-  )
-  expect_error(
-    dsFlower:::.validateTemplateProfile("sklearn_sgd", "secure_dp"),
-    "does not support.*secure_dp"
+    dsFlower:::.validateTemplateProfile("unknown_model", "clinical_dp"),
+    "no registered family"
   )
 })
 
-test_that(".validateTemplateProfile allows pytorch_mlp in secure_dp", {
-  expect_true(dsFlower:::.validateTemplateProfile("pytorch_mlp", "secure_dp"))
+# --- Template Min Rows ---
+
+test_that(".templateMinRows returns family-based minimums", {
+  # tabular_deep / clinical_default = 500
+  expect_equal(dsFlower:::.templateMinRows("pytorch_mlp", "clinical_default"), 500L)
+  # iterative_linear / clinical_default = 200
+  expect_equal(dsFlower:::.templateMinRows("sklearn_sgd", "clinical_default"), 200L)
+  # closed_form_linear / clinical_default = 100
+  expect_equal(dsFlower:::.templateMinRows("sklearn_logreg", "clinical_default"), 100L)
+  # vision / clinical_default = 1000
+  expect_equal(dsFlower:::.templateMinRows("pytorch_resnet18", "clinical_default"), 1000L)
+  # segmentation / clinical_default = 1000
+  expect_equal(dsFlower:::.templateMinRows("pytorch_unet2d", "clinical_default"), 1000L)
+  # tabular_deep / high_sensitivity_dp = 1000
+  expect_equal(dsFlower:::.templateMinRows("pytorch_mlp", "high_sensitivity_dp"), 1000L)
+  # vision / high_sensitivity_dp = 5000
+  expect_equal(dsFlower:::.templateMinRows("pytorch_resnet18", "high_sensitivity_dp"), 5000L)
+  # closed_form_linear / clinical_dp = NA -> NULL
+  expect_null(dsFlower:::.templateMinRows("sklearn_logreg", "clinical_dp"))
+  # unknown template
+  expect_null(dsFlower:::.templateMinRows("unknown_template", "clinical_default"))
 })
 
-test_that(".validateTemplateProfile rejects non-DP templates in secure_dp", {
-  for (tmpl in c("pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d")) {
-    expect_error(
-      dsFlower:::.validateTemplateProfile(tmpl, "secure_dp"),
-      "does not support.*secure_dp",
-      label = paste(tmpl, "should be rejected in secure_dp")
-    )
-  }
-})
+# --- model_release ---
 
-test_that(".validateTemplateProfile rejects xgboost in secure", {
-  expect_error(
-    dsFlower:::.validateTemplateProfile("xgboost_tabular", "secure"),
-    "does not support.*secure"
-  )
-})
-
-test_that(".validateTemplateProfile rejects xgboost in secure_dp", {
-  expect_error(
-    dsFlower:::.validateTemplateProfile("xgboost_tabular", "secure_dp"),
-    "does not support.*secure_dp"
-  )
-})
-
-test_that(".validateTemplateProfile allows new DP templates in secure_dp", {
-  for (tmpl in c("pytorch_logreg", "pytorch_linear_regression",
-                 "pytorch_coxph", "pytorch_multiclass",
-                 "pytorch_tcn", "pytorch_lstm")) {
-    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "secure_dp"),
-                label = paste(tmpl, "should be allowed in secure_dp"))
-  }
-})
-
-test_that(".validateTemplateProfile allows all templates in research", {
-  all_templates <- names(dsFlower:::.TEMPLATE_CAPABILITIES)
-  for (tmpl in all_templates) {
-    expect_true(dsFlower:::.validateTemplateProfile(tmpl, "research"),
-                label = paste(tmpl, "should be allowed in research"))
-  }
-})
-
-test_that(".validateTemplateProfile rejects unknown template in secure_dp", {
-  expect_error(
-    dsFlower:::.validateTemplateProfile("unknown_model", "secure_dp"),
-    "no registered capability"
-  )
-})
-
-test_that(".templateMinRows returns per-template minimums", {
-  expect_equal(dsFlower:::.templateMinRows("pytorch_mlp", "secure_dp"), 500)
-  expect_equal(dsFlower:::.templateMinRows("sklearn_sgd", "secure"), 200)
-  expect_equal(dsFlower:::.templateMinRows("pytorch_logreg", "secure_dp"), 200)
-  expect_equal(dsFlower:::.templateMinRows("pytorch_coxph", "secure_dp"), 500)
-  expect_equal(dsFlower:::.templateMinRows("pytorch_resnet18", "secure"), 1000)
-  expect_equal(dsFlower:::.templateMinRows("pytorch_unet2d", "secure"), 500)
-  expect_null(dsFlower:::.templateMinRows("unknown_template", "secure"))
-})
-
-test_that("model_release is advisory_gated not gated in secure profiles", {
-  for (profile in c("secure", "secure_dp")) {
-    p <- dsFlower:::.TRUST_PROFILES[[profile]]
+test_that("model_release is advisory_gated in clinical profiles", {
+  for (pname in c("clinical_default", "clinical_hardened",
+                  "clinical_dp", "high_sensitivity_dp",
+                  "consortium_internal")) {
+    p <- dsFlower:::.TRUST_PROFILES[[pname]]
     expect_equal(p$model_release, "advisory_gated",
-                 label = paste(profile, "model_release"))
+                 label = paste(pname, "model_release"))
   }
+})
+
+test_that("model_release is allowed in sandbox and trusted", {
+  for (pname in c("sandbox_open", "trusted_internal")) {
+    p <- dsFlower:::.TRUST_PROFILES[[pname]]
+    expect_equal(p$model_release, "allowed",
+                 label = paste(pname, "model_release"))
+  }
+})
+
+# --- Template Metadata ---
+
+test_that(".TEMPLATE_METADATA has entries for all 15 templates", {
+  meta <- dsFlower:::.TEMPLATE_METADATA
+  expect_equal(length(meta), 15)
+  for (nm in names(meta)) {
+    expect_true("framework" %in% names(meta[[nm]]),
+                label = paste(nm, "has framework"))
+    expect_true("requires_secagg" %in% names(meta[[nm]]),
+                label = paste(nm, "has requires_secagg"))
+  }
+})
+
+test_that("xgboost_secure_horizontal requires secagg", {
+  meta <- dsFlower:::.TEMPLATE_METADATA[["xgboost_secure_horizontal"]]
+  expect_true(meta$requires_secagg)
+})
+
+# --- Class Distribution Validation ---
+
+test_that(".validateClassDistribution passes binary with sufficient positives", {
+  data <- data.frame(target = c(rep(0, 80), rep(1, 20)))
+  trust <- list(min_positive_examples = 20L, min_per_class = 0L, min_events = 0L)
+  expect_true(dsFlower:::.validateClassDistribution(data, "target", trust))
+})
+
+test_that(".validateClassDistribution blocks binary with insufficient positives", {
+  data <- data.frame(target = c(rep(0, 99), 1))
+  trust <- list(min_positive_examples = 20L, min_per_class = 0L, min_events = 0L)
+  expect_error(
+    dsFlower:::.validateClassDistribution(data, "target", trust),
+    "Disclosive.*insufficient class counts"
+  )
+})
+
+test_that(".validateClassDistribution passes multiclass with sufficient per-class", {
+  data <- data.frame(target = c(rep("A", 30), rep("B", 30), rep("C", 30)))
+  trust <- list(min_positive_examples = 0L, min_per_class = 20L, min_events = 0L)
+  expect_true(dsFlower:::.validateClassDistribution(data, "target", trust))
+})
+
+test_that(".validateClassDistribution blocks multiclass with rare class", {
+  data <- data.frame(target = c(rep("A", 50), rep("B", 50), rep("C", 5)))
+  trust <- list(min_positive_examples = 0L, min_per_class = 20L, min_events = 0L)
+  expect_error(
+    dsFlower:::.validateClassDistribution(data, "target", trust),
+    "Disclosive.*insufficient class counts"
+  )
+})
+
+test_that(".validateClassDistribution passes survival with sufficient events", {
+  data <- data.frame(time = 1:100, event = c(rep(1, 30), rep(0, 70)))
+  trust <- list(min_positive_examples = 0L, min_per_class = 0L, min_events = 20L)
+  expect_true(
+    dsFlower:::.validateClassDistribution(data, c("time", "event"), trust)
+  )
+})
+
+test_that(".validateClassDistribution blocks survival with insufficient events", {
+  data <- data.frame(time = 1:100, event = c(rep(1, 5), rep(0, 95)))
+  trust <- list(min_positive_examples = 0L, min_per_class = 0L, min_events = 20L)
+  expect_error(
+    dsFlower:::.validateClassDistribution(data, c("time", "event"), trust),
+    "Disclosive.*insufficient event counts"
+  )
+})
+
+test_that(".validateClassDistribution detects survival from single event column name", {
+  data <- data.frame(event = c(rep(1, 5), rep(0, 95)))
+  trust <- list(min_positive_examples = 0L, min_per_class = 0L, min_events = 20L)
+  expect_error(
+    dsFlower:::.validateClassDistribution(data, "event", trust),
+    "Disclosive.*insufficient event counts"
+  )
+})
+
+test_that(".validateClassDistribution skips when min thresholds are 0", {
+  data <- data.frame(target = c(rep(0, 99), 1))
+  trust <- list(min_positive_examples = 0L, min_per_class = 0L, min_events = 0L)
+  # With min_positive_examples = 0, binary check still applies but threshold is 0
+  expect_true(dsFlower:::.validateClassDistribution(data, "target", trust))
+})
+
+# --- Absolute Floors ---
+
+test_that(".enforce_absolute_floors enforces min_train_rows >= 3", {
+  profile <- list(min_train_rows = 1, min_clients_per_round = 2L)
+  result <- dsFlower:::.enforce_absolute_floors(profile)
+  expect_equal(result$min_train_rows, 3)
+})
+
+test_that(".enforce_absolute_floors enforces min_clients_per_round >= 1", {
+  profile <- list(min_train_rows = 100, min_clients_per_round = 0L)
+  result <- dsFlower:::.enforce_absolute_floors(profile)
+  expect_equal(result$min_clients_per_round, 1L)
 })

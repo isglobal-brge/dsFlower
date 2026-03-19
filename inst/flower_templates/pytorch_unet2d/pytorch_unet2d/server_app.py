@@ -21,14 +21,15 @@ _ADAPTIVE_STRATEGIES = {FedAdam, FedAdagrad}
 
 
 def _make_save_strategy(base_cls, results_dir, num_rounds,
-                         allow_per_node_metrics=True, **kwargs):
+                         allow_per_node_metrics=True, evaluation_only=False,
+                         **kwargs):
     """Create a SaveModelStrategy that subclasses the given Flower strategy."""
 
     class _Strategy(base_cls):
         """Dynamic strategy that saves global model weights and metrics."""
 
         def __init__(self, results_dir, num_rounds, allow_per_node_metrics=True,
-                     **kw):
+                     evaluation_only=False, **kw):
             # FedAdam/FedAdagrad require initial_parameters but we don't
             # have model params at server init time. Pass a dummy value and
             # override initialize_parameters to fetch from a real client.
@@ -42,6 +43,7 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
             self.results_dir.mkdir(parents=True, exist_ok=True)
             self.num_rounds = num_rounds
             self.allow_per_node_metrics = allow_per_node_metrics
+            self.evaluation_only = evaluation_only
             self.history = []
 
         def initialize_parameters(self, client_manager):
@@ -94,6 +96,8 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
             return loss, metrics
 
         def _save_weights(self, weights, server_round):
+            if self.evaluation_only:
+                return
             data = {str(i): w.tolist() for i, w in enumerate(weights)}
             data["__shapes__"] = [list(w.shape) for w in weights]
             data["__round__"] = server_round
@@ -110,6 +114,7 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
         results_dir=results_dir,
         num_rounds=num_rounds,
         allow_per_node_metrics=allow_per_node_metrics,
+        evaluation_only=evaluation_only,
         **kwargs,
     )
 
@@ -122,6 +127,8 @@ def server_fn(context: Context) -> ServerAppComponents:
     results_dir = cfg.get("results-dir", "/tmp/dsflower_results")
     require_secagg = str(cfg.get("require-secure-aggregation", "false")).lower() == "true"
     allow_per_node_metrics = str(cfg.get("allow-per-node-metrics", "true")).lower() == "true"
+    fixed_client_sampling = str(cfg.get("fixed-client-sampling", "false")).lower() == "true"
+    evaluation_only = str(cfg.get("evaluation-only", "false")).lower() == "true"
 
     strategy_name = cfg.get("strategy", "FedAvg")
     base_cls = _STRATEGY_MAP.get(strategy_name)
@@ -144,11 +151,15 @@ def server_fn(context: Context) -> ServerAppComponents:
         strategy_kwargs["eta"] = float(cfg.get("strategy-eta", 0.01))
         strategy_kwargs["tau"] = float(cfg.get("strategy-tau", 1e-3))
 
+    if fixed_client_sampling:
+        strategy_kwargs["fraction_fit"] = 1.0
+
     strategy = _make_save_strategy(
         base_cls,
         results_dir=results_dir,
         num_rounds=num_rounds,
         allow_per_node_metrics=allow_per_node_metrics,
+        evaluation_only=evaluation_only,
         **strategy_kwargs,
     )
 

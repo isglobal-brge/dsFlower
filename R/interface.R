@@ -293,17 +293,48 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
     .assertMinSamples(n_samples, min_n = effective_min)
 
-    # DP enforcement
-    requested_mode <- run_config[["privacy-mode"]] %||% "research"
-    if (trust$dp_required && !identical(requested_mode, "dp")) {
-      stop("Trust profile '", trust$name, "' requires differential privacy. ",
-           "Set privacy mode to 'dp'.", call. = FALSE)
+    # Class distribution validation (descriptor path: read target column only)
+    if (!is.null(target_column) && length(target_column) > 0 &&
+        trust$min_positive_examples > 0) {
+      tryCatch({
+        staged_data_path <- file.path(staging_dir, staged_manifest$data_file)
+        if (file.exists(staged_data_path) &&
+            grepl("\\.parquet$", staged_data_path, ignore.case = TRUE)) {
+          target_data <- as.data.frame(
+            arrow::read_parquet(staged_data_path, col_select = target_column)
+          )
+        } else if (file.exists(staged_data_path)) {
+          target_data <- utils::read.csv(staged_data_path,
+                                          stringsAsFactors = FALSE)
+        } else {
+          target_data <- NULL
+        }
+        if (!is.null(target_data)) {
+          .validateClassDistribution(target_data, target_column, trust)
+        }
+      }, error = function(e) {
+        if (grepl("Disclosive", conditionMessage(e))) stop(e)
+      })
     }
-    if (identical(requested_mode, "dp")) {
+
+    # DP enforcement
+    requested_mode <- run_config[["privacy-mode"]] %||% "clinical_default"
+    if (trust$dp_required &&
+        !requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
+      stop("Trust profile '", trust$name, "' requires differential privacy. ",
+           "Set privacy mode to 'clinical_dp' or 'high_sensitivity_dp'.",
+           call. = FALSE)
+    }
+    if (requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
       dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
       dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
       dataset_key <- paste0("descriptor:", desc$dataset_id, ":", target_column)
       .check_budget(dataset_key, dp_epsilon, dp_delta)
+    }
+
+    # evaluation_only handling
+    if (isTRUE(trust$evaluation_only)) {
+      run_config[["evaluation_only"]] <- TRUE
     }
 
     handle$run_token       <- run_token
@@ -340,27 +371,44 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 
   .assertMinSamples(nrow(data), min_n = effective_min)
 
+  # Class distribution validation (table path)
+  if (!is.null(target_column) && length(target_column) > 0 &&
+      trust$min_positive_examples > 0) {
+    .validateClassDistribution(data, target_column, trust)
+  }
+
   # Enforce DP requirement from trust profile
-  requested_mode <- run_config[["privacy-mode"]] %||% "research"
-  if (trust$dp_required && !identical(requested_mode, "dp")) {
+  requested_mode <- run_config[["privacy-mode"]] %||% "clinical_default"
+  if (trust$dp_required &&
+      !requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
     stop("Trust profile '", trust$name, "' requires differential privacy. ",
-         "Set privacy mode to 'dp'.", call. = FALSE)
+         "Set privacy mode to 'clinical_dp' or 'high_sensitivity_dp'.",
+         call. = FALSE)
   }
 
   # Check privacy budget before staging when DP is required
-  if (identical(requested_mode, "dp")) {
+  if (requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
     dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
     dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
     dataset_key <- paste0(handle$source, ":", target_column)
     .check_budget(dataset_key, dp_epsilon, dp_delta)
   }
 
+  # evaluation_only handling
+  if (isTRUE(trust$evaluation_only)) {
+    run_config[["evaluation_only"]] <- TRUE
+  }
+
   # Write privacy config into run_config for manifest
-  run_config[["privacy_profile"]]          <- trust$name
-  run_config[["allow_per_node_metrics"]]   <- trust$allow_per_node_metrics
-  run_config[["allow_exact_num_examples"]] <- trust$allow_exact_num_examples
+  run_config[["privacy_profile"]]            <- trust$name
+  run_config[["allow_per_node_metrics"]]     <- trust$allow_per_node_metrics
+  run_config[["allow_exact_num_examples"]]   <- trust$allow_exact_num_examples
   run_config[["require_secure_aggregation"]] <- trust$require_secure_aggregation
-  run_config[["dp_required"]]              <- trust$dp_required
+  run_config[["dp_required"]]                <- trust$dp_required
+  run_config[["min_clients_per_round"]]      <- trust$min_clients_per_round
+  run_config[["fixed_client_sampling"]]      <- trust$fixed_client_sampling
+  run_config[["dp_scope"]]                   <- trust$dp_scope
+  run_config[["evaluation_only"]]            <- trust$evaluation_only
 
   # Stage data with manifest
   run_token <- .generate_run_token()
@@ -941,19 +989,19 @@ flowerListTemplatesDS <- function() {
   all_templates <- list.dirs(templates_dir, full.names = FALSE, recursive = FALSE)
 
   # Filter: only return templates that support the active trust profile.
-  # Templates that only work under 'research' (e.g. xgboost_tabular) are
-  # hidden from the catalog because the research profile is not available.
+  # Templates whose family has NA for the active profile are hidden.
   profile <- tryCatch(.flowerTrustProfile(), error = function(e) {
-    list(name = "secure")
+    list(name = "clinical_default")
   })
-  caps <- .TEMPLATE_CAPABILITIES
 
   Filter(function(t) {
-    tcap <- caps[[t]]
-    if (is.null(tcap)) return(FALSE)  # unknown templates hidden by default
-    if (profile$name == "secure_dp") return(isTRUE(tcap$supports_secure_dp))
-    if (profile$name == "secure") return(isTRUE(tcap$supports_secure))
-    TRUE
+    family <- .TEMPLATE_FAMILIES[[t]]
+    if (is.null(family)) return(FALSE)
+    profile_idx <- match(profile$name, .PROFILE_ORDER)
+    if (is.na(profile_idx)) return(FALSE)
+    min_rows_vec <- .FAMILY_MIN_ROWS[[family]]
+    if (is.null(min_rows_vec)) return(FALSE)
+    !is.na(min_rows_vec[profile_idx])
   }, all_templates)
 }
 
