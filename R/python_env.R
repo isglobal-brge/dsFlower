@@ -99,12 +99,18 @@
   python <- Sys.which("python3")
   if (!nzchar(python)) return(FALSE)
 
+  # Check framework module
   check_mod <- .FRAMEWORK_HEALTH_IMPORT[[framework]]
   if (is.null(check_mod)) return(TRUE)
 
   cmd <- paste0(shQuote(python), " -c ", shQuote(paste0("import ", check_mod)))
   rc <- suppressWarnings(system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE))
-  rc == 0L
+  if (rc != 0L) return(FALSE)
+
+  # Also verify pyarrow (required for Parquet data loading)
+  cmd_pa <- paste0(shQuote(python), " -c ", shQuote("import pyarrow"))
+  rc_pa <- suppressWarnings(system(cmd_pa, ignore.stdout = TRUE, ignore.stderr = TRUE))
+  rc_pa == 0L
 }
 
 #' Create or verify a Python venv for a framework
