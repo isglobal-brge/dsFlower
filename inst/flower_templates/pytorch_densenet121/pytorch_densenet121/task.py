@@ -23,13 +23,18 @@ _DEFAULT_TRANSFORM = transforms.Compose([
 
 
 class ImageDataset(Dataset):
-    """Dataset that loads images from a data root directory."""
+    """Dataset that loads images from a data root directory.
+
+    Supports configurable path column via manifest assets.images.path_col.
+    Handles 2D single-frame formats: PNG, JPEG, TIFF, and single-frame DICOM.
+    """
 
     def __init__(self, data_root, samples_df, target_col="label",
-                 transform=None):
+                 path_col="relative_path", transform=None):
         self.data_root = data_root
         self.samples = samples_df
         self.target_col = target_col
+        self.path_col = path_col
         self.transform = transform or _DEFAULT_TRANSFORM
 
     def __len__(self):
@@ -37,35 +42,72 @@ class ImageDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.samples.iloc[idx]
-        rel_path = row["relative_path"]
+        rel_path = row[self.path_col]
 
         # Path traversal rejection
         if ".." in rel_path or os.path.isabs(rel_path):
             raise ValueError(f"Invalid relative path: {rel_path}")
 
         img_path = os.path.join(self.data_root, rel_path)
-        image = Image.open(img_path).convert("RGB")
+
+        # DICOM single-frame support
+        if img_path.lower().endswith(".dcm"):
+            image = _load_dicom_as_pil(img_path)
+        else:
+            image = Image.open(img_path).convert("RGB")
+
         image = self.transform(image)
 
         label = row[self.target_col]
         return image, torch.tensor(label, dtype=torch.long)
 
 
+def _load_dicom_as_pil(path):
+    """Load a single-frame DICOM file as a PIL RGB image."""
+    try:
+        import pydicom
+        ds = pydicom.dcmread(path)
+        arr = ds.pixel_array.astype(np.float32)
+        if arr.max() > 0:
+            arr = (arr - arr.min()) / (arr.max() - arr.min()) * 255.0
+        arr = arr.astype(np.uint8)
+        if arr.ndim == 2:
+            return Image.fromarray(arr).convert("RGB")
+        return Image.fromarray(arr[:, :, :3])
+    except ImportError:
+        raise ImportError(
+            "pydicom is required for DICOM support. "
+            "Install it: pip install pydicom"
+        )
+
+
+def get_image_path_col(manifest):
+    """Get the path column name from manifest assets or default."""
+    assets = manifest.get("assets", {})
+    if "images" in assets:
+        return assets["images"].get("path_col", "relative_path")
+    return "relative_path"
+
+
 def load_image_data(context=None):
     """Load image manifest and return (data_root, samples_df, target_col).
 
     Supports both old format (data_root at top level) and new format
-    (assets.images.root from dsImaging manifests).
+    (assets.images.root from dsImaging manifests). Joins feature tables
+    from assets if present.
     """
     manifest = _load_manifest(context)
     manifest_dir = _get_manifest_dir(context)
 
+    assets = manifest.get("assets", {})
+
     # New format: assets.images.root (dsImaging descriptor)
-    if "assets" in manifest and "images" in manifest["assets"]:
-        data_root = manifest["assets"]["images"]["root"]
-    else:
-        # Backward compat: data_root at top level
+    if "images" in assets:
+        data_root = assets["images"]["root"]
+    elif "data_root" in manifest:
         data_root = manifest["data_root"]
+    else:
+        raise ValueError("No data_root or assets.images.root in manifest")
 
     target_col = manifest.get("target_column", "label")
 
@@ -75,6 +117,19 @@ def load_image_data(context=None):
         samples_df = pq.read_table(samples_file).to_pandas()
     else:
         samples_df = pd.read_csv(samples_file)
+
+    # Join feature tables if present in assets
+    for asset_name, asset_def in assets.items():
+        if asset_def.get("type") == "feature_table":
+            feat_file = asset_def["file"]
+            join_key = asset_def.get("join_key")
+            if join_key and os.path.exists(feat_file):
+                if feat_file.endswith(".parquet"):
+                    import pyarrow.parquet as pq
+                    feat_df = pq.read_table(feat_file).to_pandas()
+                else:
+                    feat_df = pd.read_csv(feat_file)
+                samples_df = samples_df.merge(feat_df, on=join_key, how="left")
 
     return data_root, samples_df, target_col
 

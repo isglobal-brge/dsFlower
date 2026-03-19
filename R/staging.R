@@ -419,7 +419,7 @@
         n_samples <- nrow(arrow::read_parquet(staged_samples))
       }
     } else {
-      n_samples <- nrow(utils::read.csv(staged_samples, nrows = .Machine$integer.max))
+      n_samples <- length(readLines(staged_samples)) - 1L
     }
   } else if (!is.null(desc$table_data) && is.data.frame(desc$table_data)) {
     samples_basename <- "samples.csv"
