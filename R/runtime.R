@@ -105,7 +105,7 @@
   supernode_cmd <- "flower-supernode"
   env_info <- NULL
   if (!is.null(template_name)) {
-    caps <- .TEMPLATE_CAPABILITIES[[template_name]]
+    caps <- .TEMPLATE_METADATA[[template_name]]
     if (!is.null(caps) && !is.null(caps$framework)) {
       env_info <- tryCatch(
         .ensure_python_env(caps$framework),
