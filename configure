@@ -47,11 +47,11 @@ fi
 PYTHON_VERSION=$("${PYTHON}" --version 2>&1 | head -1)
 log_info "Python: ${PYTHON} (${PYTHON_VERSION})"
 
-# Check if we can create venvs
-if ! "${PYTHON}" -m venv --help >/dev/null 2>&1; then
-  log_warn "python3-venv not available. Skipping environment setup."
-  log_warn "Install python3-venv and re-install dsFlower, or install deps manually."
-  exit 0
+# Install curl if missing (needed for uv installer)
+if ! command -v curl >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq 2>/dev/null && apt-get install -y -qq curl 2>/dev/null || true
+  fi
 fi
 
 # Check if we have write access to venv root
@@ -70,13 +70,16 @@ log_info "Venv root: ${VENV_ROOT}"
 UV="$(command -v uv 2>/dev/null || true)"
 
 if [ -z "${UV}" ]; then
-  log_info "Installing uv (fast Python package manager)..."
-  if "${PYTHON}" -m pip install --break-system-packages -q uv 2>/dev/null || \
-     "${PYTHON}" -m pip install -q uv 2>/dev/null; then
+  log_info "Installing uv..."
+  curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null
+  UV="${HOME}/.local/bin/uv"
+  if [ ! -x "${UV}" ]; then
     UV="$(command -v uv 2>/dev/null || true)"
-    if [ -n "${UV}" ]; then
-      log_info "uv installed: $(${UV} --version)"
-    fi
+  fi
+  if [ -n "${UV}" ] && [ -x "${UV}" ]; then
+    log_info "uv installed: $(${UV} --version)"
+  else
+    UV=""
   fi
 fi
 
@@ -105,7 +108,7 @@ create_venv() {
   rm -rf "${venv_path}"
 
   if [ "${USE_UV}" = true ]; then
-    "${UV}" venv --python "${PYTHON}" --seed "${venv_path}" >/dev/null 2>&1
+    "${UV}" venv --python "${PYTHON}" "${venv_path}" >/dev/null 2>&1
   else
     "${PYTHON}" -m venv --system-site-packages "${venv_path}"
   fi
