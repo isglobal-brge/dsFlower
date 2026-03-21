@@ -10,6 +10,59 @@
 # SuperNode singleton registry -- keyed by SuperLink address
 .supernode_registry <- new.env(parent = emptyenv())
 
+#' Package load hook -- verify Python venv root exists
+#'
+#' Fallback for when the configure script did not run (e.g. binary install,
+#' devtools::load_all, or missing permissions during configure).  Ensures the
+#' venv root directory is present so that .ensure_python_env() can create
+#' per-framework venvs on first use without failing on a missing parent.
+#'
+#' Resolution order for the venv root path:
+#'   1. DSFLOWER_VENV_ROOT environment variable
+#'   2. dsflower.venv_root R option
+#'   3. /var/lib/dsflower/venvs  (primary default)
+#'   4. /srv/dsflower/venvs      (fallback if primary is not writable)
+#'
+#' @param libname Library path.
+#' @param pkgname Package name.
+#' @keywords internal
+.onLoad <- function(libname, pkgname) {
+  # Ensure venv root directory exists.
+  # configure creates it during install_github (as root).
+  # This fallback handles API installs where configure doesn't run.
+  venv_root <- Sys.getenv(
+    "DSFLOWER_VENV_ROOT",
+    unset = getOption("dsflower.venv_root", "/var/lib/dsflower/venvs")
+  )
+
+  if (!dir.exists(venv_root)) {
+    created <- tryCatch(
+      dir.create(venv_root, recursive = TRUE, showWarnings = FALSE),
+      error = function(e) FALSE
+    )
+    # If primary path is not writable, try /srv (Rock persistent volume)
+    if (!isTRUE(created) && venv_root == "/var/lib/dsflower/venvs") {
+      fallback <- "/srv/dsflower/venvs"
+      tryCatch(
+        dir.create(fallback, recursive = TRUE, showWarnings = FALSE),
+        error = function(e) NULL
+      )
+      if (dir.exists(fallback)) {
+        options(dsflower.venv_root = fallback)
+      }
+    }
+  }
+
+  # Check Python availability
+  python <- Sys.which("python3")
+  if (!nzchar(python)) python <- Sys.which("python")
+  if (!nzchar(python)) {
+    packageStartupMessage(
+      "dsFlower: python3 not found. ",
+      "SuperNode operations will not work without Python.")
+  }
+}
+
 #' Package attach hook
 #' @param lib Library path.
 #' @param pkg Package name.

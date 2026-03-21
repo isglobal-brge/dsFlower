@@ -9,8 +9,6 @@
 # Requires: python3 (already in Rock/DataSHIELD base image)
 # Installs: uv (fast Python package installer) + framework deps
 
-set -e
-
 VENV_ROOT="${DSFLOWER_VENV_ROOT:-/var/lib/dsflower/venvs}"
 PYTHON="${PYTHON3:-$(command -v python3 2>/dev/null || true)}"
 LOG_PREFIX="[dsFlower configure]"
