@@ -210,9 +210,9 @@ flowerInitDS <- function(data_symbol) {
   if (is.list(obj) && !is.null(obj$url) &&
       grepl("^imaging\\+dataset://", obj$url %||% "")) {
     if (requireNamespace("dsImaging", quietly = TRUE)) {
-      parsed <- dsImaging:::.parse_imaging_url(obj$url)
-      resolved <- dsImaging:::resolve_dataset(parsed$dataset_id)
-      manifest <- dsImaging:::parse_manifest(resolved$manifest_uri, resolved$backend)
+      dataset_id <- sub("^imaging\\+dataset://", "", strsplit(obj$url, "\\?")[[1]][1])
+      resolved <- dsImaging::resolve_dataset(dataset_id)
+      manifest <- dsImaging::parse_manifest(resolved$manifest_uri, resolved$backend)
       desc <- dsImaging::imaging_dataset_descriptor(manifest)
       return(.createHandleFromDescriptor(desc))
     }

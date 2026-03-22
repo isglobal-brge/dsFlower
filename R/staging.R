@@ -327,7 +327,7 @@
     if (!requireNamespace("dsImaging", quietly = TRUE))
       stop("dsImaging required for S3 asset staging.", call. = FALSE)
     # Build backend and download
-    resolved <- dsImaging:::resolve_dataset(asset_info$dataset_id)
+    resolved <- dsImaging::resolve_dataset(asset_info$dataset_id)
     dsImaging::backend_get_file(resolved$backend, asset_info$uri, local_parquet)
   } else {
     # Local file: copy or symlink to staging dir

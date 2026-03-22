@@ -716,3 +716,14 @@
   }
   invisible(TRUE)
 }
+
+#' Get the active trust profile
+#'
+#' Public wrapper for use by other dsFlower-framework packages
+#' (e.g. dsImaging disclosure controls).
+#'
+#' @return Named list with trust profile settings.
+#' @export
+flowerTrustProfile <- function() {
+  .flowerTrustProfile()
+}
