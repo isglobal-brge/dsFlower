@@ -301,7 +301,47 @@
                                        feature_columns, extra_config))
   }
 
+  if (identical(kind, "asset_ref")) {
+    return(.stageFromDescriptor_asset_ref(desc, run_token, target_column,
+                                           feature_columns, extra_config))
+  }
+
   stop("Unknown descriptor source_kind: '", kind, "'.", call. = FALSE)
+}
+
+#' Stage from an asset_ref descriptor (dsImaging feature_table asset)
+#'
+#' Downloads the Parquet asset to the staging directory (from S3 or local),
+#' then delegates to the staged_parquet path. No data.frame materialization.
+#' @keywords internal
+.stageFromDescriptor_asset_ref <- function(desc, run_token, target_column,
+                                            feature_columns, extra_config) {
+  asset_info <- desc$asset_info
+  if (is.null(asset_info))
+    stop("asset_ref descriptor requires asset_info.", call. = FALSE)
+
+  staging_dir <- .ensureStagingDir(run_token)
+  local_parquet <- file.path(staging_dir, "train.parquet")
+
+  if (identical(asset_info$storage_backend, "s3")) {
+    if (!requireNamespace("dsImaging", quietly = TRUE))
+      stop("dsImaging required for S3 asset staging.", call. = FALSE)
+    # Build backend and download
+    resolved <- dsImaging:::resolve_dataset(asset_info$dataset_id)
+    dsImaging::backend_get_file(resolved$backend, asset_info$uri, local_parquet)
+  } else {
+    # Local file: copy or symlink to staging dir
+    src <- asset_info$uri
+    if (!file.exists(src))
+      stop("Asset file not found: ", src, call. = FALSE)
+    file.copy(src, local_parquet, overwrite = TRUE)
+  }
+
+  # Delegate to staged_parquet path
+  desc$source_kind <- "staged_parquet"
+  desc$metadata <- list(uri = local_parquet, file = local_parquet, format = "parquet")
+  .stageFromDescriptor_parquet(desc, run_token, target_column,
+                                feature_columns, extra_config)
 }
 
 #' Stage from an in-memory data.frame descriptor

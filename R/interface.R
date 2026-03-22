@@ -211,13 +211,23 @@ flowerInitDS <- function(data_symbol) {
       grepl("^imaging\\+dataset://", obj$url %||% "")) {
     if (requireNamespace("dsImaging", quietly = TRUE)) {
       parsed <- dsImaging:::.parse_imaging_url(obj$url)
-      if (!is.null(parsed$manifest_path)) {
-        manifest <- dsImaging:::parse_manifest(parsed$manifest_path)
-      } else {
-        manifest_path <- dsImaging:::resolve_dataset(parsed$dataset_id)
-        manifest <- dsImaging:::parse_manifest(manifest_path)
-      }
+      resolved <- dsImaging:::resolve_dataset(parsed$dataset_id)
+      manifest <- dsImaging:::parse_manifest(resolved$manifest_uri, resolved$backend)
       desc <- dsImaging::imaging_dataset_descriptor(manifest)
+      return(.createHandleFromDescriptor(desc))
+    }
+  }
+
+  # Asset reference path: list with asset_ref (from ds.flower.nodes.init inputs)
+  if (is.list(obj) && !is.null(obj$asset_ref)) {
+    if (requireNamespace("dsImaging", quietly = TRUE)) {
+      aref <- obj$asset_ref
+      asset_info <- dsImaging::resolve_feature_table_asset(
+        aref$dataset_id, aref$alias_or_id)
+      desc <- flower_dataset_descriptor(
+        dataset_id = asset_info$dataset_id,
+        source_kind = "asset_ref",
+        asset_info = asset_info)
       return(.createHandleFromDescriptor(desc))
     }
   }

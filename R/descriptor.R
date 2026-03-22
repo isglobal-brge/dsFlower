@@ -25,7 +25,7 @@ flower_dataset_descriptor <- function(dataset_id, source_kind,
   stopifnot(
     is.character(dataset_id), length(dataset_id) == 1L, nzchar(dataset_id),
     is.character(source_kind), length(source_kind) == 1L,
-    source_kind %in% c("in_memory_df", "staged_parquet", "image_bundle")
+    source_kind %in% c("in_memory_df", "staged_parquet", "image_bundle", "asset_ref")
   )
 
   desc <- list(
