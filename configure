@@ -6,90 +6,118 @@
 # SuperNodes have all dependencies ready at runtime. This runs ONCE
 # at package install time, not on every session.
 #
-# Requires: python3 (already in Rock/DataSHIELD base image)
-# Installs: uv (fast Python package installer) + framework deps
+# Self-contained: if neither Python nor uv are present, downloads uv
+# (a single static binary) and uses it to install Python. No system
+# dependencies required beyond a C library and curl/wget.
 
 VENV_ROOT="${DSFLOWER_VENV_ROOT:-/var/lib/dsflower/venvs}"
-PYTHON="${PYTHON3:-$(command -v python3 2>/dev/null || true)}"
 LOG_PREFIX="[dsFlower configure]"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-log_info() {
-  echo "${LOG_PREFIX} $*"
-}
+log_info() { echo "${LOG_PREFIX} $*"; }
+log_warn() { echo "${LOG_PREFIX} WARNING: $*" >&2; }
 
-log_warn() {
-  echo "${LOG_PREFIX} WARNING: $*" >&2
-}
-
-log_error() {
-  echo "${LOG_PREFIX} ERROR: $*" >&2
-}
-
-check_import() {
-  # Check if a Python module is importable
-  "$1" -c "import $2" 2>/dev/null
-}
+check_import() { "$1" -c "import $2" 2>/dev/null; }
 
 # ---------------------------------------------------------------------------
-# Pre-checks
+# Bootstrap: ensure uv + Python are available
 # ---------------------------------------------------------------------------
 
-if [ -z "${PYTHON}" ] || [ ! -x "${PYTHON}" ]; then
-  log_warn "python3 not found. Skipping Python environment setup."
-  log_warn "ML template dependencies must be installed manually."
-  exit 0
-fi
+ensure_uv() {
+  # 1. Already on PATH?
+  UV="$(command -v uv 2>/dev/null || true)"
+  if [ -n "${UV}" ] && [ -x "${UV}" ]; then return 0; fi
 
-PYTHON_VERSION=$("${PYTHON}" --version 2>&1 | head -1)
-log_info "Python: ${PYTHON} (${PYTHON_VERSION})"
+  # 2. Common install locations
+  for _p in "${HOME}/.local/bin/uv" "${HOME}/.cargo/bin/uv" "/usr/local/bin/uv"; do
+    if [ -x "${_p}" ]; then UV="${_p}"; return 0; fi
+  done
 
-# Install curl if missing (needed for uv installer)
-if ! command -v curl >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq 2>/dev/null && apt-get install -y -qq curl 2>/dev/null || true
+  # 3. Download uv standalone
+  log_info "Downloading uv (Python package manager)..."
+
+  # Ensure we have a download tool
+  if command -v curl >/dev/null 2>&1; then
+    _DL="curl -LsSf"
+  elif command -v wget >/dev/null 2>&1; then
+    _DL="wget -qO-"
+  else
+    # Try to install curl
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq 2>/dev/null && apt-get install -y -qq curl 2>/dev/null
+      _DL="curl -LsSf"
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache curl 2>/dev/null
+      _DL="curl -LsSf"
+    else
+      log_warn "No curl/wget available. Cannot download uv."
+      return 1
+    fi
   fi
-fi
 
-# Check if we have write access to venv root
-mkdir -p "${VENV_ROOT}" 2>/dev/null || {
-  log_warn "Cannot create ${VENV_ROOT}. Skipping environment setup."
-  log_warn "Create this directory with appropriate permissions, or set DSFLOWER_VENV_ROOT."
-  exit 0
-}
-
-log_info "Venv root: ${VENV_ROOT}"
-
-# ---------------------------------------------------------------------------
-# Install uv for fast package management
-# ---------------------------------------------------------------------------
-
-UV="$(command -v uv 2>/dev/null || true)"
-
-if [ -z "${UV}" ]; then
-  log_info "Installing uv..."
-  curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null
+  ${_DL} https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null
   UV="${HOME}/.local/bin/uv"
-  if [ ! -x "${UV}" ]; then
-    UV="$(command -v uv 2>/dev/null || true)"
-  fi
+  if [ ! -x "${UV}" ]; then UV="$(command -v uv 2>/dev/null || true)"; fi
   if [ -n "${UV}" ] && [ -x "${UV}" ]; then
     log_info "uv installed: $(${UV} --version)"
-  else
-    UV=""
+    return 0
   fi
-fi
 
-# Fallback: use pip if uv is not available
-if [ -z "${UV}" ]; then
-  log_warn "uv not available, falling back to pip (slower)."
-  USE_UV=false
-else
-  USE_UV=true
-fi
+  log_warn "Failed to install uv."
+  return 1
+}
+
+ensure_python() {
+  # uv provides Python -- no system Python needed
+  if [ -z "${UV}" ] || [ ! -x "${UV}" ]; then
+    log_warn "No uv available. Cannot provision Python."
+    return 1
+  fi
+
+  # Check if uv already manages a Python
+  PYTHON="$("${UV}" python find 3.11 2>/dev/null || true)"
+  if [ -n "${PYTHON}" ] && [ -x "${PYTHON}" ]; then
+    log_info "Python: ${PYTHON} ($("${PYTHON}" --version 2>&1 | head -1))"
+    return 0
+  fi
+
+  log_info "Installing Python 3.11 via uv..."
+  "${UV}" python install 3.11 --quiet 2>&1 || true
+
+  PYTHON="$("${UV}" python find 3.11 2>/dev/null || true)"
+  if [ -n "${PYTHON}" ] && [ -x "${PYTHON}" ]; then
+    log_info "Python installed: ${PYTHON} ($("${PYTHON}" --version 2>&1 | head -1))"
+    return 0
+  fi
+
+  log_warn "Failed to install Python via uv."
+  return 1
+}
+
+# --- Run bootstrap ---
+
+ensure_uv || {
+  log_warn "uv not available. Cannot proceed."
+  log_warn "Install uv: https://docs.astral.sh/uv/"
+  exit 0
+}
+
+ensure_python || {
+  log_warn "No Python available. Skipping environment setup."
+  exit 0
+}
+
+USE_UV=true
+
+# Check venv root
+mkdir -p "${VENV_ROOT}" 2>/dev/null || {
+  log_warn "Cannot create ${VENV_ROOT}. Skipping."
+  exit 0
+}
+log_info "Venv root: ${VENV_ROOT}"
 
 # ---------------------------------------------------------------------------
 # Installer functions
@@ -98,15 +126,12 @@ fi
 create_venv() {
   local name="$1"
   local venv_path="${VENV_ROOT}/${name}"
-
   if [ -d "${venv_path}" ] && [ -f "${venv_path}/.dsflower_ready" ]; then
     log_info "  ${name}: already provisioned, skipping."
     return 0
   fi
-
   log_info "  ${name}: creating venv..."
   rm -rf "${venv_path}"
-
   if [ "${USE_UV}" = true ]; then
     "${UV}" venv --python "${PYTHON}" "${venv_path}" >/dev/null 2>&1
   else
@@ -115,13 +140,10 @@ create_venv() {
 }
 
 install_deps() {
-  local name="$1"
-  shift
+  local name="$1"; shift
   local venv_path="${VENV_ROOT}/${name}"
   local venv_python="${venv_path}/bin/python"
-
   log_info "  ${name}: installing $*"
-
   if [ "${USE_UV}" = true ]; then
     "${UV}" pip install --python "${venv_python}" --quiet "$@" 2>&1 | tail -5
   else
@@ -130,22 +152,14 @@ install_deps() {
 }
 
 mark_ready() {
-  local name="$1"
-  local venv_path="${VENV_ROOT}/${name}"
-  # Write a marker with the dependency list hash
-  echo "$2" > "${venv_path}/.dsflower_ready"
+  echo "$2" > "${VENV_ROOT}/$1/.dsflower_ready"
 }
 
 provision_framework() {
-  local name="$1"
-  local check_module="$2"
-  shift 2
-  local deps="$*"
+  local name="$1"; local check_module="$2"; shift 2; local deps="$*"
   local venv_path="${VENV_ROOT}/${name}"
 
-  # Skip if already ready
   if [ -f "${venv_path}/.dsflower_ready" ]; then
-    # Quick health check
     if check_import "${venv_path}/bin/python" "${check_module}" 2>/dev/null; then
       log_info "  ${name}: OK (cached)"
       return 0
@@ -153,34 +167,24 @@ provision_framework() {
     log_info "  ${name}: cached but unhealthy, rebuilding..."
   fi
 
-  # Check if system Python already has everything
   if check_import "${PYTHON}" "${check_module}" 2>/dev/null; then
     log_info "  ${name}: system Python already has ${check_module}, skipping venv."
     return 0
   fi
 
-  create_venv "${name}" || {
-    log_warn "  ${name}: failed to create venv, skipping."
-    return 0
-  }
+  create_venv "${name}" || { log_warn "  ${name}: venv failed."; return 0; }
 
-  # Always install base deps + framework deps
   # shellcheck disable=SC2086
   install_deps "${name}" "flwr>=1.13.0" "numpy>=1.21.0" "pandas>=1.3.0" ${deps} || {
-    log_warn "  ${name}: pip install failed, removing broken venv."
-    rm -rf "${venv_path}"
-    return 0
+    log_warn "  ${name}: install failed."; rm -rf "${venv_path}"; return 0
   }
 
-  # Verify
   if check_import "${venv_path}/bin/python" "${check_module}"; then
-    # Compute simple hash of dep list for staleness detection
     dep_hash=$(echo "${deps}" | sha256sum 2>/dev/null | cut -d' ' -f1 || echo "unknown")
     mark_ready "${name}" "${dep_hash}"
     log_info "  ${name}: ready."
   else
-    log_warn "  ${name}: install succeeded but import ${check_module} failed."
-    rm -rf "${venv_path}"
+    log_warn "  ${name}: import ${check_module} failed."; rm -rf "${venv_path}"
   fi
 }
 
@@ -189,7 +193,6 @@ provision_framework() {
 # ---------------------------------------------------------------------------
 
 log_info "Provisioning Python environments for ML frameworks..."
-log_info "(This runs once at install time. Subsequent installs reuse cached venvs.)"
 echo ""
 
 provision_framework "sklearn" "sklearn" \
@@ -208,7 +211,6 @@ echo ""
 log_info "Python environment setup complete."
 log_info "Venvs stored in: ${VENV_ROOT}"
 
-# List what's ready
 for fw in sklearn pytorch pytorch_vision xgboost; do
   venv="${VENV_ROOT}/${fw}"
   if [ -f "${venv}/.dsflower_ready" ]; then
