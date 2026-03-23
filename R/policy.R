@@ -207,27 +207,35 @@
 # Excluded: losses with inter-sample dependencies (Cox risk sets),
 # vision models (not yet validated with Opacus memory/correctness),
 # and xgboost (not gradient-based).
+# Strict whitelist: only templates with verified per-sample decomposable
+# losses AND no BatchNorm AND no non-standard LSTM. Validated means:
+# - Loss is a simple sum/mean over independent per-sample terms
+# - Model passes Opacus ModuleValidator.is_valid() or uses only
+#   DP-compatible layers (Linear, ReLU, Conv without BN)
+# - No inter-sample dependencies in loss computation
 .DP_SGD_VALIDATED_TEMPLATES <- c(
   "pytorch_logreg",
   "pytorch_linear_regression",
   "pytorch_multiclass",
   "pytorch_multilabel",
   "pytorch_mlp",
-  "pytorch_poisson",
-  "pytorch_tcn",
-  "pytorch_lstm",
-  "sklearn_sgd"
+  "pytorch_poisson"
 )
 
 # Templates pending DP-SGD validation (inter-sample loss or large vision models).
 # These work with clinical_update_noise but NOT high_sensitivity_dp.
+# Templates pending DP-SGD validation. These work with clinical_update_noise
+# (update-level noise) but NOT high_sensitivity_dp (patient-level DP-SGD).
 .DP_SGD_PENDING_VALIDATION <- c(
+  "sklearn_sgd",               # No formal DP accountant in sklearn SGD
   "pytorch_coxph",             # Cox partial likelihood has risk set dependencies
   "pytorch_lognormal_aft",     # Censoring-aware loss needs validation
   "pytorch_cause_specific_cox",# Same risk set issue as CoxPH
-  "pytorch_resnet18",          # Vision: memory/correctness not validated
-  "pytorch_densenet121",       # Vision: memory/correctness not validated
-  "pytorch_unet2d"             # Vision: memory/correctness not validated
+  "pytorch_tcn",               # Uses BatchNorm (not DP-compatible per Opacus)
+  "pytorch_lstm",              # Needs DPLSTM or strict Opacus validation
+  "pytorch_resnet18",          # Vision: BN + memory not validated
+  "pytorch_densenet121",       # Vision: BN + memory not validated
+  "pytorch_unet2d"             # Vision: BN + memory not validated
 )
 
 #' Validate template compatibility with the active trust profile
