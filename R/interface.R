@@ -347,11 +347,21 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       run_config[["evaluation_only"]] <- TRUE
     }
 
+    # Resolve runtime descriptor: template -> framework -> venv -> absolute paths
+    runtime_desc <- NULL
+    if (!is.null(template_name)) {
+      runtime_desc <- .resolve_template_runtime(template_name)
+      # Persist to staging dir for flowerEnsureSuperNodeDS to read
+      writeLines(jsonlite::toJSON(runtime_desc, auto_unbox = TRUE, pretty = TRUE),
+                 file.path(staging_dir, "runtime.json"))
+    }
+
     handle$run_token       <- run_token
     handle$staging_dir     <- staging_dir
     handle$target_column   <- target_column
     handle$feature_columns <- feature_columns
     handle$template_name   <- template_name
+    handle$runtime_desc    <- runtime_desc
     handle$prepared        <- TRUE
     return(handle)
   }
@@ -439,12 +449,20 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
                               feature_columns, run_config)
   }
 
-  # Update handle
+  # Resolve runtime descriptor
+  runtime_desc <- NULL
+  if (!is.null(template_name)) {
+    runtime_desc <- .resolve_template_runtime(template_name)
+    writeLines(jsonlite::toJSON(runtime_desc, auto_unbox = TRUE, pretty = TRUE),
+               file.path(staging_dir, "runtime.json"))
+  }
+
   handle$run_token       <- run_token
   handle$staging_dir     <- staging_dir
   handle$target_column   <- target_column
   handle$feature_columns <- feature_columns
   handle$template_name   <- template_name
+  handle$runtime_desc    <- runtime_desc
   handle$prepared        <- TRUE
 
   handle
@@ -482,6 +500,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   } else if (!is.null(handle$template_name)) {
     template_name <- handle$template_name
   }
+
+  # template_name resolved: explicit > handle > runtime.json
 
   # Write code verification artifacts to staging directory
   if (!is.null(template_name) && nzchar(template_name %||% "")) {

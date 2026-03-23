@@ -62,6 +62,71 @@
   NULL
 }
 
+#' Resolve template runtime descriptor
+#'
+#' Maps template_name -> framework -> venv -> absolute paths.
+#' This is the single source of truth for how to launch a SuperNode.
+#'
+#' @param template_name Character.
+#' @return Named list: template_name, framework, venv_path, supernode_cmd.
+#' @keywords internal
+.resolve_template_runtime <- function(template_name) {
+  caps <- .TEMPLATE_METADATA[[template_name]]
+  if (is.null(caps) || is.null(caps$framework))
+    stop("Unknown template or no framework for: ", template_name, call. = FALSE)
+
+  framework <- caps$framework
+  venv_root <- .venv_root()
+  venv_path <- file.path(venv_root, framework)
+  python <- file.path(venv_path, "bin", "python")
+  cmd <- file.path(venv_path, "bin", "flower-supernode")
+
+  # File-based validation only -- no subprocess calls
+  if (!dir.exists(venv_path))
+    stop("Venv not found: ", venv_path, ". Run dsFlower configure.", call. = FALSE)
+  if (!file.exists(python))
+    stop("Python not found: ", python, call. = FALSE)
+  if (!file.exists(cmd))
+    stop("flower-supernode not found: ", cmd, call. = FALSE)
+
+  list(
+    template_name = template_name,
+    framework = framework,
+    venv_path = venv_path,
+    supernode_cmd = cmd,
+    python = python
+  )
+}
+
+#' Build a clean Python environment for subprocess launch
+#'
+#' Strips R's LD_LIBRARY_PATH and other variables that conflict
+#' with Python native libraries (pyarrow, torch).
+#'
+#' @param venv_path Character; path to the Python venv.
+#' @param staging_dir Character; staging directory for the run.
+#' @return Named character vector suitable for processx env parameter.
+#' @keywords internal
+.build_clean_python_env <- function(venv_path, staging_dir,
+                                     extra_pypath = NULL) {
+  venv_bin <- file.path(venv_path, "bin")
+  current_path <- Sys.getenv("PATH", "")
+
+  env <- c("current",
+    LD_LIBRARY_PATH = "",
+    DYLD_LIBRARY_PATH = "",
+    PYTHONHOME = "",
+    PYTHONNOUSERSITE = "1",
+    VIRTUAL_ENV = venv_path,
+    PATH = paste0(venv_bin, ":", current_path),
+    DSFLOWER_MANIFEST_DIR = staging_dir)
+
+  if (!is.null(extra_pypath))
+    env <- c(env, PYTHONPATH = extra_pypath)
+
+  env
+}
+
 #' Ensure a SuperNode is running (idempotent)
 #'
 #' Looks up the registry -> if alive, reuse -> if dead/absent, spawn new
@@ -100,26 +165,32 @@
          call. = FALSE)
   }
 
-  # Resolve Python environment for this template's framework.
-  # If the template is known, ensure the correct venv is ready.
-  supernode_cmd <- "flower-supernode"
+  # Resolve SuperNode command from runtime descriptor (written by prepare)
+  # This ensures we use the absolute venv path, never PATH fallback
+  runtime_json <- file.path(manifest_dir, "runtime.json")
+  runtime_desc <- NULL
   env_info <- NULL
-  if (!is.null(template_name)) {
-    caps <- .TEMPLATE_METADATA[[template_name]]
-    if (!is.null(caps) && !is.null(caps$framework)) {
-      env_info <- tryCatch(
-        .ensure_python_env(caps$framework),
-        error = function(e) {
-          warning("Could not provision Python env for '", caps$framework,
-                  "': ", e$message, ". Falling back to system Python.",
-                  call. = FALSE)
-          NULL
-        }
-      )
-      if (!is.null(env_info)) {
-        supernode_cmd <- env_info$flower_supernode
-      }
-    }
+
+  if (file.exists(runtime_json)) {
+    runtime_desc <- jsonlite::fromJSON(runtime_json, simplifyVector = FALSE)
+    supernode_cmd <- runtime_desc$supernode_cmd
+    if (!file.exists(supernode_cmd))
+      stop("SuperNode binary not found: ", supernode_cmd, call. = FALSE)
+    env_info <- list(
+      python = runtime_desc$python,
+      flower_supernode = supernode_cmd,
+      source = "venv")
+  } else if (!is.null(template_name)) {
+    # Fallback: resolve at launch time
+    runtime_desc <- .resolve_template_runtime(template_name)
+    supernode_cmd <- runtime_desc$supernode_cmd
+    env_info <- list(
+      python = runtime_desc$python,
+      flower_supernode = supernode_cmd,
+      source = "venv")
+  } else {
+    stop("No runtime.json and no template_name. Cannot resolve SuperNode binary.",
+         call. = FALSE)
   }
 
   # Create log directory
@@ -170,16 +241,12 @@
     hook_dir
   }
 
-  # Build environment: prepend venv bin to PATH so subprocess
-  # (flwr-clientapp) also uses the venv Python, not the system Python.
-  spawn_env <- c("current",
-                 PYTHONPATH = new_pypath,
-                 DSFLOWER_MANIFEST_DIR = manifest_dir)
-  if (!is.null(env_info) && identical(env_info$source, "venv")) {
-    venv_bin <- dirname(env_info$python)
-    current_path <- Sys.getenv("PATH", "")
-    spawn_env <- c(spawn_env, PATH = paste0(venv_bin, ":", current_path))
-  }
+  # Build clean Python environment (strips R's LD_LIBRARY_PATH etc.)
+  venv_path <- if (!is.null(runtime_desc)) runtime_desc$venv_path
+               else if (!is.null(env_info)) dirname(dirname(env_info$python))
+               else ""
+  spawn_env <- .build_clean_python_env(venv_path, manifest_dir,
+                                        extra_pypath = new_pypath)
 
   # Spawn via processx
   proc <- processx::process$new(

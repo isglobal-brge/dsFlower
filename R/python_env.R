@@ -57,34 +57,26 @@
 #' Check if a Python venv is healthy
 #' @keywords internal
 .venv_is_healthy <- function(venv_path, framework) {
+  # File-based health check ONLY -- no subprocess calls.
+  # system()/system2() hang in Rserve child processes (Rock DS sessions).
+  # The configure script writes .dsflower_ready after verifying imports,
+  # so if the marker + binaries exist, the venv is healthy.
   python <- file.path(venv_path, "bin", "python")
   if (!file.exists(python)) return(FALSE)
   marker <- file.path(venv_path, ".dsflower_ready")
   if (!file.exists(marker)) return(FALSE)
-  check_mod <- .FRAMEWORK_HEALTH_IMPORT[[framework]]
-  if (is.null(check_mod)) check_mod <- "flwr"
-  cmd <- paste0(shQuote(python), " -c ", shQuote(paste0("import ", check_mod)))
-  rc <- suppressWarnings(system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE))
-  rc == 0L
+  supernode <- file.path(venv_path, "bin", "flower-supernode")
+  if (!file.exists(supernode)) return(FALSE)
+  TRUE
 }
 
 #' Check if the system Python already satisfies framework dependencies
 #' @keywords internal
 .system_python_has_framework <- function(framework) {
-  # Only check if there happens to be a system Python; we don't require it
-  python <- Sys.which("python3")
-  if (!nzchar(python)) python <- Sys.which("python")
-  if (!nzchar(python)) return(FALSE)
-
-  check_mod <- .FRAMEWORK_HEALTH_IMPORT[[framework]]
-  if (is.null(check_mod)) return(TRUE)
-  cmd <- paste0(shQuote(python), " -c ", shQuote(paste0("import ", check_mod)))
-  rc <- suppressWarnings(system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE))
-  if (rc != 0L) return(FALSE)
-
-  cmd_pa <- paste0(shQuote(python), " -c ", shQuote("import pyarrow"))
-  rc_pa <- suppressWarnings(system(cmd_pa, ignore.stdout = TRUE, ignore.stderr = TRUE))
-  rc_pa == 0L
+  # Skip system Python check entirely in server contexts.
+  # system()/system2() hang in Rserve (Rock DataSHIELD sessions).
+  # The venv check (.venv_is_healthy) is the correct fast path.
+  FALSE
 }
 
 #' Create or verify a Python venv for a framework
@@ -97,7 +89,18 @@
 #' @return Named list with \code{python} and \code{flower_supernode} paths.
 #' @keywords internal
 .ensure_python_env <- function(framework, timeout_secs = 600) {
-  # Fast path: system Python already has everything
+  # Fast path: check venv FIRST (avoids system() calls that hang in Rserve)
+  root <- .venv_root()
+  venv_path <- file.path(root, framework)
+  if (.venv_is_healthy(venv_path, framework)) {
+    return(list(
+      python = file.path(venv_path, "bin", "python"),
+      flower_supernode = file.path(venv_path, "bin", "flower-supernode"),
+      source = "venv"
+    ))
+  }
+
+  # System Python check (skip in Rserve contexts to avoid hangs)
   if (.system_python_has_framework(framework)) {
     python <- Sys.which("python3")
     if (!nzchar(python)) python <- Sys.which("python")
