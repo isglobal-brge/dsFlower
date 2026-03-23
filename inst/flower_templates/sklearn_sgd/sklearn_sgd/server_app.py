@@ -11,6 +11,7 @@ from flwr.server.strategy import FedAvg, FedProx, FedAdam, FedAdagrad
 
 _STRATEGY_MAP = {
     "FedAvg": FedAvg,
+    "FedBN": FedAvg,  # Server-side same as FedAvg; BN exclusion is client-side
     "FedProx": FedProx,
     "FedAdam": FedAdam,
     "FedAdagrad": FedAdagrad,
