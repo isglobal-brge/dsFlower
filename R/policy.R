@@ -13,7 +13,7 @@
   "consortium_internal",
   "clinical_default",
   "clinical_hardened",
-  "clinical_dp",
+  "clinical_update_noise",
   "high_sensitivity_dp"
 )
 
@@ -73,7 +73,7 @@
     min_train_rows             = 50,
     allow_per_node_metrics     = FALSE,
     allow_exact_num_examples   = FALSE,
-    require_secure_aggregation = FALSE,
+    require_secure_aggregation = TRUE,
     dp_required                = FALSE,
     model_release              = "advisory_gated",
     min_clients_per_round      = 2L,
@@ -111,7 +111,7 @@
     min_per_class              = 30L,
     min_events                 = 30L
   ),
-  clinical_dp = list(
+  clinical_update_noise = list(
     min_train_rows             = 200,
     allow_per_node_metrics     = FALSE,
     allow_exact_num_examples   = FALSE,
@@ -207,7 +207,7 @@
   family <- .TEMPLATE_FAMILIES[[template_name]]
   if (is.null(family)) {
     # Unknown template -- block DP profiles for safety
-    if (profile_name %in% c("clinical_dp", "high_sensitivity_dp")) {
+    if (profile_name %in% c("clinical_update_noise", "high_sensitivity_dp")) {
       stop("Template '", template_name, "' has no registered family. ",
            "Cannot use with '", profile_name, "' profile (requires verified ",
            "DP support).", call. = FALSE)
@@ -276,7 +276,7 @@
 #' The "sandbox_open" profile requires explicit admin opt-in via
 #' \code{dsflower.allow_sandbox = TRUE}.
 #'
-#' DP-locked profiles (clinical_dp, high_sensitivity_dp) cannot have
+#' DP-locked profiles (clinical_update_noise, high_sensitivity_dp) cannot have
 #' require_secure_aggregation or dp_required disabled via overrides.
 #'
 #' @return Named list of trust profile settings.
@@ -305,7 +305,7 @@
   profile <- .TRUST_PROFILES[[profile_name]]
   profile$name <- profile_name
 
-  dp_locked <- profile_name %in% c("clinical_dp", "high_sensitivity_dp")
+  dp_locked <- profile_name %in% c("clinical_update_noise", "high_sensitivity_dp")
 
   # --- Authoritative overrides (can raise AND lower) ---
 

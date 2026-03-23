@@ -176,6 +176,15 @@
   # Clean orphaned SuperNodes from crashed sessions before checking limits
   .cleanup_orphaned_supernodes()
 
+  # Acquire exclusive lock for atomic count-check + spawn + PID-write
+  # This prevents TOCTTOU races between concurrent Rserve sessions.
+  lock_acquired <- .acquire_spawn_lock()
+  if (!lock_acquired) {
+    stop("Could not acquire SuperNode spawn lock. Another session may be ",
+         "spawning. Retry in a few seconds.", call. = FALSE)
+  }
+  on.exit(.release_spawn_lock(), add = TRUE)
+
   # Check concurrent limit -- server-global via PID files, not just per-session
   global_alive <- .count_global_supernodes()
 
@@ -541,4 +550,53 @@
     unlink(pf)
   }
   cleaned
+}
+
+# ---------------------------------------------------------------------------
+# Exclusive spawn lock (prevents TOCTTOU in count-check + spawn)
+# ---------------------------------------------------------------------------
+
+#' Acquire exclusive lock for SuperNode spawning
+#'
+#' Uses exclusive file creation as an atomic lock mechanism.
+#' Prevents two concurrent sessions from both passing the count check
+#' and exceeding the concurrent SuperNode limit.
+#'
+#' @param timeout_secs Numeric; max seconds to wait for lock.
+#' @return Logical; TRUE if lock acquired.
+#' @keywords internal
+.acquire_spawn_lock <- function(timeout_secs = 15) {
+  lock_path <- file.path(.supernode_pid_dir(), ".spawn_lock")
+  deadline <- Sys.time() + timeout_secs
+
+  repeat {
+    # Try exclusive creation (atomic on POSIX)
+    tryCatch({
+      con <- file(lock_path, open = "wx")
+      writeLines(as.character(Sys.getpid()), con)
+      close(con)
+      return(TRUE)
+    }, error = function(e) NULL)
+
+    # Lock exists -- check if stale (holder crashed)
+    info <- file.info(lock_path)
+    if (!is.na(info$mtime)) {
+      age_secs <- as.numeric(difftime(Sys.time(), info$mtime, units = "secs"))
+      if (age_secs > 30) {
+        # Stale lock -- remove and retry
+        unlink(lock_path)
+        next
+      }
+    }
+
+    if (Sys.time() > deadline) return(FALSE)
+    Sys.sleep(0.5)
+  }
+}
+
+#' Release the spawn lock
+#' @keywords internal
+.release_spawn_lock <- function() {
+  lock_path <- file.path(.supernode_pid_dir(), ".spawn_lock")
+  tryCatch(unlink(lock_path), error = function(e) NULL)
 }
