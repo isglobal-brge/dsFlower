@@ -172,12 +172,32 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
         def _save_weights(self, weights, server_round):
             if self.evaluation_only:
                 return
+            # Portable JSON (raw bytes as list)
             data = {str(i): w.tolist() for i, w in enumerate(weights)}
             data["__shapes__"] = [list(w.shape) for w in weights]
             data["__round__"] = server_round
             path = self.results_dir / "global_model.json"
             with open(path, "w") as f:
                 json.dump(data, f)
+
+            # Native XGBoost format
+            self._save_xgboost_native(weights, server_round)
+
+        def _save_xgboost_native(self, weights, server_round):
+            """Save as native XGBoost model file."""
+            try:
+                import xgboost as xgb
+                if len(weights) == 0 or len(weights[0]) == 0:
+                    return
+                model_bytes = weights[0].tobytes()
+                booster = xgb.Booster()
+                booster.load_model(bytearray(model_bytes))
+                # Save in XGBoost's native JSON format
+                booster.save_model(str(self.results_dir / "model.xgb.json"))
+                # Also save binary format for faster loading
+                booster.save_model(str(self.results_dir / "model.xgb"))
+            except Exception:
+                pass
 
         def _save_history(self):
             path = self.results_dir / "history.json"

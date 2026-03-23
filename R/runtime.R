@@ -10,14 +10,15 @@
 
 #' Pick a random available TCP port
 #'
-#' Selects a random port from the configured range, checking that it is
-#' not already in use by another registered SuperNode. Falls back to
-#' retries (up to 20) if the port is taken.
+#' Selects a random port from the configured range, checking both the
+#' in-process registry AND OS-level port availability (via serverSocket).
+#' This prevents collisions between concurrent Rserve sessions on the
+#' same Rock server.
 #'
 #' @return Integer; an available port number.
 #' @keywords internal
 .random_available_port <- function() {
-  # Collect ports already used by registered SuperNodes
+  # Collect ports already used by registered SuperNodes (this session)
   used_ports <- integer(0)
   for (key in ls(.supernode_registry)) {
     entry <- tryCatch(get(key, envir = .supernode_registry), error = function(e) NULL)
@@ -27,13 +28,32 @@
     }
   }
 
-  for (i in seq_len(20)) {
+  for (i in seq_len(50)) {
     port <- sample(.CLIENTAPPIO_PORT_MIN:.CLIENTAPPIO_PORT_MAX, 1)
-    if (!port %in% used_ports) return(port)
+    if (port %in% used_ports) next
+    # OS-level check: verify port is actually free (catches cross-session usage)
+    if (.port_is_free(port)) return(port)
   }
 
-  # Extremely unlikely fallback — just return the last sampled port
-  port
+  stop("Could not find an available port after 50 attempts. ",
+       "Too many SuperNodes may be running on this server.", call. = FALSE)
+}
+
+#' Check if a TCP port is free at the OS level
+#'
+#' Tries to bind a server socket on the port. If it succeeds, the port
+#' is free. Catches cross-session collisions that the in-process registry
+#' cannot detect (e.g. orphaned SuperNodes, other Rserve sessions).
+#'
+#' @param port Integer; port number.
+#' @return Logical; TRUE if the port is available.
+#' @keywords internal
+.port_is_free <- function(port) {
+  tryCatch({
+    s <- serverSocket(port)
+    close(s)
+    TRUE
+  }, error = function(e) FALSE)
 }
 
 #' Look up a SuperNode in the registry
@@ -153,15 +173,16 @@
     return(existing)
   }
 
-  # Check concurrent limit
-  alive_count <- sum(vapply(ls(.supernode_registry), function(addr) {
-    e <- get(addr, envir = .supernode_registry)
-    !is.null(e$process) && e$process$is_alive()
-  }, logical(1)))
+  # Clean orphaned SuperNodes from crashed sessions before checking limits
+  .cleanup_orphaned_supernodes()
 
-  if (alive_count >= settings$max_concurrent_runs) {
+  # Check concurrent limit -- server-global via PID files, not just per-session
+  global_alive <- .count_global_supernodes()
+
+  if (global_alive >= settings$max_concurrent_runs) {
     stop("Maximum concurrent SuperNode limit reached (",
-         settings$max_concurrent_runs, "). Stop an existing SuperNode first.",
+         settings$max_concurrent_runs, " server-wide, ", global_alive,
+         " currently running). Stop an existing SuperNode first.",
          call. = FALSE)
   }
 
@@ -200,30 +221,13 @@
   log_name <- gsub("[^a-zA-Z0-9._-]", "_", superlink_address)
   log_path <- file.path(log_dir, paste0(log_name, ".log"))
 
-  # Pick a random available port for clientappio (avoids collisions between
-  # concurrent users/sessions sharing the same Rock process)
-  clientappio_port <- .random_available_port()
-
   # TLS mode (always required)
   if (is.null(ca_cert_path) || !file.exists(ca_cert_path)) {
     stop("CA certificate not found. The SuperLink must provide a TLS certificate.",
          call. = FALSE)
   }
-  tls_args <- c("--root-certificates", ca_cert_path)
-
-  # Build command for flower-supernode
-  args <- c(
-    tls_args,
-    "--superlink", superlink_address,
-    "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
-    "--clientappio-api-address", paste0("0.0.0.0:", clientappio_port)
-  )
 
   # Inject code integrity hook via PYTHONPATH + sitecustomize.py
-  # The sitecustomize.py lives in dsFlower's inst/python/ (server filesystem)
-  # and is copied to a private directory in the staging area. Python loads
-  # it automatically before any application code, including Flower's
-  # ClientApp subprocesses.
   hook_src <- system.file("python", "sitecustomize.py", package = "dsFlower")
   hook_dir <- file.path(manifest_dir, ".dsflower_hook")
   dir.create(hook_dir, showWarnings = FALSE)
@@ -232,8 +236,6 @@
               overwrite = TRUE)
   }
 
-  # Set PYTHONPATH so sitecustomize.py is auto-loaded, and pass the
-  # manifest dir so the hook can find expected_hash.txt
   existing_pypath <- Sys.getenv("PYTHONPATH", "")
   new_pypath <- if (nzchar(existing_pypath)) {
     paste0(hook_dir, ":", existing_pypath)
@@ -248,16 +250,56 @@
   spawn_env <- .build_clean_python_env(venv_path, manifest_dir,
                                         extra_pypath = new_pypath)
 
-  # Spawn via processx
-  proc <- processx::process$new(
-    command = supernode_cmd,
-    args = args,
-    stdout = log_path,
-    stderr = "2>&1",
-    cleanup = TRUE,
-    cleanup_tree = TRUE,
-    env = spawn_env
-  )
+  # Create log directory
+  log_dir <- file.path(tempdir(), "dsflower", "supernodes")
+  dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+  log_name <- gsub("[^a-zA-Z0-9._-]", "_", superlink_address)
+  log_path <- file.path(log_dir, paste0(log_name, ".log"))
+
+  # Spawn with retry on port collision (up to 3 attempts)
+  proc <- NULL
+  clientappio_port <- NULL
+  for (attempt in seq_len(3L)) {
+    clientappio_port <- .random_available_port()
+    tls_args <- c("--root-certificates", ca_cert_path)
+    args <- c(
+      tls_args,
+      "--superlink", superlink_address,
+      "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
+      "--clientappio-api-address", paste0("0.0.0.0:", clientappio_port)
+    )
+
+    proc <- processx::process$new(
+      command = supernode_cmd,
+      args = args,
+      stdout = log_path,
+      stderr = "2>&1",
+      cleanup = TRUE,
+      cleanup_tree = TRUE,
+      env = spawn_env
+    )
+
+    # Verify SuperNode started (catches port collisions, binary issues)
+    Sys.sleep(2)
+    if (proc$is_alive()) break
+
+    # Process died -- likely port collision or config error
+    if (attempt < 3L) {
+      log_tail <- tryCatch(
+        paste(utils::tail(readLines(log_path, warn = FALSE), 5), collapse = "\n"),
+        error = function(e) "")
+      warning("SuperNode failed on attempt ", attempt, " (port ", clientappio_port,
+              "). Retrying...", call. = FALSE)
+    }
+  }
+
+  if (!proc$is_alive()) {
+    log_tail <- tryCatch(
+      paste(utils::tail(readLines(log_path, warn = FALSE), 10), collapse = "\n"),
+      error = function(e) "(no log)")
+    stop("SuperNode failed to start after 3 attempts.\nLog:\n", log_tail,
+         call. = FALSE)
+  }
 
   entry <- list(
     process           = proc,
@@ -269,6 +311,9 @@
     pid               = proc$get_pid(),
     started_at        = Sys.time()
   )
+
+  # Write PID file for server-global tracking (cross-session visibility)
+  .write_supernode_pid(proc$get_pid(), clientappio_port)
 
   assign(manifest_dir, entry, envir = .supernode_registry)
   entry
@@ -287,6 +332,7 @@
   if (is.null(entry)) return(invisible(TRUE))
 
   proc <- entry$process
+  pid <- entry$pid
   if (proc$is_alive()) {
     proc$signal(15L)  # SIGTERM
     proc$wait(timeout = 5000)
@@ -294,6 +340,9 @@
       proc$kill()
     }
   }
+
+  # Remove PID file
+  .remove_supernode_pid(pid)
 
   key <- manifest_dir
   if (exists(key, envir = .supernode_registry)) {
@@ -357,4 +406,139 @@
     lines <- utils::tail(lines, last_n)
   }
   .sanitizeLogs(lines, last_n)
+}
+
+# ---------------------------------------------------------------------------
+# Server-global PID tracking (cross-session SuperNode visibility)
+# ---------------------------------------------------------------------------
+# Each running SuperNode writes a PID file to a shared directory.
+# This allows concurrent Rserve sessions to see each other's SuperNodes
+# and enforce a true server-wide concurrent limit.
+
+#' Get the shared PID directory for SuperNode tracking
+#' @keywords internal
+.supernode_pid_dir <- function() {
+  root <- .venv_root()
+  pid_dir <- file.path(dirname(root), "supernode_pids")
+  if (!dir.exists(pid_dir)) {
+    tryCatch(
+      dir.create(pid_dir, recursive = TRUE, showWarnings = FALSE),
+      error = function(e) NULL
+    )
+  }
+  # Fallback to temp if server dir not writable
+  if (!dir.exists(pid_dir)) {
+    pid_dir <- file.path(tempdir(), "dsflower_supernode_pids")
+    dir.create(pid_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  pid_dir
+}
+
+#' Write a PID file for a SuperNode (atomic via temp+rename)
+#' @keywords internal
+.write_supernode_pid <- function(pid, port) {
+  tryCatch({
+    pid_dir <- .supernode_pid_dir()
+    pid_file <- file.path(pid_dir, paste0(pid, ".pid"))
+    tmp_file <- paste0(pid_file, ".tmp.", Sys.getpid())
+    writeLines(
+      c(as.character(pid), as.character(port),
+        format(Sys.time(), "%Y-%m-%dT%H:%M:%S")),
+      tmp_file
+    )
+    file.rename(tmp_file, pid_file)
+  }, error = function(e) NULL)
+}
+
+#' Remove a PID file for a SuperNode
+#' @keywords internal
+.remove_supernode_pid <- function(pid) {
+  tryCatch({
+    pid_file <- file.path(.supernode_pid_dir(), paste0(pid, ".pid"))
+    if (file.exists(pid_file)) unlink(pid_file)
+  }, error = function(e) NULL)
+}
+
+#' Count server-global alive SuperNodes via PID files
+#'
+#' Reads the shared PID directory, checks each PID is still alive,
+#' and removes stale entries (orphaned processes from crashed sessions).
+#'
+#' @return Integer; number of alive SuperNodes across all sessions.
+#' @keywords internal
+.count_global_supernodes <- function() {
+  pid_dir <- .supernode_pid_dir()
+  pid_files <- list.files(pid_dir, pattern = "\\.pid$", full.names = TRUE)
+  if (length(pid_files) == 0L) return(0L)
+
+  alive <- 0L
+  for (pf in pid_files) {
+    lines <- tryCatch(readLines(pf, warn = FALSE), error = function(e) NULL)
+    if (is.null(lines) || length(lines) < 1L) {
+      unlink(pf)
+      next
+    }
+    pid <- suppressWarnings(as.integer(lines[1]))
+    if (is.na(pid)) { unlink(pf); next }
+
+    # Check if process is still alive
+    if (.pid_is_alive(pid)) {
+      alive <- alive + 1L
+    } else {
+      # Orphaned PID file -- process died, clean up
+      unlink(pf)
+    }
+  }
+  alive
+}
+
+#' Check if a process with the given PID is alive
+#' @keywords internal
+.pid_is_alive <- function(pid) {
+  # kill(pid, 0) returns 0 if process exists, error otherwise
+  tryCatch({
+    rc <- tools::pskill(pid, signal = 0L)
+    # pskill returns TRUE if signal was sent successfully
+    isTRUE(rc)
+  }, error = function(e) FALSE)
+}
+
+#' Clean up orphaned SuperNode processes
+#'
+#' Scans PID files, kills orphaned SuperNode processes that are still
+#' running but have no owning Rserve session. Called during package
+#' attach to reclaim resources.
+#'
+#' @return Integer; number of orphans cleaned.
+#' @keywords internal
+.cleanup_orphaned_supernodes <- function() {
+  pid_dir <- .supernode_pid_dir()
+  pid_files <- list.files(pid_dir, pattern = "\\.pid$", full.names = TRUE)
+  cleaned <- 0L
+
+  for (pf in pid_files) {
+    lines <- tryCatch(readLines(pf, warn = FALSE), error = function(e) NULL)
+    if (is.null(lines) || length(lines) < 1L) { unlink(pf); next }
+
+    pid <- suppressWarnings(as.integer(lines[1]))
+    if (is.na(pid)) { unlink(pf); next }
+
+    # Check age -- only clean orphans older than 2 hours
+    info <- file.info(pf)
+    if (is.na(info$mtime)) { unlink(pf); next }
+    age_hours <- as.numeric(difftime(Sys.time(), info$mtime, units = "hours"))
+    if (age_hours < 2) next
+
+    if (.pid_is_alive(pid)) {
+      # Process alive but PID file is old -- likely orphaned
+      tryCatch({
+        tools::pskill(pid, signal = 15L)
+        Sys.sleep(1)
+        if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
+      }, error = function(e) NULL)
+      cleaned <- cleaned + 1L
+    }
+    unlink(pf)
+  }
+  cleaned
 }

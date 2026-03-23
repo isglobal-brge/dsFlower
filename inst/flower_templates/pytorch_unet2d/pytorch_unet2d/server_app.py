@@ -22,14 +22,14 @@ _ADAPTIVE_STRATEGIES = {FedAdam, FedAdagrad}
 
 def _make_save_strategy(base_cls, results_dir, num_rounds,
                          allow_per_node_metrics=True, evaluation_only=False,
-                         **kwargs):
+                         template_name="unknown", **kwargs):
     """Create a SaveModelStrategy that subclasses the given Flower strategy."""
 
     class _Strategy(base_cls):
         """Dynamic strategy that saves global model weights and metrics."""
 
         def __init__(self, results_dir, num_rounds, allow_per_node_metrics=True,
-                     evaluation_only=False, **kw):
+                     evaluation_only=False, template_name="unknown", **kw):
             # FedAdam/FedAdagrad require initial_parameters but we don't
             # have model params at server init time. Pass a dummy value and
             # override initialize_parameters to fetch from a real client.
@@ -44,6 +44,7 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
             self.num_rounds = num_rounds
             self.allow_per_node_metrics = allow_per_node_metrics
             self.evaluation_only = evaluation_only
+            self._template_name = template_name
             self.history = []
 
         def initialize_parameters(self, client_manager):
@@ -98,12 +99,122 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
         def _save_weights(self, weights, server_round):
             if self.evaluation_only:
                 return
+            # Portable JSON format (always saved)
             data = {str(i): w.tolist() for i, w in enumerate(weights)}
             data["__shapes__"] = [list(w.shape) for w in weights]
             data["__round__"] = server_round
             path = self.results_dir / "global_model.json"
             with open(path, "w") as f:
                 json.dump(data, f)
+
+            # Native framework format (best effort)
+            self._save_native(weights, server_round)
+
+        def _save_native(self, weights, server_round):
+            """Save model in native ML framework format."""
+            try:
+                self._save_pytorch_native(weights, server_round)
+                return
+            except ImportError:
+                pass
+            try:
+                self._save_sklearn_native(weights, server_round)
+                return
+            except ImportError:
+                pass
+
+        def _save_sklearn_native(self, weights, server_round):
+            """Save as sklearn model via joblib."""
+            import importlib
+            import joblib
+
+            _SKLEARN_MODELS = {
+                "sklearn_logreg": ("sklearn.linear_model", "LogisticRegression"),
+                "sklearn_ridge": ("sklearn.linear_model", "RidgeClassifier"),
+                "sklearn_sgd": ("sklearn.linear_model", "SGDClassifier"),
+            }
+
+            template = self._template_name
+            entry = _SKLEARN_MODELS.get(template)
+            if entry is None:
+                # Fallback: save raw numpy arrays
+                np.savez(
+                    self.results_dir / "model.npz",
+                    **{str(i): w for i, w in enumerate(weights)},
+                )
+                return
+
+            mod_name, cls_name = entry
+            mod = importlib.import_module(mod_name)
+            ModelClass = getattr(mod, cls_name)
+
+            model = ModelClass()
+            coef = np.array(weights[0])
+            if coef.ndim == 1:
+                coef = coef.reshape(1, -1)
+            model.coef_ = coef
+            model.intercept_ = np.array(weights[1]).reshape(-1)
+            model.classes_ = np.arange(coef.shape[0] + 1) if coef.shape[0] > 1 \
+                else np.array([0, 1])
+            model.n_features_in_ = coef.shape[1]
+
+            path = self.results_dir / "model.joblib"
+            joblib.dump(model, path)
+
+        def _save_pytorch_native(self, weights, server_round):
+            """Save as PyTorch state_dict checkpoint."""
+            import torch
+            from collections import OrderedDict
+
+            # Try to resolve state_dict key names from the template's model
+            keys = None
+            try:
+                import importlib
+                template = self._template_name
+                client_mod = importlib.import_module(f"{template}.client_app")
+                Net = getattr(client_mod, "Net", None)
+                if Net is not None:
+                    # Build a tiny dummy model to extract key names
+                    import inspect
+                    sig = inspect.signature(Net.__init__)
+                    params = list(sig.parameters.keys())
+                    kw = {}
+                    for p in params:
+                        if p == "self":
+                            continue
+                        if p in ("input_dim", "input_size", "in_features",
+                                 "n_features", "in_channels"):
+                            kw[p] = weights[0].shape[-1] if weights[0].ndim >= 2 \
+                                else weights[0].shape[0]
+                        elif p in ("n_classes", "output_dim", "num_classes"):
+                            kw[p] = weights[-2].shape[0] if weights[-2].ndim >= 2 \
+                                else 1
+                        elif p in ("hidden_size", "hidden_dim"):
+                            kw[p] = 64
+                        elif p in ("num_layers", "n_layers"):
+                            kw[p] = 2
+                    dummy = Net(**kw)
+                    keys = list(dummy.state_dict().keys())
+            except Exception:
+                keys = None
+
+            if keys is not None and len(keys) == len(weights):
+                state_dict = OrderedDict(
+                    {k: torch.tensor(w) for k, w in zip(keys, weights)}
+                )
+            else:
+                state_dict = OrderedDict(
+                    {str(i): torch.tensor(w) for i, w in enumerate(weights)}
+                )
+
+            checkpoint = {
+                "state_dict": state_dict,
+                "round": server_round,
+                "template": getattr(self, "_template_name", "unknown"),
+                "shapes": [list(w.shape) for w in weights],
+            }
+            path = self.results_dir / "model.pt"
+            torch.save(checkpoint, path)
 
         def _save_history(self):
             path = self.results_dir / "history.json"
@@ -115,6 +226,7 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
         num_rounds=num_rounds,
         allow_per_node_metrics=allow_per_node_metrics,
         evaluation_only=evaluation_only,
+        template_name=template_name,
         **kwargs,
     )
 
@@ -125,6 +237,7 @@ def server_fn(context: Context) -> ServerAppComponents:
 
     num_rounds = int(cfg.get("num-server-rounds", 5))
     results_dir = cfg.get("results-dir", "/tmp/dsflower_results")
+    template_name = cfg.get("template-name", "unknown")
     require_secagg = str(cfg.get("require-secure-aggregation", "false")).lower() == "true"
     allow_per_node_metrics = str(cfg.get("allow-per-node-metrics", "true")).lower() == "true"
     fixed_client_sampling = str(cfg.get("fixed-client-sampling", "false")).lower() == "true"
@@ -160,6 +273,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         num_rounds=num_rounds,
         allow_per_node_metrics=allow_per_node_metrics,
         evaluation_only=evaluation_only,
+        template_name=template_name,
         **strategy_kwargs,
     )
 

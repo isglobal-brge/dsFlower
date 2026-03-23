@@ -74,6 +74,13 @@
 
   # Stale staging janitor: remove staging directories older than 24 hours
   .cleanup_stale_staging()
+
+  # Clean orphaned SuperNode processes from crashed sessions
+  orphans <- tryCatch(.cleanup_orphaned_supernodes(), error = function(e) 0L)
+  if (orphans > 0L) {
+    packageStartupMessage(
+      "dsFlower: cleaned ", orphans, " orphaned SuperNode process(es).")
+  }
 }
 
 #' Remove stale staging directories older than 24 hours
@@ -109,6 +116,8 @@
         entry$process$wait(timeout = 5000)
         if (entry$process$is_alive()) entry$process$kill()
       }
+      # Clean PID file
+      if (!is.null(entry$pid)) .remove_supernode_pid(entry$pid)
     }, error = function(e) NULL)
   }
   rm(list = ls(.supernode_registry), envir = .supernode_registry)
