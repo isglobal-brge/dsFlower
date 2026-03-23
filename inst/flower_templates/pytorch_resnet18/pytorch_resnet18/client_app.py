@@ -14,7 +14,10 @@ from torch.utils.data import DataLoader
 from torchvision.models import resnet18
 
 from .task import load_image_data, load_privacy_config, ImageDataset
-from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count
+from .privacy_utils import (
+    clip_weights, add_gaussian_noise, compute_sigma, bucket_count,
+    get_parameters_fedbn, set_parameters_fedbn,
+)
 
 
 def _build_resnet18(n_classes):
@@ -26,25 +29,24 @@ def _build_resnet18(n_classes):
 
 class FlowerClient(NumPyClient):
     def __init__(self, model, trainloader, privacy_config,
-                 learning_rate=0.001, local_epochs=1, device="cpu"):
+                 learning_rate=0.001, local_epochs=1, device="cpu",
+                 fedbn=False):
         self.model = model.to(device)
         self.trainloader = trainloader
         self.privacy_config = privacy_config
         self.device = device
         self.local_epochs = local_epochs
+        self.fedbn = fedbn
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(
             model.parameters(), lr=learning_rate
         )
 
     def get_parameters(self, config):
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        return get_parameters_fedbn(self.model, exclude_bn=self.fedbn)
 
     def set_parameters(self, parameters):
-        state_dict = OrderedDict()
-        for key, val in zip(self.model.state_dict().keys(), parameters):
-            state_dict[key] = torch.tensor(val)
-        self.model.load_state_dict(state_dict, strict=True)
+        set_parameters_fedbn(self.model, parameters, exclude_bn=self.fedbn)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -125,13 +127,17 @@ def client_fn(context: Context) -> FlowerClient:
     dataset = ImageDataset(data_root, samples_df, target_col=target_col)
     trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    strategy = cfg.get("strategy", "FedAvg")
+    fedbn = (strategy == "FedBN")
+
     model = _build_resnet18(n_classes)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return FlowerClient(
         model, trainloader, privacy_config,
         learning_rate=learning_rate,
         local_epochs=local_epochs,
-        device=device
+        device=device,
+        fedbn=fedbn
     )
 
 

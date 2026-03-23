@@ -94,3 +94,88 @@ def bucket_count(n):
     if n < 4:
         return int(n)
     return int(2 ** round(math.log2(n)))
+
+
+def make_private_opacus(model, optimizer, trainloader, clipping_norm,
+                        epsilon, delta, epochs, noise_multiplier=None):
+    """Wrap model/optimizer/dataloader with Opacus PrivacyEngine for DP-SGD.
+
+    This provides REAL per-example differential privacy, not update-level noise.
+    Opacus validates the model architecture and automatically replaces
+    incompatible modules (e.g. BatchNorm -> GroupNorm, LSTM -> DPLSTM).
+
+    Args:
+        model: PyTorch module.
+        optimizer: PyTorch optimizer (will be recreated if model is fixed).
+        trainloader: DataLoader for training data.
+        clipping_norm: Maximum per-example gradient L2 norm.
+        epsilon: Target privacy budget (used to derive noise_multiplier
+            when noise_multiplier is not provided).
+        delta: Privacy failure probability.
+        epochs: Number of training epochs (for accountant reference).
+        noise_multiplier: Explicit noise scale. If None, derived from
+            epsilon/delta via the Gaussian mechanism formula.
+
+    Returns:
+        Tuple of (model, optimizer, trainloader, privacy_engine).
+    """
+    from opacus import PrivacyEngine
+    from opacus.validators import ModuleValidator
+
+    if not ModuleValidator.is_valid(model):
+        model = ModuleValidator.fix(model)
+        optimizer = type(optimizer)(model.parameters(), **optimizer.defaults)
+
+    privacy_engine = PrivacyEngine()
+
+    if noise_multiplier is None:
+        noise_multiplier = math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon
+
+    model, optimizer, trainloader = privacy_engine.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=trainloader,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=clipping_norm,
+    )
+
+    return model, optimizer, trainloader, privacy_engine
+
+
+# --- FedBN helpers ---
+
+def is_bn_key(key):
+    """Check if a state_dict key belongs to a BatchNorm layer."""
+    bn_indicators = (".bn", "batch_norm", ".norm", "running_mean",
+                     "running_var", "num_batches_tracked")
+    key_lower = key.lower()
+    return any(ind in key_lower for ind in bn_indicators)
+
+
+def get_parameters_fedbn(model, exclude_bn=False):
+    """Extract model parameters, optionally excluding BatchNorm."""
+    import numpy as np
+    module = getattr(model, '_module', model)
+    sd = module.state_dict()
+    if not exclude_bn:
+        return [val.cpu().numpy() for val in sd.values()]
+    return [val.cpu().numpy() for key, val in sd.items() if not is_bn_key(key)]
+
+
+def set_parameters_fedbn(model, parameters, exclude_bn=False):
+    """Set model parameters, optionally skipping BatchNorm (keeping local)."""
+    import torch
+    from collections import OrderedDict
+    module = getattr(model, '_module', model)
+    sd = module.state_dict()
+    if not exclude_bn:
+        new_sd = OrderedDict()
+        for key, val in zip(sd.keys(), parameters):
+            new_sd[key] = torch.tensor(val)
+        module.load_state_dict(new_sd, strict=True)
+    else:
+        non_bn_keys = [k for k in sd.keys() if not is_bn_key(k)]
+        new_sd = OrderedDict(sd)  # start with current (preserves BN)
+        for key, val in zip(non_bn_keys, parameters):
+            new_sd[key] = torch.tensor(val)
+        module.load_state_dict(new_sd, strict=True)

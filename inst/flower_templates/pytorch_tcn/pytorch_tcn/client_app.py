@@ -13,7 +13,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .task import load_data, load_privacy_config
-from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count, make_private_opacus
+from .privacy_utils import (
+    clip_weights, add_gaussian_noise, compute_sigma, bucket_count,
+    make_private_opacus, get_parameters_fedbn, set_parameters_fedbn,
+)
 
 
 class _TCNBlock(nn.Module):
@@ -68,12 +71,13 @@ class TCN(nn.Module):
 class FlowerClient(NumPyClient):
     def __init__(self, model, trainloader, privacy_config,
                  learning_rate=0.001, local_epochs=1, device="cpu",
-                 optimizer=None, privacy_engine=None):
+                 optimizer=None, privacy_engine=None, fedbn=False):
         self.model = model.to(device)
         self.trainloader = trainloader
         self.privacy_config = privacy_config
         self.device = device
         self.local_epochs = local_epochs
+        self.fedbn = fedbn
         self.criterion = nn.BCEWithLogitsLoss()
         self.privacy_engine = privacy_engine
         if optimizer is not None:
@@ -85,14 +89,11 @@ class FlowerClient(NumPyClient):
 
     def get_parameters(self, config):
         module = getattr(self.model, '_module', self.model)
-        return [val.cpu().numpy() for val in module.state_dict().values()]
+        return get_parameters_fedbn(module, exclude_bn=self.fedbn)
 
     def set_parameters(self, parameters):
         module = getattr(self.model, '_module', self.model)
-        state_dict = OrderedDict()
-        for key, val in zip(module.state_dict().keys(), parameters):
-            state_dict[key] = torch.tensor(val)
-        module.load_state_dict(state_dict, strict=True)
+        set_parameters_fedbn(module, parameters, exclude_bn=self.fedbn)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -204,6 +205,9 @@ def client_fn(context: Context) -> FlowerClient:
             epochs=local_epochs,
         )
 
+    strategy = cfg.get("strategy", "FedAvg")
+    fedbn = (strategy == "FedBN")
+
     return FlowerClient(
         model, trainloader, privacy_config,
         learning_rate=learning_rate,
@@ -211,6 +215,7 @@ def client_fn(context: Context) -> FlowerClient:
         device=device,
         optimizer=optimizer,
         privacy_engine=privacy_engine,
+        fedbn=fedbn,
     )
 
 

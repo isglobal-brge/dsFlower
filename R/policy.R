@@ -154,8 +154,8 @@
   pytorch_multiclass         = "iterative_linear",
   pytorch_coxph              = "iterative_linear",
   pytorch_poisson            = "iterative_linear",
-  pytorch_aft                = "iterative_linear",
-  pytorch_competing_risks    = "iterative_linear",
+  pytorch_lognormal_aft          = "iterative_linear",
+  pytorch_cause_specific_cox     = "iterative_linear",
   pytorch_multilabel         = "tabular_deep",
   pytorch_mlp                = "tabular_deep",
   pytorch_tcn                = "tabular_deep",
@@ -190,8 +190,8 @@
   pytorch_linear_regression = list(framework = "pytorch",        requires_secagg = FALSE),
   pytorch_coxph             = list(framework = "pytorch",        requires_secagg = FALSE),
   pytorch_poisson           = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_aft               = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_competing_risks   = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_lognormal_aft         = list(framework = "pytorch",        requires_secagg = FALSE),
+  pytorch_cause_specific_cox    = list(framework = "pytorch",        requires_secagg = FALSE),
   pytorch_multilabel        = list(framework = "pytorch",        requires_secagg = FALSE),
   pytorch_multiclass        = list(framework = "pytorch",        requires_secagg = FALSE),
   pytorch_resnet18          = list(framework = "pytorch_vision", requires_secagg = FALSE),
@@ -203,18 +203,62 @@
   xgboost_tabular           = list(framework = "xgboost",       requires_secagg = FALSE)
 )
 
+# Templates validated for patient-level DP-SGD (Opacus per-sample gradients).
+# Excluded: losses with inter-sample dependencies (Cox risk sets),
+# vision models (not yet validated with Opacus memory/correctness),
+# and xgboost (not gradient-based).
+.DP_SGD_VALIDATED_TEMPLATES <- c(
+  "pytorch_logreg",
+  "pytorch_linear_regression",
+  "pytorch_multiclass",
+  "pytorch_multilabel",
+  "pytorch_mlp",
+  "pytorch_poisson",
+  "pytorch_tcn",
+  "pytorch_lstm",
+  "sklearn_sgd"
+)
+
+# Templates pending DP-SGD validation (inter-sample loss or large vision models).
+# These work with clinical_update_noise but NOT high_sensitivity_dp.
+.DP_SGD_PENDING_VALIDATION <- c(
+  "pytorch_coxph",             # Cox partial likelihood has risk set dependencies
+  "pytorch_lognormal_aft",     # Censoring-aware loss needs validation
+  "pytorch_cause_specific_cox",# Same risk set issue as CoxPH
+  "pytorch_resnet18",          # Vision: memory/correctness not validated
+  "pytorch_densenet121",       # Vision: memory/correctness not validated
+  "pytorch_unet2d"             # Vision: memory/correctness not validated
+)
+
 #' Validate template compatibility with the active trust profile
 #'
 #' Rejects templates whose family has NA for the given profile index.
+#' Additionally enforces per-template DP-SGD validation: only templates
+#' with verified per-sample gradient support are allowed under
+#' \code{high_sensitivity_dp}.
 #'
 #' @param template_name Character; the template name.
 #' @param profile_name Character; the active trust profile name.
 #' @return TRUE invisibly, or stops with an error.
 #' @keywords internal
 .validateTemplateProfile <- function(template_name, profile_name) {
+  # Per-template DP-SGD restriction
+  if (profile_name == "high_sensitivity_dp") {
+    if (!template_name %in% .DP_SGD_VALIDATED_TEMPLATES) {
+      reason <- if (template_name %in% .DP_SGD_PENDING_VALIDATION) {
+        paste0("This template's loss function has not been validated for ",
+               "Opacus per-sample gradients (inter-sample dependencies or ",
+               "large model). Use 'clinical_update_noise' profile instead.")
+      } else {
+        "This template is not validated for patient-level DP-SGD."
+      }
+      stop("Template '", template_name, "' cannot be used with ",
+           "'high_sensitivity_dp' profile. ", reason, call. = FALSE)
+    }
+  }
+
   family <- .TEMPLATE_FAMILIES[[template_name]]
   if (is.null(family)) {
-    # Unknown template -- block DP profiles for safety
     if (profile_name %in% c("clinical_update_noise", "high_sensitivity_dp")) {
       stop("Template '", template_name, "' has no registered family. ",
            "Cannot use with '", profile_name, "' profile (requires verified ",
@@ -548,7 +592,7 @@
                           "pytorch_logreg", "pytorch_linear_regression",
                           "pytorch_coxph", "pytorch_multiclass",
                           "pytorch_poisson", "pytorch_multilabel",
-                          "pytorch_aft", "pytorch_competing_risks",
+                          "pytorch_lognormal_aft", "pytorch_cause_specific_cox",
                           "xgboost_tabular", "pytorch_resnet18",
                           "pytorch_densenet121", "pytorch_unet2d",
                           "pytorch_tcn", "pytorch_lstm",

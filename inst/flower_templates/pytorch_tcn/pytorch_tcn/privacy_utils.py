@@ -140,3 +140,42 @@ def make_private_opacus(model, optimizer, trainloader, clipping_norm,
     )
 
     return model, optimizer, trainloader, privacy_engine
+
+
+# --- FedBN helpers ---
+
+def is_bn_key(key):
+    """Check if a state_dict key belongs to a BatchNorm layer."""
+    bn_indicators = (".bn", "batch_norm", ".norm", "running_mean",
+                     "running_var", "num_batches_tracked")
+    key_lower = key.lower()
+    return any(ind in key_lower for ind in bn_indicators)
+
+
+def get_parameters_fedbn(model, exclude_bn=False):
+    """Extract model parameters, optionally excluding BatchNorm."""
+    import numpy as np
+    module = getattr(model, '_module', model)
+    sd = module.state_dict()
+    if not exclude_bn:
+        return [val.cpu().numpy() for val in sd.values()]
+    return [val.cpu().numpy() for key, val in sd.items() if not is_bn_key(key)]
+
+
+def set_parameters_fedbn(model, parameters, exclude_bn=False):
+    """Set model parameters, optionally skipping BatchNorm (keeping local)."""
+    import torch
+    from collections import OrderedDict
+    module = getattr(model, '_module', model)
+    sd = module.state_dict()
+    if not exclude_bn:
+        new_sd = OrderedDict()
+        for key, val in zip(sd.keys(), parameters):
+            new_sd[key] = torch.tensor(val)
+        module.load_state_dict(new_sd, strict=True)
+    else:
+        non_bn_keys = [k for k in sd.keys() if not is_bn_key(k)]
+        new_sd = OrderedDict(sd)  # start with current (preserves BN)
+        for key, val in zip(non_bn_keys, parameters):
+            new_sd[key] = torch.tensor(val)
+        module.load_state_dict(new_sd, strict=True)
