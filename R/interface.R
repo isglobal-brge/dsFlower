@@ -360,6 +360,31 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       run_config[["evaluation_only"]] <- TRUE
     }
 
+    # Inject validated mask paths from dsRadiomics (segmentation tasks)
+    seg_generation_id <- run_config[["segmentation_generation_id"]] %||% NULL
+    if (!is.null(seg_generation_id) && requireNamespace("dsRadiomics", quietly = TRUE)) {
+      mask_paths <- dsRadiomics::radiomicsGetMaskPaths(seg_generation_id)
+      if (length(mask_paths) > 0) {
+        # Create a mask root directory with symlinks to actual artifacts
+        mask_root <- file.path(staging_dir, "masks")
+        dir.create(mask_root, showWarnings = FALSE)
+        for (sid in names(mask_paths)) {
+          src <- mask_paths[[sid]]
+          dst <- file.path(mask_root, basename(src))
+          if (file.exists(src) && !file.exists(dst)) file.symlink(src, dst)
+        }
+        # Update manifest with masks asset
+        staged_manifest$assets$masks <- list(
+          type = "image_root",
+          root = normalizePath(mask_root),
+          path_col = "mask_path"
+        )
+        staged_manifest$segmentation_generation_id <- seg_generation_id
+        jsonlite::write_json(staged_manifest, manifest_path,
+                             auto_unbox = TRUE, pretty = TRUE, null = "null")
+      }
+    }
+
     # Resolve runtime descriptor: template -> framework -> venv -> absolute paths
     runtime_desc <- NULL
     if (!is.null(template_name)) {
