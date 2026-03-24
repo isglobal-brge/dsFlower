@@ -176,14 +176,13 @@
   # Clean orphaned SuperNodes from crashed sessions before checking limits
   .cleanup_orphaned_supernodes()
 
-  # Acquire exclusive lock for atomic count-check + spawn + PID-write
-  # This prevents TOCTTOU races between concurrent Rserve sessions.
-  lock_acquired <- .acquire_spawn_lock()
-  if (!lock_acquired) {
-    stop("Could not acquire SuperNode spawn lock. Another session may be ",
-         "spawning. Retry in a few seconds.", call. = FALSE)
+  # Try exclusive lock for atomic count-check + spawn + PID-write.
+  # If lock fails (permissions, tmpdir issues), proceed without lock.
+  lock_acquired <- tryCatch(.acquire_spawn_lock(timeout_secs = 10),
+                             error = function(e) FALSE)
+  if (lock_acquired) {
+    on.exit(.release_spawn_lock(), add = TRUE)
   }
-  on.exit(.release_spawn_lock(), add = TRUE)
 
   # Check concurrent limit -- server-global via PID files, not just per-session
   global_alive <- .count_global_supernodes()

@@ -498,7 +498,27 @@
     asset_type <- asset$type %||% "unknown"
 
     if (asset_type %in% dir_asset_types) {
-      root <- asset$root
+      root <- asset$root %||% asset$uri
+      s3_uri <- asset$uri
+
+      # S3 asset: download all files to local staging
+      if (!is.null(s3_uri) && grepl("^s3://", s3_uri) &&
+          !is.null(desc$backend)) {
+        local_root <- file.path(staging_dir, asset_name)
+        dir.create(local_root, showWarnings = FALSE)
+        message("  Downloading ", asset_name, " from S3...")
+        files <- dsImaging::backend_list(desc$backend, s3_uri)
+        for (f in files) {
+          fname <- basename(f)
+          local_path <- file.path(local_root, fname)
+          if (!file.exists(local_path)) {
+            dsImaging::backend_get_file(desc$backend, f, local_path)
+          }
+        }
+        root <- local_root
+        message("  Downloaded ", length(files), " files to staging")
+      }
+
       if (is.null(root) || !dir.exists(root)) {
         stop("Asset '", asset_name, "' root directory does not exist: ",
              root %||% "(NULL)", call. = FALSE)
