@@ -4,7 +4,7 @@
 \alias{.assertMinSamples}
 \title{Assert minimum training samples}
 \usage{
-.assertMinSamples(n_samples)
+.assertMinSamples(n_samples, min_n = NULL)
 }
 \arguments{
 \item{n_samples}{Numeric; number of training samples}

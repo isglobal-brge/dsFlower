@@ -10,8 +10,9 @@
 Integer; an available port number.
 }
 \description{
-Selects a random port from the configured range, checking that it is
-not already in use by another registered SuperNode. Falls back to
-retries (up to 20) if the port is taken.
+Selects a random port from the configured range, checking both the
+in-process registry AND OS-level port availability (via serverSocket).
+This prevents collisions between concurrent Rserve sessions on the
+same Rock server.
 }
 \keyword{internal}

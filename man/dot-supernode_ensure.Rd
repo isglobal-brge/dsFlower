@@ -8,7 +8,8 @@
   superlink_address,
   manifest_dir,
   python_path = "python3",
-  ca_cert_path = NULL
+  ca_cert_path = NULL,
+  template_name = NULL
 )
 }
 \arguments{
