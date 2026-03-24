@@ -337,12 +337,18 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     # DP enforcement
     requested_mode <- run_config[["privacy-mode"]] %||% "clinical_default"
     if (trust$dp_required &&
-        !requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
+        !requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
       stop("Trust profile '", trust$name, "' requires differential privacy. ",
-           "Set privacy mode to 'clinical_dp' or 'high_sensitivity_dp'.",
+           "Set privacy mode to 'clinical_update_noise' or 'high_sensitivity_dp'.",
            call. = FALSE)
     }
-    if (requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
+    if (requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
+      # Validate template against the REQUESTED DP profile too
+      # (server profile might be less strict than what the client requested)
+      if (!is.null(template_name) &&
+          requested_mode == "high_sensitivity_dp") {
+        .validateTemplateProfile(template_name, "high_sensitivity_dp")
+      }
       dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
       dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
       dataset_key <- paste0("descriptor:", desc$dataset_id, ":", target_column)
@@ -433,14 +439,18 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   # Enforce DP requirement from trust profile
   requested_mode <- run_config[["privacy-mode"]] %||% "clinical_default"
   if (trust$dp_required &&
-      !requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
+      !requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
     stop("Trust profile '", trust$name, "' requires differential privacy. ",
-         "Set privacy mode to 'clinical_dp' or 'high_sensitivity_dp'.",
+         "Set privacy mode to 'clinical_update_noise' or 'high_sensitivity_dp'.",
          call. = FALSE)
   }
 
   # Check privacy budget before staging when DP is required
-  if (requested_mode %in% c("clinical_dp", "high_sensitivity_dp", "dp")) {
+  if (requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
+    if (!is.null(template_name) &&
+        requested_mode == "high_sensitivity_dp") {
+      .validateTemplateProfile(template_name, "high_sensitivity_dp")
+    }
     dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
     dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
     dataset_key <- paste0(handle$source, ":", target_column)
