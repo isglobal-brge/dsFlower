@@ -487,6 +487,28 @@
          call. = FALSE)
   }
 
+  # Join label set if specified
+  label_set_name <- extra_config[["label_set"]] %||% NULL
+  if (!is.null(label_set_name) && !is.null(desc$manifest$labels) &&
+      !is.null(desc$backend)) {
+    label_uri <- dsImaging::.get_label_uri(desc$manifest, label_set_name)
+    if (is.null(label_uri))
+      stop("Label set '", label_set_name, "' not found in manifest.", call. = FALSE)
+
+    label_file <- file.path(staging_dir, "labels.parquet")
+    dsImaging::backend_get_file(desc$backend, label_uri, label_file)
+
+    if (requireNamespace("arrow", quietly = TRUE)) {
+      samples_df <- arrow::read_parquet(staged_samples)
+      labels_df <- arrow::read_parquet(label_file)
+      merged <- merge(samples_df, labels_df, by = "sample_id", all.x = TRUE)
+      arrow::write_parquet(merged, staged_samples)
+      message("  Joined label set '", label_set_name, "' (",
+              ncol(labels_df) - 1, " label columns)")
+    }
+    unlink(label_file)
+  }
+
   # Validate and collect asset roots
   dir_asset_types <- c("image_root", "wsi_root", "dicom_series_root",
                         "rt_struct_root")
