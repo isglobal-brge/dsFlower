@@ -164,20 +164,9 @@
 #' @return A Flower handle object (assigned server-side).
 #' @export
 flowerInitDS <- function(data_symbol) {
-  # DataSHIELD evaluates the symbol before passing it to us.
-  # When called as flowerInitDS(D), Rock evaluates D and passes the data.frame.
-  # When called as flowerInitDS("D"), we receive a string and must resolve it.
-  obj <- data_symbol
-  if (is.character(obj) && length(obj) == 1 && nchar(obj) < 100) {
-    # Legacy: string symbol name -- resolve from .GlobalEnv
-    if (exists(obj, envir = .GlobalEnv, inherits = FALSE)) {
-      obj <- get(obj, envir = .GlobalEnv, inherits = FALSE)
-    } else {
-      stop("Symbol '", data_symbol, "' not found. ",
-           "Assign your data first with datashield.assign.table().",
-           call. = FALSE)
-    }
-  }
+  # data_symbol is a STRING (e.g. "D"), not the object itself.
+  # Pattern matches dsOMOP: get(symbol, parent.frame())
+  obj <- get(data_symbol, envir = parent.frame(), inherits = FALSE)
 
   if (is.matrix(obj)) obj <- as.data.frame(obj)
 
