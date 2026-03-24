@@ -446,16 +446,29 @@
   dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
   Sys.chmod(staging_dir, "0700")
 
-  # Stage metadata table
+  # Stage metadata table (local file, S3 URI, or in-memory table)
   n_samples <- 0L
-  if (!is.null(meta$file) && file.exists(meta$file)) {
-    # Copy or re-export metadata file
-    samples_basename <- basename(meta$file)
+  meta_file <- meta$file
+  meta_uri <- meta$uri
+
+  # If local file doesn't exist but S3 URI is available, download via backend
+  if ((is.null(meta_file) || !file.exists(meta_file %||% "")) &&
+      !is.null(meta_uri) && grepl("^s3://", meta_uri) &&
+      !is.null(desc$backend)) {
+    ext <- if (grepl("\\.parquet$", meta_uri)) ".parquet" else ".csv"
+    meta_file <- file.path(staging_dir, paste0("samples", ext))
+    dsImaging::backend_get_file(desc$backend, meta_uri, meta_file)
+  }
+
+  if (!is.null(meta_file) && file.exists(meta_file)) {
+    samples_basename <- basename(meta_file)
     staged_samples <- file.path(staging_dir, samples_basename)
-    file.copy(meta$file, staged_samples)
+    if (!identical(normalizePath(meta_file, mustWork = FALSE),
+                   normalizePath(staged_samples, mustWork = FALSE))) {
+      file.copy(meta_file, staged_samples)
+    }
     Sys.chmod(staged_samples, "0600")
 
-    # Count rows
     if (grepl("\\.parquet$", samples_basename, ignore.case = TRUE)) {
       if (requireNamespace("arrow", quietly = TRUE)) {
         n_samples <- nrow(arrow::read_parquet(staged_samples))
@@ -470,7 +483,7 @@
     Sys.chmod(staged_samples, "0600")
     n_samples <- nrow(desc$table_data)
   } else {
-    stop("Image bundle descriptor requires metadata$file or table_data.",
+    stop("Image bundle descriptor requires metadata (local file, S3 URI, or table_data).",
          call. = FALSE)
   }
 

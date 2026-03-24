@@ -190,10 +190,13 @@ flowerInitDS <- function(data_symbol) {
   # structurally rather than by class.
   if (is.list(obj) && !is.null(obj$descriptor)) {
     desc <- obj$descriptor
+    # Carry backend from imaging handle to descriptor (needed for S3 staging)
+    if (!is.null(obj$backend) && is.null(desc$backend)) {
+      desc$backend <- obj$backend
+    }
     if (inherits(desc, "FlowerDatasetDescriptor")) {
       return(.createHandleFromDescriptor(desc))
     }
-    # Reconstruct descriptor if class was lost during serialization
     if (is.list(desc) && !is.null(desc$dataset_id) &&
         !is.null(desc$source_kind)) {
       desc <- flower_dataset_descriptor(
@@ -204,6 +207,7 @@ flowerInitDS <- function(data_symbol) {
         manifest    = desc$manifest,
         table_data  = desc$table_data
       )
+      desc$backend <- obj$backend
       return(.createHandleFromDescriptor(desc))
     }
   }
@@ -729,6 +733,18 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
       caps$data_source <- handle$source %||% "resource"
       caps$prepared <- handle$prepared
       caps$node_ensured <- handle$node_ensured
+
+      # Detect imaging data
+      if (identical(handle$source, "descriptor") && !is.null(handle$descriptor)) {
+        sk <- handle$descriptor$source_kind
+        if (sk %in% c("image_bundle", "imaging_resource")) {
+          caps$has_imagedata <- TRUE
+          assets <- handle$descriptor$assets
+          if (!is.null(assets)) {
+            caps$image_assets <- names(assets)
+          }
+        }
+      }
     }, error = function(e) NULL)
   }
 
