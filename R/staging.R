@@ -495,11 +495,11 @@
   validated_assets <- list()
   for (asset_name in names(assets)) {
     asset <- assets[[asset_name]]
-    asset_type <- asset$type %||% "unknown"
+    asset_type <- asset$type %||% asset$kind %||% "unknown"
 
     if (asset_type %in% dir_asset_types) {
-      root <- asset$root %||% asset$uri
-      s3_uri <- asset$uri
+      root <- asset$root %||% NULL
+      s3_uri <- asset$uri %||% NULL
 
       # S3 asset: download all files to local staging
       if (!is.null(s3_uri) && grepl("^s3://", s3_uri) &&

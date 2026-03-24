@@ -50,9 +50,12 @@ class ImageDataset(Dataset):
 
         img_path = os.path.join(self.data_root, rel_path)
 
-        # DICOM single-frame support
-        if img_path.lower().endswith(".dcm"):
+        # Medical image format support
+        lower = img_path.lower()
+        if lower.endswith(".dcm"):
             image = _load_dicom_as_pil(img_path)
+        elif lower.endswith((".nii", ".nii.gz", ".nrrd")):
+            image = _load_volume_as_pil(img_path)
         else:
             image = Image.open(img_path).convert("RGB")
 
@@ -80,6 +83,34 @@ def _load_dicom_as_pil(path):
             "pydicom is required for DICOM support. "
             "Install it: pip install pydicom"
         )
+
+
+def _load_volume_as_pil(path):
+    """Load a NIfTI or NRRD volume and extract the middle axial slice as PIL RGB."""
+    if path.lower().endswith((".nii", ".nii.gz")):
+        import nibabel as nib
+        vol = nib.load(path).get_fdata()
+    elif path.lower().endswith(".nrrd"):
+        import nrrd
+        vol, _ = nrrd.read(path)
+    else:
+        raise ValueError(f"Unsupported volume format: {path}")
+
+    # Extract middle axial slice (3D -> 2D)
+    if vol.ndim == 3:
+        mid = vol.shape[2] // 2
+        arr = vol[:, :, mid]
+    elif vol.ndim == 4:
+        mid = vol.shape[2] // 2
+        arr = vol[:, :, mid, 0]
+    else:
+        arr = vol
+
+    arr = arr.astype(np.float32)
+    if arr.max() > arr.min():
+        arr = (arr - arr.min()) / (arr.max() - arr.min()) * 255.0
+    arr = arr.astype(np.uint8)
+    return Image.fromarray(arr).convert("RGB")
 
 
 class WSIDataset(Dataset):
