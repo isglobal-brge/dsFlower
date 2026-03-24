@@ -306,6 +306,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
         effective_min <- max(effective_min, template_min)
       }
       .validateTemplateProfile(template_name, trust$name)
+      .validateTemplateHyperparameters(template_name, run_config)
     }
     .assertMinSamples(n_samples, min_n = effective_min)
 
@@ -418,6 +419,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
     # Enforce template/profile compatibility
     .validateTemplateProfile(template_name, trust$name)
+    .validateTemplateHyperparameters(template_name, run_config)
   }
 
   .assertMinSamples(nrow(data), min_n = effective_min)

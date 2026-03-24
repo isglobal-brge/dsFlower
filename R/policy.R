@@ -203,6 +203,137 @@
   xgboost_tabular           = list(framework = "xgboost",       requires_secagg = FALSE)
 )
 
+# --- Hyperparameter schemas per template ---
+# Server-side validation: bounds, types, allowed values.
+# Rejects bad params before staging. Does NOT replace Python-side defaults.
+.TEMPLATE_PARAM_SCHEMA <- list(
+  # Shared bounds for all sklearn templates
+  .sklearn_common = list(
+    alpha       = list(type = "numeric", min = 1e-10, max = 100),
+    C           = list(type = "numeric", min = 1e-10, max = 1000),
+    max_iter    = list(type = "integer", min = 1,     max = 100000),
+    l1_ratio    = list(type = "numeric", min = 0,     max = 1)
+  ),
+  # Shared bounds for all pytorch templates
+  .pytorch_common = list(
+    learning_rate = list(type = "numeric", min = 1e-8,  max = 1.0),
+    batch_size    = list(type = "integer", min = 1,     max = 100000),
+    local_epochs  = list(type = "integer", min = 1,     max = 1000)
+  ),
+  # Template-specific overrides/additions
+  pytorch_mlp = list(
+    hidden_layers = list(type = "string", max_length = 100)
+  ),
+  pytorch_multiclass = list(
+    n_classes     = list(type = "integer", min = 2,   max = 10000),
+    hidden_layers = list(type = "string", max_length = 100)
+  ),
+  pytorch_multilabel = list(
+    n_labels      = list(type = "integer", min = 1,   max = 10000),
+    hidden_layers = list(type = "string", max_length = 100)
+  ),
+  pytorch_resnet18 = list(
+    n_classes     = list(type = "integer", min = 2,   max = 10000)
+  ),
+  pytorch_densenet121 = list(
+    n_classes     = list(type = "integer", min = 2,   max = 10000)
+  ),
+  pytorch_unet2d = list(
+    n_classes     = list(type = "integer", min = 1,   max = 100)
+  ),
+  pytorch_lstm = list(
+    hidden_size   = list(type = "integer", min = 1,   max = 4096),
+    num_layers    = list(type = "integer", min = 1,   max = 20)
+  ),
+  pytorch_tcn = list(
+    n_channels    = list(type = "integer", min = 1,   max = 100),
+    kernel_size   = list(type = "integer", min = 1,   max = 100),
+    n_layers      = list(type = "integer", min = 1,   max = 50)
+  ),
+  pytorch_cause_specific_cox = list(
+    n_causes      = list(type = "integer", min = 2,   max = 100)
+  ),
+  xgboost_secure_horizontal = list(
+    n_trees       = list(type = "integer", min = 1,   max = 1000),
+    max_depth     = list(type = "integer", min = 1,   max = 15),
+    n_bins        = list(type = "integer", min = 2,   max = 1024),
+    eta           = list(type = "numeric", min = 1e-6, max = 1.0),
+    reg_lambda    = list(type = "numeric", min = 0,   max = 1000)
+  ),
+  xgboost_tabular = list(
+    max_depth     = list(type = "integer", min = 1,   max = 30),
+    eta           = list(type = "numeric", min = 1e-6, max = 1.0),
+    local_rounds  = list(type = "integer", min = 1,   max = 10000)
+  )
+)
+
+#' Validate hyperparameters against template schema
+#'
+#' Checks that all hyperparameters in run_config fall within the
+#' server-defined bounds for the given template. Rejects out-of-range
+#' or wrong-type values before staging.
+#'
+#' @param template_name Character; the template name.
+#' @param run_config Named list; the run configuration.
+#' @return Invisible TRUE, or stops with a descriptive error.
+#' @keywords internal
+.validateTemplateHyperparameters <- function(template_name, run_config) {
+  # Get the framework for common bounds
+  meta <- .TEMPLATE_METADATA[[template_name]]
+  if (is.null(meta)) return(invisible(TRUE))
+
+  framework <- meta$framework
+  common_key <- if (grepl("sklearn", framework)) ".sklearn_common"
+                else if (grepl("pytorch", framework)) ".pytorch_common"
+                else NULL
+
+  # Merge common + template-specific schemas
+  schema <- list()
+  if (!is.null(common_key) && !is.null(.TEMPLATE_PARAM_SCHEMA[[common_key]]))
+    schema <- .TEMPLATE_PARAM_SCHEMA[[common_key]]
+  template_schema <- .TEMPLATE_PARAM_SCHEMA[[template_name]]
+  if (!is.null(template_schema))
+    schema <- c(schema, template_schema)
+
+  if (length(schema) == 0) return(invisible(TRUE))
+
+  # Validate each param that appears in run_config
+  for (param_name in names(schema)) {
+    spec <- schema[[param_name]]
+    val <- run_config[[param_name]]
+    if (is.null(val)) next  # not provided, use default
+
+    # Type check
+    if (identical(spec$type, "integer")) {
+      val <- suppressWarnings(as.integer(val))
+      if (is.na(val))
+        stop("Parameter '", param_name, "' must be an integer for template '",
+             template_name, "'.", call. = FALSE)
+    } else if (identical(spec$type, "numeric")) {
+      val <- suppressWarnings(as.numeric(val))
+      if (is.na(val))
+        stop("Parameter '", param_name, "' must be numeric for template '",
+             template_name, "'.", call. = FALSE)
+    } else if (identical(spec$type, "string")) {
+      val <- as.character(val)
+    }
+
+    # Range check
+    if (!is.null(spec$min) && is.numeric(val) && val < spec$min)
+      stop("Parameter '", param_name, "' = ", val, " is below minimum (",
+           spec$min, ") for template '", template_name, "'.", call. = FALSE)
+    if (!is.null(spec$max) && is.numeric(val) && val > spec$max)
+      stop("Parameter '", param_name, "' = ", val, " exceeds maximum (",
+           spec$max, ") for template '", template_name, "'.", call. = FALSE)
+
+    # String length check
+    if (!is.null(spec$max_length) && is.character(val) && nchar(val) > spec$max_length)
+      stop("Parameter '", param_name, "' string too long (max ",
+           spec$max_length, " chars).", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
 # Templates validated for patient-level DP-SGD (Opacus per-sample gradients).
 # Excluded: losses with inter-sample dependencies (Cox risk sets),
 # vision models (not yet validated with Opacus memory/correctness),
