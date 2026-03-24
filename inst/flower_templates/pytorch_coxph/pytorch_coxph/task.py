@@ -1,4 +1,4 @@
-"""Data loading for survival (Cox PH) analysis via manifest-based staging."""
+"""Data loading via manifest-based staging."""
 
 import json
 import os
@@ -7,14 +7,16 @@ import numpy as np
 import pandas as pd
 
 
+# Module-level privacy config cache
 _privacy_config = None
 
 
 def load_data(context=None):
-    """Load survival data from manifest directory.
+    """Load training data from manifest directory.
 
-    Expects target_column to be a list of two column names:
-    [time_column, event_column]. Returns (X, time, event).
+    Reads the manifest.json from either context.node_config["manifest-dir"]
+    or the DSFLOWER_MANIFEST_DIR environment variable, then loads the
+    data file specified in the manifest.
     """
     manifest = _load_manifest(context)
     manifest_dir = _get_manifest_dir(context)
@@ -31,28 +33,41 @@ def load_data(context=None):
     target_col = manifest["target_column"]
     feat_cols = manifest.get("feature_columns")
 
-    if isinstance(target_col, list) and len(target_col) == 2:
-        time_col, event_col = target_col
-    else:
-        raise ValueError(
-            "Cox PH requires target_column to be [time_col, event_col], "
-            f"got: {target_col}"
-        )
+    # Survival: target_column is a list of 2 (time_col, event_col)
+    if isinstance(target_col, list) and len(target_col) >= 2:
+        time_col, event_col = target_col[0], target_col[1]
+        drop_cols = [time_col, event_col]
+        if feat_cols:
+            X = df[feat_cols].values
+        else:
+            X = df.drop(columns=[c for c in drop_cols if c in df.columns]
+                        ).select_dtypes(include=[np.number]).values
+        time = df[time_col].values.astype(np.float32)
+        event = df[event_col].values.astype(np.float32)
+        return X.astype(np.float32), time, event
 
-    time = df[time_col].values.astype(np.float32)
-    event = df[event_col].values.astype(np.float32)
-
-    drop_cols = [time_col, event_col]
+    # Standard: single target column
+    y = df[target_col].values
     if feat_cols:
         X = df[feat_cols].values
     else:
-        X = df.drop(columns=drop_cols).values
+        X = df.drop(columns=[target_col]).values
 
-    return X.astype(np.float32), time, event
+    return X.astype(np.float32), y.astype(np.float32)
 
 
 def load_privacy_config(context=None):
-    """Load privacy configuration from manifest.json."""
+    """Load privacy configuration from manifest.json.
+
+    Privacy config is written by the server into manifest.json and is
+    tamper-proof (the server controls the staging directory). This must
+    NOT be read from pyproject.toml which is client-controlled.
+
+    Returns:
+        dict with keys: privacy_mode, allow_per_node_metrics,
+        allow_exact_num_examples, require_secure_aggregation, dp_required,
+        plus DP params (epsilon, delta, clipping_norm) when applicable.
+    """
     global _privacy_config
     if _privacy_config is not None:
         return _privacy_config
