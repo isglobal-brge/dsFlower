@@ -260,11 +260,16 @@ def server_fn(context: Context) -> ServerAppComponents:
     config = ServerConfig(num_rounds=num_rounds)
 
     if require_secagg:
-        from flwr.server.workflow import SecAggPlusWorkflow, DefaultWorkflow
-        return ServerAppComponents(
-            strategy=strategy, config=config,
-            workflow=SecAggPlusWorkflow()
-        )
+        try:
+            from flwr.server.workflow import SecAggPlusWorkflow
+            return ServerAppComponents(
+                strategy=strategy, config=config,
+                workflow=SecAggPlusWorkflow()
+            )
+        except TypeError:
+            pass  # Flower version doesn't support workflow param
+        except ImportError:
+            pass
 
     return ServerAppComponents(strategy=strategy, config=config)
 

@@ -283,25 +283,37 @@ def server_fn(context: Context) -> ServerAppComponents:
     if require_secagg:
         num_clients = int(cfg.get("strategy-min_available_clients", 2))
         if num_clients >= 3:
-            from flwr.server.workflow import SecAggPlusWorkflow, DefaultWorkflow
-            return ServerAppComponents(
-                strategy=strategy, config=config,
-                workflow=SecAggPlusWorkflow(
-                    num_shares=num_clients,
-                    reconstruction_threshold=max(1, num_clients - 1),
+            try:
+                # Flower >= 1.10: ServerAppComponents accepts workflow
+                from flwr.server.workflow import SecAggPlusWorkflow
+                return ServerAppComponents(
+                    strategy=strategy, config=config,
+                    workflow=SecAggPlusWorkflow(
+                        num_shares=num_clients,
+                        reconstruction_threshold=max(1, num_clients - 1),
+                    )
                 )
+            except TypeError:
+                # Flower < 1.10: workflow param not supported in ServerAppComponents.
+                # SecAgg protection is provided client-side via secaggplus_mod
+                # (the client checks manifest.json and loads the mod at import time).
+                import sys
+                print(
+                    "\nDSFLOWER NOTE: Server-side SecAggPlusWorkflow not supported "
+                    "in this Flower version. Client-side secaggplus_mod is active.\n",
+                    file=sys.stderr, flush=True,
+                )
+            except ImportError:
+                pass
+        else:
+            import sys
+            print(
+                "\nDSFLOWER NOTE: SecAgg+ requires 3+ clients but only "
+                f"{num_clients} configured. Running without SecAgg+.\n"
+                "Privacy of individual updates is protected by DP-SGD noise "
+                "when secure_dp profile is active.\n",
+                file=sys.stderr, flush=True,
             )
-        # SecAgg+ requires 3+ clients. With fewer, fall back to standard
-        # aggregation. Privacy is maintained by DP-SGD (Opacus) when the
-        # secure_dp profile is active.
-        import sys
-        print(
-            "\nDSFLOWER NOTE: SecAgg+ requires 3+ clients but only "
-            f"{num_clients} configured. Running without SecAgg+.\n"
-            "Privacy of individual updates is protected by DP-SGD noise "
-            "when secure_dp profile is active.\n",
-            file=sys.stderr, flush=True,
-        )
 
     return ServerAppComponents(strategy=strategy, config=config)
 
