@@ -175,7 +175,7 @@ provision_framework() {
   create_venv "${name}" || { log_warn "  ${name}: venv failed."; return 0; }
 
   # shellcheck disable=SC2086
-  install_deps "${name}" "flwr>=1.13.0" "numpy>=1.21.0" "pandas>=1.3.0" ${deps} || {
+  install_deps "${name}" "flwr>=1.13.0" "numpy>=1.21.0" "pandas>=1.3.0" "pyarrow>=10.0.0" ${deps} || {
     log_warn "  ${name}: install failed."; rm -rf "${venv_path}"; return 0
   }
 
@@ -206,6 +206,13 @@ provision_framework "pytorch_vision" "torchvision" \
 
 provision_framework "xgboost" "xgboost" \
   "xgboost>=1.7.0"
+
+# Fix Python permissions (Rock runs as non-root 'rock' user)
+if [ -d "/root/.local/share/uv/python" ]; then
+  chmod -R 755 /root/.local/share/uv/python/ 2>/dev/null
+  chmod 755 /root /root/.local /root/.local/share /root/.local/share/uv 2>/dev/null
+  log_info "Python permissions fixed for rock user"
+fi
 
 echo ""
 log_info "Python environment setup complete."
