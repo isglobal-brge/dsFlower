@@ -13,7 +13,8 @@
 Integer; the bucketed count.
 }
 \description{
-Uses power-of-two bucketing: \code{2^round(log2(n))}, with a minimum
-bucket of 1 and a floor for small counts.
+Delegates to \code{dsImaging::safe_metadata_count()} for consistent
+profile-aware bucketing across all DS packages. Falls back to local
+power-of-two bucketing if dsImaging is unavailable.
 }
 \keyword{internal}
