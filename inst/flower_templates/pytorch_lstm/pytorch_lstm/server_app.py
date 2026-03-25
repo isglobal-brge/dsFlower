@@ -288,7 +288,7 @@ def server_fn(context: Context) -> ServerAppComponents:
                 strategy=strategy, config=config,
                 workflow=SecAggPlusWorkflow(
                     num_shares=num_clients,
-                    reconstruction_threshold=num_clients,
+                    reconstruction_threshold=max(1, num_clients - 1),
                 )
             )
         # SecAgg+ requires 3+ clients. With fewer, fall back to standard
