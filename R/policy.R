@@ -697,13 +697,18 @@
 
 #' Bucket a count to prevent exact sample sizes from leaking
 #'
-#' Uses power-of-two bucketing: \code{2^round(log2(n))}, with a minimum
-#' bucket of 1 and a floor for small counts.
+#' Delegates to \code{dsImaging::safe_metadata_count()} for consistent
+#' profile-aware bucketing across all DS packages. Falls back to local
+#' power-of-two bucketing if dsImaging is unavailable.
 #'
 #' @param n Integer; the exact count.
 #' @return Integer; the bucketed count.
 #' @keywords internal
 .bucket_count <- function(n) {
+  if (requireNamespace("dsImaging", quietly = TRUE)) {
+    return(dsImaging::safe_metadata_count(as.integer(n)))
+  }
+  # Fallback: local power-of-two bucketing
   n <- as.integer(n)
   if (is.na(n) || n <= 0) return(0L)
   if (n < 4) return(as.integer(n))
@@ -799,6 +804,16 @@
     unsafe_cols <- grep("path|ip|host|pid|dir", names(metrics),
                         ignore.case = TRUE, value = TRUE)
     metrics <- metrics[, !names(metrics) %in% unsafe_cols, drop = FALSE]
+    # Bucket count-bearing metrics (num_examples, num_clients)
+    if ("metric" %in% names(metrics) && "value" %in% names(metrics)) {
+      count_rows <- tolower(metrics$metric) %in% c("num_examples", "num_clients")
+      if (any(count_rows)) {
+        metrics$value[count_rows] <- vapply(
+          metrics$value[count_rows],
+          function(v) as.numeric(dsImaging::safe_metadata_count(as.integer(v))),
+          numeric(1))
+      }
+    }
     rownames(metrics) <- NULL
     return(metrics)
   }
@@ -810,6 +825,10 @@
       if (tolower(nm) %in% safe_metrics) {
         val <- metrics[[nm]]
         if (is.numeric(val)) {
+          # Bucket count-bearing metrics
+          if (tolower(nm) %in% c("num_examples", "num_clients")) {
+            val <- as.numeric(dsImaging::safe_metadata_count(as.integer(val)))
+          }
           rows[[length(rows) + 1]] <- data.frame(
             metric = nm, value = val, stringsAsFactors = FALSE
           )

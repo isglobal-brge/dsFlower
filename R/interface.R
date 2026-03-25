@@ -733,12 +733,12 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     tryCatch({
       handle <- .getHandle(handle_symbol)
       if (identical(handle$source, "table") && !is.null(handle$table_data)) {
-        caps$data_n_rows <- nrow(handle$table_data)
+        caps$data_n_rows <- dsImaging::safe_metadata_count(nrow(handle$table_data))
         caps$data_n_cols <- ncol(handle$table_data)
         caps$data_columns <- names(handle$table_data)
       } else {
         data_summary <- .getDataSummary(handle$data_path, handle$data_format)
-        caps$data_n_rows <- data_summary$n_rows
+        caps$data_n_rows <- dsImaging::safe_metadata_count(data_summary$n_rows)
         caps$data_n_cols <- data_summary$n_cols
         caps$data_columns <- data_summary$columns
       }
