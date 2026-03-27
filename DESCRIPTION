@@ -17,16 +17,18 @@ Encoding: UTF-8
 Depends:
     R (>= 4.1.0)
 Imports:
+    arrow,
     digest,
     jsonlite,
     processx,
     rappdirs,
-    utils
+    tools,
+    utils,
+    yaml
 Suggests:
-    arrow,
     resourcer,
-    yaml,
     dsImaging,
+    dsRadiomics,
     testthat (>= 3.0.0),
     withr,
     DSLite

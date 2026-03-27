@@ -226,4 +226,22 @@ for fw in sklearn pytorch pytorch_vision xgboost; do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# Ensure R dependencies are installed (Rock only)
+# ---------------------------------------------------------------------------
+
+ROCK_LIB="/var/lib/rock/R/library"
+if [ -d "${ROCK_LIB}" ]; then
+  log_info "Checking R dependencies..."
+  for pkg in arrow digest jsonlite processx rappdirs yaml; do
+    Rscript --vanilla -e "
+      if (!requireNamespace('${pkg}', quietly=TRUE, lib.loc='${ROCK_LIB}')) {
+        cat('Installing ${pkg}...\n')
+        install.packages('${pkg}', lib='${ROCK_LIB}', repos='https://cloud.r-project.org', quiet=TRUE)
+      }
+    " 2>/dev/null
+  done
+  log_info "R dependencies OK"
+fi
+
 exit 0
