@@ -9,7 +9,7 @@ attach(test_env, warn.conflicts = FALSE)
 caps <- dsFlower:::.TEMPLATE_CAPABILITIES
 expected <- c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd",
                 "pytorch_mlp", "pytorch_logreg", "pytorch_linear_regression",
-                "pytorch_coxph", "pytorch_multiclass", "xgboost_tabular",
+                "pytorch_coxph", "pytorch_multiclass", "xgboost",
                 "pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d",
                 "pytorch_tcn", "pytorch_lstm")
 for (tmpl in expected) {

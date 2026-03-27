@@ -163,8 +163,7 @@
   pytorch_resnet18           = "vision",
   pytorch_densenet121        = "vision",
   pytorch_unet2d             = "segmentation",
-  xgboost_secure_horizontal  = "xgboost_secure",
-  xgboost_tabular            = "xgboost_research"
+  xgboost                    = "xgboost_secure"
 )
 
 # Per-family minimum rows indexed by .PROFILE_ORDER.
@@ -175,8 +174,7 @@
   tabular_deep       = c(3L, 250L, 250L, 500L, 750L, 500L, 1000L),
   vision             = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
   segmentation       = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
-  xgboost_secure     = c(NA_integer_, 100L, 100L, 200L, 300L, NA_integer_, NA_integer_),
-  xgboost_research   = c(3L, 100L, NA_integer_, NA_integer_, NA_integer_, NA_integer_, NA_integer_)
+  xgboost_secure     = c(NA_integer_, 100L, 100L, 200L, 300L, NA_integer_, NA_integer_)
 )
 
 # --- Template Metadata ---
@@ -199,8 +197,7 @@
   pytorch_unet2d            = list(framework = "pytorch_vision", requires_secagg = FALSE),
   pytorch_tcn               = list(framework = "pytorch",        requires_secagg = FALSE),
   pytorch_lstm              = list(framework = "pytorch",        requires_secagg = FALSE),
-  xgboost_secure_horizontal = list(framework = "xgboost",       requires_secagg = TRUE),
-  xgboost_tabular           = list(framework = "xgboost",       requires_secagg = FALSE)
+  xgboost                   = list(framework = "xgboost",       requires_secagg = TRUE)
 )
 
 # --- Hyperparameter schemas per template ---
@@ -253,17 +250,12 @@
   pytorch_cause_specific_cox = list(
     n_causes      = list(type = "integer", min = 2,   max = 100)
   ),
-  xgboost_secure_horizontal = list(
+  xgboost = list(
     n_trees       = list(type = "integer", min = 1,   max = 1000),
     max_depth     = list(type = "integer", min = 1,   max = 15),
     n_bins        = list(type = "integer", min = 2,   max = 1024),
     eta           = list(type = "numeric", min = 1e-6, max = 1.0),
     reg_lambda    = list(type = "numeric", min = 0,   max = 1000)
-  ),
-  xgboost_tabular = list(
-    max_depth     = list(type = "integer", min = 1,   max = 30),
-    eta           = list(type = "numeric", min = 1e-6, max = 1.0),
-    local_rounds  = list(type = "integer", min = 1,   max = 10000)
   )
 )
 
@@ -737,10 +729,10 @@
                           "pytorch_coxph", "pytorch_multiclass",
                           "pytorch_poisson", "pytorch_multilabel",
                           "pytorch_lognormal_aft", "pytorch_cause_specific_cox",
-                          "xgboost_tabular", "pytorch_resnet18",
+                          "pytorch_resnet18",
                           "pytorch_densenet121", "pytorch_unet2d",
                           "pytorch_tcn", "pytorch_lstm",
-                          "xgboost_secure_horizontal"),
+                          "xgboost"),
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
     max_concurrent_runs = as.integer(.dsf_option("max_concurrent_runs", 5))
   )

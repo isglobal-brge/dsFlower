@@ -41,7 +41,7 @@ from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import Strategy
 
-logger = logging.getLogger("xgboost_secure_horizontal.server")
+logger = logging.getLogger("xgboost.server")
 
 SCALE_FACTOR = 1_000_000  # Must match client
 
@@ -427,7 +427,7 @@ class SecureXGBoostStrategy(Strategy):
         if self.evaluation_only:
             return
         model = {
-            "model_type": "xgboost_secure_horizontal",
+            "model_type": "xgboost",
             "n_trees": len(self.completed_trees),
             "max_depth": self.max_depth,
             "learning_rate": self.learning_rate,

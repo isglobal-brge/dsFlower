@@ -26,7 +26,7 @@ test_that(".flowerDisclosureSettings returns correct defaults", {
   expect_true("pytorch_linear_regression" %in% settings$allowed_templates)
   expect_true("pytorch_coxph" %in% settings$allowed_templates)
   expect_true("pytorch_multiclass" %in% settings$allowed_templates)
-  expect_true("xgboost_tabular" %in% settings$allowed_templates)
+  expect_true("xgboost" %in% settings$allowed_templates)
   expect_true("pytorch_resnet18" %in% settings$allowed_templates)
   expect_true("pytorch_densenet121" %in% settings$allowed_templates)
   expect_true("pytorch_unet2d" %in% settings$allowed_templates)
@@ -142,7 +142,7 @@ test_that(".validateTemplate allows built-in templates", {
   expect_true(dsFlower:::.validateTemplate("pytorch_linear_regression"))
   expect_true(dsFlower:::.validateTemplate("pytorch_coxph"))
   expect_true(dsFlower:::.validateTemplate("pytorch_multiclass"))
-  expect_true(dsFlower:::.validateTemplate("xgboost_tabular"))
+  expect_true(dsFlower:::.validateTemplate("xgboost"))
   expect_true(dsFlower:::.validateTemplate("pytorch_resnet18"))
   expect_true(dsFlower:::.validateTemplate("pytorch_densenet121"))
   expect_true(dsFlower:::.validateTemplate("pytorch_unet2d"))
@@ -466,9 +466,9 @@ test_that(".TEMPLATE_FAMILIES has entries for all built-in templates", {
   families <- dsFlower:::.TEMPLATE_FAMILIES
   expected <- c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd",
                 "pytorch_mlp", "pytorch_logreg", "pytorch_linear_regression",
-                "pytorch_coxph", "pytorch_multiclass", "xgboost_tabular",
+                "pytorch_coxph", "pytorch_multiclass", "xgboost",
                 "pytorch_resnet18", "pytorch_densenet121", "pytorch_unet2d",
-                "pytorch_tcn", "pytorch_lstm", "xgboost_secure_horizontal")
+                "pytorch_tcn", "pytorch_lstm", "xgboost")
   for (tmpl in expected) {
     expect_true(tmpl %in% names(families), label = paste(tmpl, "in families"))
   }
@@ -534,25 +534,25 @@ test_that(".validateTemplateProfile allows pytorch_mlp in clinical_dp", {
   expect_true(dsFlower:::.validateTemplateProfile("pytorch_mlp", "clinical_dp"))
 })
 
-test_that(".validateTemplateProfile rejects xgboost_tabular in clinical_default", {
+test_that(".validateTemplateProfile rejects xgboost in clinical_default", {
   expect_error(
-    dsFlower:::.validateTemplateProfile("xgboost_tabular", "clinical_default"),
+    dsFlower:::.validateTemplateProfile("xgboost", "clinical_default"),
     "not supported"
   )
 })
 
-test_that(".validateTemplateProfile allows xgboost_tabular in sandbox_open", {
-  expect_true(dsFlower:::.validateTemplateProfile("xgboost_tabular", "sandbox_open"))
+test_that(".validateTemplateProfile allows xgboost in sandbox_open", {
+  expect_true(dsFlower:::.validateTemplateProfile("xgboost", "sandbox_open"))
 })
 
-test_that(".validateTemplateProfile allows xgboost_secure_horizontal in clinical_default", {
-  expect_true(dsFlower:::.validateTemplateProfile("xgboost_secure_horizontal", "clinical_default"))
+test_that(".validateTemplateProfile allows xgboost in clinical_default", {
+  expect_true(dsFlower:::.validateTemplateProfile("xgboost", "clinical_default"))
 })
 
-test_that(".validateTemplateProfile rejects xgboost_secure_horizontal in sandbox_open", {
+test_that(".validateTemplateProfile rejects xgboost in sandbox_open", {
   # xgboost_secure has NA for sandbox
   expect_error(
-    dsFlower:::.validateTemplateProfile("xgboost_secure_horizontal", "sandbox_open"),
+    dsFlower:::.validateTemplateProfile("xgboost", "sandbox_open"),
     "not supported"
   )
 })
@@ -571,7 +571,7 @@ test_that(".validateTemplateProfile allows all templates in sandbox_open (except
                           "pytorch_linear_regression", "pytorch_coxph",
                           "pytorch_multiclass", "pytorch_resnet18",
                           "pytorch_densenet121", "pytorch_unet2d",
-                          "pytorch_tcn", "pytorch_lstm", "xgboost_tabular")
+                          "pytorch_tcn", "pytorch_lstm", "xgboost")
   for (tmpl in allowed_in_sandbox) {
     expect_true(dsFlower:::.validateTemplateProfile(tmpl, "sandbox_open"),
                 label = paste(tmpl, "should be allowed in sandbox_open"))
@@ -641,8 +641,8 @@ test_that(".TEMPLATE_METADATA has entries for all 15 templates", {
   }
 })
 
-test_that("xgboost_secure_horizontal requires secagg", {
-  meta <- dsFlower:::.TEMPLATE_METADATA[["xgboost_secure_horizontal"]]
+test_that("xgboost requires secagg", {
+  meta <- dsFlower:::.TEMPLATE_METADATA[["xgboost"]]
   expect_true(meta$requires_secagg)
 })
 
