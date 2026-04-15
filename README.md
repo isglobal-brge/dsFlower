@@ -1,6 +1,6 @@
 # dsFlower
 
-Federated learning for [DataSHIELD](https://www.datashield.org/) powered by [Flower](https://flower.ai/).
+Privacy-preserving federated learning for biomedical research, integrating [DataSHIELD](https://www.datashield.org/) and [Flower](https://flower.ai/).
 
 Train machine learning models across multiple hospitals without moving patient data. Each institution keeps its data behind its own DataSHIELD server. Only model weight updates travel between nodes via [Flower's](https://flower.ai/) gRPC protocol.
 
