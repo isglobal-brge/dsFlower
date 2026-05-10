@@ -24,6 +24,9 @@ same federation.}
 \item{ca_cert_pem}{Character or NULL; B64-encoded CA certificate PEM for
 TLS verification. The SuperNode uses \code{--root-certificates} to
 verify the SuperLink's identity.}
+
+\item{template_name}{Character or NULL; Flower template name used to resolve
+the server-side runtime and write code-verification artifacts.}
 }
 \value{
 Updated handle with SuperNode information.

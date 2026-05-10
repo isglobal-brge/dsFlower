@@ -217,8 +217,10 @@ flowerInitDS <- function(data_symbol) {
       grepl("^imaging\\+dataset://", obj$url %||% "")) {
     if (requireNamespace("dsImaging", quietly = TRUE)) {
       dataset_id <- sub("^imaging\\+dataset://", "", strsplit(obj$url, "\\?")[[1]][1])
-      resolved <- dsImaging::resolve_dataset(dataset_id)
-      manifest <- dsImaging::parse_manifest(resolved$manifest_uri, resolved$backend)
+      resolve_dataset <- utils::getFromNamespace("resolve_dataset", "dsImaging")
+      parse_manifest <- utils::getFromNamespace("parse_manifest", "dsImaging")
+      resolved <- resolve_dataset(dataset_id)
+      manifest <- parse_manifest(resolved$manifest_uri, resolved$backend)
       desc <- dsImaging::imaging_dataset_descriptor(manifest)
       return(.createHandleFromDescriptor(desc))
     }
@@ -243,6 +245,19 @@ flowerInitDS <- function(data_symbol) {
        "Assign your data first with datashield.assign.table(), ",
        "imagingInitDS(), or similar.",
        call. = FALSE)
+}
+
+.addTrustConfigToRunConfig <- function(run_config, trust) {
+  run_config[["privacy_profile"]]            <- trust$name
+  run_config[["allow_per_node_metrics"]]     <- trust$allow_per_node_metrics
+  run_config[["allow_exact_num_examples"]]   <- trust$allow_exact_num_examples
+  run_config[["require_secure_aggregation"]] <- trust$require_secure_aggregation
+  run_config[["dp_required"]]                <- trust$dp_required
+  run_config[["min_clients_per_round"]]      <- trust$min_clients_per_round
+  run_config[["fixed_client_sampling"]]      <- trust$fixed_client_sampling
+  run_config[["dp_scope"]]                   <- trust$dp_scope
+  run_config[["evaluation_only"]]            <- trust$evaluation_only
+  run_config
 }
 
 #' Prepare a Training Run
@@ -287,6 +302,11 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     # which handles in_memory_df, staged_parquet, and image_bundle
     desc <- handle$descriptor
     run_token <- .generate_run_token()
+
+    # Enforce trust profile min_train_rows
+    trust <- .flowerTrustProfile()
+    run_config <- .addTrustConfigToRunConfig(run_config, trust)
+
     staging_dir <- .stageFromDescriptor(desc, run_token, target_column,
                                          feature_columns, run_config)
 
@@ -295,8 +315,6 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     staged_manifest <- jsonlite::fromJSON(manifest_path, simplifyVector = TRUE)
     n_samples <- staged_manifest$n_samples
 
-    # Enforce trust profile min_train_rows
-    trust <- .flowerTrustProfile()
     effective_min <- max(trust$min_train_rows,
                          .flowerDisclosureSettings()$nfilter_subset)
     template_name <- run_config[["template_name"]] %||% NULL
@@ -464,16 +482,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     run_config[["evaluation_only"]] <- TRUE
   }
 
-  # Write privacy config into run_config for manifest
-  run_config[["privacy_profile"]]            <- trust$name
-  run_config[["allow_per_node_metrics"]]     <- trust$allow_per_node_metrics
-  run_config[["allow_exact_num_examples"]]   <- trust$allow_exact_num_examples
-  run_config[["require_secure_aggregation"]] <- trust$require_secure_aggregation
-  run_config[["dp_required"]]                <- trust$dp_required
-  run_config[["min_clients_per_round"]]      <- trust$min_clients_per_round
-  run_config[["fixed_client_sampling"]]      <- trust$fixed_client_sampling
-  run_config[["dp_scope"]]                   <- trust$dp_scope
-  run_config[["evaluation_only"]]            <- trust$evaluation_only
+  # Write privacy config into run_config for manifest.
+  run_config <- .addTrustConfigToRunConfig(run_config, trust)
 
   # Stage data with manifest
   run_token <- .generate_run_token()
@@ -526,6 +536,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #' @param ca_cert_pem Character or NULL; B64-encoded CA certificate PEM for
 #'   TLS verification. The SuperNode uses \code{--root-certificates} to
 #'   verify the SuperLink's identity.
+#' @param template_name Character or NULL; Flower template name used to resolve
+#'   the server-side runtime and write code-verification artifacts.
 #' @return Updated handle with SuperNode information.
 #' @export
 flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,

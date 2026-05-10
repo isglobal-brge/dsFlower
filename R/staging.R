@@ -92,6 +92,64 @@
   invisible(TRUE)
 }
 
+.trainingColumns <- function(data, target_column, feature_columns = NULL) {
+  target_column <- as.character(unlist(target_column, use.names = FALSE))
+  feature_columns <- as.character(unlist(feature_columns, use.names = FALSE))
+  feature_columns <- feature_columns[nzchar(feature_columns)]
+
+  if (length(feature_columns) > 0L) {
+    unique(c(target_column, feature_columns))
+  } else {
+    names(data)
+  }
+}
+
+.prepareTrainingFrame <- function(data, target_column, feature_columns = NULL,
+                                  drop_missing = TRUE,
+                                  select_columns = TRUE) {
+  .validateDataSchema(data, target_column, feature_columns)
+
+  cols <- .trainingColumns(data, target_column, feature_columns)
+  cols <- intersect(cols, names(data))
+  input_n <- nrow(data)
+
+  if (isTRUE(drop_missing) && length(cols) > 0L && nrow(data) > 0L) {
+    ok <- stats::complete.cases(data[, cols, drop = FALSE])
+    for (nm in cols) {
+      x <- data[[nm]]
+      if (is.numeric(x) || is.integer(x)) {
+        ok <- ok & is.finite(x)
+      }
+    }
+    data <- data[ok, , drop = FALSE]
+  }
+
+  if (isTRUE(select_columns) &&
+      !is.null(feature_columns) && length(feature_columns) > 0L) {
+    data <- data[, cols, drop = FALSE]
+  }
+
+  if (nrow(data) == 0L) {
+    stop("Training data has no complete rows after applying target and ",
+         "feature-column missing-value filters.", call. = FALSE)
+  }
+
+  list(
+    data = data,
+    n_input_samples = input_n,
+    n_samples = nrow(data),
+    dropped_missing = input_n - nrow(data)
+  )
+}
+
+.ensureStagingDir <- function(run_token) {
+  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
+  staging_dir <- file.path(base_dir, "dsflower", run_token)
+  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
+  Sys.chmod(staging_dir, "0700")
+  staging_dir
+}
+
 #' Stage data for a training run
 #'
 #' Creates a run-specific directory under \code{{tempdir()}/dsflower/{run_token}/},
@@ -106,13 +164,18 @@
 #' @keywords internal
 .stageData <- function(data, run_token, target_column,
                        feature_columns = NULL, extra_config = list()) {
-  # Prefer tmpfs (/dev/shm) when available for ephemeral staging
-  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
-  staging_dir <- file.path(base_dir, "dsflower", run_token)
-  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
+  drop_missing <- !identical(extra_config[["drop_missing"]], FALSE)
+  prepared <- .prepareTrainingFrame(
+    data,
+    target_column = target_column,
+    feature_columns = feature_columns,
+    drop_missing = drop_missing,
+    select_columns = TRUE
+  )
+  data <- prepared$data
 
-  # Strict directory permissions (owner-only)
-  Sys.chmod(staging_dir, "0700")
+  # Prefer tmpfs (/dev/shm) when available for ephemeral staging
+  staging_dir <- .ensureStagingDir(run_token)
 
   # Write training data -- prefer Parquet when arrow is available
   use_parquet <- requireNamespace("arrow", quietly = TRUE)
@@ -134,7 +197,9 @@
     run_token       = run_token,
     data_file       = data_file,
     data_format     = data_format,
-    n_samples       = nrow(data),
+    n_samples       = prepared$n_samples,
+    n_input_samples = prepared$n_input_samples,
+    dropped_missing = prepared$dropped_missing,
     target_column   = target_column,
     feature_columns = feature_columns,
     staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
@@ -327,7 +392,8 @@
     if (!requireNamespace("dsImaging", quietly = TRUE))
       stop("dsImaging required for S3 asset staging.", call. = FALSE)
     # Build backend and download
-    resolved <- dsImaging::resolve_dataset(asset_info$dataset_id)
+    resolve_dataset <- utils::getFromNamespace("resolve_dataset", "dsImaging")
+    resolved <- resolve_dataset(asset_info$dataset_id)
     dsImaging::backend_get_file(resolved$backend, asset_info$uri, local_parquet)
   } else {
     # Local file: copy or symlink to staging dir
@@ -385,9 +451,11 @@
   # Determine columns to select
   # Ensure character vector (JSON deserialization may produce a list)
   if (is.list(feature_columns)) feature_columns <- unlist(feature_columns)
-  cols_needed <- target_column
-  if (!is.null(feature_columns) && length(feature_columns) > 0) {
-    cols_needed <- unique(c(cols_needed, feature_columns))
+  feature_columns <- as.character(feature_columns)
+  feature_columns <- feature_columns[nzchar(feature_columns)]
+  cols_needed <- NULL
+  if (!is.null(feature_columns) && length(feature_columns) > 0L) {
+    cols_needed <- unique(c(target_column, feature_columns))
   }
 
   # Create staging directory
@@ -396,20 +464,31 @@
   dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
   Sys.chmod(staging_dir, "0700")
 
-  # Read with column selection and write to staging
-  tbl <- arrow::read_parquet(src_path, col_select = cols_needed)
+  # Read with column selection, drop incomplete rows, and write to staging.
+  tbl <- if (is.null(cols_needed)) {
+    arrow::read_parquet(src_path)
+  } else {
+    arrow::read_parquet(src_path, col_select = cols_needed)
+  }
+  prepared <- .prepareTrainingFrame(
+    as.data.frame(tbl),
+    target_column = target_column,
+    feature_columns = feature_columns,
+    drop_missing = !identical(extra_config[["drop_missing"]], FALSE),
+    select_columns = TRUE
+  )
   data_file <- "train.parquet"
-  arrow::write_parquet(tbl, file.path(staging_dir, data_file))
+  arrow::write_parquet(prepared$data, file.path(staging_dir, data_file))
   Sys.chmod(file.path(staging_dir, data_file), "0600")
-
-  n_samples <- nrow(tbl)
 
   # Build manifest
   manifest <- list(
     run_token       = run_token,
     data_file       = data_file,
     data_format     = "parquet",
-    n_samples       = n_samples,
+    n_samples       = prepared$n_samples,
+    n_input_samples = prepared$n_input_samples,
+    dropped_missing = prepared$dropped_missing,
     target_column   = target_column,
     feature_columns = feature_columns,
     dataset_id      = desc$dataset_id,
@@ -491,7 +570,8 @@
   label_set_name <- extra_config[["label_set"]] %||% NULL
   if (!is.null(label_set_name) && !is.null(desc$manifest$labels) &&
       !is.null(desc$backend)) {
-    label_uri <- dsImaging::.get_label_uri(desc$manifest, label_set_name)
+    get_label_uri <- utils::getFromNamespace(".get_label_uri", "dsImaging")
+    label_uri <- get_label_uri(desc$manifest, label_set_name)
     if (is.null(label_uri))
       stop("Label set '", label_set_name, "' not found in manifest.", call. = FALSE)
 

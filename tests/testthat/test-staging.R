@@ -127,6 +127,42 @@ test_that(".stageData writes privacy settings from extra_config", {
   expect_equal(manifest$privacy_profile, "clinical_default")
 })
 
+test_that(".stageData drops incomplete target/feature rows before manifesting", {
+  data <- data.frame(
+    f1 = c(1, 2, NA, 4, 5, 6),
+    f2 = c(1, 2, 3, Inf, 5, 6),
+    unused = c(NA, NA, NA, NA, NA, NA),
+    target = c(0, 1, 0, 1, NA, 0)
+  )
+  token <- "run_test_staging_missing"
+
+  staging_dir <- dsFlower:::.stageData(
+    data, token, "target", c("f1", "f2")
+  )
+  on.exit(unlink(staging_dir, recursive = TRUE))
+
+  manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  expect_equal(manifest$n_input_samples, 6)
+  expect_equal(manifest$n_samples, 3)
+  expect_equal(manifest$dropped_missing, 3)
+})
+
+test_that(".stageData can preserve incomplete rows when explicitly requested", {
+  data <- data.frame(f1 = c(1, NA, 3), target = c(0, 1, 0))
+  token <- "run_test_staging_keep_missing"
+
+  staging_dir <- dsFlower:::.stageData(
+    data, token, "target", c("f1"),
+    extra_config = list(drop_missing = FALSE)
+  )
+  on.exit(unlink(staging_dir, recursive = TRUE))
+
+  manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  expect_equal(manifest$n_input_samples, 3)
+  expect_equal(manifest$n_samples, 3)
+  expect_equal(manifest$dropped_missing, 0)
+})
+
 test_that(".cleanupStaging removes the directory", {
   token <- "run_test_cleanup_001"
   staging_dir <- file.path(tempdir(), "dsflower", token)

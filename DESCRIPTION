@@ -22,8 +22,7 @@ Imports:
     processx,
     rappdirs,
     tools,
-    utils,
-    yaml
+    utils
 Suggests:
     resourcer,
     dsImaging,

@@ -95,7 +95,7 @@ as_flower_dataset.ResourceClient <- function(x, ...) {
          call. = FALSE)
   }
 
-  df <- resourcer::as.data.frame(x)
+  df <- as.data.frame(x)
   as_flower_dataset.data.frame(df, ...)
 }
 

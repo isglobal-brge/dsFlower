@@ -336,6 +336,15 @@
 #' @return Invisible TRUE.
 #' @keywords internal
 .supernode_stop <- function(manifest_dir) {
+  stop_pid <- function(pid) {
+    tryCatch({
+      tools::pskill(pid, signal = 15L)
+      Sys.sleep(1)
+      if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
+    }, error = function(e) NULL)
+    .remove_supernode_pid(pid)
+  }
+
   entry <- .supernode_lookup(manifest_dir)
   if (is.null(entry)) {
     # Cleanup can run in a different Rserve process than the one that spawned
@@ -346,12 +355,7 @@
       matches <- procs[!is.na(procs$manifest_dir) &
                          procs$manifest_dir == manifest_dir, , drop = FALSE]
       for (pid in matches$pid) {
-        tryCatch({
-          tools::pskill(pid, signal = 15L)
-          Sys.sleep(1)
-          if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
-          .remove_supernode_pid(pid)
-        }, error = function(e) NULL)
+        stop_pid(pid)
       }
     }
     return(invisible(TRUE))
@@ -359,16 +363,31 @@
 
   proc <- entry$process
   pid <- entry$pid
-  if (proc$is_alive()) {
-    proc$signal(15L)  # SIGTERM
-    proc$wait(timeout = 5000)
+  tryCatch({
     if (proc$is_alive()) {
-      proc$kill()
+      proc$signal(15L)  # SIGTERM
+      proc$wait(timeout = 5000)
+      if (proc$is_alive()) {
+        proc$kill()
+      }
     }
-  }
+  }, error = function(e) NULL)
+
+  if (.pid_is_alive(pid)) stop_pid(pid)
 
   # Remove PID file
   .remove_supernode_pid(pid)
+
+  # A stale SuperNode may be visible by manifest_dir even if the processx
+  # object did not survive across Rserve workers. Clean those matches too.
+  procs <- .list_supernode_processes()
+  if (nrow(procs) > 0L) {
+    matches <- procs[!is.na(procs$manifest_dir) &
+                       procs$manifest_dir == manifest_dir, , drop = FALSE]
+    for (match_pid in matches$pid) {
+      if (match_pid != pid) stop_pid(match_pid)
+    }
+  }
 
   key <- manifest_dir
   if (exists(key, envir = .supernode_registry)) {
@@ -570,7 +589,7 @@
       con <- file(cmd_path, open = "rb")
       tryCatch(readBin(con, what = "raw", n = 65536L),
                finally = close(con))
-    }, error = function(e) raw())
+    }, error = function(e) raw(), warning = function(w) raw())
     if (length(raw) == 0L) next
     raw[raw == as.raw(0)] <- charToRaw(" ")
     cmd <- rawToChar(raw)
