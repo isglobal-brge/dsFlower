@@ -14,5 +14,5 @@ Updated handle with reset state.
 }
 \description{
 DataSHIELD ASSIGN method. Removes staging directory and resets
-handle state. Does NOT stop the SuperNode (it's a singleton).
+handle state. Stops the per-run SuperNode before deleting staging.
 }

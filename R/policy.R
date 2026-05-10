@@ -37,8 +37,8 @@
 #
 # 3. Secure aggregation (SecAgg+) protects individual weight updates from
 #    the SuperLink, but the final aggregated model is still visible to the
-#    researcher. SecAgg+ is implemented both server-side (SecAggPlusWorkflow)
-#    and client-side (secaggplus_mod) in all templates.
+#    researcher. Profiles/templates that require SecAgg must have both
+#    server-side SecAggPlusWorkflow support and client-side secaggplus_mod.
 
 .TRUST_PROFILES <- list(
   sandbox_open = list(
@@ -447,6 +447,9 @@
 .enforce_absolute_floors <- function(profile) {
   profile$min_train_rows <- max(profile$min_train_rows, 3)
   profile$min_clients_per_round <- max(profile$min_clients_per_round, 1L)
+  if (isTRUE(profile$require_secure_aggregation)) {
+    profile$min_clients_per_round <- max(profile$min_clients_per_round, 3L)
+  }
   profile
 }
 

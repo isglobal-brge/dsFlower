@@ -11,6 +11,7 @@
 # dependencies required beyond a C library and curl/wget.
 
 VENV_ROOT="${DSFLOWER_VENV_ROOT:-/var/lib/dsflower/venvs}"
+DSFLOWER_HOME="$(dirname "${VENV_ROOT}")"
 LOG_PREFIX="[dsFlower configure]"
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,11 @@ mkdir -p "${VENV_ROOT}" 2>/dev/null || {
   log_warn "Cannot create ${VENV_ROOT}. Skipping."
   exit 0
 }
+mkdir -p "${DSFLOWER_HOME}/supernode_pids" 2>/dev/null || true
+if id rock >/dev/null 2>&1; then
+  chown rock:rock "${DSFLOWER_HOME}/supernode_pids" 2>/dev/null || true
+fi
+chmod 775 "${DSFLOWER_HOME}/supernode_pids" 2>/dev/null || true
 log_info "Venv root: ${VENV_ROOT}"
 
 # ---------------------------------------------------------------------------

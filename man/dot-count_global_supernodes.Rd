@@ -11,6 +11,8 @@ Integer; number of alive SuperNodes across all sessions.
 }
 \description{
 Reads the shared PID directory, checks each PID is still alive,
-and removes stale entries (orphaned processes from crashed sessions).
+removes stale entries, and includes untracked live SuperNode processes
+discovered through /proc on Linux. Counting untracked processes prevents
+overcommitting a host after a previous Rserve session crashed before cleanup.
 }
 \keyword{internal}

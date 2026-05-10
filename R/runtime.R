@@ -337,7 +337,25 @@
 #' @keywords internal
 .supernode_stop <- function(manifest_dir) {
   entry <- .supernode_lookup(manifest_dir)
-  if (is.null(entry)) return(invisible(TRUE))
+  if (is.null(entry)) {
+    # Cleanup can run in a different Rserve process than the one that spawned
+    # the SuperNode. In that case the processx object is not in this registry,
+    # so stop by matching the manifest_dir recorded in the SuperNode cmdline.
+    procs <- .list_supernode_processes()
+    if (nrow(procs) > 0L) {
+      matches <- procs[!is.na(procs$manifest_dir) &
+                         procs$manifest_dir == manifest_dir, , drop = FALSE]
+      for (pid in matches$pid) {
+        tryCatch({
+          tools::pskill(pid, signal = 15L)
+          Sys.sleep(1)
+          if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
+          .remove_supernode_pid(pid)
+        }, error = function(e) NULL)
+      }
+    }
+    return(invisible(TRUE))
+  }
 
   proc <- entry$process
   pid <- entry$pid
@@ -435,7 +453,7 @@
     )
   }
   # Fallback to temp if server dir not writable
-  if (!dir.exists(pid_dir)) {
+  if (!dir.exists(pid_dir) || file.access(pid_dir, 2) != 0L) {
     pid_dir <- file.path(tempdir(), "dsflower_supernode_pids")
     dir.create(pid_dir, recursive = TRUE, showWarnings = FALSE)
   }
@@ -467,19 +485,34 @@
   }, error = function(e) NULL)
 }
 
+#' Read tracked SuperNode PIDs from the shared PID directory
+#' @keywords internal
+.tracked_supernode_pids <- function() {
+  pid_dir <- .supernode_pid_dir()
+  pid_files <- list.files(pid_dir, pattern = "\\.pid$", full.names = TRUE)
+  if (length(pid_files) == 0L) return(integer())
+  pids <- vapply(pid_files, function(pf) {
+    lines <- tryCatch(readLines(pf, warn = FALSE), error = function(e) NULL)
+    if (is.null(lines) || length(lines) < 1L) return(NA_integer_)
+    suppressWarnings(as.integer(lines[1]))
+  }, integer(1))
+  stats::na.omit(pids)
+}
+
 #' Count server-global alive SuperNodes via PID files
 #'
 #' Reads the shared PID directory, checks each PID is still alive,
-#' and removes stale entries (orphaned processes from crashed sessions).
+#' removes stale entries, and includes untracked live SuperNode processes
+#' discovered through /proc on Linux. Counting untracked processes prevents
+#' overcommitting a host after a previous Rserve session crashed before cleanup.
 #'
 #' @return Integer; number of alive SuperNodes across all sessions.
 #' @keywords internal
 .count_global_supernodes <- function() {
   pid_dir <- .supernode_pid_dir()
   pid_files <- list.files(pid_dir, pattern = "\\.pid$", full.names = TRUE)
-  if (length(pid_files) == 0L) return(0L)
-
   alive <- 0L
+  tracked <- integer()
   for (pf in pid_files) {
     lines <- tryCatch(readLines(pf, warn = FALSE), error = function(e) NULL)
     if (is.null(lines) || length(lines) < 1L) {
@@ -492,10 +525,16 @@
     # Check if process is still alive
     if (.pid_is_alive(pid)) {
       alive <- alive + 1L
+      tracked <- c(tracked, pid)
     } else {
       # Orphaned PID file -- process died, clean up
       unlink(pf)
     }
+  }
+
+  untracked <- .list_supernode_processes()
+  if (nrow(untracked) > 0L) {
+    alive <- alive + sum(!untracked$pid %in% tracked)
   }
   alive
 }
@@ -511,11 +550,75 @@
   }, error = function(e) FALSE)
 }
 
+#' List live flower-supernode processes on Linux without spawning subprocesses
+#' @keywords internal
+.list_supernode_processes <- function() {
+  if (!dir.exists("/proc")) {
+    return(data.frame(pid = integer(), cmdline = character(),
+                      manifest_dir = character(), started_at = as.POSIXct(character()),
+                      stringsAsFactors = FALSE))
+  }
+
+  proc_dirs <- list.dirs("/proc", recursive = FALSE, full.names = FALSE)
+  pids <- suppressWarnings(as.integer(proc_dirs))
+  pids <- pids[!is.na(pids)]
+  rows <- list()
+
+  for (pid in pids) {
+    cmd_path <- file.path("/proc", pid, "cmdline")
+    raw <- tryCatch({
+      con <- file(cmd_path, open = "rb")
+      tryCatch(readBin(con, what = "raw", n = 65536L),
+               finally = close(con))
+    }, error = function(e) raw())
+    if (length(raw) == 0L) next
+    raw[raw == as.raw(0)] <- charToRaw(" ")
+    cmd <- rawToChar(raw)
+    if (!grepl("flower-supernode", cmd, fixed = TRUE)) next
+
+    manifest_dir <- NA_character_
+    match <- regmatches(cmd, regexpr("manifest-dir=\"?[^\" ]+", cmd))
+    if (length(match) > 0L && nzchar(match)) {
+      manifest_dir <- sub("^manifest-dir=\"?", "", match)
+    }
+
+    started_at <- as.POSIXct(NA)
+    if (!is.na(manifest_dir) && dir.exists(manifest_dir)) {
+      started_at <- file.info(manifest_dir)$mtime
+    }
+    if (is.na(started_at) && !is.na(manifest_dir)) {
+      token <- basename(manifest_dir)
+      stamp <- sub("^run_([0-9]{8}_[0-9]{6}).*$", "\\1", token)
+      if (!identical(stamp, token)) {
+        started_at <- suppressWarnings(
+          as.POSIXct(stamp, format = "%Y%m%d_%H%M%S", tz = Sys.timezone())
+        )
+      }
+    }
+
+    rows[[length(rows) + 1L]] <- data.frame(
+      pid = pid,
+      cmdline = cmd,
+      manifest_dir = manifest_dir,
+      started_at = started_at,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  if (length(rows) == 0L) {
+    return(data.frame(pid = integer(), cmdline = character(),
+                      manifest_dir = character(), started_at = as.POSIXct(character()),
+                      stringsAsFactors = FALSE))
+  }
+  do.call(rbind, rows)
+}
+
 #' Clean up orphaned SuperNode processes
 #'
 #' Scans PID files, kills orphaned SuperNode processes that are still
-#' running but have no owning Rserve session. Called during package
-#' attach to reclaim resources.
+#' running but have no owning Rserve session. It also scans /proc on Linux for
+#' flower-supernode processes without PID files and reclaims old untracked
+#' processes. Called before spawning to reclaim resources.
 #'
 #' @return Integer; number of orphans cleaned.
 #' @keywords internal
@@ -547,6 +650,30 @@
       cleaned <- cleaned + 1L
     }
     unlink(pf)
+  }
+
+  tracked <- .tracked_supernode_pids()
+  untracked <- .list_supernode_processes()
+  if (nrow(untracked) > 0L) {
+    grace_mins <- as.numeric(.dsf_option("supernode_orphan_grace_minutes", 30))
+    for (i in seq_len(nrow(untracked))) {
+      pid <- untracked$pid[[i]]
+      if (pid %in% tracked) next
+
+      age_mins <- Inf
+      started_at <- untracked$started_at[[i]]
+      if (!is.na(started_at)) {
+        age_mins <- as.numeric(difftime(Sys.time(), started_at, units = "mins"))
+      }
+      if (!is.na(age_mins) && age_mins < grace_mins) next
+
+      tryCatch({
+        tools::pskill(pid, signal = 15L)
+        Sys.sleep(1)
+        if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
+      }, error = function(e) NULL)
+      cleaned <- cleaned + 1L
+    }
   }
   cleaned
 }

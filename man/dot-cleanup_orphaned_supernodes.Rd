@@ -11,7 +11,8 @@ Integer; number of orphans cleaned.
 }
 \description{
 Scans PID files, kills orphaned SuperNode processes that are still
-running but have no owning Rserve session. Called during package
-attach to reclaim resources.
+running but have no owning Rserve session. It also scans /proc on Linux for
+flower-supernode processes without PID files and reclaims old untracked
+processes. Called before spawning to reclaim resources.
 }
 \keyword{internal}

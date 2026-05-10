@@ -169,6 +169,14 @@ test_that(".supernode_ensure uses --root-certificates when ca_cert_path provided
 
   mock_manifest <- file.path(tempdir(), "tls_test_manifest")
   dir.create(mock_manifest, showWarnings = FALSE)
+  fake_supernode <- tempfile("flower-supernode")
+  file.create(fake_supernode)
+  jsonlite::write_json(
+    list(supernode_cmd = fake_supernode, python = "python3",
+         venv_path = tempdir()),
+    file.path(mock_manifest, "runtime.json"),
+    auto_unbox = TRUE
+  )
 
   # We need to mock processx::process$new — use a different approach:
   # intercept at the registry level by checking args after the fact
@@ -197,6 +205,14 @@ test_that(".supernode_ensure errors when no ca_cert_path", {
 
   mock_manifest <- file.path(tempdir(), "no_cert_test_manifest")
   dir.create(mock_manifest, showWarnings = FALSE)
+  fake_supernode <- tempfile("flower-supernode")
+  file.create(fake_supernode)
+  jsonlite::write_json(
+    list(supernode_cmd = fake_supernode, python = "python3",
+         venv_path = tempdir()),
+    file.path(mock_manifest, "runtime.json"),
+    auto_unbox = TRUE
+  )
 
   expect_error(
     dsFlower:::.supernode_ensure("test:9092", mock_manifest, "python3"),

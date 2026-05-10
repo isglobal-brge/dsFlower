@@ -307,6 +307,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       }
       .validateTemplateProfile(template_name, trust$name)
       .validateTemplateHyperparameters(template_name, run_config)
+      .assert_secure_aggregation_runtime(template_name, trust)
     }
     .assertMinSamples(n_samples, min_n = effective_min)
 
@@ -360,10 +361,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       run_config[["evaluation_only"]] <- TRUE
     }
 
-    # Inject validated mask paths from dsRadiomics (segmentation tasks)
+    # Inject validated mask paths from dsImaging (segmentation tasks)
     seg_generation_id <- run_config[["segmentation_generation_id"]] %||% NULL
-    if (!is.null(seg_generation_id) && requireNamespace("dsRadiomics", quietly = TRUE)) {
-      mask_paths <- dsRadiomics::radiomicsGetMaskPaths(seg_generation_id)
+    if (!is.null(seg_generation_id) && requireNamespace("dsImaging", quietly = TRUE)) {
+      mask_paths <- dsImaging::imagingSegmentationGetMaskPaths(seg_generation_id)
       if (length(mask_paths) > 0) {
         # Create a mask root directory with symlinks to actual artifacts
         mask_root <- file.path(staging_dir, "masks")
@@ -426,6 +427,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     # Enforce template/profile compatibility
     .validateTemplateProfile(template_name, trust$name)
     .validateTemplateHyperparameters(template_name, run_config)
+    .assert_secure_aggregation_runtime(template_name, trust)
   }
 
   .assertMinSamples(nrow(data), min_n = effective_min)
@@ -589,7 +591,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 #' Clean Up Run Staging
 #'
 #' DataSHIELD ASSIGN method. Removes staging directory and resets
-#' handle state. Does NOT stop the SuperNode (it's a singleton).
+#' handle state. Stops the per-run SuperNode before deleting staging.
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @return Updated handle with reset state.
@@ -619,6 +621,12 @@ flowerCleanupRunDS <- function(handle_symbol) {
     }
   }
 
+  # Stop SuperNode if associated. This must happen before staging deletion
+  # because orphan cleanup uses the manifest_dir embedded in the process args.
+  if (!is.null(handle$staging_dir)) {
+    .supernode_stop(handle$staging_dir)
+  }
+
   # Clean up staging
   if (!is.null(handle$run_token)) {
     .cleanupStaging(handle$run_token)
@@ -646,13 +654,13 @@ flowerDestroyDS <- function(handle_symbol) {
   handle <- tryCatch(.getHandle(handle_symbol), error = function(e) NULL)
 
   if (!is.null(handle)) {
-    # Clean up staging
-    if (!is.null(handle$run_token)) {
-      .cleanupStaging(handle$run_token)
-    }
     # Stop SuperNode if associated
     if (!is.null(handle$staging_dir)) {
       .supernode_stop(handle$staging_dir)
+    }
+    # Clean up staging
+    if (!is.null(handle$run_token)) {
+      .cleanupStaging(handle$run_token)
     }
   }
 
@@ -688,18 +696,7 @@ flowerPingDS <- function() {
 #' @return Named list of capabilities.
 #' @export
 flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
-  # Check Python availability
-  python_version <- tryCatch({
-    out <- system2("python3", "--version", stdout = TRUE, stderr = TRUE)
-    trimws(gsub("Python\\s*", "", out[1]))
-  }, error = function(e) "not available")
-
-  # Check Flower version
-  flower_version <- tryCatch({
-    out <- system2("python3", c("-c", shQuote("import flwr; print(flwr.__version__)")),
-                   stdout = TRUE, stderr = TRUE)
-    trimws(out[1])
-  }, error = function(e) "not installed")
+  runtime <- .python_runtime_capabilities()
 
   # Disclosure settings
   settings <- .flowerDisclosureSettings()
@@ -715,8 +712,11 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
 
   caps <- list(
     dsflower_version    = as.character(utils::packageVersion("dsFlower")),
-    python_version      = python_version,
-    flower_version      = flower_version,
+    python_version      = runtime$python_version,
+    flower_version      = runtime$flower_version,
+    python_envs         = runtime$python_envs,
+    secure_aggregation_supported = isTRUE(runtime$secure_aggregation$supported),
+    secure_aggregation_runtime = runtime$secure_aggregation,
     templates           = settings$allowed_templates,
     max_rounds          = settings$max_rounds,
     allow_custom_config = settings$allow_custom_config,

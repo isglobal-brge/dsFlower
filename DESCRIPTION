@@ -27,7 +27,6 @@ Imports:
 Suggests:
     resourcer,
     dsImaging,
-    dsRadiomics,
     testthat (>= 3.0.0),
     withr,
     DSLite

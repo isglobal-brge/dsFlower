@@ -248,6 +248,189 @@
   do.call(rbind, rows)
 }
 
+#' Read the Python version recorded by a virtual environment
+#' @keywords internal
+.read_venv_python_version <- function(venv_path) {
+  cfg <- file.path(venv_path, "pyvenv.cfg")
+  if (!file.exists(cfg)) return("unknown")
+  lines <- tryCatch(readLines(cfg, warn = FALSE), error = function(e) character())
+  version <- sub("^version_info\\s*=\\s*", "",
+                 lines[grepl("^version_info\\s*=", lines)])
+  if (length(version) > 0 && nzchar(version[1])) return(version[1])
+  "unknown"
+}
+
+#' Read a Python package version from venv dist-info metadata
+#' @keywords internal
+.read_venv_package_version <- function(venv_path, package) {
+  site_dirs <- .venv_site_packages_dirs(venv_path)
+  if (length(site_dirs) == 0) return("unknown")
+
+  pattern <- paste0("^", package, "-.*\\.dist-info$")
+  for (site_dir in site_dirs) {
+    infos <- list.files(site_dir, pattern = pattern, full.names = TRUE)
+    for (info in infos) {
+      metadata <- file.path(info, "METADATA")
+      if (!file.exists(metadata)) next
+      lines <- tryCatch(readLines(metadata, warn = FALSE),
+                        error = function(e) character())
+      version <- sub("^Version:\\s*", "", lines[grepl("^Version:\\s*", lines)])
+      if (length(version) > 0 && nzchar(version[1])) return(version[1])
+    }
+  }
+  "unknown"
+}
+
+#' Locate site-packages directories inside a virtual environment
+#' @keywords internal
+.venv_site_packages_dirs <- function(venv_path) {
+  lib_root <- file.path(venv_path, "lib")
+  if (!dir.exists(lib_root)) return(character())
+  lib_dirs <- tryCatch(
+    list.dirs(lib_root, recursive = TRUE, full.names = TRUE),
+    error = function(e) character()
+  )
+  lib_dirs[basename(lib_dirs) == "site-packages"]
+}
+
+#' Detect whether Flower ServerAppComponents accepts a workflow argument
+#'
+#' dsFlower templates need server-side SecAggPlusWorkflow whenever a profile or
+#' template requires Secure Aggregation. This check is deliberately file-based:
+#' Rserve child processes can hang when they spawn Python subprocesses.
+#' @keywords internal
+.serverapp_components_supports_workflow <- function(venv_path) {
+  site_dirs <- .venv_site_packages_dirs(venv_path)
+  for (site_dir in site_dirs) {
+    src <- file.path(site_dir, "flwr", "server", "serverapp_components.py")
+    if (!file.exists(src)) next
+    lines <- tryCatch(readLines(src, warn = FALSE),
+                      error = function(e) character())
+    if (length(lines) == 0) next
+    if (any(grepl("^\\s*workflow\\s*:", lines))) return(TRUE)
+    if (any(grepl("workflow\\s*=", lines))) return(TRUE)
+  }
+  FALSE
+}
+
+#' Summarise server-side Secure Aggregation support
+#'
+#' @param template_name Optional Flower template name. When provided, only the
+#'   framework environment used by that template is checked.
+#' @return Named list with supported flag, reason, and per-environment details.
+#' @keywords internal
+.flower_server_secagg_capability <- function(template_name = NULL) {
+  framework <- NULL
+  if (!is.null(template_name)) {
+    meta <- .TEMPLATE_METADATA[[template_name]]
+    framework <- meta$framework %||% NULL
+  }
+
+  envs <- .list_python_envs()
+  if (!is.null(framework)) {
+    envs <- envs[envs$framework == framework, , drop = FALSE]
+  }
+
+  if (nrow(envs) == 0) {
+    return(list(
+      supported = FALSE,
+      reason = if (is.null(framework)) {
+        "no provisioned Python environments"
+      } else {
+        paste0("no provisioned Python environment for framework '",
+               framework, "'")
+      },
+      environments = envs
+    ))
+  }
+
+  rows <- lapply(seq_len(nrow(envs)), function(i) {
+    path <- envs$path[[i]]
+    data.frame(
+      framework = envs$framework[[i]],
+      path = path,
+      healthy = isTRUE(envs$healthy[[i]]),
+      flower_version = .read_venv_package_version(path, "flwr"),
+      server_workflow_supported = .serverapp_components_supports_workflow(path),
+      stringsAsFactors = FALSE
+    )
+  })
+  details <- do.call(rbind, rows)
+  supported <- nrow(details) > 0 &&
+    all(details$healthy & details$server_workflow_supported)
+
+  reason <- if (supported) {
+    "server-side SecAggPlusWorkflow is available"
+  } else if (any(!details$healthy)) {
+    "one or more Python environments are not healthy"
+  } else {
+    paste0(
+      "installed Flower runtime does not expose ",
+      "ServerAppComponents(workflow=...)"
+    )
+  }
+
+  list(supported = supported, reason = reason, environments = details)
+}
+
+#' Stop if Secure Aggregation is required but unsupported by the runtime
+#' @keywords internal
+.assert_secure_aggregation_runtime <- function(template_name, trust) {
+  if (is.null(template_name) || !nzchar(template_name)) return(invisible(TRUE))
+
+  meta <- .TEMPLATE_METADATA[[template_name]]
+  required_by_template <- isTRUE(meta$requires_secagg)
+  required_by_profile <- isTRUE(trust$require_secure_aggregation)
+  if (!required_by_template && !required_by_profile) return(invisible(TRUE))
+
+  cap <- .flower_server_secagg_capability(template_name)
+  if (isTRUE(cap$supported)) return(invisible(TRUE))
+
+  reason_bits <- character()
+  if (required_by_profile) {
+    reason_bits <- c(reason_bits,
+                     paste0("privacy profile '", trust$name, "'"))
+  }
+  if (required_by_template) {
+    reason_bits <- c(reason_bits,
+                     paste0("template '", template_name, "'"))
+  }
+
+  stop(
+    "Secure Aggregation is required by ",
+    paste(reason_bits, collapse = " and "),
+    ", but this server cannot enable server-side SecAgg+. ",
+    cap$reason, ". ",
+    "Use a non-SecAgg profile such as 'trusted_internal' for trusted local ",
+    "demos, or install a Flower runtime/server app implementation that supports ",
+    "server-side SecAggPlusWorkflow.",
+    call. = FALSE
+  )
+}
+
+#' Summarise provisioned Python runtime without spawning subprocesses
+#' @keywords internal
+.python_runtime_capabilities <- function() {
+  envs <- .list_python_envs()
+  healthy <- envs[isTRUE(envs$healthy) | envs$healthy, , drop = FALSE]
+  if (nrow(healthy) == 0) {
+    return(list(
+      python_version = "not provisioned",
+      flower_version = "not provisioned",
+      python_envs = envs,
+      secure_aggregation = .flower_server_secagg_capability()
+    ))
+  }
+
+  first <- healthy$path[1]
+  list(
+    python_version = .read_venv_python_version(first),
+    flower_version = .read_venv_package_version(first, "flwr"),
+    python_envs = envs,
+    secure_aggregation = .flower_server_secagg_capability()
+  )
+}
+
 # ---------------------------------------------------------------------------
 # uv bootstrap
 # ---------------------------------------------------------------------------

@@ -63,6 +63,12 @@ DSI::datashield.logout(conns)
 | `clinical_hardened` | High-security clinical |
 | `high_sensitivity_dp` | Differential privacy (DP-SGD via Opacus) |
 
+Profiles that require Secure Aggregation need a Flower runtime with
+server-side `SecAggPlusWorkflow` support and at least three participating
+clients. `flowerGetCapabilitiesDS()` reports this as
+`secure_aggregation_supported`; dsFlower fails early if a requested profile
+cannot be executed safely instead of launching a doomed training run.
+
 ## Installation
 
 **Server** (on each Opal/Rock node):
