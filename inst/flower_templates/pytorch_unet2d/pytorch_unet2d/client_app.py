@@ -12,7 +12,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from .task import load_image_data, load_privacy_config, SegmentationDataset
+from .task import (
+    load_image_data, load_privacy_config, SegmentationDataset,
+    get_mask_root, get_path_cols,
+)
 from .privacy_utils import (
     clip_weights, add_gaussian_noise, compute_sigma, bucket_count,
     get_parameters_fedbn, set_parameters_fedbn,
@@ -190,8 +193,15 @@ def client_fn(context: Context) -> FlowerClient:
     batch_size = int(cfg.get("batch_size", 8))
     local_epochs = int(cfg.get("local_epochs", 1))
 
+    mask_root = get_mask_root(context)
+    image_path_col, mask_path_col = get_path_cols(context)
     dataset = SegmentationDataset(
-        data_root, samples_df, target_col=target_col
+        data_root,
+        samples_df,
+        target_col=target_col,
+        image_path_col=image_path_col,
+        mask_root=mask_root,
+        mask_path_col=mask_path_col,
     )
     trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 

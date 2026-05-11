@@ -8,7 +8,7 @@ from flwr.common import Context
 
 import numpy as np
 from sklearn.linear_model import SGDClassifier
-from sklearn.metrics import log_loss, accuracy_score
+from sklearn.metrics import log_loss, accuracy_score, hinge_loss
 
 from .task import load_data, load_privacy_config
 from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count
@@ -69,8 +69,16 @@ class FlowerClient(NumPyClient):
                 n_examples = bucket_count(n_examples)
             return 0.0, n_examples, {}
 
-        y_pred_proba = self.model.predict_proba(self.X)
-        loss = log_loss(self.y, y_pred_proba, labels=np.unique(self.y))
+        if hasattr(self.model, "predict_proba"):
+            y_pred_proba = self.model.predict_proba(self.X)
+            loss = log_loss(self.y, y_pred_proba, labels=np.unique(self.y))
+        else:
+            scores = self.model.decision_function(self.X)
+            if np.ndim(scores) == 1:
+                y_signed = np.where(self.y > 0, 1, -1)
+                loss = hinge_loss(y_signed, scores)
+            else:
+                loss = hinge_loss(self.y, scores)
         accuracy = accuracy_score(self.y, self.model.predict(self.X))
 
         n_examples = len(self.X)

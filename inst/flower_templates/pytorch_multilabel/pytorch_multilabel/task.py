@@ -33,18 +33,16 @@ def load_data(context=None):
     target_col = manifest["target_column"]
     feat_cols = manifest.get("feature_columns")
 
-    # Survival: target_column is a list of 2 (time_col, event_col)
-    if isinstance(target_col, list) and len(target_col) >= 2:
-        time_col, event_col = target_col[0], target_col[1]
-        drop_cols = [time_col, event_col]
+    # Multi-label: target_column is a list of label columns.
+    if isinstance(target_col, list) and len(target_col) >= 1:
+        drop_cols = target_col
         if feat_cols:
             X = df[feat_cols].values
         else:
             X = df.drop(columns=[c for c in drop_cols if c in df.columns]
                         ).select_dtypes(include=[np.number]).values
-        time = df[time_col].values.astype(np.float32)
-        event = df[event_col].values.astype(np.float32)
-        return X.astype(np.float32), time, event
+        y = df[target_col].values
+        return X.astype(np.float32), y.astype(np.float32)
 
     # Standard: single target column
     y = df[target_col].values

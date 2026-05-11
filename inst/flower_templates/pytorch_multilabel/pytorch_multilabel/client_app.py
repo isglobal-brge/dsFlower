@@ -150,7 +150,12 @@ def client_fn(context: Context) -> FlowerClient:
     # Multi-label: y has shape (n_samples, n_labels)
     if y.ndim == 1:
         n_labels = int(cfg.get("n_labels", 1))
-        y = y.reshape(-1, 1) if n_labels == 1 else y
+        if n_labels != 1:
+            raise ValueError(
+                "pytorch_multilabel with n_labels > 1 requires target_column "
+                "to contain one column per label."
+            )
+        y = y.reshape(-1, 1)
     else:
         n_labels = y.shape[1]
 
