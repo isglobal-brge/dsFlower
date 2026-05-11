@@ -16,7 +16,9 @@
 .FRAMEWORK_PYTHON_DEPS <- list(
   sklearn = c("scikit-learn>=1.0.0"),
   pytorch = c("torch>=2.0.0", "opacus>=1.4.0"),
-  pytorch_vision = c("torch>=2.0.0", "torchvision>=0.15.0", "Pillow>=9.0.0"),
+  pytorch_vision = c("torch>=2.0.0", "torchvision>=0.15.0",
+                     "Pillow>=9.0.0", "nibabel>=5.0.0",
+                     "pydicom>=2.4.0", "pynrrd>=1.0.0"),
   xgboost = c("xgboost>=1.7.0")
 )
 
@@ -50,7 +52,7 @@
 #' Compute a hash of the dependency list for staleness detection
 #' @keywords internal
 .deps_hash <- function(deps) {
-  digest::digest(paste(sort(deps), collapse = "\n"), algo = "sha256",
+  digest::digest(paste(sort(deps, method = "radix"), collapse = "\n"), algo = "sha256",
                  serialize = FALSE)
 }
 
@@ -65,6 +67,10 @@
   if (!file.exists(python)) return(FALSE)
   marker <- file.path(venv_path, ".dsflower_ready")
   if (!file.exists(marker)) return(FALSE)
+  expected_hash <- .deps_hash(.python_deps_for_framework(framework))
+  current_hash <- tryCatch(readLines(marker, warn = FALSE, n = 1),
+                           error = function(e) "")
+  if (!identical(current_hash, expected_hash)) return(FALSE)
   supernode <- file.path(venv_path, "bin", "flower-supernode")
   if (!file.exists(supernode)) return(FALSE)
   TRUE

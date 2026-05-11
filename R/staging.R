@@ -142,8 +142,81 @@
   )
 }
 
-.ensureStagingDir <- function(run_token) {
-  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
+.as_nonempty_character <- function(x) {
+  if (is.null(x)) return(character(0))
+  x <- as.character(x)
+  x[nzchar(x)]
+}
+
+.stagingBaseCandidates <- function(create = FALSE) {
+  roots <- c(
+    .as_nonempty_character(.dsf_option("staging_root", NULL)),
+    .as_nonempty_character(.dsf_option("staging.root", NULL)),
+    .as_nonempty_character(Sys.getenv("DSFLOWER_STAGING_ROOT", "")),
+    .as_nonempty_character(Sys.getenv("DSFLOWER_STAGING_DIR", "")),
+    if (dir.exists("/dev/shm")) "/dev/shm" else character(0),
+    tempdir()
+  )
+  roots <- unique(normalizePath(roots, mustWork = FALSE))
+  if (isTRUE(create)) {
+    for (root in roots) {
+      dir.create(file.path(root, "dsflower"), recursive = TRUE,
+                 showWarnings = FALSE)
+    }
+  }
+  roots
+}
+
+.filesystemFreeBytes <- function(path) {
+  probe <- path
+  while (!dir.exists(probe) && !identical(dirname(probe), probe)) {
+    probe <- dirname(probe)
+  }
+  if (!dir.exists(probe)) return(NA_real_)
+
+  out <- tryCatch(
+    system2("df", c("-Pk", probe), stdout = TRUE, stderr = FALSE),
+    error = function(e) character(0)
+  )
+  if (length(out) < 2L) return(NA_real_)
+  fields <- strsplit(trimws(out[length(out)]), "\\s+")[[1]]
+  if (length(fields) < 4L) return(NA_real_)
+  suppressWarnings(as.numeric(fields[[4]]) * 1024)
+}
+
+.chooseStagingBase <- function(required_bytes = 0) {
+  required <- suppressWarnings(as.numeric(required_bytes %||% 0))
+  if (!is.finite(required) || is.na(required) || required < 0) required <- 0
+
+  min_free <- suppressWarnings(
+    as.numeric(.dsf_option("staging_min_free_bytes", 64 * 1024^2))
+  )
+  if (!is.finite(min_free) || is.na(min_free) || min_free < 0) {
+    min_free <- 64 * 1024^2
+  }
+  headroom <- suppressWarnings(
+    as.numeric(.dsf_option("staging_free_headroom", 0.25))
+  )
+  if (!is.finite(headroom) || is.na(headroom) || headroom < 0) headroom <- 0.25
+
+  needed <- required * (1 + headroom) + min_free
+  candidates <- .stagingBaseCandidates(create = TRUE)
+  for (root in candidates) {
+    free <- .filesystemFreeBytes(root)
+    if (is.na(free) || free >= needed) return(root)
+    message("  Skipping staging root ", root, " (free ",
+            round(free / 1024^2, 1), " MiB; need ",
+            round(needed / 1024^2, 1), " MiB)")
+  }
+
+  stop("No dsFlower staging root has enough free space. Required: ",
+       round(needed / 1024^2, 1), " MiB. Configure ",
+       "options(dsflower.staging_root='/path/with/space') or ",
+       "DSFLOWER_STAGING_ROOT.", call. = FALSE)
+}
+
+.ensureStagingDir <- function(run_token, required_bytes = 0) {
+  base_dir <- .chooseStagingBase(required_bytes)
   staging_dir <- file.path(base_dir, "dsflower", run_token)
   dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
   Sys.chmod(staging_dir, "0700")
@@ -174,7 +247,6 @@
   )
   data <- prepared$data
 
-  # Prefer tmpfs (/dev/shm) when available for ephemeral staging
   staging_dir <- .ensureStagingDir(run_token)
 
   # Write training data -- prefer Parquet when arrow is available
@@ -229,8 +301,9 @@
 .cleanupStaging <- function(run_token) {
   if (is.null(run_token)) return(invisible(TRUE))
 
-  # Check both possible base directories (tmpfs and tempdir)
-  for (base in c("/dev/shm", tempdir())) {
+  # Check configured and default base directories. Older runs may exist in
+  # either tmpfs or tempdir, so cleanup intentionally scans all candidates.
+  for (base in .stagingBaseCandidates(create = FALSE)) {
     staging_dir <- file.path(base, "dsflower", run_token)
     if (dir.exists(staging_dir)) {
       unlink(staging_dir, recursive = TRUE)
@@ -274,11 +347,7 @@
                                    samples_data, extra_config = list()) {
   data_root <- .resolve_image_data_root()
 
-  # Create staging directory
-  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
-  staging_dir <- file.path(base_dir, "dsflower", run_token)
-  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
-  Sys.chmod(staging_dir, "0700")
+  staging_dir <- .ensureStagingDir(run_token)
 
   # Write samples metadata to staging
   if (is.data.frame(samples_data)) {
@@ -458,11 +527,10 @@
     cols_needed <- unique(c(target_column, feature_columns))
   }
 
-  # Create staging directory
-  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
-  staging_dir <- file.path(base_dir, "dsflower", run_token)
-  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
-  Sys.chmod(staging_dir, "0700")
+  staging_dir <- .ensureStagingDir(
+    run_token,
+    required_bytes = file.info(src_path)$size %||% 0
+  )
 
   # Read with column selection, drop incomplete rows, and write to staging.
   tbl <- if (is.null(cols_needed)) {
@@ -507,6 +575,219 @@
   staging_dir
 }
 
+.readStagedSamples <- function(path) {
+  if (grepl("\\.parquet$", path, ignore.case = TRUE)) {
+    if (!requireNamespace("arrow", quietly = TRUE)) {
+      stop("arrow package required for Parquet image metadata.", call. = FALSE)
+    }
+    return(as.data.frame(arrow::read_parquet(path)))
+  }
+  utils::read.csv(path, stringsAsFactors = FALSE)
+}
+
+.writeStagedSamples <- function(data, path) {
+  if (grepl("\\.parquet$", path, ignore.case = TRUE)) {
+    if (!requireNamespace("arrow", quietly = TRUE)) {
+      stop("arrow package required for Parquet image metadata.", call. = FALSE)
+    }
+    arrow::write_parquet(data, path)
+  } else {
+    utils::write.csv(data, path, row.names = FALSE)
+  }
+  Sys.chmod(path, "0600")
+  invisible(path)
+}
+
+.regex_escape <- function(x) {
+  gsub("([][{}()+*^$|\\\\?.])", "\\\\\\1", x)
+}
+
+.s3ObjectKey <- function(uri) {
+  sub("^s3://[^/]+/?", "", uri)
+}
+
+.s3RelativePath <- function(uri, prefix) {
+  key <- .s3ObjectKey(uri)
+  prefix_key <- .s3ObjectKey(prefix)
+  prefix_key <- paste0(sub("/+$", "", prefix_key), "/")
+  rel <- sub(paste0("^", .regex_escape(prefix_key)), "", key)
+  if (!nzchar(rel) || identical(rel, key)) basename(uri) else rel
+}
+
+.isDirectoryLikeObject <- function(uri) {
+  grepl("/$", uri)
+}
+
+.stageS3DirectoryAssetPlan <- function(backend, s3_uri) {
+  files <- dsImaging::backend_list(backend, s3_uri)
+  files <- files[!vapply(files, .isDirectoryLikeObject, logical(1))]
+  sizes <- vapply(files, function(f) {
+    h <- tryCatch(dsImaging::backend_head(backend, f), error = function(e) NULL)
+    suppressWarnings(as.numeric(h$size %||% NA_real_))
+  }, numeric(1))
+  list(
+    files = files,
+    total_bytes = sum(sizes[is.finite(sizes)], na.rm = TRUE)
+  )
+}
+
+.downloadS3DirectoryAsset <- function(backend, s3_uri, local_root, files) {
+  dir.create(local_root, recursive = TRUE, showWarnings = FALSE)
+  rel_paths <- character(0)
+  for (f in files) {
+    rel <- .s3RelativePath(f, s3_uri)
+    if (!nzchar(rel) || .isDirectoryLikeObject(rel)) next
+    local_path <- file.path(local_root, rel)
+    if (!file.exists(local_path)) {
+      dsImaging::backend_get_file(backend, f, local_path)
+    }
+    rel_paths <- c(rel_paths, rel)
+  }
+  unique(rel_paths)
+}
+
+.knownImageExtensions <- function() {
+  c(".nii.gz", ".nii", ".nrrd", ".mha", ".mhd", ".dcm",
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff")
+}
+
+.stripKnownImageExtension <- function(path) {
+  sub("\\.(nii\\.gz|nii|nrrd|mha|mhd|dcm|png|jpe?g|tiff?)$",
+      "", basename(path), ignore.case = TRUE)
+}
+
+.loadSampleManifests <- function(desc, staging_dir) {
+  sm <- desc$manifest$sample_manifests %||% NULL
+  if (is.null(sm)) return(NULL)
+
+  sm_file <- sm$file %||% NULL
+  sm_uri <- sm$uri %||% NULL
+  if ((is.null(sm_file) || !file.exists(sm_file %||% "")) &&
+      !is.null(sm_uri) && grepl("^s3://", sm_uri) &&
+      !is.null(desc$backend)) {
+    ext <- if (grepl("\\.parquet$", sm_uri, ignore.case = TRUE)) ".parquet" else ".csv"
+    sm_file <- file.path(staging_dir, paste0("sample_manifests", ext))
+    dsImaging::backend_get_file(desc$backend, sm_uri, sm_file)
+    Sys.chmod(sm_file, "0600")
+  }
+
+  if (is.null(sm_file) || !file.exists(sm_file)) return(NULL)
+  .readStagedSamples(sm_file)
+}
+
+.primaryFromFilesJson <- function(files_json) {
+  if (is.null(files_json) || is.na(files_json) || !nzchar(files_json)) {
+    return(NA_character_)
+  }
+  parsed <- tryCatch(
+    jsonlite::fromJSON(files_json, simplifyVector = FALSE),
+    error = function(e) NULL
+  )
+  if (!is.list(parsed) || length(parsed) == 0L) return(NA_character_)
+  roles <- vapply(parsed, function(x) as.character(x$role %||% ""), character(1))
+  idx <- which(roles %in% c("image", "primary"))
+  item <- parsed[[if (length(idx) > 0L) idx[[1]] else 1L]]
+  as.character(item$path %||% item$uri %||% item$file %||% NA_character_)
+}
+
+.normalisePrimaryPath <- function(primary, image_uri) {
+  primary <- as.character(primary %||% NA_character_)
+  if (is.na(primary) || !nzchar(primary)) return(NA_character_)
+  if (grepl("^s3://", primary)) return(.s3RelativePath(primary, image_uri %||% primary))
+  primary <- sub("^/+", "", primary)
+  image_key <- if (!is.null(image_uri) && grepl("^s3://", image_uri)) {
+    .s3ObjectKey(image_uri)
+  } else {
+    ""
+  }
+  image_key <- paste0(sub("/+$", "", image_key), "/")
+  if (nzchar(image_key)) {
+    primary <- sub(paste0("^", .regex_escape(image_key)), "", primary)
+  }
+  sub("^source/images/", "", primary)
+}
+
+.ensureImagePathColumn <- function(samples_df, path_col = "relative_path",
+                                   sample_manifests = NULL,
+                                   image_root = NULL,
+                                   image_uri = NULL,
+                                   downloaded_rels = character(0)) {
+  if (path_col %in% names(samples_df)) {
+    current <- as.character(samples_df[[path_col]])
+    if (all(!is.na(current) & nzchar(current))) return(samples_df)
+  }
+
+  if (!("sample_id" %in% names(samples_df))) {
+    stop("Image metadata requires either '", path_col, "' or 'sample_id'.",
+         call. = FALSE)
+  }
+
+  sample_ids <- as.character(samples_df$sample_id)
+  rel_paths <- rep(NA_character_, length(sample_ids))
+
+  if (!is.null(sample_manifests) && "sample_id" %in% names(sample_manifests)) {
+    sm_ids <- as.character(sample_manifests$sample_id)
+    primary <- rep(NA_character_, nrow(sample_manifests))
+    if ("primary_uri" %in% names(sample_manifests)) {
+      primary <- as.character(sample_manifests$primary_uri)
+    }
+    if ("files_json" %in% names(sample_manifests)) {
+      missing_primary <- is.na(primary) | !nzchar(primary)
+      primary[missing_primary] <- vapply(
+        sample_manifests$files_json[missing_primary],
+        .primaryFromFilesJson,
+        character(1)
+      )
+    }
+    primary <- vapply(primary, .normalisePrimaryPath, character(1),
+                      image_uri = image_uri)
+    rel_paths <- primary[match(sample_ids, sm_ids)]
+  }
+
+  missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
+  if (any(missing_rel) && length(downloaded_rels) > 0L) {
+    rel_by_stem <- downloaded_rels
+    names(rel_by_stem) <- .stripKnownImageExtension(downloaded_rels)
+    rel_paths[missing_rel] <- rel_by_stem[sample_ids[missing_rel]]
+  }
+
+  missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
+  if (any(missing_rel) && !is.null(image_root) && dir.exists(image_root)) {
+    for (i in which(missing_rel)) {
+      for (ext in .knownImageExtensions()) {
+        candidate <- paste0(sample_ids[[i]], ext)
+        if (file.exists(file.path(image_root, candidate))) {
+          rel_paths[[i]] <- candidate
+          break
+        }
+      }
+    }
+  }
+
+  missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
+  if (any(missing_rel)) {
+    stop("Could not resolve image path for sample_id(s): ",
+         paste(utils::head(sample_ids[missing_rel], 5L), collapse = ", "),
+         if (sum(missing_rel) > 5L) "..." else "",
+         ". Provide a relative path column or a dsImaging sample_manifests table.",
+         call. = FALSE)
+  }
+
+  samples_df[[path_col]] <- unname(rel_paths)
+  samples_df
+}
+
+.imageAssetNeedsStaging <- function(asset_name, asset_type, extra_config) {
+  if (identical(asset_type, "mask_root")) {
+    return(identical(extra_config[["template_name"]], "pytorch_unet2d") ||
+             !is.null(extra_config[["mask_asset"]]) ||
+             !is.null(extra_config[["mask_path_col"]]))
+  }
+  asset_name == "images" || asset_type %in% c("image_root", "wsi_root",
+                                              "dicom_series_root",
+                                              "rt_struct_root")
+}
+
 #' Stage from an image bundle descriptor
 #'
 #' Handles multi-root image assets from the descriptor. Metadata is staged
@@ -518,15 +799,29 @@
                                         feature_columns, extra_config) {
   meta <- desc$metadata
   assets <- desc$assets
+  dir_asset_types <- c("image_root", "mask_root", "wsi_root",
+                       "dicom_series_root", "rt_struct_root")
+  file_asset_types <- c("feature_table", "rt_dose_file", "rt_plan_file")
 
-  # Create staging directory
-  base_dir <- if (dir.exists("/dev/shm")) "/dev/shm" else tempdir()
-  staging_dir <- file.path(base_dir, "dsflower", run_token)
-  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
-  Sys.chmod(staging_dir, "0700")
+  s3_asset_plans <- list()
+  required_bytes <- 0
+  for (asset_name in names(assets)) {
+    asset <- assets[[asset_name]]
+    asset_type <- asset$type %||% asset$kind %||% "unknown"
+    s3_uri <- asset$uri %||% NULL
+    if (asset_type %in% dir_asset_types &&
+        .imageAssetNeedsStaging(asset_name, asset_type, extra_config) &&
+        !is.null(s3_uri) && grepl("^s3://", s3_uri) &&
+        !is.null(desc$backend)) {
+      plan <- .stageS3DirectoryAssetPlan(desc$backend, s3_uri)
+      s3_asset_plans[[asset_name]] <- plan
+      required_bytes <- required_bytes + plan$total_bytes
+    }
+  }
+
+  staging_dir <- .ensureStagingDir(run_token, required_bytes = required_bytes)
 
   # Stage metadata table (local file, S3 URI, or in-memory table)
-  n_samples <- 0L
   meta_file <- meta$file
   meta_uri <- meta$uri
 
@@ -547,20 +842,11 @@
       file.copy(meta_file, staged_samples)
     }
     Sys.chmod(staged_samples, "0600")
-
-    if (grepl("\\.parquet$", samples_basename, ignore.case = TRUE)) {
-      if (requireNamespace("arrow", quietly = TRUE)) {
-        n_samples <- nrow(arrow::read_parquet(staged_samples))
-      }
-    } else {
-      n_samples <- length(readLines(staged_samples)) - 1L
-    }
   } else if (!is.null(desc$table_data) && is.data.frame(desc$table_data)) {
     samples_basename <- "samples.csv"
     staged_samples <- file.path(staging_dir, samples_basename)
     utils::write.csv(desc$table_data, staged_samples, row.names = FALSE)
     Sys.chmod(staged_samples, "0600")
-    n_samples <- nrow(desc$table_data)
   } else {
     stop("Image bundle descriptor requires metadata (local file, S3 URI, or table_data).",
          call. = FALSE)
@@ -579,22 +865,30 @@
     dsImaging::backend_get_file(desc$backend, label_uri, label_file)
 
     if (requireNamespace("arrow", quietly = TRUE)) {
-      samples_df <- arrow::read_parquet(staged_samples)
+      samples_df <- .readStagedSamples(staged_samples)
       labels_df <- arrow::read_parquet(label_file)
       merged <- merge(samples_df, labels_df, by = "sample_id", all.x = TRUE)
-      arrow::write_parquet(merged, staged_samples)
+      .writeStagedSamples(merged, staged_samples)
       message("  Joined label set '", label_set_name, "' (",
               ncol(labels_df) - 1, " label columns)")
     }
     unlink(label_file)
   }
 
-  # Validate and collect asset roots
-  dir_asset_types <- c("image_root", "wsi_root", "dicom_series_root",
-                        "rt_struct_root")
-  file_asset_types <- c("feature_table", "rt_dose_file", "rt_plan_file")
+  samples_df <- .readStagedSamples(staged_samples)
+  prepared <- .prepareTrainingFrame(
+    samples_df,
+    target_column = target_column,
+    feature_columns = feature_columns,
+    drop_missing = !identical(extra_config[["drop_missing"]], FALSE),
+    select_columns = FALSE
+  )
+  samples_df <- prepared$data
+
+  sample_manifests <- .loadSampleManifests(desc, staging_dir)
 
   validated_assets <- list()
+  downloaded_rels <- list()
   for (asset_name in names(assets)) {
     asset <- assets[[asset_name]]
     asset_type <- asset$type %||% asset$kind %||% "unknown"
@@ -603,24 +897,25 @@
       root <- asset$root %||% NULL
       s3_uri <- asset$uri %||% NULL
 
-      # S3 asset: download all files to local staging
-      if (!is.null(s3_uri) && grepl("^s3://", s3_uri) &&
+      # S3 asset: download required objects, preserving paths under the prefix.
+      if (.imageAssetNeedsStaging(asset_name, asset_type, extra_config) &&
+          !is.null(s3_uri) && grepl("^s3://", s3_uri) &&
           !is.null(desc$backend)) {
         local_root <- file.path(staging_dir, asset_name)
-        dir.create(local_root, showWarnings = FALSE)
         message("  Downloading ", asset_name, " from S3...")
-        files <- dsImaging::backend_list(desc$backend, s3_uri)
-        for (f in files) {
-          fname <- basename(f)
-          local_path <- file.path(local_root, fname)
-          if (!file.exists(local_path)) {
-            dsImaging::backend_get_file(desc$backend, f, local_path)
-          }
-        }
+        plan <- s3_asset_plans[[asset_name]] %||%
+          .stageS3DirectoryAssetPlan(desc$backend, s3_uri)
+        rels <- .downloadS3DirectoryAsset(desc$backend, s3_uri, local_root,
+                                          plan$files)
+        downloaded_rels[[asset_name]] <- rels
         root <- local_root
-        message("  Downloaded ", length(files), " files to staging")
+        message("  Downloaded ", length(rels), " files to staging")
       }
 
+      if (is.null(root) && !.imageAssetNeedsStaging(asset_name, asset_type,
+                                                     extra_config)) {
+        next
+      }
       if (is.null(root) || !dir.exists(root)) {
         stop("Asset '", asset_name, "' root directory does not exist: ",
              root %||% "(NULL)", call. = FALSE)
@@ -671,6 +966,21 @@
     data_root <- validated_assets$images$root
   }
 
+  if (!is.null(validated_assets$images)) {
+    image_asset <- assets$images %||% list()
+    image_path_col <- validated_assets$images$path_col %||% "relative_path"
+    samples_df <- .ensureImagePathColumn(
+      samples_df,
+      path_col = image_path_col,
+      sample_manifests = sample_manifests,
+      image_root = validated_assets$images$root,
+      image_uri = image_asset$uri %||% NULL,
+      downloaded_rels = downloaded_rels$images %||% character(0)
+    )
+  }
+  .writeStagedSamples(samples_df, staged_samples)
+  n_samples <- nrow(samples_df)
+
   # Build manifest
   manifest <- list(
     run_token     = run_token,
@@ -678,6 +988,8 @@
     data_root     = data_root,
     samples_file  = samples_basename,
     n_samples     = n_samples,
+    n_input_samples = prepared$n_input_samples,
+    dropped_missing = prepared$dropped_missing,
     target_column = target_column,
     dataset_id    = desc$dataset_id,
     source_kind   = "image_bundle",

@@ -163,6 +163,45 @@ test_that(".stageData can preserve incomplete rows when explicitly requested", {
   expect_equal(manifest$dropped_missing, 0)
 })
 
+test_that(".ensureStagingDir honors configured staging root", {
+  root <- tempfile("dsflower-stage-root-")
+  old <- getOption("dsflower.staging_root")
+  options(dsflower.staging_root = root)
+  on.exit({
+    options(dsflower.staging_root = old)
+    unlink(root, recursive = TRUE)
+  }, add = TRUE)
+
+  staging_dir <- dsFlower:::.ensureStagingDir("run_test_configured_root")
+  expect_true(dir.exists(staging_dir))
+  expect_true(startsWith(normalizePath(staging_dir, mustWork = TRUE),
+                         normalizePath(root, mustWork = TRUE)))
+})
+
+test_that(".ensureImagePathColumn derives paths from dsImaging manifests", {
+  samples <- data.frame(
+    sample_id = c("LUNG1-001", "LUNG1-002"),
+    label = c(0L, 1L)
+  )
+  sample_manifests <- data.frame(
+    sample_id = c("LUNG1-001", "LUNG1-002"),
+    primary_uri = c(
+      "LUNG1-001.nii.gz",
+      "s3://imaging-data/datasets/site/source/images/LUNG1-002.nii.gz"
+    )
+  )
+
+  out <- dsFlower:::.ensureImagePathColumn(
+    samples,
+    sample_manifests = sample_manifests,
+    image_uri = "s3://imaging-data/datasets/site/source/images/",
+    downloaded_rels = c("LUNG1-001.nii.gz", "LUNG1-002.nii.gz")
+  )
+
+  expect_equal(out$relative_path,
+               c("LUNG1-001.nii.gz", "LUNG1-002.nii.gz"))
+})
+
 test_that(".cleanupStaging removes the directory", {
   token <- "run_test_cleanup_001"
   staging_dir <- file.path(tempdir(), "dsflower", token)
