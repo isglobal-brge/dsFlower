@@ -1,8 +1,10 @@
-"""Flower ServerApp for Secure Federated XGBoost (Histogram Protocol).
+"""Flower ServerApp for Federated XGBoost (Histogram Protocol).
 
 Implements a custom Strategy that orchestrates a multi-phase histogram
-aggregation protocol. The server never sees individual client gradients --
-only the SecAgg+ aggregated sums of quantized histograms.
+aggregation protocol. In secure profiles, SecAgg+ protects individual client
+histograms so the server sees only aggregated sums of quantized histograms.
+Trusted demo profiles can run the same protocol without SecAgg+ for end-to-end
+validation.
 
 Protocol per tree:
   1. bin_edges   - Collect local percentile edges, compute global edges.
@@ -29,6 +31,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from flwr.common import (
     Context,
+    EvaluateIns,
+    EvaluateRes,
     FitIns,
     FitRes,
     Parameters,
@@ -456,7 +460,7 @@ class SecureXGBoostStrategy(Strategy):
     def configure_evaluate(
         self, server_round: int, parameters: Parameters,
         client_manager: ClientManager
-    ) -> List[Tuple[ClientProxy, FitIns]]:
+    ) -> List[Tuple[ClientProxy, EvaluateIns]]:
         # Only evaluate after all trees are built
         if self.phase == "done" or (
             self.phase == "leaf" and self.current_tree >= self.n_trees - 1
@@ -465,7 +469,7 @@ class SecureXGBoostStrategy(Strategy):
                 num_clients=self.min_fit_clients,
                 min_num_clients=self.min_fit_clients,
             )
-            eval_ins = FitIns(
+            eval_ins = EvaluateIns(
                 parameters=ndarrays_to_parameters([np.array([], dtype=np.float32)]),
                 config={},
             )
@@ -473,7 +477,10 @@ class SecureXGBoostStrategy(Strategy):
         return []
 
     def aggregate_evaluate(
-        self, server_round: int, results, failures
+        self,
+        server_round: int,
+        results: List[Tuple[ClientProxy, EvaluateRes]],
+        failures: List[Union[Tuple[ClientProxy, EvaluateRes], BaseException]],
     ) -> Tuple[Optional[float], Dict[str, Scalar]]:
         if not results:
             return None, {}
@@ -495,6 +502,15 @@ class SecureXGBoostStrategy(Strategy):
 
         if not self.allow_per_node_metrics:
             metrics = {}
+
+        self.history.append({
+            "round": server_round,
+            "loss": avg_loss,
+            "n_clients": len(results),
+            "n_failures": len(failures),
+            **metrics,
+        })
+        self._save_history()
 
         return avg_loss, metrics
 
@@ -526,7 +542,7 @@ def _compute_num_rounds(n_trees, max_depth):
 
 
 def server_fn(context: Context) -> ServerAppComponents:
-    """Configure the server for secure histogram-based XGBoost."""
+    """Configure the server for histogram-based XGBoost."""
     cfg = context.run_config
 
     n_trees = int(cfg.get("n_trees", 10))

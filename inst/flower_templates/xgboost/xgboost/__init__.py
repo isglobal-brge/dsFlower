@@ -1,1 +1,1 @@
-"""Flower App: Secure Federated XGBoost (Histogram Protocol)."""
+"""Flower App: Federated XGBoost (Histogram Protocol)."""

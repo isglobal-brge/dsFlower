@@ -16,12 +16,16 @@ from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, buck
 
 class FlowerClient(NumPyClient):
     def __init__(self, X, y, privacy_config, loss="log_loss", alpha=0.0001,
-                 lr_schedule="optimal", penalty="l2", l1_ratio=0.15):
+                 lr_schedule="optimal", penalty="l2", l1_ratio=0.15,
+                 eta0=0.01, max_iter=1000):
         self.X = X
         self.y = y
         self.privacy_config = privacy_config
         kw = dict(loss=loss, alpha=alpha, learning_rate=lr_schedule,
-                  penalty=penalty, warm_start=True)
+                  penalty=penalty, warm_start=True, max_iter=max_iter,
+                  tol=1e-4, random_state=42)
+        if lr_schedule in ("constant", "invscaling", "adaptive"):
+            kw["eta0"] = eta0
         if penalty == "elasticnet":
             kw["l1_ratio"] = l1_ratio
         self.model = SGDClassifier(**kw)
@@ -99,10 +103,13 @@ def client_fn(context: Context) -> FlowerClient:
     lr_schedule = cfg.get("lr_schedule", "optimal")
     penalty = cfg.get("penalty", "l2")
     l1_ratio = float(cfg.get("l1_ratio", 0.15))
+    eta0 = float(cfg.get("eta0", 0.01))
+    max_iter = int(cfg.get("max_iter", 1000))
 
     return FlowerClient(X, y, privacy_config,
                         loss=loss, alpha=alpha, lr_schedule=lr_schedule,
-                        penalty=penalty, l1_ratio=l1_ratio)
+                        penalty=penalty, l1_ratio=l1_ratio,
+                        eta0=eta0, max_iter=max_iter)
 
 
 def _needs_secagg():

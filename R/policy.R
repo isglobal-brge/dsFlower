@@ -163,7 +163,7 @@
   pytorch_resnet18           = "vision",
   pytorch_densenet121        = "vision",
   pytorch_unet2d             = "segmentation",
-  xgboost                    = "xgboost_secure"
+  xgboost                    = "xgboost_histogram"
 )
 
 # Per-family minimum rows indexed by .PROFILE_ORDER.
@@ -174,11 +174,14 @@
   tabular_deep       = c(3L, 250L, 250L, 500L, 750L, 500L, 1000L),
   vision             = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
   segmentation       = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
-  xgboost_secure     = c(NA_integer_, 100L, 100L, 200L, 300L, NA_integer_, NA_integer_)
+  xgboost_histogram  = c(3L, 100L, 100L, 200L, 300L, NA_integer_, NA_integer_)
 )
 
 # --- Template Metadata ---
-# Per-template metadata that does NOT vary by profile (framework, SecAgg requirement).
+# Per-template metadata that does NOT vary by profile.
+# SecAgg requirements are profile-driven: XGBoost can run in sandbox/trusted
+# validation profiles without SecAgg, but clinical/consortium profiles still
+# require server-side Secure Aggregation through their trust profile.
 .TEMPLATE_METADATA <- list(
   sklearn_logreg            = list(framework = "sklearn",        requires_secagg = FALSE),
   sklearn_ridge             = list(framework = "sklearn",        requires_secagg = FALSE),
@@ -197,7 +200,7 @@
   pytorch_unet2d            = list(framework = "pytorch_vision", requires_secagg = FALSE),
   pytorch_tcn               = list(framework = "pytorch",        requires_secagg = FALSE),
   pytorch_lstm              = list(framework = "pytorch",        requires_secagg = FALSE),
-  xgboost                   = list(framework = "xgboost",       requires_secagg = TRUE)
+  xgboost                   = list(framework = "xgboost",       requires_secagg = FALSE)
 )
 
 # --- Hyperparameter schemas per template ---
@@ -208,6 +211,7 @@
   .sklearn_common = list(
     alpha       = list(type = "numeric", min = 1e-10, max = 100),
     C           = list(type = "numeric", min = 1e-10, max = 1000),
+    eta0        = list(type = "numeric", min = 1e-8,  max = 10),
     max_iter    = list(type = "integer", min = 1,     max = 100000),
     l1_ratio    = list(type = "numeric", min = 0,     max = 1)
   ),

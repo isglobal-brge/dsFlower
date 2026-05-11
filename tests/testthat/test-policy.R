@@ -479,7 +479,7 @@ test_that(".FAMILY_MIN_ROWS has correct families", {
   expect_true("tabular_deep" %in% names(fmr))
   expect_true("vision" %in% names(fmr))
   expect_true("segmentation" %in% names(fmr))
-  expect_true("xgboost_secure" %in% names(fmr))
+  expect_true("xgboost_histogram" %in% names(fmr))
   expect_equal(length(fmr), 6)
   # Each vector has 7 entries (one per profile)
   for (nm in names(fmr)) {
@@ -494,9 +494,9 @@ test_that("closed_form_linear has NA for DP profiles", {
   expect_true(is.na(fmr[7]))
 })
 
-test_that("xgboost_secure has NA for DP profiles", {
-  fmr <- dsFlower:::.FAMILY_MIN_ROWS[["xgboost_secure"]]
-  expect_true(is.na(fmr[1]))  # sandbox
+test_that("xgboost_histogram supports demo/internal profiles and blocks DP profiles", {
+  fmr <- dsFlower:::.FAMILY_MIN_ROWS[["xgboost_histogram"]]
+  expect_equal(fmr[1], 3L)    # sandbox
   expect_true(is.na(fmr[6]))  # clinical_update_noise
   expect_true(is.na(fmr[7]))  # high_sensitivity_dp
   expect_equal(fmr[2], 100L)  # trusted
@@ -525,12 +525,8 @@ test_that(".validateTemplateProfile allows xgboost in clinical_default", {
   expect_true(dsFlower:::.validateTemplateProfile("xgboost", "clinical_default"))
 })
 
-test_that(".validateTemplateProfile rejects xgboost in sandbox_open", {
-  # xgboost_secure has NA for sandbox
-  expect_error(
-    dsFlower:::.validateTemplateProfile("xgboost", "sandbox_open"),
-    "not supported"
-  )
+test_that(".validateTemplateProfile allows xgboost in sandbox_open", {
+  expect_true(dsFlower:::.validateTemplateProfile("xgboost", "sandbox_open"))
 })
 
 test_that(".validateTemplateProfile allows only DP-SGD validated templates in high_sensitivity_dp", {
@@ -550,7 +546,7 @@ test_that(".validateTemplateProfile allows only DP-SGD validated templates in hi
   }
 })
 
-test_that(".validateTemplateProfile allows all templates in sandbox_open (except xgboost_secure)", {
+test_that(".validateTemplateProfile allows all templates in sandbox_open", {
   allowed_in_sandbox <- c("sklearn_logreg", "sklearn_ridge", "sklearn_sgd",
                           "pytorch_mlp", "pytorch_logreg",
                           "pytorch_linear_regression", "pytorch_coxph",
@@ -559,7 +555,7 @@ test_that(".validateTemplateProfile allows all templates in sandbox_open (except
                           "pytorch_cause_specific_cox",
                           "pytorch_multiclass", "pytorch_resnet18",
                           "pytorch_densenet121", "pytorch_unet2d",
-                          "pytorch_tcn", "pytorch_lstm")
+                          "pytorch_tcn", "pytorch_lstm", "xgboost")
   for (tmpl in allowed_in_sandbox) {
     expect_true(dsFlower:::.validateTemplateProfile(tmpl, "sandbox_open"),
                 label = paste(tmpl, "should be allowed in sandbox_open"))
@@ -590,6 +586,8 @@ test_that(".templateMinRows returns family-based minimums", {
   expect_equal(dsFlower:::.templateMinRows("pytorch_mlp", "high_sensitivity_dp"), 1000L)
   # vision / high_sensitivity_dp = 5000
   expect_equal(dsFlower:::.templateMinRows("pytorch_resnet18", "high_sensitivity_dp"), 5000L)
+  # xgboost histogram / sandbox_open = 3
+  expect_equal(dsFlower:::.templateMinRows("xgboost", "sandbox_open"), 3L)
   # closed_form_linear / clinical_update_noise = NA -> NULL
   expect_null(dsFlower:::.templateMinRows("sklearn_logreg", "clinical_update_noise"))
   # unknown template
@@ -629,9 +627,9 @@ test_that(".TEMPLATE_METADATA has entries for all built-in templates", {
   }
 })
 
-test_that("xgboost requires secagg", {
+test_that("xgboost follows profile-level secagg requirements", {
   meta <- dsFlower:::.TEMPLATE_METADATA[["xgboost"]]
-  expect_true(meta$requires_secagg)
+  expect_false(meta$requires_secagg)
 })
 
 # --- Class Distribution Validation ---

@@ -1,4 +1,4 @@
-"""Flower ClientApp for Secure Federated XGBoost (Histogram Protocol)."""
+"""Flower ClientApp for Federated XGBoost (Histogram Protocol)."""
 
 import json
 import os
@@ -229,7 +229,7 @@ def _needs_secagg():
         return False
 
 
-# SecAgg+ is ALWAYS required for this template (secure by design)
+# SecAgg+ is enabled when the server trust profile requires it.
 if _needs_secagg():
     from flwr.client.mod import secaggplus_mod
     app = ClientApp(client_fn=client_fn, mods=[secaggplus_mod])
