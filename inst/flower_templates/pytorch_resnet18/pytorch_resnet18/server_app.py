@@ -23,14 +23,16 @@ _ADAPTIVE_STRATEGIES = {FedAdam, FedAdagrad}
 
 def _make_save_strategy(base_cls, results_dir, num_rounds,
                          allow_per_node_metrics=True, evaluation_only=False,
-                         template_name="unknown", **kwargs):
+                         template_name="unknown", save_json_max_bytes=16777216,
+                         **kwargs):
     """Create a SaveModelStrategy that subclasses the given Flower strategy."""
 
     class _Strategy(base_cls):
         """Dynamic strategy that saves global model weights and metrics."""
 
         def __init__(self, results_dir, num_rounds, allow_per_node_metrics=True,
-                     evaluation_only=False, template_name="unknown", **kw):
+                     evaluation_only=False, template_name="unknown",
+                     save_json_max_bytes=16777216, **kw):
             # FedAdam/FedAdagrad require initial_parameters but we don't
             # have model params at server init time. Pass a dummy value and
             # override initialize_parameters to fetch from a real client.
@@ -46,6 +48,7 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
             self.allow_per_node_metrics = allow_per_node_metrics
             self.evaluation_only = evaluation_only
             self._template_name = template_name
+            self.save_json_max_bytes = int(save_json_max_bytes)
             self.history = []
 
         def initialize_parameters(self, client_manager):
@@ -100,16 +103,31 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
         def _save_weights(self, weights, server_round):
             if self.evaluation_only:
                 return
-            # Portable JSON format (always saved)
+
+            # Native framework format is the primary artifact for large
+            # vision models. Portable JSON is kept only while reasonably small.
+            self._save_native(weights, server_round)
+
+            total_bytes = int(sum(getattr(w, "nbytes", 0) for w in weights))
+            if total_bytes > self.save_json_max_bytes:
+                path = self.results_dir / "global_model.skipped.json"
+                with open(path, "w") as f:
+                    json.dump({
+                        "reason": "weights_exceed_json_limit",
+                        "nbytes": total_bytes,
+                        "max_bytes": self.save_json_max_bytes,
+                        "round": server_round,
+                        "native_artifact": "model.pt",
+                    }, f)
+                return
+
+            # Portable JSON format for small models.
             data = {str(i): w.tolist() for i, w in enumerate(weights)}
             data["__shapes__"] = [list(w.shape) for w in weights]
             data["__round__"] = server_round
             path = self.results_dir / "global_model.json"
             with open(path, "w") as f:
                 json.dump(data, f)
-
-            # Native framework format (best effort)
-            self._save_native(weights, server_round)
 
         def _save_native(self, weights, server_round):
             """Save model in native ML framework format."""
@@ -228,6 +246,7 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
         allow_per_node_metrics=allow_per_node_metrics,
         evaluation_only=evaluation_only,
         template_name=template_name,
+        save_json_max_bytes=save_json_max_bytes,
         **kwargs,
     )
 
@@ -243,6 +262,7 @@ def server_fn(context: Context) -> ServerAppComponents:
     allow_per_node_metrics = str(cfg.get("allow-per-node-metrics", "true")).lower() == "true"
     fixed_client_sampling = str(cfg.get("fixed-client-sampling", "false")).lower() == "true"
     evaluation_only = str(cfg.get("evaluation-only", "false")).lower() == "true"
+    save_json_max_bytes = int(cfg.get("save-json-max-bytes", 16777216))
 
     strategy_name = cfg.get("strategy", "FedAvg")
     base_cls = _STRATEGY_MAP.get(strategy_name)
@@ -275,6 +295,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         allow_per_node_metrics=allow_per_node_metrics,
         evaluation_only=evaluation_only,
         template_name=template_name,
+        save_json_max_bytes=save_json_max_bytes,
         **strategy_kwargs,
     )
 

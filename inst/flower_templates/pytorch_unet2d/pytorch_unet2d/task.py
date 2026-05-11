@@ -24,17 +24,24 @@ from torchvision import transforms
 
 _privacy_config = None
 
-_DEFAULT_IMAGE_TRANSFORM = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+def make_segmentation_transforms(image_size=224):
+    """Build image and mask transforms for a configurable square size."""
+    image_size = int(image_size)
+    image_transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    mask_transform = transforms.Compose([
+        transforms.Resize((image_size, image_size),
+                          interpolation=transforms.InterpolationMode.NEAREST),
+        transforms.ToTensor(),
+    ])
+    return image_transform, mask_transform
 
-_DEFAULT_MASK_TRANSFORM = transforms.Compose([
-    transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
-    transforms.ToTensor(),
-])
+
+_DEFAULT_IMAGE_TRANSFORM, _DEFAULT_MASK_TRANSFORM = make_segmentation_transforms(224)
 
 
 class SegmentationDataset(Dataset):

@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from .task import (
     load_image_data, load_privacy_config, SegmentationDataset,
-    get_mask_root, get_path_cols,
+    get_mask_root, get_path_cols, make_segmentation_transforms,
 )
 from .privacy_utils import (
     clip_weights, add_gaussian_noise, compute_sigma, bucket_count,
@@ -41,29 +41,34 @@ class _DoubleConv(nn.Module):
 
 class UNet2D(nn.Module):
     """Simple U-Net with 4-level encoder-decoder and skip connections."""
-    def __init__(self, n_classes=1, in_channels=3):
+    def __init__(self, n_classes=1, in_channels=3, base_channels=64):
         super().__init__()
+        c1 = int(base_channels)
+        c2 = c1 * 2
+        c3 = c1 * 4
+        c4 = c1 * 8
+        cb = c1 * 16
         # Encoder
-        self.enc1 = _DoubleConv(in_channels, 64)
-        self.enc2 = _DoubleConv(64, 128)
-        self.enc3 = _DoubleConv(128, 256)
-        self.enc4 = _DoubleConv(256, 512)
+        self.enc1 = _DoubleConv(in_channels, c1)
+        self.enc2 = _DoubleConv(c1, c2)
+        self.enc3 = _DoubleConv(c2, c3)
+        self.enc4 = _DoubleConv(c3, c4)
         self.pool = nn.MaxPool2d(2)
 
         # Bottleneck
-        self.bottleneck = _DoubleConv(512, 1024)
+        self.bottleneck = _DoubleConv(c4, cb)
 
         # Decoder
-        self.up4 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
-        self.dec4 = _DoubleConv(1024, 512)
-        self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
-        self.dec3 = _DoubleConv(512, 256)
-        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.dec2 = _DoubleConv(256, 128)
-        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec1 = _DoubleConv(128, 64)
+        self.up4 = nn.ConvTranspose2d(cb, c4, 2, stride=2)
+        self.dec4 = _DoubleConv(c4 * 2, c4)
+        self.up3 = nn.ConvTranspose2d(c4, c3, 2, stride=2)
+        self.dec3 = _DoubleConv(c3 * 2, c3)
+        self.up2 = nn.ConvTranspose2d(c3, c2, 2, stride=2)
+        self.dec2 = _DoubleConv(c2 * 2, c2)
+        self.up1 = nn.ConvTranspose2d(c2, c1, 2, stride=2)
+        self.dec1 = _DoubleConv(c1 * 2, c1)
 
-        self.final = nn.Conv2d(64, n_classes, 1)
+        self.final = nn.Conv2d(c1, n_classes, 1)
 
     def forward(self, x):
         e1 = self.enc1(x)
@@ -192,9 +197,12 @@ def client_fn(context: Context) -> FlowerClient:
     learning_rate = float(cfg.get("learning_rate", 0.001))
     batch_size = int(cfg.get("batch_size", 8))
     local_epochs = int(cfg.get("local_epochs", 1))
+    image_size = int(cfg.get("image_size", 224))
+    base_channels = int(cfg.get("base_channels", 64))
 
     mask_root = get_mask_root(context)
     image_path_col, mask_path_col = get_path_cols(context)
+    image_transform, mask_transform = make_segmentation_transforms(image_size)
     dataset = SegmentationDataset(
         data_root,
         samples_df,
@@ -202,13 +210,15 @@ def client_fn(context: Context) -> FlowerClient:
         image_path_col=image_path_col,
         mask_root=mask_root,
         mask_path_col=mask_path_col,
+        image_transform=image_transform,
+        mask_transform=mask_transform,
     )
     trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     strategy = cfg.get("strategy", "FedAvg")
     fedbn = (strategy == "FedBN")
 
-    model = UNet2D(n_classes=n_classes)
+    model = UNet2D(n_classes=n_classes, base_channels=base_channels)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return FlowerClient(
         model, trainloader, privacy_config,

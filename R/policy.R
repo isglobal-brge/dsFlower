@@ -230,13 +230,17 @@
     hidden_layers = list(type = "string", max_length = 100)
   ),
   pytorch_resnet18 = list(
-    n_classes     = list(type = "integer", min = 2,   max = 10000)
+    n_classes     = list(type = "integer", min = 2,   max = 10000),
+    image_size    = list(type = "integer", min = 16,  max = 4096)
   ),
   pytorch_densenet121 = list(
-    n_classes     = list(type = "integer", min = 2,   max = 10000)
+    n_classes     = list(type = "integer", min = 2,   max = 10000),
+    image_size    = list(type = "integer", min = 16,  max = 4096)
   ),
   pytorch_unet2d = list(
-    n_classes     = list(type = "integer", min = 1,   max = 100)
+    n_classes     = list(type = "integer", min = 1,   max = 100),
+    image_size    = list(type = "integer", min = 16,  max = 4096),
+    base_channels = list(type = "integer", min = 1,   max = 512)
   ),
   pytorch_lstm = list(
     hidden_size   = list(type = "integer", min = 1,   max = 4096),

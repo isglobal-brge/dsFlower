@@ -14,12 +14,18 @@ from torchvision import transforms
 
 _privacy_config = None
 
-_DEFAULT_TRANSFORM = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+def make_image_transform(image_size=224):
+    """Build the standard vision transform for a configurable square size."""
+    image_size = int(image_size)
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+
+
+_DEFAULT_TRANSFORM = make_image_transform(224)
 
 
 class ImageDataset(Dataset):
@@ -293,8 +299,9 @@ class DICOMSeriesDataset(Dataset):
         return image, torch.tensor(label, dtype=torch.long)
 
 
-def get_image_path_col(manifest):
+def get_image_path_col(context=None):
     """Get the path column name from manifest assets or default."""
+    manifest = context if isinstance(context, dict) else _load_manifest(context)
     assets = manifest.get("assets", {})
     if "images" in assets:
         return assets["images"].get("path_col", "relative_path")

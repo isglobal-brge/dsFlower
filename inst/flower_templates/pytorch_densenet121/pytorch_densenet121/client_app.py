@@ -13,7 +13,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision.models import densenet121
 
-from .task import load_image_data, load_privacy_config, ImageDataset
+from .task import (
+    load_image_data, load_privacy_config, ImageDataset,
+    get_image_path_col, make_image_transform,
+)
 from .privacy_utils import (
     clip_weights, add_gaussian_noise, compute_sigma, bucket_count,
     get_parameters_fedbn, set_parameters_fedbn,
@@ -123,8 +126,15 @@ def client_fn(context: Context) -> FlowerClient:
     learning_rate = float(cfg.get("learning_rate", 0.001))
     batch_size = int(cfg.get("batch_size", 32))
     local_epochs = int(cfg.get("local_epochs", 1))
+    image_size = int(cfg.get("image_size", 224))
 
-    dataset = ImageDataset(data_root, samples_df, target_col=target_col)
+    dataset = ImageDataset(
+        data_root,
+        samples_df,
+        target_col=target_col,
+        path_col=get_image_path_col(context),
+        transform=make_image_transform(image_size),
+    )
     trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     strategy = cfg.get("strategy", "FedAvg")
