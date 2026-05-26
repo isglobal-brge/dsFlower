@@ -280,42 +280,47 @@ def server_fn(context: Context) -> ServerAppComponents:
 
     config = ServerConfig(num_rounds=num_rounds)
 
-    if require_secagg:
-        num_clients = int(cfg.get("strategy-min_available_clients", 2))
-        if num_clients >= 3:
-            try:
-                # Flower >= 1.10: ServerAppComponents accepts workflow
-                from flwr.server.workflow import SecAggPlusWorkflow
-                return ServerAppComponents(
-                    strategy=strategy, config=config,
-                    workflow=SecAggPlusWorkflow(
-                        num_shares=num_clients,
-                        reconstruction_threshold=max(1, num_clients - 1),
-                    )
-                )
-            except TypeError:
-                # Flower < 1.10: workflow param not supported in ServerAppComponents.
-                # SecAgg protection is provided client-side via secaggplus_mod
-                # (the client checks manifest.json and loads the mod at import time).
-                import sys
-                print(
-                    "\nDSFLOWER NOTE: Server-side SecAggPlusWorkflow not supported "
-                    "in this Flower version. Client-side secaggplus_mod is active.\n",
-                    file=sys.stderr, flush=True,
-                )
-            except ImportError:
-                pass
-        else:
-            import sys
-            print(
-                "\nDSFLOWER NOTE: SecAgg+ requires 3+ clients but only "
-                f"{num_clients} configured. Running without SecAgg+.\n"
-                "Privacy of individual updates is protected by DP-SGD noise "
-                "when secure_dp profile is active.\n",
-                file=sys.stderr, flush=True,
-            )
-
     return ServerAppComponents(strategy=strategy, config=config)
 
 
-app = ServerApp(server_fn=server_fn)
+def _requires_secagg(context: Context) -> bool:
+    return str(context.run_config.get("require-secure-aggregation", "false")).lower() == "true"
+
+
+def _run_server_app(grid, context: Context) -> None:
+    components = server_fn(context)
+    if _requires_secagg(context):
+        from flwr.server.compat import LegacyContext
+        from flwr.server.workflow import DefaultWorkflow, SecAggPlusWorkflow
+
+        cfg = context.run_config
+        num_clients = int(cfg.get("strategy-min_available_clients", 2))
+        if num_clients < 3:
+            raise RuntimeError("SecAgg+ requires at least three available clients.")
+        legacy_context = LegacyContext(
+            context,
+            config=components.config,
+            strategy=components.strategy,
+            client_manager=components.client_manager,
+        )
+        workflow = DefaultWorkflow(
+            fit_workflow=SecAggPlusWorkflow(
+                num_shares=num_clients,
+                reconstruction_threshold=max(2, num_clients - 1),
+            )
+        )
+        workflow(grid, legacy_context)
+        return
+
+    from flwr.server.compat import start_grid
+    start_grid(
+        server=components.server,
+        config=components.config,
+        strategy=components.strategy,
+        client_manager=components.client_manager,
+        grid=grid,
+    )
+
+
+app = ServerApp()
+app.main()(_run_server_app)

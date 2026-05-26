@@ -302,12 +302,29 @@
 #' Detect whether Flower ServerAppComponents accepts a workflow argument
 #'
 #' dsFlower templates need server-side SecAggPlusWorkflow whenever a profile or
-#' template requires Secure Aggregation. This check is deliberately file-based:
-#' Rserve child processes can hang when they spawn Python subprocesses.
+#' template requires Secure Aggregation. Recent Flower releases expose this
+#' through DefaultWorkflow/SecAggPlusWorkflow rather than a workflow argument on
+#' ServerAppComponents. This check is deliberately file-based: Rserve child
+#' processes can hang when they spawn Python subprocesses.
 #' @keywords internal
 .serverapp_components_supports_workflow <- function(venv_path) {
   site_dirs <- .venv_site_packages_dirs(venv_path)
   for (site_dir in site_dirs) {
+    secagg_src <- file.path(
+      site_dir, "flwr", "server", "workflow", "secure_aggregation",
+      "secaggplus_workflow.py"
+    )
+    default_src <- file.path(
+      site_dir, "flwr", "server", "workflow", "default_workflows.py"
+    )
+    legacy_src <- file.path(
+      site_dir, "flwr", "server", "compat", "legacy_context.py"
+    )
+    if (file.exists(secagg_src) && file.exists(default_src) &&
+        file.exists(legacy_src)) {
+      return(TRUE)
+    }
+
     src <- file.path(site_dir, "flwr", "server", "serverapp_components.py")
     if (!file.exists(src)) next
     lines <- tryCatch(readLines(src, warn = FALSE),

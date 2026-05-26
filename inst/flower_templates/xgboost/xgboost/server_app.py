@@ -16,10 +16,9 @@ Protocol per tree:
 
 Round budget:
   1 round for bin_edges
-  Per tree: up to (2^max_depth - 1) histogram rounds + same number of split
-  rounds + 1 leaf round = 2 * max_internal_nodes + 1 rounds per tree.
-  With max_depth=3 (7 internal nodes max): 15 rounds per tree.
-  Total: 1 + n_trees * (2 * max_internal_nodes + 1).
+  Per tree: all node histograms, internal-node split broadcasts, and one leaf
+  broadcast. With max_depth=3 this is 15 histogram rounds, 7 split rounds and
+  1 leaf round per tree.
 """
 
 import json
@@ -531,13 +530,15 @@ def _compute_num_rounds(n_trees, max_depth):
 
     Round budget:
       1 round for bin_edges
-      Per tree: worst case 2 * (2^max_depth - 1) + 1 rounds
-        = (2^max_depth - 1) histogram rounds
+      Per tree: worst case histograms for every node in the full binary tree,
+      split broadcasts for internal nodes, and one leaf broadcast:
+        = (2^(max_depth + 1) - 1) histogram rounds
         + (2^max_depth - 1) split rounds
         + 1 leaf round
     """
     max_internal_nodes = (2 ** max_depth) - 1
-    rounds_per_tree = 2 * max_internal_nodes + 1
+    max_total_nodes = (2 ** (max_depth + 1)) - 1
+    rounds_per_tree = max_total_nodes + max_internal_nodes + 1
     return 1 + n_trees * rounds_per_tree
 
 
@@ -586,25 +587,47 @@ def server_fn(context: Context) -> ServerAppComponents:
 
     config = ServerConfig(num_rounds=num_rounds)
 
-    if require_secagg:
-        num_clients = int(cfg.get("strategy-min_available_clients", 2))
-        if num_clients >= 3:
-            from flwr.server.workflow import SecAggPlusWorkflow
-            return ServerAppComponents(
-                strategy=strategy, config=config,
-                workflow=SecAggPlusWorkflow(
-                    num_shares=num_clients,
-                    reconstruction_threshold=num_clients,
-                ),
-            )
-        import sys
-        print(
-            "\nDSFLOWER NOTE: SecAgg+ requires 3+ clients but only "
-            f"{num_clients} configured. Running without SecAgg+.\n",
-            file=sys.stderr, flush=True,
-        )
-
     return ServerAppComponents(strategy=strategy, config=config)
 
 
-app = ServerApp(server_fn=server_fn)
+def _requires_secagg(context: Context) -> bool:
+    return str(context.run_config.get("require-secure-aggregation", "false")).lower() == "true"
+
+
+def _run_server_app(grid, context: Context) -> None:
+    components = server_fn(context)
+    if _requires_secagg(context):
+        from flwr.server.compat import LegacyContext
+        from flwr.server.workflow import DefaultWorkflow, SecAggPlusWorkflow
+
+        cfg = context.run_config
+        num_clients = int(cfg.get("strategy-min_available_clients", 2))
+        if num_clients < 3:
+            raise RuntimeError("SecAgg+ requires at least three available clients.")
+        legacy_context = LegacyContext(
+            context,
+            config=components.config,
+            strategy=components.strategy,
+            client_manager=components.client_manager,
+        )
+        workflow = DefaultWorkflow(
+            fit_workflow=SecAggPlusWorkflow(
+                num_shares=num_clients,
+                reconstruction_threshold=max(2, num_clients - 1),
+            )
+        )
+        workflow(grid, legacy_context)
+        return
+
+    from flwr.server.compat import start_grid
+    start_grid(
+        server=components.server,
+        config=components.config,
+        strategy=components.strategy,
+        client_manager=components.client_manager,
+        grid=grid,
+    )
+
+
+app = ServerApp()
+app.main()(_run_server_app)

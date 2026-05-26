@@ -619,8 +619,14 @@ flowerCleanupRunDS <- function(handle_symbol) {
         jsonlite::fromJSON(manifest_path, simplifyVector = TRUE),
         error = function(e) NULL
       )
-      if (!is.null(manifest) &&
-          identical(manifest[["privacy-mode"]], "dp")) {
+      mode <- manifest[["privacy-mode"]] %||% manifest[["privacy_profile"]]
+      dp_scope <- manifest[["dp_scope"]] %||% "none"
+      is_dp_run <- !is.null(manifest) && (
+        mode %in% c("dp", "high_sensitivity_dp", "clinical_update_noise") ||
+          dp_scope %in% c("patient_level_dp_sgd", "update_noise_only") ||
+          isTRUE(manifest[["dp_required"]])
+      )
+      if (is_dp_run) {
         dataset_key <- paste0(handle$source %||% "table", ":",
                               manifest$target_column)
         .record_spend(

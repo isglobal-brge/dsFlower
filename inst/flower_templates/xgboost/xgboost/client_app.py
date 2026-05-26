@@ -8,7 +8,7 @@ from flwr.common import Context
 
 import numpy as np
 
-from .task import load_data, load_privacy_config
+from .task import load_data, load_privacy_config, _get_manifest_dir
 from .privacy_utils import bucket_count
 
 SCALE_FACTOR = 1_000_000  # Quantization scale for SecAgg+ (int64)
@@ -16,7 +16,8 @@ SCALE_FACTOR = 1_000_000  # Quantization scale for SecAgg+ (int64)
 
 class SecureXGBClient(NumPyClient):
     def __init__(self, X, y, privacy_config, n_bins=64,
-                 learning_rate=0.3, reg_lambda=1.0, objective="binary:logistic"):
+                 learning_rate=0.3, reg_lambda=1.0, objective="binary:logistic",
+                 manifest_dir=None):
         self.X = X.astype(np.float64)
         self.y = y.astype(np.float64)
         self.privacy_config = privacy_config
@@ -31,6 +32,48 @@ class SecureXGBClient(NumPyClient):
         self.predictions = np.zeros(len(y), dtype=np.float64)
         self.node_assignments = np.zeros(len(y), dtype=np.int32)
         self.trees = []  # List of tree dicts for final model
+        self.state_path = None
+        if manifest_dir:
+            self.state_path = os.path.join(manifest_dir, "xgboost_state.npz")
+            self._load_state()
+
+    def _load_state(self):
+        """Restore per-run client state across Flower ClientApp invocations."""
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        try:
+            state = np.load(self.state_path, allow_pickle=False)
+            predictions = state["predictions"] if "predictions" in state.files else None
+            node_assignments = (
+                state["node_assignments"] if "node_assignments" in state.files else None
+            )
+            bin_edges = state["bin_edges"] if "bin_edges" in state.files else None
+            if predictions is not None and len(predictions) == len(self.y):
+                self.predictions = predictions.astype(np.float64)
+            if node_assignments is not None and len(node_assignments) == len(self.y):
+                self.node_assignments = node_assignments.astype(np.int32)
+            if bin_edges is not None and bin_edges.size:
+                self.bin_edges = bin_edges.astype(np.float64)
+        except Exception:
+            # State can be rebuilt from the protocol messages. A corrupt cache
+            # should not abort the run; it simply starts this client state fresh.
+            self.predictions = np.zeros(len(self.y), dtype=np.float64)
+            self.node_assignments = np.zeros(len(self.y), dtype=np.int32)
+            self.bin_edges = None
+
+    def _save_state(self):
+        """Persist per-run state needed by the multi-phase histogram protocol."""
+        if not self.state_path:
+            return
+        bin_edges = self.bin_edges
+        if bin_edges is None:
+            bin_edges = np.array([], dtype=np.float64)
+        np.savez(
+            self.state_path,
+            predictions=self.predictions.astype(np.float64),
+            node_assignments=self.node_assignments.astype(np.int32),
+            bin_edges=bin_edges.astype(np.float64),
+        )
 
     def get_parameters(self, config):
         # Return predictions (used for initialization)
@@ -38,6 +81,18 @@ class SecureXGBClient(NumPyClient):
 
     def set_parameters(self, parameters):
         pass  # Parameters are handled per-phase in fit()
+
+    def _fit_num_examples(self, n):
+        """Return the weighting factor used by Flower for fit aggregation."""
+        if self.privacy_config.get("require_secure_aggregation", False):
+            # Flower SecAgg+ computes a weighted average over masked vectors.
+            # Histogram boosting needs sums, not sample-size weighted averages.
+            # Giving every client weight 1 lets the strategy recover the sum by
+            # summing the identical aggregate vector passed back by the workflow.
+            return 1
+        if not self.privacy_config.get("allow_exact_num_examples", True):
+            return bucket_count(int(n))
+        return int(n)
 
     def fit(self, parameters, config):
         phase = config.get("phase", "histogram")
@@ -51,7 +106,7 @@ class SecureXGBClient(NumPyClient):
         elif phase == "leaf":
             return self._handle_leaf(parameters, config)
         else:
-            return [np.array([], dtype=np.float32)], len(self.y), {}
+            return [np.array([], dtype=np.float32)], self._fit_num_examples(len(self.y)), {}
 
     def _compute_gradients(self):
         """Compute first and second order gradients for the objective."""
@@ -85,8 +140,9 @@ class SecureXGBClient(NumPyClient):
             percentiles = np.linspace(0, 100, self.n_bins + 1)[1:-1]
             local_edges.append(np.percentile(col, percentiles))
         local_edges = np.array(local_edges, dtype=np.float32)
+        self._save_state()
 
-        return [local_edges.ravel()], len(self.y), {}
+        return [local_edges.ravel()], self._fit_num_examples(len(self.y)), {}
 
     def _handle_histogram(self, parameters, config):
         """Compute and return quantized histograms for SecAgg+."""
@@ -104,7 +160,9 @@ class SecureXGBClient(NumPyClient):
         if not np.any(mask):
             # No samples in this node - return zero histograms
             n_hist_values = self.n_features * self.n_bins * 2  # grad + hess
-            return [np.zeros(n_hist_values, dtype=np.int64)], len(self.y), {}
+            return [
+                np.zeros(n_hist_values, dtype=np.int64)
+            ], self._fit_num_examples(0), {}
 
         X_node = self.X[mask]
         grad_node = grad[mask]
@@ -129,16 +187,12 @@ class SecureXGBClient(NumPyClient):
         # Flatten: [grad_f0_b0, ..., grad_fN_bM, hess_f0_b0, ..., hess_fN_bM]
         flat = np.concatenate([grad_quantized.ravel(), hess_quantized.ravel()])
 
-        n_examples = int(mask.sum())
-        if not self.privacy_config.get("allow_exact_num_examples", True):
-            n_examples = bucket_count(n_examples)
-
-        return [flat], n_examples, {}
+        return [flat], self._fit_num_examples(mask.sum()), {}
 
     def _handle_split(self, parameters, config):
         """Apply split decision to node assignments."""
         if len(parameters) == 0 or len(parameters[0]) == 0:
-            return [np.array([], dtype=np.float32)], len(self.y), {}
+            return [np.array([], dtype=np.float32)], self._fit_num_examples(len(self.y)), {}
 
         split_info = parameters[0].astype(np.float64)
         feature_idx = int(split_info[0])
@@ -153,13 +207,14 @@ class SecureXGBClient(NumPyClient):
             go_left = self.X[indices, feature_idx] <= threshold
             self.node_assignments[indices[go_left]] = left_child
             self.node_assignments[indices[~go_left]] = right_child
+        self._save_state()
 
-        return [np.array([], dtype=np.float32)], len(self.y), {}
+        return [np.array([], dtype=np.float32)], self._fit_num_examples(len(self.y)), {}
 
     def _handle_leaf(self, parameters, config):
         """Apply leaf values to update predictions."""
         if len(parameters) == 0 or len(parameters[0]) == 0:
-            return self.get_parameters(config), len(self.y), {}
+            return self.get_parameters(config), self._fit_num_examples(len(self.y)), {}
 
         leaf_values = parameters[0].astype(np.float64)
 
@@ -170,8 +225,9 @@ class SecureXGBClient(NumPyClient):
 
         # Reset for next tree
         self.node_assignments[:] = 0
+        self._save_state()
 
-        return self.get_parameters(config), len(self.y), {}
+        return self.get_parameters(config), self._fit_num_examples(len(self.y)), {}
 
     def evaluate(self, parameters, config):
         if not self.privacy_config.get("allow_per_node_metrics", True):
@@ -203,6 +259,7 @@ def client_fn(context: Context) -> SecureXGBClient:
     cfg = context.run_config
     X, y = load_data(context)
     privacy_config = load_privacy_config(context)
+    manifest_dir = _get_manifest_dir(context)
 
     n_bins = int(cfg.get("n_bins", 64))
     learning_rate = float(cfg.get("eta", 0.3))
@@ -215,6 +272,7 @@ def client_fn(context: Context) -> SecureXGBClient:
         learning_rate=learning_rate,
         reg_lambda=reg_lambda,
         objective=objective,
+        manifest_dir=manifest_dir,
     )
 
 

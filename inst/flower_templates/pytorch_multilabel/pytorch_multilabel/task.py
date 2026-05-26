@@ -54,6 +54,17 @@ def load_data(context=None):
     return X.astype(np.float32), y.astype(np.float32)
 
 
+def _privacy_execution_mode(manifest):
+    """Map server trust profiles to template execution modes."""
+    requested = manifest.get("privacy-mode", manifest.get("privacy_profile", "research"))
+    dp_scope = manifest.get("dp_scope", "none")
+    if requested in ("high_sensitivity_dp", "dp") or dp_scope == "patient_level_dp_sgd":
+        return "dp"
+    if requested in ("clinical_update_noise", "dp_update_level") or dp_scope == "update_noise_only":
+        return "dp_update_level"
+    return requested
+
+
 def load_privacy_config(context=None):
     """Load privacy configuration from manifest.json.
 
@@ -73,7 +84,10 @@ def load_privacy_config(context=None):
     manifest = _load_manifest(context)
 
     config = {
-        "privacy_mode": manifest.get("privacy-mode", "research"),
+        "privacy_profile": manifest.get("privacy_profile", manifest.get("privacy-mode", "research")),
+        "privacy_requested_mode": manifest.get("privacy-mode", "research"),
+        "privacy_mode": _privacy_execution_mode(manifest),
+        "dp_scope": manifest.get("dp_scope", "none"),
         "allow_per_node_metrics": manifest.get("allow_per_node_metrics", True),
         "allow_exact_num_examples": manifest.get("allow_exact_num_examples", True),
         "require_secure_aggregation": manifest.get("require_secure_aggregation", False),
