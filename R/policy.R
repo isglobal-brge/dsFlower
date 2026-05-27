@@ -174,7 +174,7 @@
   tabular_deep       = c(3L, 250L, 250L, 500L, 750L, 500L, 1000L),
   vision             = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
   segmentation       = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
-  xgboost_histogram  = c(3L, 100L, 100L, 200L, 300L, NA_integer_, NA_integer_)
+  xgboost_histogram  = c(3L, 100L, 100L, 200L, 300L, 500L, NA_integer_)
 )
 
 # --- Template Metadata ---

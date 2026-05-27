@@ -494,10 +494,10 @@ test_that("closed_form_linear has NA for DP profiles", {
   expect_true(is.na(fmr[7]))
 })
 
-test_that("xgboost_histogram supports demo/internal profiles and blocks DP profiles", {
+test_that("xgboost_histogram supports secure update-noise profile and blocks DP-SGD", {
   fmr <- dsFlower:::.FAMILY_MIN_ROWS[["xgboost_histogram"]]
   expect_equal(fmr[1], 3L)    # sandbox
-  expect_true(is.na(fmr[6]))  # clinical_update_noise
+  expect_equal(fmr[6], 500L)  # clinical_update_noise
   expect_true(is.na(fmr[7]))  # high_sensitivity_dp
   expect_equal(fmr[2], 100L)  # trusted
   expect_equal(fmr[4], 200L)  # clinical_default

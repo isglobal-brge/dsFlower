@@ -6,13 +6,21 @@ histograms so the server sees only aggregated sums of quantized histograms.
 Trusted demo profiles can run the same protocol without SecAgg+ for end-to-end
 validation.
 
-Protocol per tree:
+Trusted-profile protocol per tree:
   1. bin_edges   - Collect local percentile edges, compute global edges.
   2. histogram   - For each node to split: collect quantized grad/hess
                    histograms, find best split from aggregated sums.
   3. split       - Broadcast split decision; clients update node assignments.
   4. leaf        - After all splits done, broadcast leaf values; clients
                    update predictions.
+
+Secure-profile protocol:
+  SecAgg+ workflows require a stable fit shape and do not tolerate the
+  variable control phases used by the full tree builder. For clinical profiles
+  the template therefore runs a boosted-stump protocol: each secure round
+  aggregates one fixed-shape root histogram, the server derives one split and
+  two leaf values, and the next round's config tells clients to apply the
+  previous stump before computing the next encrypted histogram.
 
 Round budget:
   1 round for bin_edges
@@ -66,6 +74,7 @@ class SecureXGBoostStrategy(Strategy):
         allow_per_node_metrics: bool = True,
         evaluation_only: bool = False,
         secure_single_round: bool = False,
+        secure_stump_boost: bool = False,
         fixed_bin_range: float = 4.0,
     ):
         super().__init__()
@@ -83,8 +92,10 @@ class SecureXGBoostStrategy(Strategy):
         self.min_fit_clients = min_fit_clients
         self.allow_per_node_metrics = allow_per_node_metrics
         self.evaluation_only = evaluation_only
+        self.secure_stump_boost = secure_stump_boost or secure_single_round
         self.secure_single_round = secure_single_round
         self.fixed_bin_range = fixed_bin_range
+        self.pending_stump_update = None
 
         # State machine
         self.current_tree = 0
@@ -109,7 +120,7 @@ class SecureXGBoostStrategy(Strategy):
         # Maximum internal nodes in a tree of depth max_depth
         self.max_internal_nodes = (2 ** max_depth) - 1
 
-        if self.secure_single_round:
+        if self.secure_stump_boost:
             self.global_bin_edges = self._fixed_bin_edges()
             self._start_new_tree()
             self.phase = "histogram"
@@ -186,11 +197,24 @@ class SecureXGBoostStrategy(Strategy):
         elif self.phase == "histogram":
             node_id = self._get_current_histogram_node()
             config["node_id"] = str(node_id)
+            if self.secure_stump_boost:
+                config["secure_stump_boost"] = "true"
+                config["tree_id"] = str(self.current_tree)
+                if self.pending_stump_update is not None:
+                    update = self.pending_stump_update
+                    config["apply_tree_id"] = str(update["tree_id"])
+                    config["apply_feature"] = str(update["feature"])
+                    config["apply_threshold"] = str(update["threshold"])
+                    config["apply_left_leaf"] = str(update["left_leaf"])
+                    config["apply_right_leaf"] = str(update["right_leaf"])
             # Send global bin edges
             if self.global_bin_edges is not None:
-                fit_params = ndarrays_to_parameters(
-                    [self.global_bin_edges.ravel().astype(np.float32)]
-                )
+                if self.secure_stump_boost:
+                    fit_params = self._fixed_parameters(self.global_bin_edges.ravel())
+                else:
+                    fit_params = ndarrays_to_parameters(
+                        [self.global_bin_edges.ravel().astype(np.float32)]
+                    )
             else:
                 fit_params = ndarrays_to_parameters(
                     [np.array([], dtype=np.float32)]
@@ -369,6 +393,19 @@ class SecureXGBoostStrategy(Strategy):
 
         self.nodes_to_split.popleft()
 
+        if self.secure_stump_boost:
+            return self._aggregate_secure_stump(
+                node_id=node_id,
+                depth=depth,
+                grad_hist=grad_hist,
+                hess_hist=hess_hist,
+                G_total=G_total,
+                H_total=H_total,
+                best_gain=best_gain,
+                best_feature=best_feature,
+                best_bin=best_bin,
+            )
+
         if best_gain <= 0 or depth >= self.max_depth:
             # Make this a leaf
             leaf_value = -G_total / (H_total + self.reg_lambda)
@@ -436,6 +473,77 @@ class SecureXGBoostStrategy(Strategy):
             split["right"],
         ], dtype=np.float32)
         return self._fixed_parameters(split_arr), {}
+
+    def _aggregate_secure_stump(
+        self,
+        node_id,
+        depth,
+        grad_hist,
+        hess_hist,
+        G_total,
+        H_total,
+        best_gain,
+        best_feature,
+        best_bin,
+    ):
+        """Build exactly one split-or-leaf tree from a secure root histogram."""
+        self.nodes_to_split.clear()
+
+        if best_gain <= 0 or depth >= self.max_depth or best_feature < 0:
+            leaf_value = -G_total / (H_total + self.reg_lambda)
+            self.tree_leaf_values[node_id] = leaf_value
+            update = {
+                "tree_id": self.current_tree,
+                "feature": -1,
+                "threshold": 0.0,
+                "left_leaf": float(leaf_value),
+                "right_leaf": float(leaf_value),
+            }
+        else:
+            left_child = 1
+            right_child = 2
+            threshold = float(self.global_bin_edges[best_feature, best_bin])
+
+            G_left = float(grad_hist[best_feature, :(best_bin + 1)].sum())
+            H_left = float(hess_hist[best_feature, :(best_bin + 1)].sum())
+            G_right = float(G_total - G_left)
+            H_right = float(H_total - H_left)
+            left_leaf = -G_left / (H_left + self.reg_lambda)
+            right_leaf = -G_right / (H_right + self.reg_lambda)
+
+            self.tree_splits[node_id] = {
+                "feature": int(best_feature),
+                "threshold": threshold,
+                "left": left_child,
+                "right": right_child,
+                "gain": float(best_gain),
+            }
+            self.tree_leaf_values[left_child] = float(left_leaf)
+            self.tree_leaf_values[right_child] = float(right_leaf)
+            update = {
+                "tree_id": self.current_tree,
+                "feature": int(best_feature),
+                "threshold": threshold,
+                "left_leaf": float(left_leaf),
+                "right_leaf": float(right_leaf),
+            }
+
+        self._record_completed_tree()
+        self.current_tree += 1
+        self.pending_stump_update = update
+
+        if self.current_tree < self.n_trees:
+            self._start_new_tree()
+            self.phase = "histogram"
+        else:
+            self._save_model()
+            self._save_history()
+            self.phase = "done"
+
+        return self._fixed_parameters(), {
+            "secure_histogram_tree": float(self.current_tree),
+            "secure_stump_gain": float(best_gain),
+        }
 
     def _aggregate_split(self, results):
         """Split broadcast acknowledged. Move to next histogram or leaf."""
@@ -605,6 +713,11 @@ def _compute_num_rounds(n_trees, max_depth):
     return 1 + n_trees * rounds_per_tree
 
 
+def _compute_secure_num_rounds(n_trees):
+    """One fixed-shape secure histogram aggregation per boosted stump."""
+    return max(1, int(n_trees))
+
+
 def server_fn(context: Context) -> ServerAppComponents:
     """Configure the server for histogram-based XGBoost."""
     cfg = context.run_config
@@ -624,9 +737,21 @@ def server_fn(context: Context) -> ServerAppComponents:
     ).lower() == "true"
     fixed_client_sampling = str(cfg.get("fixed-client-sampling", "false")).lower() == "true"
     evaluation_only = str(cfg.get("evaluation-only", "false")).lower() == "true"
-    secure_single_round = require_secagg and n_trees == 1 and max_depth == 1
+    secure_stump_boost = require_secagg
+    if secure_stump_boost and max_depth != 1:
+        logger.warning(
+            "Secure XGBoost profiles use boosted stumps; requested max_depth=%s "
+            "will be treated as max_depth=1.",
+            max_depth,
+        )
+        max_depth = 1
+    secure_single_round = secure_stump_boost and n_trees == 1 and max_depth == 1
 
-    num_rounds = 1 if secure_single_round else _compute_num_rounds(n_trees, max_depth)
+    num_rounds = (
+        _compute_secure_num_rounds(n_trees)
+        if secure_stump_boost
+        else _compute_num_rounds(n_trees, max_depth)
+    )
 
     min_available = int(cfg.get("strategy-min_available_clients", 2))
     min_fit = int(cfg.get("strategy-min_fit_clients", 2))
@@ -648,6 +773,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         allow_per_node_metrics=allow_per_node_metrics,
         evaluation_only=evaluation_only,
         secure_single_round=secure_single_round,
+        secure_stump_boost=secure_stump_boost,
         fixed_bin_range=float(cfg.get("fixed-bin-range", 4.0)),
     )
 

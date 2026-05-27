@@ -1,6 +1,7 @@
 """Flower ClientApp for Federated XGBoost (Histogram Protocol)."""
 
 import json
+import math
 import os
 
 from flwr.client import ClientApp, NumPyClient
@@ -32,6 +33,7 @@ class SecureXGBClient(NumPyClient):
         self.node_assignments = np.zeros(len(y), dtype=np.int32)
         self.trees = []  # List of tree dicts for final model
         self.state_path = None
+        self.last_applied_tree = -1
         if manifest_dir:
             self.state_path = os.path.join(manifest_dir, "xgboost_state.npz")
             self._load_state()
@@ -53,12 +55,15 @@ class SecureXGBClient(NumPyClient):
                 self.node_assignments = node_assignments.astype(np.int32)
             if bin_edges is not None and bin_edges.size:
                 self.bin_edges = bin_edges.astype(np.float64)
+            if "last_applied_tree" in state.files:
+                self.last_applied_tree = int(state["last_applied_tree"])
         except Exception:
             # State can be rebuilt from the protocol messages. A corrupt cache
             # should not abort the run; it simply starts this client state fresh.
             self.predictions = np.zeros(len(self.y), dtype=np.float64)
             self.node_assignments = np.zeros(len(self.y), dtype=np.int32)
             self.bin_edges = None
+            self.last_applied_tree = -1
 
     def _save_state(self):
         """Persist per-run state needed by the multi-phase histogram protocol."""
@@ -72,6 +77,7 @@ class SecureXGBClient(NumPyClient):
             predictions=self.predictions.astype(np.float64),
             node_assignments=self.node_assignments.astype(np.int32),
             bin_edges=bin_edges.astype(np.float64),
+            last_applied_tree=np.array(self.last_applied_tree, dtype=np.int32),
         )
 
     def get_parameters(self, config):
@@ -133,6 +139,52 @@ class SecureXGBClient(NumPyClient):
             hess = np.ones_like(grad)
         return grad, hess
 
+    def _maybe_apply_previous_stump(self, config):
+        """Apply the previous boosted stump exactly once per client state."""
+        tree_raw = config.get("apply_tree_id")
+        if tree_raw is None:
+            return
+        tree_id = int(tree_raw)
+        if tree_id <= self.last_applied_tree:
+            return
+
+        feature_idx = int(float(config.get("apply_feature", -1)))
+        threshold = float(config.get("apply_threshold", 0.0))
+        left_leaf = float(config.get("apply_left_leaf", 0.0))
+        right_leaf = float(config.get("apply_right_leaf", left_leaf))
+
+        if feature_idx < 0:
+            leaf = np.full(len(self.y), left_leaf, dtype=np.float64)
+        else:
+            leaf = np.where(self.X[:, feature_idx] <= threshold, left_leaf, right_leaf)
+        self.predictions += self.learning_rate * leaf
+        self.last_applied_tree = tree_id
+        self.node_assignments[:] = 0
+        self._save_state()
+
+    def _maybe_add_update_noise(self, flat):
+        """Add Gaussian noise to bounded histogram contributions.
+
+        For binary-logistic histogram boosting, each row contributes bounded
+        gradient and Hessian terms to one bin per feature. The profile's
+        clipping_norm is treated here as the declared L2 sensitivity bound for
+        a single row's histogram contribution, not as a norm cap on the whole
+        site-level aggregate histogram. Clipping the aggregate would destroy
+        the split signal before secure aggregation.
+        """
+        if self.privacy_config.get("privacy_mode") != "dp_update_level":
+            return flat.astype(np.float32)
+
+        sensitivity = float(self.privacy_config.get("clipping_norm", 1.0))
+        epsilon = float(self.privacy_config.get("epsilon", 1.0))
+        delta = float(self.privacy_config.get("delta", 1e-5))
+        if sensitivity <= 0 or epsilon <= 0 or delta <= 0:
+            raise ValueError("epsilon, delta, and clipping_norm must be positive")
+
+        sigma = math.sqrt(2.0 * math.log(1.25 / delta)) * (sensitivity / epsilon)
+        noise = np.random.normal(0.0, sigma, size=flat.shape)
+        return (flat.astype(np.float64) + noise).astype(np.float32)
+
     def _handle_bin_edges(self, parameters, config):
         """Receive global bin edges from server."""
         if len(parameters) > 0 and len(parameters[0]) > 0:
@@ -160,13 +212,18 @@ class SecureXGBClient(NumPyClient):
 
     def _handle_histogram(self, parameters, config):
         """Compute and return quantized histograms for SecAgg+."""
+        if str(config.get("secure_stump_boost", "false")).lower() == "true":
+            self._maybe_apply_previous_stump(config)
+            self.node_assignments[:] = 0
+
         node_id = int(config.get("node_id", "0"))
 
         # Update bin edges if provided
         if len(parameters) > 0 and len(parameters[0]) > 0:
             flat = parameters[0].astype(np.float64)
-            if len(flat) == self.n_features * (self.n_bins - 1):
-                self.bin_edges = flat.reshape(self.n_features, -1)
+            edge_len = self.n_features * (self.n_bins - 1)
+            if len(flat) >= edge_len:
+                self.bin_edges = flat[:edge_len].reshape(self.n_features, -1)
 
         grad, hess = self._compute_gradients()
         mask = self.node_assignments == node_id
@@ -195,6 +252,7 @@ class SecureXGBClient(NumPyClient):
 
         # Flatten: [grad_f0_b0, ..., grad_fN_bM, hess_f0_b0, ..., hess_fN_bM]
         flat = np.concatenate([grad_hist.ravel(), hess_hist.ravel()]).astype(np.float32)
+        flat = self._maybe_add_update_noise(flat)
 
         return [flat], self._fit_num_examples(mask.sum()), {}
 
