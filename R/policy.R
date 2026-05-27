@@ -605,27 +605,36 @@
   profile
 }
 
-#' Validate class distribution against trust profile thresholds
+#' Validate target distribution against trust profile thresholds
 #'
-#' Infers task type from the target column and validates:
+#' Uses the explicit task type when provided and otherwise infers a conservative
+#' classification/survival interpretation from the target column. Validates:
 #' - Binary (2 unique values): min(table(target)) >= trust$min_positive_examples
 #' - Multiclass (>2 unique): all(table(target) >= trust$min_per_class)
 #' - Survival (2-column target or event/status column): sum(events==1) >= trust$min_events
+#' - Regression/count targets: no class-count check is applied.
 #'
 #' Error messages are deliberately generic to avoid leaking counts.
 #'
 #' @param data Data.frame or Arrow Table; the training data.
 #' @param target_column Character; name(s) of the target column(s).
 #' @param trust Named list; the trust profile settings.
+#' @param task_type Character task type ("classification", "regression",
+#'   "survival", etc.) or NULL.
 #' @return TRUE invisibly, or stops with an error.
 #' @keywords internal
-.validateClassDistribution <- function(data, target_column, trust) {
+.validateClassDistribution <- function(data, target_column, trust,
+                                       task_type = NULL) {
   if (is.null(target_column) || length(target_column) == 0) {
+    return(invisible(TRUE))
+  }
+  task_type <- tolower(as.character(task_type %||% ""))
+  if (task_type %in% c("regression", "count", "continuous")) {
     return(invisible(TRUE))
   }
 
   # Survival detection: 2-column target or column named "event"/"status"
-  is_survival <- FALSE
+  is_survival <- identical(task_type, "survival")
   if (length(target_column) == 2) {
     is_survival <- TRUE
     # Look for the event/status column (not the time column)
@@ -667,7 +676,8 @@
   }
 
   # Check for survival-like single column (named event/status)
-  if (tolower(tc) %in% c("event", "status", "dead", "died")) {
+  if (identical(task_type, "survival") ||
+      tolower(tc) %in% c("event", "status", "dead", "died")) {
     n_events <- sum(target_vals == 1, na.rm = TRUE)
     if (n_events < trust$min_events) {
       stop("Disclosive: operation blocked -- insufficient event counts to ",

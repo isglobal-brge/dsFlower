@@ -664,6 +664,16 @@ test_that(".validateClassDistribution blocks multiclass with rare class", {
   )
 })
 
+test_that(".validateClassDistribution skips class checks for regression tasks", {
+  data <- data.frame(target = seq(0, 1, length.out = 100))
+  trust <- list(min_positive_examples = 20L, min_per_class = 20L, min_events = 20L)
+  expect_true(
+    dsFlower:::.validateClassDistribution(
+      data, "target", trust, task_type = "regression"
+    )
+  )
+})
+
 test_that(".validateClassDistribution passes survival with sufficient events", {
   data <- data.frame(time = 1:100, event = c(rep(1, 30), rep(0, 70)))
   trust <- list(min_positive_examples = 0L, min_per_class = 0L, min_events = 20L)

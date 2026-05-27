@@ -13,9 +13,64 @@
 #' @return Character; path to the ledger JSON file.
 #' @keywords internal
 .ledger_path <- function() {
-  ledger_dir <- file.path(rappdirs::user_data_dir("dsFlower"), "privacy")
+  explicit_path <- .dsf_option("privacy_ledger_path", NULL)
+  if (!is.null(explicit_path) && nzchar(as.character(explicit_path))) {
+    dir.create(dirname(explicit_path), recursive = TRUE, showWarnings = FALSE)
+    return(as.character(explicit_path))
+  }
+
+  ledger_dir <- .dsf_option(
+    "privacy_ledger_dir",
+    file.path(rappdirs::user_data_dir("dsFlower"), "privacy")
+  )
   dir.create(ledger_dir, recursive = TRUE, showWarnings = FALSE)
-  file.path(ledger_dir, "privacy_ledger.json")
+  namespace <- .dsf_option("privacy_ledger_namespace", "default")
+  namespace <- as.character(namespace %||% "default")
+  namespace <- gsub("[^A-Za-z0-9_.-]+", "_", namespace)
+  namespace <- gsub("^_+|_+$", "", namespace)
+  if (!nzchar(namespace)) namespace <- "default"
+
+  filename <- if (identical(namespace, "default")) {
+    "privacy_ledger.json"
+  } else {
+    paste0("privacy_ledger_", namespace, ".json")
+  }
+  file.path(ledger_dir, filename)
+}
+
+#' Build a stable privacy-budget key for the current training data
+#'
+#' The key is deliberately server-side. For descriptor-backed resources we use
+#' the descriptor dataset id. For in-session DataSHIELD tables we include the
+#' assigned symbol and a local digest of the materialised table, so independent
+#' validation tables do not consume each other's budget merely because they use
+#' the same target column name.
+#'
+#' @param handle Flower handle.
+#' @param target_column Character target column.
+#' @return Character privacy-budget key.
+#' @keywords internal
+.privacy_dataset_key <- function(handle, target_column) {
+  target <- paste(as.character(target_column %||% "unknown"), collapse = "+")
+
+  if (identical(handle$source, "descriptor")) {
+    dataset_id <- handle$dataset_id %||% handle$descriptor$dataset_id %||% "unknown"
+    return(paste("descriptor", dataset_id, target, sep = ":"))
+  }
+
+  if (identical(handle$source, "table")) {
+    symbol <- handle$data_symbol %||% "table"
+    fingerprint <- handle$table_fingerprint
+    if ((is.null(fingerprint) || !nzchar(as.character(fingerprint))) &&
+        !is.null(handle$table_data)) {
+      fingerprint <- digest::digest(handle$table_data, algo = "xxhash64")
+    }
+    if (!is.null(fingerprint) && nzchar(as.character(fingerprint))) {
+      return(paste("table", symbol, fingerprint, target, sep = ":"))
+    }
+  }
+
+  paste(handle$source %||% "table", target, sep = ":")
 }
 
 #' Read the privacy ledger

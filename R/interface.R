@@ -88,13 +88,15 @@
 #' @param df A data.frame.
 #' @return A list representing the Flower handle.
 #' @keywords internal
-.createHandleFromTable <- function(df) {
+.createHandleFromTable <- function(df, data_symbol = NULL) {
   python_path <- Sys.which("python3")
   if (!nzchar(python_path)) python_path <- Sys.which("python")
   if (!nzchar(python_path)) python_path <- "python3"
 
   list(
     source             = "table",
+    data_symbol        = data_symbol %||% "table",
+    table_fingerprint  = digest::digest(df, algo = "xxhash64"),
     resource_client    = NULL,
     data_path          = NULL,
     data_format        = "table",
@@ -121,7 +123,7 @@
 #' @param desc A \code{FlowerDatasetDescriptor}.
 #' @return A list representing the Flower handle.
 #' @keywords internal
-.createHandleFromDescriptor <- function(desc) {
+.createHandleFromDescriptor <- function(desc, data_symbol = NULL) {
   stopifnot(inherits(desc, "FlowerDatasetDescriptor"))
 
   python_path <- Sys.which("python3")
@@ -130,6 +132,7 @@
 
   list(
     source             = "descriptor",
+    data_symbol        = data_symbol %||% "descriptor",
     source_kind        = desc$source_kind,
     dataset_id         = desc$dataset_id,
     descriptor         = desc,
@@ -172,17 +175,17 @@ flowerInitDS <- function(data_symbol) {
 
   # Existing path: data.frame
   if (is.data.frame(obj)) {
-    return(.createHandleFromTable(obj))
+    return(.createHandleFromTable(obj, data_symbol = data_symbol))
   }
 
   # Descriptor path: FlowerDatasetDescriptor or ResourceClient
   if (inherits(obj, "FlowerDatasetDescriptor")) {
-    return(.createHandleFromDescriptor(obj))
+    return(.createHandleFromDescriptor(obj, data_symbol = data_symbol))
   }
 
   if (inherits(obj, "ResourceClient")) {
     desc <- as_flower_dataset(obj)
-    return(.createHandleFromDescriptor(desc))
+    return(.createHandleFromDescriptor(desc, data_symbol = data_symbol))
   }
 
   # Imaging handle path: list with descriptor field (from imagingInitDS)
@@ -195,7 +198,7 @@ flowerInitDS <- function(data_symbol) {
       desc$backend <- obj$backend
     }
     if (inherits(desc, "FlowerDatasetDescriptor")) {
-      return(.createHandleFromDescriptor(desc))
+      return(.createHandleFromDescriptor(desc, data_symbol = data_symbol))
     }
     if (is.list(desc) && !is.null(desc$dataset_id) &&
         !is.null(desc$source_kind)) {
@@ -208,7 +211,7 @@ flowerInitDS <- function(data_symbol) {
         table_data  = desc$table_data
       )
       desc$backend <- obj$backend
-      return(.createHandleFromDescriptor(desc))
+      return(.createHandleFromDescriptor(desc, data_symbol = data_symbol))
     }
   }
 
@@ -222,7 +225,7 @@ flowerInitDS <- function(data_symbol) {
       resolved <- resolve_dataset(dataset_id)
       manifest <- parse_manifest(resolved$manifest_uri, resolved$backend)
       desc <- dsImaging::imaging_dataset_descriptor(manifest)
-      return(.createHandleFromDescriptor(desc))
+      return(.createHandleFromDescriptor(desc, data_symbol = data_symbol))
     }
   }
 
@@ -236,7 +239,7 @@ flowerInitDS <- function(data_symbol) {
         dataset_id = asset_info$dataset_id,
         source_kind = "asset_ref",
         asset_info = asset_info)
-      return(.createHandleFromDescriptor(desc))
+      return(.createHandleFromDescriptor(desc, data_symbol = data_symbol))
     }
   }
 
@@ -346,7 +349,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
           target_data <- NULL
         }
         if (!is.null(target_data)) {
-          .validateClassDistribution(target_data, target_column, trust)
+          .validateClassDistribution(
+            target_data, target_column, trust,
+            task_type = run_config[["task-type"]] %||% run_config[["task_type"]]
+          )
         }
       }, error = function(e) {
         if (grepl("Disclosive", conditionMessage(e))) stop(e)
@@ -370,7 +376,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       }
       dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
       dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
-      dataset_key <- paste0("descriptor:", desc$dataset_id, ":", target_column)
+      dataset_key <- .privacy_dataset_key(handle, target_column)
       .check_budget(dataset_key, dp_epsilon, dp_delta)
     }
 
@@ -453,7 +459,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   # Class distribution validation (table path)
   if (!is.null(target_column) && length(target_column) > 0 &&
       trust$min_positive_examples > 0) {
-    .validateClassDistribution(data, target_column, trust)
+    .validateClassDistribution(
+      data, target_column, trust,
+      task_type = run_config[["task-type"]] %||% run_config[["task_type"]]
+    )
   }
 
   # Enforce DP requirement from trust profile
@@ -473,7 +482,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
     dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
     dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
-    dataset_key <- paste0(handle$source, ":", target_column)
+    dataset_key <- .privacy_dataset_key(handle, target_column)
     .check_budget(dataset_key, dp_epsilon, dp_delta)
   }
 
@@ -627,8 +636,10 @@ flowerCleanupRunDS <- function(handle_symbol) {
           isTRUE(manifest[["dp_required"]])
       )
       if (is_dp_run) {
-        dataset_key <- paste0(handle$source %||% "table", ":",
-                              manifest$target_column)
+        dataset_key <- .privacy_dataset_key(
+          handle,
+          manifest$target_column %||% handle$target_column %||% "unknown"
+        )
         .record_spend(
           dataset_key  = dataset_key,
           epsilon      = as.numeric(manifest[["privacy-epsilon"]] %||% 1.0),
@@ -910,7 +921,7 @@ flowerLogDS <- function(handle_symbol, last_n = 50L) {
 flowerPrivacyBudgetDS <- function(handle_symbol) {
   handle <- .getHandle(handle_symbol)
   target <- handle$target_column %||% "unknown"
-  dataset_key <- paste0(handle$source %||% "table", ":", target)
+  dataset_key <- .privacy_dataset_key(handle, target)
   .get_budget(dataset_key)
 }
 

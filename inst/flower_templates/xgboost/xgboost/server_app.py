@@ -46,8 +46,6 @@ from flwr.server.strategy import Strategy
 
 logger = logging.getLogger("xgboost.server")
 
-SCALE_FACTOR = 1_000_000  # Must match client
-
 
 class SecureXGBoostStrategy(Strategy):
     """Custom strategy for histogram-based secure federated XGBoost."""
@@ -67,6 +65,8 @@ class SecureXGBoostStrategy(Strategy):
         min_fit_clients: int = 2,
         allow_per_node_metrics: bool = True,
         evaluation_only: bool = False,
+        secure_single_round: bool = False,
+        fixed_bin_range: float = 4.0,
     ):
         super().__init__()
         self.n_trees = n_trees
@@ -83,6 +83,8 @@ class SecureXGBoostStrategy(Strategy):
         self.min_fit_clients = min_fit_clients
         self.allow_per_node_metrics = allow_per_node_metrics
         self.evaluation_only = evaluation_only
+        self.secure_single_round = secure_single_round
+        self.fixed_bin_range = fixed_bin_range
 
         # State machine
         self.current_tree = 0
@@ -106,6 +108,59 @@ class SecureXGBoostStrategy(Strategy):
 
         # Maximum internal nodes in a tree of depth max_depth
         self.max_internal_nodes = (2 ** max_depth) - 1
+
+        if self.secure_single_round:
+            self.global_bin_edges = self._fixed_bin_edges()
+            self._start_new_tree()
+            self.phase = "histogram"
+
+    def _fixed_parameters(self, values=None) -> Parameters:
+        """Return a single fixed-shape parameter vector for SecAgg+ rounds."""
+        length = max(1, int(self.n_features) * int(self.n_bins) * 2)
+        arr = np.zeros(length, dtype=np.float32)
+        if values is not None:
+            values = np.asarray(values, dtype=np.float32).ravel()
+            n = min(len(values), length)
+            if n:
+                arr[:n] = values[:n]
+        return ndarrays_to_parameters([arr])
+
+    def _fixed_bin_edges(self):
+        """Use deterministic bins for one-round secure histogram aggregation."""
+        if self.n_features <= 0:
+            return None
+        edges = np.linspace(
+            -self.fixed_bin_range,
+            self.fixed_bin_range,
+            self.n_bins + 1,
+            dtype=np.float64,
+        )[1:-1]
+        return np.tile(edges, (self.n_features, 1))
+
+    def _record_completed_tree(self):
+        """Export the current in-memory tree into the completed tree list."""
+        tree_dict = {
+            "tree_id": self.current_tree,
+            "splits": {},
+            "leaves": {},
+        }
+        for nid, split in self.tree_splits.items():
+            tree_dict["splits"][str(nid)] = {
+                "feature": split["feature"],
+                "threshold": split["threshold"],
+                "left": split["left"],
+                "right": split["right"],
+                "gain": split.get("gain", 0.0),
+            }
+        for nid, val in self.tree_leaf_values.items():
+            tree_dict["leaves"][str(nid)] = val
+
+        self.completed_trees.append(tree_dict)
+        self.history.append({
+            "tree": self.current_tree,
+            "n_splits": len(self.tree_splits),
+            "n_leaves": len(self.tree_leaf_values),
+        })
 
     def initialize_parameters(
         self, client_manager: ClientManager
@@ -208,9 +263,11 @@ class SecureXGBoostStrategy(Strategy):
                 self.n_features = len(all_edges[0]) // n_edges_per_feature
 
             # Average edges across clients
-            stacked = np.stack(
-                [e.reshape(self.n_features, n_edges_per_feature) for e in all_edges]
-            )
+            edge_len = self.n_features * n_edges_per_feature
+            stacked = np.stack([
+                e[:edge_len].reshape(self.n_features, n_edges_per_feature)
+                for e in all_edges
+            ])
             self.global_bin_edges = np.mean(stacked, axis=0)
 
         # Start building the first tree
@@ -218,7 +275,9 @@ class SecureXGBoostStrategy(Strategy):
         self._start_new_tree()
         self.phase = "histogram"
 
-        return None, {}
+        return self._fixed_parameters(
+            None if self.global_bin_edges is None else self.global_bin_edges.ravel()
+        ), {}
 
     def _start_new_tree(self):
         """Reset state for building a new tree."""
@@ -243,7 +302,7 @@ class SecureXGBoostStrategy(Strategy):
         if not self.nodes_to_split:
             # No more nodes - move to leaf phase
             self.phase = "leaf"
-            return None, {}
+            return self._fixed_parameters(), {}
 
         node_id, depth = self.nodes_to_split[0]
 
@@ -264,12 +323,11 @@ class SecureXGBoostStrategy(Strategy):
             self.nodes_to_split.popleft()
             self.tree_leaf_values[node_id] = 0.0
             self._advance_after_node_processed()
-            return None, {}
+            return self._fixed_parameters(), {}
 
-        # Dequantize
         n_hist = self.n_features * self.n_bins
-        grad_flat = aggregated[:n_hist] / SCALE_FACTOR
-        hess_flat = aggregated[n_hist:] / SCALE_FACTOR
+        grad_flat = aggregated[:n_hist]
+        hess_flat = aggregated[n_hist:(2 * n_hist)]
 
         grad_hist = grad_flat.reshape(self.n_features, self.n_bins)
         hess_hist = hess_flat.reshape(self.n_features, self.n_bins)
@@ -315,8 +373,15 @@ class SecureXGBoostStrategy(Strategy):
             # Make this a leaf
             leaf_value = -G_total / (H_total + self.reg_lambda)
             self.tree_leaf_values[node_id] = leaf_value
+            if self.secure_single_round:
+                self._record_completed_tree()
+                self.current_tree += 1
+                self._save_model()
+                self._save_history()
+                self.phase = "done"
+                return self._fixed_parameters(), {}
             self._advance_after_node_processed()
-            return None, {}
+            return self._fixed_parameters(), {}
 
         # Record split
         left_child = self.next_node_id
@@ -334,6 +399,20 @@ class SecureXGBoostStrategy(Strategy):
             "gain": best_gain,
         }
 
+        if self.secure_single_round:
+            G_left = float(grad_hist[best_feature, :(best_bin + 1)].sum())
+            H_left = float(hess_hist[best_feature, :(best_bin + 1)].sum())
+            G_right = float(G_total - G_left)
+            H_right = float(H_total - H_left)
+            self.tree_leaf_values[left_child] = -G_left / (H_left + self.reg_lambda)
+            self.tree_leaf_values[right_child] = -G_right / (H_right + self.reg_lambda)
+            self._record_completed_tree()
+            self.current_tree += 1
+            self._save_model()
+            self._save_history()
+            self.phase = "done"
+            return self._fixed_parameters(), {}
+
         # Queue children for splitting (depth + 1)
         if depth + 1 < self.max_depth:
             self.nodes_to_split.append((left_child, depth + 1))
@@ -348,13 +427,21 @@ class SecureXGBoostStrategy(Strategy):
         # Move to split phase to broadcast this decision
         self.current_split_node = node_id
         self.phase = "split"
-        return None, {}
+        split = self.tree_splits[node_id]
+        split_arr = np.array([
+            split["feature"],
+            split["threshold"],
+            node_id,
+            split["left"],
+            split["right"],
+        ], dtype=np.float32)
+        return self._fixed_parameters(split_arr), {}
 
     def _aggregate_split(self, results):
         """Split broadcast acknowledged. Move to next histogram or leaf."""
         self.current_split_node = None
         self._advance_after_node_processed()
-        return None, {}
+        return self._fixed_parameters([1.0]), {}
 
     def _advance_after_node_processed(self):
         """Decide next phase after a node has been processed."""
@@ -387,31 +474,7 @@ class SecureXGBoostStrategy(Strategy):
 
     def _aggregate_leaf(self, results):
         """Leaf values applied. Save this tree and move to next."""
-        # Build tree structure for export
-        tree_dict = {
-            "tree_id": self.current_tree,
-            "splits": {},
-            "leaves": {},
-        }
-        for nid, split in self.tree_splits.items():
-            tree_dict["splits"][str(nid)] = {
-                "feature": split["feature"],
-                "threshold": split["threshold"],
-                "left": split["left"],
-                "right": split["right"],
-                "gain": split.get("gain", 0.0),
-            }
-        for nid, val in self.tree_leaf_values.items():
-            tree_dict["leaves"][str(nid)] = val
-
-        self.completed_trees.append(tree_dict)
-
-        self.history.append({
-            "tree": self.current_tree,
-            "n_splits": len(self.tree_splits),
-            "n_leaves": len(self.tree_leaf_values),
-        })
-
+        self._record_completed_tree()
         self.current_tree += 1
 
         if self.current_tree < self.n_trees:
@@ -423,7 +486,7 @@ class SecureXGBoostStrategy(Strategy):
             self._save_history()
             self.phase = "done"
 
-        return None, {}
+        return self._fixed_parameters([1.0]), {}
 
     def _save_model(self):
         """Save the completed model as JSON."""
@@ -561,8 +624,9 @@ def server_fn(context: Context) -> ServerAppComponents:
     ).lower() == "true"
     fixed_client_sampling = str(cfg.get("fixed-client-sampling", "false")).lower() == "true"
     evaluation_only = str(cfg.get("evaluation-only", "false")).lower() == "true"
+    secure_single_round = require_secagg and n_trees == 1 and max_depth == 1
 
-    num_rounds = _compute_num_rounds(n_trees, max_depth)
+    num_rounds = 1 if secure_single_round else _compute_num_rounds(n_trees, max_depth)
 
     min_available = int(cfg.get("strategy-min_available_clients", 2))
     min_fit = int(cfg.get("strategy-min_fit_clients", 2))
@@ -583,6 +647,8 @@ def server_fn(context: Context) -> ServerAppComponents:
         min_fit_clients=min_fit,
         allow_per_node_metrics=allow_per_node_metrics,
         evaluation_only=evaluation_only,
+        secure_single_round=secure_single_round,
+        fixed_bin_range=float(cfg.get("fixed-bin-range", 4.0)),
     )
 
     config = ServerConfig(num_rounds=num_rounds)
@@ -614,6 +680,10 @@ def _run_server_app(grid, context: Context) -> None:
             fit_workflow=SecAggPlusWorkflow(
                 num_shares=num_clients,
                 reconstruction_threshold=max(2, num_clients - 1),
+                max_weight=10.0,
+                clipping_range=float(cfg.get("secagg-clipping-range", 4096.0)),
+                quantization_range=int(cfg.get("secagg-quantization-range", 16777216)),
+                modulus_range=int(cfg.get("secagg-modulus-range", 4294967296)),
             )
         )
         workflow(grid, legacy_context)

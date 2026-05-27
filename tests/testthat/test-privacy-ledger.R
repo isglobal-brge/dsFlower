@@ -41,6 +41,32 @@ test_that(".read_ledger returns empty list when no ledger exists", {
   })
 })
 
+test_that(".ledger_path supports admin-scoped namespaces", {
+  withr::with_tempdir({
+    withr::with_options(list(
+      dsflower.privacy_ledger_dir = getwd(),
+      dsflower.privacy_ledger_namespace = "clinical demo/eps=8"
+    ), {
+      path <- dsFlower:::.ledger_path()
+      expect_equal(dirname(path), getwd())
+      expect_match(basename(path), "^privacy_ledger_clinical_demo_eps_8[.]json$")
+    })
+  })
+})
+
+test_that(".privacy_dataset_key distinguishes assigned tables with same target", {
+  a <- data.frame(x = 1:3, outcome = c(0, 1, 0))
+  b <- data.frame(x = 4:6, outcome = c(1, 1, 0))
+  ha <- dsFlower:::.createHandleFromTable(a, data_symbol = "D")
+  hb <- dsFlower:::.createHandleFromTable(b, data_symbol = "D")
+
+  key_a <- dsFlower:::.privacy_dataset_key(ha, "outcome")
+  key_b <- dsFlower:::.privacy_dataset_key(hb, "outcome")
+
+  expect_match(key_a, "^table:D:[A-Za-z0-9]+:outcome$")
+  expect_false(identical(key_a, key_b))
+})
+
 test_that(".record_spend creates RDP-based ledger entry", {
   withr::with_tempdir({
     ledger_path <- file.path(getwd(), "test_ledger.json")

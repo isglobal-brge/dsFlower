@@ -11,8 +11,6 @@ import numpy as np
 from .task import load_data, load_privacy_config, _get_manifest_dir
 from .privacy_utils import bucket_count
 
-SCALE_FACTOR = 1_000_000  # Quantization scale for SecAgg+ (int64)
-
 
 class SecureXGBClient(NumPyClient):
     def __init__(self, X, y, privacy_config, n_bins=64,
@@ -26,6 +24,7 @@ class SecureXGBClient(NumPyClient):
         self.reg_lambda = reg_lambda
         self.objective = objective
         self.n_features = X.shape[1]
+        self.vector_length = self.n_features * self.n_bins * 2
 
         # State maintained across rounds
         self.bin_edges = None  # (n_features, n_bins-1)
@@ -76,11 +75,26 @@ class SecureXGBClient(NumPyClient):
         )
 
     def get_parameters(self, config):
-        # Return predictions (used for initialization)
-        return [self.predictions.astype(np.float32)]
+        # SecAgg+ expects a stable parameter shape across secure rounds. The
+        # histogram vector is the largest vector used by the protocol, so all
+        # control phases use the same padded shape.
+        return [np.zeros(self.vector_length, dtype=np.float32)]
 
     def set_parameters(self, parameters):
         pass  # Parameters are handled per-phase in fit()
+
+    def _pad_vector(self, values):
+        out = np.zeros(self.vector_length, dtype=np.float32)
+        values = np.asarray(values, dtype=np.float32).ravel()
+        n = min(len(values), self.vector_length)
+        if n:
+            out[:n] = values[:n]
+        return out
+
+    def _ack_vector(self):
+        out = np.zeros(self.vector_length, dtype=np.float32)
+        out[0] = 1.0
+        return out
 
     def _fit_num_examples(self, n):
         """Return the weighting factor used by Flower for fit aggregation."""
@@ -106,7 +120,7 @@ class SecureXGBClient(NumPyClient):
         elif phase == "leaf":
             return self._handle_leaf(parameters, config)
         else:
-            return [np.array([], dtype=np.float32)], self._fit_num_examples(len(self.y)), {}
+            return [self._ack_vector()], self._fit_num_examples(len(self.y)), {}
 
     def _compute_gradients(self):
         """Compute first and second order gradients for the objective."""
@@ -142,7 +156,7 @@ class SecureXGBClient(NumPyClient):
         local_edges = np.array(local_edges, dtype=np.float32)
         self._save_state()
 
-        return [local_edges.ravel()], self._fit_num_examples(len(self.y)), {}
+        return [self._pad_vector(local_edges.ravel())], self._fit_num_examples(len(self.y)), {}
 
     def _handle_histogram(self, parameters, config):
         """Compute and return quantized histograms for SecAgg+."""
@@ -159,9 +173,8 @@ class SecureXGBClient(NumPyClient):
 
         if not np.any(mask):
             # No samples in this node - return zero histograms
-            n_hist_values = self.n_features * self.n_bins * 2  # grad + hess
             return [
-                np.zeros(n_hist_values, dtype=np.int64)
+                np.zeros(self.vector_length, dtype=np.float32)
             ], self._fit_num_examples(0), {}
 
         X_node = self.X[mask]
@@ -180,19 +193,15 @@ class SecureXGBClient(NumPyClient):
                 grad_hist[f, b] = grad_node[in_bin].sum()
                 hess_hist[f, b] = hess_node[in_bin].sum()
 
-        # Quantize for SecAgg+ (int64)
-        grad_quantized = np.round(grad_hist * SCALE_FACTOR).astype(np.int64)
-        hess_quantized = np.round(hess_hist * SCALE_FACTOR).astype(np.int64)
-
         # Flatten: [grad_f0_b0, ..., grad_fN_bM, hess_f0_b0, ..., hess_fN_bM]
-        flat = np.concatenate([grad_quantized.ravel(), hess_quantized.ravel()])
+        flat = np.concatenate([grad_hist.ravel(), hess_hist.ravel()]).astype(np.float32)
 
         return [flat], self._fit_num_examples(mask.sum()), {}
 
     def _handle_split(self, parameters, config):
         """Apply split decision to node assignments."""
         if len(parameters) == 0 or len(parameters[0]) == 0:
-            return [np.array([], dtype=np.float32)], self._fit_num_examples(len(self.y)), {}
+            return [self._ack_vector()], self._fit_num_examples(len(self.y)), {}
 
         split_info = parameters[0].astype(np.float64)
         feature_idx = int(split_info[0])
@@ -209,12 +218,12 @@ class SecureXGBClient(NumPyClient):
             self.node_assignments[indices[~go_left]] = right_child
         self._save_state()
 
-        return [np.array([], dtype=np.float32)], self._fit_num_examples(len(self.y)), {}
+        return [self._ack_vector()], self._fit_num_examples(len(self.y)), {}
 
     def _handle_leaf(self, parameters, config):
         """Apply leaf values to update predictions."""
         if len(parameters) == 0 or len(parameters[0]) == 0:
-            return self.get_parameters(config), self._fit_num_examples(len(self.y)), {}
+            return [self._ack_vector()], self._fit_num_examples(len(self.y)), {}
 
         leaf_values = parameters[0].astype(np.float64)
 
@@ -227,7 +236,7 @@ class SecureXGBClient(NumPyClient):
         self.node_assignments[:] = 0
         self._save_state()
 
-        return self.get_parameters(config), self._fit_num_examples(len(self.y)), {}
+        return [self._ack_vector()], self._fit_num_examples(len(self.y)), {}
 
     def evaluate(self, parameters, config):
         if not self.privacy_config.get("allow_per_node_metrics", True):
