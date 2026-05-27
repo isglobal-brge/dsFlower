@@ -544,6 +544,11 @@ test_that(".validateTemplateProfile allows only DP-SGD validated templates in hi
                  "cannot be used",
                  label = paste(tmpl, "should be blocked in high_sensitivity_dp"))
   }
+  expect_error(
+    dsFlower:::.validateTemplateProfile("pytorch_coxph", "high_sensitivity_dp"),
+    "Cox risk sets",
+    label = "CoxPH should explain why patient-level DP-SGD is blocked"
+  )
 })
 
 test_that(".validateTemplateProfile allows all templates in sandbox_open", {

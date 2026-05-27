@@ -386,8 +386,10 @@
     if (!template_name %in% .DP_SGD_VALIDATED_TEMPLATES) {
       reason <- if (template_name %in% .DP_SGD_PENDING_VALIDATION) {
         paste0("This template's loss function has not been validated for ",
-               "Opacus per-sample gradients (inter-sample dependencies or ",
-               "large model). Use 'clinical_update_noise' profile instead.")
+               "Opacus per-sample gradients (inter-sample dependencies such ",
+               "as Cox risk sets, censoring-aware objectives, sequence state ",
+               "or large vision models). Use 'clinical_update_noise' profile ",
+               "instead.")
       } else {
         "This template is not validated for patient-level DP-SGD."
       }

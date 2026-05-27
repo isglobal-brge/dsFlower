@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .task import load_data, load_privacy_config
-from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count, make_private_opacus
+from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count
 
 
 def _cox_partial_likelihood_loss(log_risk, time, event):
@@ -163,12 +163,12 @@ def client_fn(context: Context) -> FlowerClient:
     privacy_engine = None
 
     if privacy_config.get("privacy_mode") == "dp":
-        model, optimizer, trainloader, privacy_engine = make_private_opacus(
-            model, optimizer, trainloader,
-            clipping_norm=privacy_config["clipping_norm"],
-            epsilon=privacy_config["epsilon"],
-            delta=privacy_config["delta"],
-            epochs=local_epochs,
+        raise RuntimeError(
+            "pytorch_coxph is not validated for patient-level DP-SGD. "
+            "The Cox partial likelihood couples samples through risk sets, "
+            "so Opacus per-example-gradient accounting is not used for this "
+            "template. Use clinical_default or clinical_update_noise, or "
+            "choose a DP-SGD-compatible template."
         )
 
     return FlowerClient(
