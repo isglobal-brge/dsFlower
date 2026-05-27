@@ -2,9 +2,9 @@
 % Please edit documentation in R/policy.R
 \name{.validateClassDistribution}
 \alias{.validateClassDistribution}
-\title{Validate class distribution against trust profile thresholds}
+\title{Validate target distribution against trust profile thresholds}
 \usage{
-.validateClassDistribution(data, target_column, trust)
+.validateClassDistribution(data, target_column, trust, task_type = NULL)
 }
 \arguments{
 \item{data}{Data.frame or Arrow Table; the training data.}
@@ -12,15 +12,20 @@
 \item{target_column}{Character; name(s) of the target column(s).}
 
 \item{trust}{Named list; the trust profile settings.}
+
+\item{task_type}{Character task type ("classification", "regression",
+"survival", etc.) or NULL.}
 }
 \value{
 TRUE invisibly, or stops with an error.
 }
 \description{
-Infers task type from the target column and validates:
+Uses the explicit task type when provided and otherwise infers a conservative
+classification/survival interpretation from the target column. Validates:
 - Binary (2 unique values): min(table(target)) >= trust$min_positive_examples
 - Multiclass (>2 unique): all(table(target) >= trust$min_per_class)
 - Survival (2-column target or event/status column): sum(events==1) >= trust$min_events
+- Regression/count targets: no class-count check is applied.
 }
 \details{
 Error messages are deliberately generic to avoid leaking counts.

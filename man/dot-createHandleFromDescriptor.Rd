@@ -4,7 +4,7 @@
 \alias{.createHandleFromDescriptor}
 \title{Create a Flower handle from a FlowerDatasetDescriptor}
 \usage{
-.createHandleFromDescriptor(desc)
+.createHandleFromDescriptor(desc, data_symbol = NULL)
 }
 \arguments{
 \item{desc}{A \code{FlowerDatasetDescriptor}.}

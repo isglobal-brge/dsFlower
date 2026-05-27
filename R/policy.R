@@ -353,10 +353,10 @@
   "pytorch_poisson"
 )
 
-# Templates pending DP-SGD validation (inter-sample loss or large vision models).
-# These work with clinical_update_noise but NOT high_sensitivity_dp.
-# Templates pending DP-SGD validation. These work with clinical_update_noise
-# (update-level noise) but NOT high_sensitivity_dp (patient-level DP-SGD).
+# Templates that are deliberately excluded from high_sensitivity_dp because
+# their current loss/model path has not been validated for Opacus per-example
+# gradients. Some can still run under clinical_update_noise, which is an
+# update/histogram hardening profile rather than a patient-level DP-SGD claim.
 .DP_SGD_PENDING_VALIDATION <- c(
   "sklearn_sgd",               # No formal DP accountant in sklearn SGD
   "pytorch_coxph",             # Cox partial likelihood has risk set dependencies

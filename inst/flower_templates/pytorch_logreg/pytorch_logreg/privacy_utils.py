@@ -5,9 +5,9 @@ Gaussian noise), NOT patient-level DP-SGD. This provides meaningful
 protection of individual node weight updates but does NOT constitute
 formal per-example differential privacy.
 
-For formal patient-level DP, templates should use Opacus DP-SGD with
-per-example gradient clipping. That is a planned upgrade (see secure_dp
-profile documentation in policy.R).
+Patient-level DP-SGD is handled separately through Opacus and the
+high_sensitivity_dp server profile. Templates that have not been validated for
+per-example gradients are blocked by policy before training starts.
 
 All privacy enforcement reads from manifest.json (server-written,
 tamper-proof), NOT from pyproject.toml.

@@ -4,7 +4,7 @@
 \alias{.createHandleFromTable}
 \title{Create a Flower handle from a data.frame}
 \usage{
-.createHandleFromTable(df)
+.createHandleFromTable(df, data_symbol = NULL)
 }
 \arguments{
 \item{df}{A data.frame.}

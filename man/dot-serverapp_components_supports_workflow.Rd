@@ -8,7 +8,9 @@
 }
 \description{
 dsFlower templates need server-side SecAggPlusWorkflow whenever a profile or
-template requires Secure Aggregation. This check is deliberately file-based:
-Rserve child processes can hang when they spawn Python subprocesses.
+template requires Secure Aggregation. Recent Flower releases expose this
+through DefaultWorkflow/SecAggPlusWorkflow rather than a workflow argument on
+ServerAppComponents. This check is deliberately file-based: Rserve child
+processes can hang when they spawn Python subprocesses.
 }
 \keyword{internal}
