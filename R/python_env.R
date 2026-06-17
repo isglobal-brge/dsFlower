@@ -183,8 +183,10 @@
     if (dir.exists(venv_path)) unlink(venv_path, recursive = TRUE)
 
     uv <- .ensure_uv()
-    rc <- system2(uv, c("venv", "--python", "3.11", "--quiet", venv_path),
-                  stdout = "", stderr = "")
+    # processx passes args without a shell, so a venv_path containing spaces
+    # (e.g. macOS "Application Support") is handled correctly.
+    rc <- processx::run(uv, c("venv", "--python", "3.11", "--quiet", venv_path),
+                        error_on_status = FALSE)$status
     if (rc != 0L)
       stop("Failed to create venv at ", venv_path, call. = FALSE)
 
