@@ -98,11 +98,6 @@ class FlowerClient(NumPyClient):
         if not self.privacy_config.get("allow_exact_num_examples", True):
             n_examples = bucket_count(n_examples)
 
-        # fp16 wire compression (halves the weight payload; ~lossless for a
-        # linear model). Disable with run config compress_fp16 = false.
-        if config.get("compress_fp16", True):
-            new_weights = [np.asarray(w, dtype=np.float16) for w in new_weights]
-
         return new_weights, n_examples, {}
 
     def evaluate(self, parameters, config):

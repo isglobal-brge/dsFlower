@@ -112,17 +112,26 @@ def _make_save_strategy(base_cls, results_dir, num_rounds,
             self._save_native(weights, server_round)
 
         def _save_native(self, weights, server_round):
-            """Save model in native ML framework format."""
-            try:
-                self._save_pytorch_native(weights, server_round)
-                return
-            except ImportError:
-                pass
-            try:
-                self._save_sklearn_native(weights, server_round)
-                return
-            except ImportError:
-                pass
+            """Save model in the template's native ML framework format.
+
+            Order matters: the serverapp host may have torch installed even for
+            an sklearn template, so we must dispatch on the template's framework
+            (not "whatever imports first"), or predict would load an sklearn
+            LogisticRegression as a PyTorch checkpoint and return garbage.
+            """
+            template = self._template_name or ""
+            if template.startswith("sklearn"):
+                savers = (self._save_sklearn_native, self._save_pytorch_native)
+            elif template.startswith("xgboost"):
+                savers = (self._save_sklearn_native,)  # falls back to model.npz
+            else:
+                savers = (self._save_pytorch_native, self._save_sklearn_native)
+            for saver in savers:
+                try:
+                    saver(weights, server_round)
+                    return
+                except ImportError:
+                    continue
 
         def _save_sklearn_native(self, weights, server_round):
             """Save as sklearn model via joblib."""
