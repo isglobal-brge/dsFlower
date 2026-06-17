@@ -290,10 +290,19 @@
       # private key is required.
       auth_args <- c("--auth-supernode-private-key", npriv)
     }
+    # Transport must match the SuperLink's Fleet API type (grpc-rere default).
+    transport <- .dsf_option("supernode_transport", "grpc-rere")
+    transport_args <- if (identical(transport, "rest")) "--rest"
+                      else if (identical(transport, "grpc-adapter")) "--grpc-adapter"
+                      else character(0)
+    # The REST transport needs --superlink as an https:// URL (grpc uses host:port).
+    sl_addr <- if (identical(transport, "rest") && !grepl("^https?://", superlink_address))
+                 paste0("https://", superlink_address) else superlink_address
     args <- c(
       tls_args,
       auth_args,
-      "--superlink", superlink_address,
+      transport_args,
+      "--superlink", sl_addr,
       "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
       # ClientAppIO is loopback-only IPC between the SuperNode and its local
       # ClientApp on this data-holding node -- never dialed remotely.

@@ -69,8 +69,9 @@ class FlowerClient(NumPyClient):
         return [self.model.coef_, self.model.intercept_]
 
     def set_parameters(self, parameters):
-        self.model.coef_ = parameters[0]
-        self.model.intercept_ = parameters[1]
+        # Weights may arrive fp16-compressed; sklearn fits in fp64.
+        self.model.coef_ = np.asarray(parameters[0], dtype=np.float64)
+        self.model.intercept_ = np.asarray(parameters[1], dtype=np.float64)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -96,6 +97,11 @@ class FlowerClient(NumPyClient):
         n_examples = len(self.X)
         if not self.privacy_config.get("allow_exact_num_examples", True):
             n_examples = bucket_count(n_examples)
+
+        # fp16 wire compression (halves the weight payload; ~lossless for a
+        # linear model). Disable with run config compress_fp16 = false.
+        if config.get("compress_fp16", True):
+            new_weights = [np.asarray(w, dtype=np.float16) for w in new_weights]
 
         return new_weights, n_examples, {}
 

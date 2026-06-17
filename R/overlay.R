@@ -123,6 +123,8 @@
 #' @return Named list: joined, tailnet_ip, socks_port.
 #' @export
 flowerOverlayUpDS <- function(authkey, hostname = "dsflower-node") {
+  stop("The Tailscale overlay transport is disabled for now. Use the Tor ",
+       "transport (flowerTorUpDS) instead.", call. = FALSE)
   authkey <- .ds_arg(authkey)
   if (is.list(authkey)) authkey <- authkey[[1]]
   hostname <- .ds_arg(hostname)
