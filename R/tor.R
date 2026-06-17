@@ -77,14 +77,23 @@
     .dsflower_env$tor_proc <- p
     deadline <- Sys.time() + 120
     repeat {
-      lg <- tryCatch(readLines(logf, warn = FALSE), error = function(e) character(0))
+      # tor.log is created a moment after tor starts; reading it earlier makes
+      # file() warn ("cannot open file"). Only read once it exists.
+      lg <- if (file.exists(logf))
+              suppressWarnings(tryCatch(readLines(logf, warn = FALSE),
+                                        error = function(e) character(0)))
+            else character(0)
       if (any(grepl("Bootstrapped 100%", lg))) break
       if (Sys.time() > deadline || !p$is_alive()) break
       Sys.sleep(3)
     }
   }
   .dsflower_env$overlay_socks_port <- socks_port  # reuse ensure forwarder path
-  lg <- tryCatch(readLines(file.path(d, "tor.log"), warn = FALSE), error = function(e) character(0))
+  tor_log <- file.path(d, "tor.log")
+  lg <- if (file.exists(tor_log))
+          suppressWarnings(tryCatch(readLines(tor_log, warn = FALSE),
+                                    error = function(e) character(0)))
+        else character(0)
   list(ready = any(grepl("Bootstrapped 100%", lg)), socks_port = socks_port)
 }
 
