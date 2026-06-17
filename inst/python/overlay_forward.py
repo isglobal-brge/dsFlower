@@ -10,7 +10,12 @@ the researcher's machine across NAT, using only outbound connections.
 Usage:
     overlay_forward.py --listen 127.0.0.1:PORT --socks 127.0.0.1:1055 --target 100.x.y.z:9092
 """
-import argparse, socket, struct, sys, threading
+import argparse, itertools, socket, struct, sys, threading
+
+# Per-connection SOCKS5 username counter. With Tor's IsolateSOCKSAuth (default),
+# a distinct username forces a distinct circuit -> concurrent REST object
+# transfers fan out across N Tor circuits for ~N x throughput on large models.
+_conn_counter = itertools.count()
 
 
 def pipe(a, b):
@@ -30,11 +35,22 @@ def pipe(a, b):
                 pass
 
 
-def socks5_connect(proxy_host, proxy_port, dst_host, dst_port):
+def socks5_connect(proxy_host, proxy_port, dst_host, dst_port, isolate=False):
     s = socket.create_connection((proxy_host, proxy_port), timeout=30)
-    s.sendall(b"\x05\x01\x00")
-    if s.recv(2) != b"\x05\x00":
-        raise RuntimeError("SOCKS5 no-auth refused")
+    if isolate:
+        # Offer username/password auth; a unique username per connection makes
+        # Tor build a separate circuit (RFC 1929 + IsolateSOCKSAuth).
+        s.sendall(b"\x05\x01\x02")
+        if s.recv(2) != b"\x05\x02":
+            raise RuntimeError("SOCKS5 username/password auth refused")
+        user = ("dsf%d" % next(_conn_counter)).encode()
+        s.sendall(b"\x01" + bytes([len(user)]) + user + b"\x01x")
+        if s.recv(2) != b"\x01\x00":
+            raise RuntimeError("SOCKS5 auth failed")
+    else:
+        s.sendall(b"\x05\x01\x00")
+        if s.recv(2) != b"\x05\x00":
+            raise RuntimeError("SOCKS5 no-auth refused")
     # IPv4 if dotted-quad, else domain
     parts = dst_host.split(".")
     is_ip = len(parts) == 4 and all(p.isdigit() for p in parts)
@@ -56,6 +72,7 @@ def main():
     ap.add_argument("--listen", required=True)   # host:port
     ap.add_argument("--socks", required=True)    # host:port
     ap.add_argument("--target", required=True)   # host:port
+    ap.add_argument("--isolate", action="store_true")  # one Tor circuit per connection
     a = ap.parse_args()
 
     lh, lp = a.listen.rsplit(":", 1)
@@ -65,7 +82,7 @@ def main():
 
     def handle(c):
         try:
-            up = socks5_connect(ph, pp, th, tp)
+            up = socks5_connect(ph, pp, th, tp, isolate=a.isolate)
             threading.Thread(target=pipe, args=(c, up), daemon=True).start()
             pipe(up, c)
         except Exception as e:

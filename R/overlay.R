@@ -104,7 +104,8 @@
     .overlay_python(),
     c(fwd, "--listen", paste0("127.0.0.1:", local_port),
       "--socks", paste0("127.0.0.1:", socks_port),
-      "--target", target_addr),
+      "--target", target_addr,
+      "--isolate"),  # one Tor circuit per connection -> REST multi-circuit fan-out
     stdout = file.path(.overlay_dir(), "forward.log"), stderr = "2>&1",
     cleanup = FALSE, cleanup_tree = FALSE)
   .dsflower_env$overlay_fwd <- p
