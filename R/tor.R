@@ -58,6 +58,10 @@
     writeLines(c(
       paste0("SocksPort 127.0.0.1:", socks_port),
       paste0("DataDirectory ", datadir),
+      # We don't need cover traffic on this client; shed padding to cut
+      # setup overhead and latency.
+      "ConnectionPadding 0",
+      "ReducedConnectionPadding 1",
       paste0("Log notice file ", logf)
     ), torrc)
     env <- c("current")
