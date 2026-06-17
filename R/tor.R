@@ -52,7 +52,12 @@
     inherits(.dsflower_env$tor_proc, "process") &&
     tryCatch(.dsflower_env$tor_proc$is_alive(), error = function(e) FALSE)
   if (!running) {
-    datadir <- file.path(d, "data"); dir.create(datadir, showWarnings = FALSE)
+    # Clear any stale state/lock from a crashed previous run so the fresh tor
+    # never fails to start on a leftover lock (and nothing accumulates).
+    datadir <- file.path(d, "data")
+    tryCatch(unlink(c(datadir, file.path(d, "tor.log"), file.path(d, "tor.out")),
+                    recursive = TRUE, force = TRUE), error = function(e) NULL)
+    dir.create(datadir, showWarnings = FALSE)
     logf <- file.path(d, "tor.log")
     torrc <- file.path(d, "torrc")
     writeLines(c(
