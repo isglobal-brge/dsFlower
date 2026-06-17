@@ -573,7 +573,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   # instead of dialing the (NAT'd) researcher address directly. The remaining
   # checks then run against the loopback forwarder, which itself proves the
   # overlay path is reachable.
-  if (!is.null(.dsflower_env$overlay_socks_port)) {
+  via_forwarder <- !is.null(.dsflower_env$overlay_socks_port)
+  if (via_forwarder) {
     superlink_address <- .overlay_start_forward(superlink_address)
   }
 
@@ -649,8 +650,16 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 
   # Egress preflight: confirm this node can actually reach the SuperLink
   # before spawning a SuperNode that would otherwise fail to connect
-  # silently and time out 30s later on the client.
-  conn_check <- flowerCheckConnectivityDS(superlink_address)
+  # silently and time out 30s later on the client. When an overlay/Tor
+  # forwarder is active the address is the loopback forwarder WE created,
+  # so probe it directly (the anti-SSRF guard in flowerCheckConnectivityDS
+  # would otherwise reject our own legitimate loopback endpoint).
+  if (via_forwarder) {
+    fp <- strsplit(superlink_address, ":", fixed = TRUE)[[1]]
+    conn_check <- .probe_tcp(fp[1], suppressWarnings(as.integer(fp[2])))
+  } else {
+    conn_check <- flowerCheckConnectivityDS(superlink_address)
+  }
   if (!isTRUE(conn_check$reachable)) {
     stop("This node has no outbound egress to the SuperLink at '",
          superlink_address, "' (", conn_check$error %||% "unreachable", "). ",
@@ -1168,11 +1177,21 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
                 error = "Connectivity check rate limit exceeded; try again shortly."))
   }
 
-  # Use socketConnection with open="wb" and immediately close.
-  # For TLS ports the TCP handshake succeeds even though the TLS
-  # handshake won't complete -- that's fine, we only need to verify
-  # the port is reachable.
-  result <- tryCatch({
+  .probe_tcp(host, port, timeout_secs)
+}
+
+#' Raw TCP reachability probe (no SSRF guard)
+#'
+#' Internal helper: opens and immediately closes a socket to host:port.
+#' Callers are responsible for authorizing the target. flowerCheckConnectivityDS
+#' wraps this with the anti-SSRF restriction for client-facing use; the egress
+#' preflight in flowerEnsureSuperNodeDS calls it directly on the loopback overlay
+#' forwarder it created itself (a legitimate, non-client-controlled target).
+#' @keywords internal
+.probe_tcp <- function(host, port, timeout_secs = 3) {
+  # For TLS ports the TCP handshake succeeds even though the TLS handshake
+  # won't complete -- that's fine, we only need to verify the port is reachable.
+  tryCatch({
     con <- suppressWarnings(
       socketConnection(host = host, port = port,
                        open = "wb", blocking = TRUE,
@@ -1181,12 +1200,10 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
     close(con)
     list(reachable = TRUE, error = NULL)
   }, warning = function(w) {
-    # socketConnection emits a warning when connect fails
     list(reachable = FALSE, error = conditionMessage(w))
   }, error = function(e) {
     list(reachable = FALSE, error = conditionMessage(e))
   })
-  result
 }
 
 #' Get Configured Coordinator (Public SuperLink)
