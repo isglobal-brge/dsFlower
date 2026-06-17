@@ -108,5 +108,12 @@ flowerTorDownDS <- function() {
     .dsflower_env[[key]] <- NULL
   }
   .dsflower_env$overlay_socks_port <- NULL
+  # Wipe this session's Tor state (circuits, logs, torrc) so no trace of the run
+  # is left. The cached tor binary is kept to avoid re-downloading next time.
+  d <- .tor_dir()
+  for (f in c("data", "torrc", "tor.log", "tor.out")) {
+    tryCatch(unlink(file.path(d, f), recursive = TRUE, force = TRUE),
+             error = function(e) NULL)
+  }
   TRUE
 }
