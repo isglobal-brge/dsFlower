@@ -40,15 +40,24 @@
       dir.create(venv_root, recursive = TRUE, showWarnings = FALSE),
       error = function(e) FALSE
     )
-    # If primary path is not writable, try /srv (Rock persistent volume)
-    if (!isTRUE(created) && venv_root == "/var/lib/dsflower/venvs") {
-      fallback <- "/srv/dsflower/venvs"
-      tryCatch(
-        dir.create(fallback, recursive = TRUE, showWarnings = FALSE),
-        error = function(e) NULL
+    # If the configured path is not writable, cascade through fallbacks so the
+    # package self-provisions with ZERO root: /srv (Rock persistent volume)
+    # first, then a user-space dir. This makes a plain `install_github` install
+    # (as the unprivileged Rock R user) work without a root configure step.
+    if (!isTRUE(created) && !dir.exists(venv_root)) {
+      fallbacks <- c(
+        "/srv/dsflower/venvs",
+        file.path(tools::R_user_dir("dsFlower", "data"), "venvs")
       )
-      if (dir.exists(fallback)) {
-        options(dsflower.venv_root = fallback)
+      for (fb in fallbacks) {
+        ok <- tryCatch(
+          dir.create(fb, recursive = TRUE, showWarnings = FALSE),
+          error = function(e) FALSE
+        )
+        if (isTRUE(ok) || dir.exists(fb)) {
+          options(dsflower.venv_root = fb)
+          break
+        }
       }
     }
   }

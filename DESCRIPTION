@@ -36,6 +36,7 @@ AggregateMethods:
     flowerMetricsDS,
     flowerLogDS,
     flowerCheckConnectivityDS,
+    flowerGetCoordinatorDS,
     flowerListTemplatesDS,
     flowerGetTemplateDS,
     flowerVerifyAppHashDS,

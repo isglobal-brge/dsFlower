@@ -10,7 +10,21 @@
 # (a single static binary) and uses it to install Python. No system
 # dependencies required beyond a C library and curl/wget.
 
-VENV_ROOT="${DSFLOWER_VENV_ROOT:-/var/lib/dsflower/venvs}"
+# Resolve a WRITABLE venv root so install works with ZERO root. Honor an
+# explicit DSFLOWER_VENV_ROOT; otherwise pick the first creatable location,
+# cascading from system paths down to a user-space dir. The user-space path
+# mirrors tools::R_user_dir("dsFlower","data") so .onLoad resolves the same
+# location at runtime.
+if [ -n "${DSFLOWER_VENV_ROOT:-}" ]; then
+  VENV_ROOT="${DSFLOWER_VENV_ROOT}"
+else
+  _user_data="${XDG_DATA_HOME:-${HOME}/.local/share}/R/dsFlower/venvs"
+  VENV_ROOT=""
+  for _cand in "/var/lib/dsflower/venvs" "/srv/dsflower/venvs" "${_user_data}"; do
+    if mkdir -p "${_cand}" 2>/dev/null; then VENV_ROOT="${_cand}"; break; fi
+  done
+  VENV_ROOT="${VENV_ROOT:-/var/lib/dsflower/venvs}"
+fi
 DSFLOWER_HOME="$(dirname "${VENV_ROOT}")"
 LOG_PREFIX="[dsFlower configure]"
 

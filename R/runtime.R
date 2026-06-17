@@ -180,9 +180,13 @@
   # If lock fails (permissions, tmpdir issues), proceed without lock.
   lock_acquired <- tryCatch(.acquire_spawn_lock(timeout_secs = 10),
                              error = function(e) FALSE)
-  if (lock_acquired) {
-    on.exit(.release_spawn_lock(), add = TRUE)
+  if (!isTRUE(lock_acquired)) {
+    # Fail closed: spawning without the lock would race the server-wide
+    # concurrency check and let a client exceed max_concurrent_runs.
+    stop("Could not acquire the SuperNode spawn lock; refusing to spawn ",
+         "unsynchronised. Retry shortly.", call. = FALSE)
   }
+  on.exit(.release_spawn_lock(), add = TRUE)
 
   # Check concurrent limit -- server-global via PID files, not just per-session
   global_alive <- .count_global_supernodes()
@@ -270,11 +274,25 @@
   for (attempt in seq_len(3L)) {
     clientappio_port <- .random_available_port()
     tls_args <- c("--root-certificates", ca_cert_path)
+    # SuperNode authentication: if the operator configured this node's auth
+    # keypair, present it so the SuperLink admits us by KEY, not merely by CA
+    # possession (CA alone must not be enough to join the federation).
+    auth_args <- character(0)
+    npriv <- .dsf_option("node_auth_private_key",
+                         Sys.getenv("DSFLOWER_NODE_AUTH_PRIVATE_KEY", ""))
+    if (!is.null(npriv) && nzchar(npriv) && file.exists(npriv)) {
+      # The public key is derived from the private key by Flower, so only the
+      # private key is required.
+      auth_args <- c("--auth-supernode-private-key", npriv)
+    }
     args <- c(
       tls_args,
+      auth_args,
       "--superlink", superlink_address,
       "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
-      "--clientappio-api-address", paste0("0.0.0.0:", clientappio_port)
+      # ClientAppIO is loopback-only IPC between the SuperNode and its local
+      # ClientApp on this data-holding node -- never dialed remotely.
+      "--clientappio-api-address", paste0("127.0.0.1:", clientappio_port)
     )
 
     proc <- processx::process$new(

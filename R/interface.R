@@ -376,6 +376,15 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       }
       dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
       dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
+      # Server-side epsilon ceiling: a client cannot request an arbitrarily
+      # large (i.e. effectively no) privacy budget.
+      eps_ceiling <- suppressWarnings(as.numeric(.dsf_option("dp_epsilon_ceiling", 10)))
+      if (!is.na(eps_ceiling) &&
+          (is.na(dp_epsilon) || dp_epsilon > eps_ceiling)) {
+        stop("Requested DP epsilon (", dp_epsilon, ") exceeds this server's ceiling (",
+             eps_ceiling, "). Lower epsilon, or have the operator raise ",
+             "dsflower.dp_epsilon_ceiling.", call. = FALSE)
+      }
       dataset_key <- .privacy_dataset_key(handle, target_column)
       .check_budget(dataset_key, dp_epsilon, dp_delta)
     }
@@ -559,6 +568,40 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     stop("Handle is not prepared. Call flowerPrepareRunDS first.", call. = FALSE)
   }
 
+  # SuperLink pinning: if the operator pinned a coordinator on this node, a
+  # client must NOT be able to redirect this node's SuperNode to a rogue
+  # SuperLink (which would harvest its model updates).
+  pinned_addr <- .dsf_option("coordinator_address",
+                             Sys.getenv("DSFLOWER_COORDINATOR_ADDRESS", ""))
+  if (!is.null(pinned_addr) && nzchar(pinned_addr) &&
+      !identical(superlink_address, pinned_addr)) {
+    stop("Refusing SuperNode: client requested SuperLink '", superlink_address,
+         "' but this node is pinned to coordinator '", pinned_addr,
+         "'. Redirecting a pinned node is not allowed.", call. = FALSE)
+  }
+
+  # Coordinator-trust gate: a remote/public coordinator can observe every
+  # per-round model update, so weak privacy profiles are refused there unless
+  # the operator explicitly opts in.
+  sl_host <- sub(":.*", "", superlink_address)
+  if (!.is_private_or_local_host(sl_host) &&
+      !isTRUE(as.logical(.dsf_option("allow_untrusted_coordinator", FALSE)))) {
+    pmode <- ""
+    mpath <- file.path(handle$staging_dir %||% "", "manifest.json")
+    if (nzchar(mpath) && file.exists(mpath)) {
+      m <- tryCatch(jsonlite::fromJSON(mpath, simplifyVector = TRUE),
+                    error = function(e) NULL)
+      pmode <- (m[["privacy-mode"]] %||% m[["privacy_profile"]]) %||% ""
+    }
+    if (pmode %in% c("sandbox_open", "trusted_internal", "none", "")) {
+      stop("Refusing SuperNode: coordinator '", superlink_address, "' is remote/public ",
+           "but the run uses a weak privacy profile ('", pmode, "'). A remote ",
+           "coordinator can observe model updates; use a Secure Aggregation / DP ",
+           "profile (e.g. clinical_default or high_sensitivity_dp), or set ",
+           "dsflower.allow_untrusted_coordinator=TRUE to override.", call. = FALSE)
+    }
+  }
+
   # Resolve template_name: explicit arg > handle > NULL
   if (!is.null(template_name) && nzchar(template_name %||% "")) {
     template_name <- .ds_arg(template_name)
@@ -578,6 +621,9 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     template_hash <- .compute_template_hash(template_name)
     writeLines(template_hash,
                file.path(handle$staging_dir, "expected_hash.txt"))
+    # Pin the exact template the SuperNode is allowed to run (default-deny).
+    writeLines(template_name,
+               file.path(handle$staging_dir, "expected_template.txt"))
   }
 
   # Decode ca_cert_pem if B64-encoded from DSI transport
@@ -590,6 +636,18 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
       ca_cert_path <- file.path(handle$staging_dir, "ca.pem")
       writeLines(pem_text, ca_cert_path)
     }
+  }
+
+  # Egress preflight: confirm this node can actually reach the SuperLink
+  # before spawning a SuperNode that would otherwise fail to connect
+  # silently and time out 30s later on the client.
+  conn_check <- flowerCheckConnectivityDS(superlink_address)
+  if (!isTRUE(conn_check$reachable)) {
+    stop("This node has no outbound egress to the SuperLink at '",
+         superlink_address, "' (", conn_check$error %||% "unreachable", "). ",
+         "Open outbound access from this server to that host:port, or point ",
+         "the federation at a reachable coordinator (see flowerGetCoordinatorDS).",
+         call. = FALSE)
   }
 
   # Ensure SuperNode via singleton registry
@@ -1063,7 +1121,43 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
                 error = "Invalid address format, expected host:port"))
   }
   host <- parts[1]
-  port <- as.integer(parts[2])
+  port <- suppressWarnings(as.integer(parts[2]))
+  if (is.na(port) || port < 1L || port > 65535L) {
+    return(list(reachable = FALSE, error = "Invalid port"))
+  }
+
+  # Cap the timeout so this cannot be turned into a slow connection-holding
+  # primitive (callers cannot tune it upward).
+  timeout_secs <- min(suppressWarnings(as.numeric(timeout_secs)), 5)
+  if (is.na(timeout_secs) || timeout_secs <= 0) timeout_secs <- 3
+
+  # Authorization: this method makes the node open an outbound socket, so it
+  # must not become an internal port scanner (SSRF). When a coordinator is
+  # configured, ONLY that endpoint may be probed; otherwise refuse private,
+  # loopback and link-local targets.
+  allowed <- c(.dsf_option("coordinator_address",
+                           Sys.getenv("DSFLOWER_COORDINATOR_ADDRESS", "")),
+               .dsf_option("coordinator_control_address",
+                           Sys.getenv("DSFLOWER_COORDINATOR_CONTROL_ADDRESS", "")))
+  allowed <- allowed[!is.null(allowed) & nzchar(allowed %||% "")]
+  restrict <- isTRUE(as.logical(.dsf_option("restrict_connectivity", TRUE)))
+  if (length(allowed) > 0) {
+    if (!address %in% allowed) {
+      return(list(reachable = FALSE,
+                  error = "Connectivity checks are restricted to the configured coordinator address."))
+    }
+  } else if (restrict && .is_private_or_local_host(host)) {
+    return(list(reachable = FALSE,
+                error = paste0("Connectivity checks to private/loopback/link-local hosts are ",
+                               "not allowed. Pin dsflower.coordinator_address, or set ",
+                               "dsflower.restrict_connectivity=FALSE for trusted local dev.")))
+  }
+
+  # Per-session rate limit to blunt scanning even within the allowed scope.
+  if (!.connectivity_rate_ok()) {
+    return(list(reachable = FALSE,
+                error = "Connectivity check rate limit exceeded; try again shortly."))
+  }
 
   # Use socketConnection with open="wb" and immediately close.
   # For TLS ports the TCP handshake succeeds even though the TLS
@@ -1084,6 +1178,48 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
     list(reachable = FALSE, error = conditionMessage(e))
   })
   result
+}
+
+#' Get Configured Coordinator (Public SuperLink)
+#'
+#' DataSHIELD AGGREGATE method. Returns the publicly reachable SuperLink
+#' ("coordinator") this node has been configured to dial, so the client can
+#' auto-discover it and attach with zero manual address/certificate handling.
+#'
+#' The node operator configures it once via options or environment:
+#' \itemize{
+#'   \item \code{dsflower.coordinator_address} / \code{DSFLOWER_COORDINATOR_ADDRESS}
+#'         -- the Fleet API address SuperNodes dial (e.g. "coordinator.datashield.live:9092").
+#'   \item \code{dsflower.coordinator_control_address} /
+#'         \code{DSFLOWER_COORDINATOR_CONTROL_ADDRESS} -- the Control API the
+#'         researcher's \code{flwr run} dials (e.g. "coordinator.datashield.live:9093").
+#'   \item \code{dsflower.coordinator_ca} / \code{DSFLOWER_COORDINATOR_CA} --
+#'         path to the coordinator's CA certificate PEM.
+#' }
+#'
+#' @return Named list with \code{configured} (logical); when configured, also
+#'   \code{address}, \code{control_address}, and \code{ca_cert_pem}.
+#' @export
+flowerGetCoordinatorDS <- function() {
+  addr <- .dsf_option("coordinator_address",
+                      Sys.getenv("DSFLOWER_COORDINATOR_ADDRESS", ""))
+  if (is.null(addr) || !nzchar(addr)) {
+    return(list(configured = FALSE))
+  }
+  ctrl <- .dsf_option("coordinator_control_address",
+                      Sys.getenv("DSFLOWER_COORDINATOR_CONTROL_ADDRESS", ""))
+  ca_path <- .dsf_option("coordinator_ca",
+                         Sys.getenv("DSFLOWER_COORDINATOR_CA", ""))
+  ca_pem <- NULL
+  if (!is.null(ca_path) && nzchar(ca_path) && file.exists(ca_path)) {
+    ca_pem <- paste(readLines(ca_path, warn = FALSE), collapse = "\n")
+  }
+  list(
+    configured      = TRUE,
+    address         = addr,
+    control_address = if (!is.null(ctrl) && nzchar(ctrl)) ctrl else NULL,
+    ca_cert_pem     = ca_pem
+  )
 }
 
 # --- Template serving methods ---
@@ -1200,16 +1336,21 @@ flowerVerifyAppHashDS <- function(handle_symbol, app_hash, template_name) {
                                package = "dsFlower")
   pkg_dir <- file.path(template_dir, template_name)
 
-  py_files <- sort(list.files(pkg_dir, pattern = "\\.py$",
-                               full.names = FALSE))
+  # Recurse over ALL shipped files (so an injected sub-package / .so / .pth is
+  # detected), excluding environment-specific compiled artifacts. Must match
+  # _hash_package in sitecustomize.py byte-for-byte: forward-slash relative
+  # paths, codepoint (radix) sort, each as relpath + "\n" + content + "\x00".
+  rel_files <- list.files(pkg_dir, recursive = TRUE, full.names = FALSE,
+                          all.files = TRUE, no.. = TRUE)
+  rel_files <- rel_files[!grepl("(^|/)__pycache__(/|$)", rel_files)]
+  rel_files <- rel_files[!grepl("\\.(pyc|pyo)$", rel_files)]
+  rel_files <- sort(rel_files, method = "radix")
 
-  # Build binary blob matching Python's algorithm:
-  # for each file: filename + "\n" + content + "\x00"
   blob <- raw(0)
-  for (fname in py_files) {
-    content <- readBin(file.path(pkg_dir, fname), "raw",
-                       file.info(file.path(pkg_dir, fname))$size)
-    blob <- c(blob, charToRaw(fname), charToRaw("\n"), content, as.raw(0x00))
+  for (rel in rel_files) {
+    full <- file.path(pkg_dir, rel)
+    content <- readBin(full, "raw", file.info(full)$size)
+    blob <- c(blob, charToRaw(rel), charToRaw("\n"), content, as.raw(0x00))
   }
 
   digest::digest(blob, algo = "sha256", serialize = FALSE)

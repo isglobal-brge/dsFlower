@@ -50,3 +50,48 @@
     getOption(paste0("default.dsflower.", name), default)
   )
 }
+
+#' Whether a host is loopback / private (RFC1918) / link-local / non-routable
+#'
+#' Used to stop flowerCheckConnectivityDS from being used as an internal port
+#' scanner. Non-literal hostnames are treated as private (deny by default) when
+#' no coordinator is pinned, since they could resolve to internal addresses.
+#'
+#' @param host Character; a hostname or IP literal.
+#' @return Logical.
+#' @keywords internal
+.is_private_or_local_host <- function(host) {
+  h <- tolower(trimws(host %||% ""))
+  if (h %in% c("", "localhost", "localhost.localdomain", "ip6-localhost")) return(TRUE)
+  if (h %in% c("::1", "0:0:0:0:0:0:0:1")) return(TRUE)
+  if (grepl("^fe80:", h)) return(TRUE)              # IPv6 link-local
+  if (grepl("^f[cd][0-9a-f]{2}:", h)) return(TRUE)  # IPv6 unique-local fc00::/7
+  if (grepl("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$", h)) {
+    o <- suppressWarnings(as.integer(strsplit(h, ".", fixed = TRUE)[[1]]))
+    if (any(is.na(o)) || any(o < 0L) || any(o > 255L)) return(TRUE)
+    if (o[1] == 127L) return(TRUE)                                  # loopback
+    if (o[1] == 10L) return(TRUE)                                   # 10/8
+    if (o[1] == 172L && o[2] >= 16L && o[2] <= 31L) return(TRUE)    # 172.16/12
+    if (o[1] == 192L && o[2] == 168L) return(TRUE)                  # 192.168/16
+    if (o[1] == 169L && o[2] == 254L) return(TRUE)                  # link-local
+    if (o[1] == 0L) return(TRUE)
+    return(FALSE)
+  }
+  # Non-literal hostname, no coordinator pinned: deny by default.
+  TRUE
+}
+
+#' Per-session rate limit for connectivity checks
+#' @keywords internal
+.connectivity_rate_ok <- function(max_per_min = 30L) {
+  now <- Sys.time()
+  hist <- .dsflower_env$.conn_check_times
+  if (is.null(hist)) hist <- now[0]
+  hist <- hist[difftime(now, hist, units = "secs") < 60]
+  if (length(hist) >= max_per_min) {
+    .dsflower_env$.conn_check_times <- hist
+    return(FALSE)
+  }
+  .dsflower_env$.conn_check_times <- c(hist, now)
+  TRUE
+}
