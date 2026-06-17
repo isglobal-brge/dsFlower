@@ -568,6 +568,15 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     stop("Handle is not prepared. Call flowerPrepareRunDS first.", call. = FALSE)
   }
 
+  # Overlay transport: if this node has joined a tailnet (flowerOverlayUpDS),
+  # route the SuperNode to the SuperLink through the local SOCKS5 forwarder
+  # instead of dialing the (NAT'd) researcher address directly. The remaining
+  # checks then run against the loopback forwarder, which itself proves the
+  # overlay path is reachable.
+  if (!is.null(.dsflower_env$overlay_socks_port)) {
+    superlink_address <- .overlay_start_forward(superlink_address)
+  }
+
   # SuperLink pinning: if the operator pinned a coordinator on this node, a
   # client must NOT be able to redirect this node's SuperNode to a rogue
   # SuperLink (which would harvest its model updates).

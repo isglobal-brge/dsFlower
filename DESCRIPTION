@@ -47,6 +47,10 @@ AssignMethods:
     flowerInitDS,
     flowerPrepareRunDS,
     flowerEnsureSuperNodeDS,
+    flowerOverlayUpDS,
+    flowerOverlayDownDS,
+    flowerTorUpDS,
+    flowerTorDownDS,
     flowerCleanupRunDS,
     flowerDestroyDS
 Config/testthat/edition: 3
