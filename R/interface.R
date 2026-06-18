@@ -568,20 +568,13 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     stop("Handle is not prepared. Call flowerPrepareRunDS first.", call. = FALSE)
   }
 
-  # Overlay transport: if this node has joined a tailnet (flowerOverlayUpDS),
-  # route the SuperNode to the SuperLink through the local SOCKS5 forwarder
-  # instead of dialing the (NAT'd) researcher address directly. The remaining
-  # checks then run against the loopback forwarder, which itself proves the
-  # overlay path is reachable.
-  # DSI tunnel: the node-local tunnel forwarder (flowerTunnelUpDS) carries the
-  # SuperNode<->SuperLink bytes over DataSHIELD, so the SuperNode dials its own
-  # loopback forwarder and runs insecure (the DSI channel already provides TLS).
-  via_tunnel    <- !is.null(.dsflower_env$tunnel_forwarder_port)
-  via_forwarder <- via_tunnel || !is.null(.dsflower_env$overlay_socks_port)
+  # DSI tunnel transport: the node-local tunnel forwarder (flowerTunnelUpDS)
+  # carries the SuperNode<->SuperLink bytes over DataSHIELD, so the SuperNode
+  # dials its own loopback forwarder and runs insecure (the DSI channel already
+  # provides TLS). This is the only transport -- no Tor, no tailnet.
+  via_tunnel <- !is.null(.dsflower_env$tunnel_forwarder_port)
   if (via_tunnel) {
     superlink_address <- paste0("127.0.0.1:", .dsflower_env$tunnel_forwarder_port)
-  } else if (via_forwarder) {
-    superlink_address <- .overlay_start_forward(superlink_address)
   }
 
   # SuperLink pinning: if the operator pinned a coordinator on this node, a
@@ -664,9 +657,6 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     # The tunnel forwarder accepts exactly one connection (the SuperNode); a
     # probe here would consume that slot, so trust it (we just started it).
     conn_check <- list(reachable = TRUE)
-  } else if (via_forwarder) {
-    fp <- strsplit(superlink_address, ":", fixed = TRUE)[[1]]
-    conn_check <- .probe_tcp(fp[1], suppressWarnings(as.integer(fp[2])))
   } else {
     conn_check <- flowerCheckConnectivityDS(superlink_address)
   }

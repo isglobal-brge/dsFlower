@@ -91,6 +91,30 @@ flowerTunnelPushDS <- function(conn_id, data_b64) {
   TRUE
 }
 
+#' Bidirectional tunnel exchange in one fan-out call (DataSHIELD AGGREGATE)
+#'
+#' Combines push + poll so the researcher's relay needs a single
+#' \code{datashield.aggregate} round-trip per cycle instead of one poll plus a
+#' push per node. \code{downmap} is a \code{.ds_encode}'d named list mapping each
+#' node's federation name to its "B64:" down-bytes; each node appends only its
+#' own slice, then returns its drained up-bytes.
+#' @param conn_id Character; tunnel connection id.
+#' @param downmap Character; \code{.ds_encode}'d named list, or "" if none.
+#' @return URL-safe base64 of this node's new up bytes, or "" if none.
+#' @keywords internal
+#' @export
+flowerTunnelExchangeDS <- function(conn_id, downmap = "") {
+  spool <- .tunnel_spool(conn_id)
+  if (is.character(downmap) && length(downmap) == 1L && nzchar(downmap)) {
+    dm <- tryCatch(.ds_arg(downmap), error = function(e) NULL)
+    nm <- .dsflower_env$tunnel_name
+    if (is.list(dm) && !is.null(nm) && !is.null(dm[[nm]])) {
+      .tunnel_append(spool, "down.bin", .tunnel_dec(dm[[nm]]))
+    }
+  }
+  .tunnel_enc(.tunnel_drain(spool, "up.bin", "up.read_offset"))
+}
+
 #' TEST: inject bytes as if the SuperNode sent them (DataSHIELD AGGREGATE)
 #' @param conn_id Character; tunnel connection id.
 #' @param data_b64 Character; B64: url-safe payload to append to up.bin.
@@ -128,10 +152,13 @@ flowerTunnelDrainDS <- function(conn_id) {
 #' @return list(ok, listen).
 #' @keywords internal
 #' @export
-flowerTunnelUpDS <- function(conn_id, listen_port) {
+flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "") {
   spool <- .tunnel_spool(conn_id)
   unlink(list.files(spool, full.names = TRUE))
   for (f in c("up.bin", "down.bin")) file.create(file.path(spool, f))
+  # Record this node's federation name so flowerTunnelExchangeDS can pick its
+  # slice out of the single fan-out down-payload.
+  if (is.character(node_name) && nzchar(node_name)) .dsflower_env$tunnel_name <- node_name
   fwd <- system.file("python", "dsi_tunnel_forward.py", package = "dsFlower")
   p <- processx::process$new(
     .tunnel_python(),
@@ -186,6 +213,7 @@ flowerTunnelDownDS <- function(conn_id) {
   }
   unlink(.tunnel_spool(conn_id), recursive = TRUE)
   .dsflower_env$tunnel_forwarder_port <- NULL
+  .dsflower_env$tunnel_name <- NULL
   TRUE
 }
 

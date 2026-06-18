@@ -4,7 +4,7 @@
 \alias{flowerTunnelUpDS}
 \title{Start the node-side tunnel forwarder (DataSHIELD AGGREGATE)}
 \usage{
-flowerTunnelUpDS(conn_id, listen_port)
+flowerTunnelUpDS(conn_id, listen_port, node_name = "")
 }
 \arguments{
 \item{conn_id}{Character; tunnel connection id.}
