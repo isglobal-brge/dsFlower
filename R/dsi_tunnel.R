@@ -156,7 +156,12 @@ flowerTunnelExchangeDS <- function(conn_id, req = "") {
   }
   # up: read SuperNode->SuperLink bytes from the relay-owned offset
   up <- .tunnel_read_at(spool, "up.bin", pf)
-  list(sz = down_sz, ud = .tunnel_enc(up$data), ue = up$eof)
+  # generation: bumps each time the forwarder accepts a new SuperNode connection,
+  # signalling the relay to reset its socket + offsets for the fresh stream.
+  gf <- file.path(spool, "gen")
+  gen <- if (file.exists(gf)) suppressWarnings(as.numeric(readLines(gf, n = 1, warn = FALSE))) else 0
+  if (length(gen) == 0 || is.na(gen)) gen <- 0
+  list(sz = down_sz, ud = .tunnel_enc(up$data), ue = up$eof, g = gen)
 }
 
 #' TEST: inject bytes as if the SuperNode sent them (DataSHIELD AGGREGATE)
