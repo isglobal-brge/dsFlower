@@ -59,6 +59,36 @@
   invisible(TRUE)
 }
 
+#' Read a byte range [from, EOF) from a spool file (relay-owned offset).
+#' @keywords internal
+.tunnel_read_at <- function(spool, binname, from) {
+  bin <- file.path(spool, binname)
+  if (!file.exists(bin)) return(list(data = raw(0), eof = 0))
+  sz <- file.size(bin)
+  from <- suppressWarnings(as.numeric(from))
+  if (length(from) == 0 || is.na(from) || from < 0) from <- 0
+  if (sz <= from) return(list(data = raw(0), eof = sz))
+  con <- file(bin, "rb"); on.exit(close(con))
+  seek(con, from)
+  list(data = readBin(con, "raw", sz - from), eof = sz)
+}
+
+#' Idempotent append: 'at' is the size the relay believes the file has; append
+#' only the bytes of 'raw' not already present, so a retried push never
+#' duplicates or loses bytes. Returns the new file size.
+#' @keywords internal
+.tunnel_append_at <- function(spool, binname, at, raw) {
+  bin <- file.path(spool, binname)
+  sz <- if (file.exists(bin)) file.size(bin) else 0
+  at <- suppressWarnings(as.numeric(at))
+  if (length(at) == 0 || is.na(at)) at <- sz
+  already <- sz - at                          # bytes of 'raw' already appended
+  if (already < 0) return(sz)                 # gap (at > sz): refuse, report size
+  if (already >= length(raw)) return(sz)      # nothing new to append
+  .tunnel_append(spool, binname, raw[(already + 1):length(raw)])
+  if (file.exists(bin)) file.size(bin) else 0
+}
+
 #' Reset/initialise a tunnel spool (DataSHIELD AGGREGATE)
 #' @param conn_id Character; tunnel connection id.
 #' @return TRUE.
@@ -91,28 +121,42 @@ flowerTunnelPushDS <- function(conn_id, data_b64) {
   TRUE
 }
 
-#' Bidirectional tunnel exchange in one fan-out call (DataSHIELD AGGREGATE)
+#' Idempotent bidirectional tunnel exchange in one fan-out call (AGGREGATE)
 #'
-#' Combines push + poll so the researcher's relay needs a single
-#' \code{datashield.aggregate} round-trip per cycle instead of one poll plus a
-#' push per node. \code{downmap} is a \code{.ds_encode}'d named list mapping each
-#' node's federation name to its "B64:" down-bytes; each node appends only its
-#' own slice, then returns its drained up-bytes.
+#' The RELAY owns the byte offsets, so this method is loss-free and idempotent: a
+#' retried call re-delivers / re-reads the same byte ranges without duplication
+#' or loss. \code{req} is a \code{.ds_encode}'d named list keyed by node name;
+#' this node's entry is list(pa = down append-offset the relay believes,
+#' pd = "B64:" SuperLink->SuperNode bytes, pf = up read-offset). Returns this
+#' node's list(sz = new down.bin size, ud = "B64:" SuperNode->SuperLink bytes
+#' from pf, ue = new up.bin EOF).
 #' @param conn_id Character; tunnel connection id.
-#' @param downmap Character; \code{.ds_encode}'d named list, or "" if none.
-#' @return URL-safe base64 of this node's new up bytes, or "" if none.
+#' @param req Character; \code{.ds_encode}'d named request map, or "".
+#' @return list(sz, ud, ue) for this node.
 #' @keywords internal
 #' @export
-flowerTunnelExchangeDS <- function(conn_id, downmap = "") {
+flowerTunnelExchangeDS <- function(conn_id, req = "") {
   spool <- .tunnel_spool(conn_id)
-  if (is.character(downmap) && length(downmap) == 1L && nzchar(downmap)) {
-    dm <- tryCatch(.ds_arg(downmap), error = function(e) NULL)
-    nm <- .dsflower_env$tunnel_name
-    if (is.list(dm) && !is.null(nm) && !is.null(dm[[nm]])) {
-      .tunnel_append(spool, "down.bin", .tunnel_dec(dm[[nm]]))
+  nm <- .dsflower_env$tunnel_name
+  pa <- NA; pd <- ""; pf <- 0
+  if (is.character(req) && length(req) == 1L && nzchar(req)) {
+    rm <- tryCatch(.ds_arg(req), error = function(e) NULL)
+    if (is.list(rm) && !is.null(nm) && !is.null(rm[[nm]])) {
+      r <- rm[[nm]]
+      if (!is.null(r$pa)) pa <- r$pa
+      if (!is.null(r$pd)) pd <- r$pd
+      if (!is.null(r$pf)) pf <- r$pf
     }
   }
-  .tunnel_enc(.tunnel_drain(spool, "up.bin", "up.read_offset"))
+  # down: idempotently append the relay's SuperLink->SuperNode bytes
+  down_sz <- if (is.character(pd) && nzchar(pd)) {
+    .tunnel_append_at(spool, "down.bin", pa, .tunnel_dec(pd))
+  } else {
+    b <- file.path(spool, "down.bin"); if (file.exists(b)) file.size(b) else 0
+  }
+  # up: read SuperNode->SuperLink bytes from the relay-owned offset
+  up <- .tunnel_read_at(spool, "up.bin", pf)
+  list(sz = down_sz, ud = .tunnel_enc(up$data), ue = up$eof)
 }
 
 #' TEST: inject bytes as if the SuperNode sent them (DataSHIELD AGGREGATE)
