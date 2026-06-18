@@ -33,7 +33,15 @@ class SecureXGBClient(NumPyClient):
         self.n_classes = int(num_class) if self.multiclass else 2
         self.n_outputs = self.n_classes if self.multiclass else 1
         self.n_features = X.shape[1]
-        self.vector_length = self.n_features * self.n_bins * 2
+        # Batched multiclass packs every class's gradient/hessian histogram into
+        # ONE secure round (vector widened by n_outputs), so all K per-class
+        # stumps are built per boosting round instead of one per round. Mirrors
+        # the server's `batched` flag; both gate on SecAgg + multiclass.
+        self.batched = bool(
+            privacy_config.get("require_secure_aggregation", False)
+        ) and self.n_outputs > 1
+        outputs = self.n_outputs if self.batched else 1
+        self.vector_length = self.n_features * self.n_bins * 2 * outputs
 
         # State maintained across rounds
         self.bin_edges = None  # (n_features, n_bins-1)
@@ -189,6 +197,41 @@ class SecureXGBClient(NumPyClient):
         self.node_assignments[:] = 0
         self._save_state()
 
+    def _apply_pending_updates(self, config):
+        """Apply all K per-class stumps from the previous batched round, once.
+
+        Each update advances one class's predictions; idempotent via
+        last_applied_tree so a resent config never double-applies.
+        """
+        raw = config.get("apply_updates")
+        if not raw:
+            return
+        try:
+            updates = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        max_tree = self.last_applied_tree
+        for u in updates:
+            tree_id = int(u.get("tree_id", -1))
+            if tree_id <= self.last_applied_tree:
+                continue
+            class_idx = int(u.get("class_idx", 0))
+            feature_idx = int(u.get("feature", -1))
+            threshold = float(u.get("threshold", 0.0))
+            left_leaf = float(u.get("left_leaf", 0.0))
+            right_leaf = float(u.get("right_leaf", left_leaf))
+            if feature_idx < 0:
+                leaf = np.full(len(self.y), left_leaf, dtype=np.float64)
+            else:
+                leaf = np.where(
+                    self.X[:, feature_idx] <= threshold, left_leaf, right_leaf
+                )
+            self.predictions[:, class_idx] += self.learning_rate * leaf
+            max_tree = max(max_tree, tree_id)
+        self.last_applied_tree = max_tree
+        self.node_assignments[:] = 0
+        self._save_state()
+
     def _maybe_add_update_noise(self, flat):
         """Add Gaussian noise to bounded histogram contributions.
 
@@ -240,7 +283,10 @@ class SecureXGBClient(NumPyClient):
     def _handle_histogram(self, parameters, config):
         """Compute and return quantized histograms for SecAgg+."""
         if str(config.get("secure_stump_boost", "false")).lower() == "true":
-            self._maybe_apply_previous_stump(config)
+            if self.batched:
+                self._apply_pending_updates(config)
+            else:
+                self._maybe_apply_previous_stump(config)
             self.node_assignments[:] = 0
 
         node_id = int(config.get("node_id", "0"))
@@ -252,6 +298,9 @@ class SecureXGBClient(NumPyClient):
             edge_len = self.n_features * (self.n_bins - 1)
             if len(flat) >= edge_len:
                 self.bin_edges = flat[:edge_len].reshape(self.n_features, -1)
+
+        if self.batched:
+            return self._batched_histograms(node_id)
 
         grad, hess = self._compute_gradients(class_idx)
         mask = self.node_assignments == node_id
@@ -283,6 +332,45 @@ class SecureXGBClient(NumPyClient):
         flat = self._maybe_add_update_noise(flat)
 
         return [flat], self._fit_num_examples(mask.sum()), {}
+
+    def _batched_histograms(self, node_id):
+        """All K classes' grad/hess histograms packed into one widened vector.
+
+        Layout per class c: grad_hist(F*B) then hess_hist(F*B), concatenated
+        c=0..K-1. The server unpacks the same layout after SecAgg summation.
+        """
+        mask = self.node_assignments == node_id
+        n = int(mask.sum())
+        if n == 0:
+            return [np.zeros(self.vector_length, dtype=np.float32)], \
+                self._fit_num_examples(0), {}
+
+        X_node = self.X[mask]
+        # Bin index per (sample, feature) -- shared across all classes.
+        bin_idx = np.empty((n, self.n_features), dtype=np.int64)
+        for f in range(self.n_features):
+            bi = np.digitize(X_node[:, f], self.bin_edges[f])
+            bin_idx[:, f] = np.clip(bi, 0, self.n_bins - 1)
+
+        fb = self.n_features * self.n_bins
+        per_class = fb * 2
+        out = np.zeros(self.vector_length, dtype=np.float64)
+        for c in range(self.n_outputs):
+            grad, hess = self._compute_gradients(c)
+            grad_node = grad[mask]
+            hess_node = hess[mask]
+            grad_hist = np.zeros((self.n_features, self.n_bins), dtype=np.float64)
+            hess_hist = np.zeros((self.n_features, self.n_bins), dtype=np.float64)
+            for f in range(self.n_features):
+                bi = bin_idx[:, f]
+                grad_hist[f] = np.bincount(bi, weights=grad_node, minlength=self.n_bins)[:self.n_bins]
+                hess_hist[f] = np.bincount(bi, weights=hess_node, minlength=self.n_bins)[:self.n_bins]
+            off = c * per_class
+            out[off:off + fb] = grad_hist.ravel()
+            out[off + fb:off + per_class] = hess_hist.ravel()
+
+        out = self._maybe_add_update_noise(out)
+        return [out.astype(np.float32)], self._fit_num_examples(n), {}
 
     def _handle_split(self, parameters, config):
         """Apply split decision to node assignments."""

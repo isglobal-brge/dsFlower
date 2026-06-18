@@ -104,6 +104,14 @@ class SecureXGBoostStrategy(Strategy):
         self.secure_single_round = secure_single_round
         self.fixed_bin_range = fixed_bin_range
         self.pending_stump_update = None
+        # Batched multiclass: build all K per-class stumps in ONE secure round
+        # instead of K sequential rounds. The histogram vector carries every
+        # class's gradient/hessian sums at once (still a single SecAgg-summed
+        # vector, so the privacy guarantee is unchanged), cutting the number of
+        # secure round-trips by a factor of K. Binary/regression (n_outputs == 1)
+        # is the degenerate 1-class case and behaves exactly as before.
+        self.batched = self.secure_stump_boost and self.n_outputs > 1
+        self.pending_stump_updates = []
 
         # State machine
         self.current_tree = 0
@@ -135,7 +143,8 @@ class SecureXGBoostStrategy(Strategy):
 
     def _fixed_parameters(self, values=None) -> Parameters:
         """Return a single fixed-shape parameter vector for SecAgg+ rounds."""
-        length = max(1, int(self.n_features) * int(self.n_bins) * 2)
+        outputs = self.n_outputs if self.batched else 1
+        length = max(1, int(self.n_features) * int(self.n_bins) * 2 * outputs)
         arr = np.zeros(length, dtype=np.float32)
         if values is not None:
             values = np.asarray(values, dtype=np.float32).ravel()
@@ -214,7 +223,12 @@ class SecureXGBoostStrategy(Strategy):
             if self.secure_stump_boost:
                 config["secure_stump_boost"] = "true"
                 config["tree_id"] = str(self.current_tree)
-                if self.pending_stump_update is not None:
+                if self.batched:
+                    # All K per-class updates from the previous round, applied
+                    # together before clients compute this round's histograms.
+                    if self.pending_stump_updates:
+                        config["apply_updates"] = json.dumps(self.pending_stump_updates)
+                elif self.pending_stump_update is not None:
                     update = self.pending_stump_update
                     config["apply_tree_id"] = str(update["tree_id"])
                     config["apply_class_idx"] = str(update.get("class_idx", 0))
@@ -357,6 +371,14 @@ class SecureXGBoostStrategy(Strategy):
                 else:
                     aggregated += arr
 
+        n_hist = self.n_features * self.n_bins
+
+        # Batched multiclass: aggregated carries all K classes' histograms.
+        # Build every per-class stump from this single secure round.
+        if self.batched:
+            self.nodes_to_split.popleft()
+            return self._aggregate_secure_stumps_batched(aggregated, n_hist)
+
         if aggregated is None or len(aggregated) == 0:
             # No data - make this a leaf
             self.nodes_to_split.popleft()
@@ -364,47 +386,16 @@ class SecureXGBoostStrategy(Strategy):
             self._advance_after_node_processed()
             return self._fixed_parameters(), {}
 
-        n_hist = self.n_features * self.n_bins
         grad_flat = aggregated[:n_hist]
         hess_flat = aggregated[n_hist:(2 * n_hist)]
 
         grad_hist = grad_flat.reshape(self.n_features, self.n_bins)
         hess_hist = hess_flat.reshape(self.n_features, self.n_bins)
 
-        # Total G and H for this node
-        G_total = grad_hist.sum()
-        H_total = hess_hist.sum()
+        best_gain, best_feature, best_bin, G_total, H_total = self._best_split(
+            grad_hist, hess_hist
+        )
         self.node_grad_sums[node_id] = (G_total, H_total)
-
-        # Find best split
-        best_gain = 0.0
-        best_feature = -1
-        best_bin = -1
-
-        base_score = (G_total ** 2) / (H_total + self.reg_lambda)
-
-        for f in range(self.n_features):
-            G_left = 0.0
-            H_left = 0.0
-            for b in range(self.n_bins - 1):  # Don't split on last bin
-                G_left += grad_hist[f, b]
-                H_left += hess_hist[f, b]
-                G_right = G_total - G_left
-                H_right = H_total - H_left
-
-                if H_left < self.min_child_weight or H_right < self.min_child_weight:
-                    continue
-
-                gain = 0.5 * (
-                    (G_left ** 2) / (H_left + self.reg_lambda)
-                    + (G_right ** 2) / (H_right + self.reg_lambda)
-                    - base_score
-                )
-
-                if gain > best_gain:
-                    best_gain = gain
-                    best_feature = f
-                    best_bin = b
 
         self.nodes_to_split.popleft()
 
@@ -560,6 +551,107 @@ class SecureXGBoostStrategy(Strategy):
         return self._fixed_parameters(), {
             "secure_histogram_tree": float(self.current_tree),
             "secure_stump_gain": float(best_gain),
+        }
+
+    def _best_split(self, grad_hist, hess_hist):
+        """Find the best (feature, bin) split for one node's histogram."""
+        G_total = float(grad_hist.sum())
+        H_total = float(hess_hist.sum())
+        best_gain, best_feature, best_bin = 0.0, -1, -1
+        base_score = (G_total ** 2) / (H_total + self.reg_lambda)
+        for f in range(self.n_features):
+            G_left = 0.0
+            H_left = 0.0
+            for b in range(self.n_bins - 1):  # Don't split on last bin
+                G_left += grad_hist[f, b]
+                H_left += hess_hist[f, b]
+                G_right = G_total - G_left
+                H_right = H_total - H_left
+                if H_left < self.min_child_weight or H_right < self.min_child_weight:
+                    continue
+                gain = 0.5 * (
+                    (G_left ** 2) / (H_left + self.reg_lambda)
+                    + (G_right ** 2) / (H_right + self.reg_lambda)
+                    - base_score
+                )
+                if gain > best_gain:
+                    best_gain, best_feature, best_bin = gain, f, b
+        return best_gain, best_feature, best_bin, G_total, H_total
+
+    def _build_stump(self, tree_id, class_idx, grad_hist, hess_hist,
+                     G_total, H_total, best_gain, best_feature, best_bin):
+        """Build one boosted stump, record it as tree `tree_id`, return its
+        apply-update (the leaf values clients use to advance their predictions)."""
+        splits, leaves = {}, {}
+        if best_gain <= 0 or best_feature < 0:
+            leaf_value = -G_total / (H_total + self.reg_lambda)
+            leaves["0"] = float(leaf_value)
+            update = {
+                "tree_id": tree_id, "class_idx": class_idx, "feature": -1,
+                "threshold": 0.0, "left_leaf": float(leaf_value),
+                "right_leaf": float(leaf_value),
+            }
+        else:
+            threshold = float(self.global_bin_edges[best_feature, best_bin])
+            G_left = float(grad_hist[best_feature, :(best_bin + 1)].sum())
+            H_left = float(hess_hist[best_feature, :(best_bin + 1)].sum())
+            G_right = G_total - G_left
+            H_right = H_total - H_left
+            left_leaf = -G_left / (H_left + self.reg_lambda)
+            right_leaf = -G_right / (H_right + self.reg_lambda)
+            splits["0"] = {
+                "feature": int(best_feature), "threshold": threshold,
+                "left": 1, "right": 2, "gain": float(best_gain),
+            }
+            leaves["1"] = float(left_leaf)
+            leaves["2"] = float(right_leaf)
+            update = {
+                "tree_id": tree_id, "class_idx": class_idx,
+                "feature": int(best_feature), "threshold": threshold,
+                "left_leaf": float(left_leaf), "right_leaf": float(right_leaf),
+            }
+        self.completed_trees.append({
+            "tree_id": tree_id, "class_idx": class_idx,
+            "splits": splits, "leaves": leaves,
+        })
+        self.history.append({
+            "tree": tree_id, "n_splits": len(splits), "n_leaves": len(leaves),
+        })
+        return update
+
+    def _aggregate_secure_stumps_batched(self, aggregated, n_hist):
+        """Build all K per-class stumps from one widened secure histogram.
+
+        `aggregated` packs, per class c: grad_hist(F*B) then hess_hist(F*B).
+        Each class's split is decided independently from its own SecAgg-summed
+        histogram; the server never sees any single site's contribution.
+        """
+        per_class = n_hist * 2
+        if aggregated is None:
+            aggregated = np.zeros(per_class * self.n_outputs, dtype=np.float64)
+        base = self.current_tree
+        updates = []
+        for c in range(self.n_outputs):
+            off = c * per_class
+            grad_hist = aggregated[off:off + n_hist].reshape(self.n_features, self.n_bins)
+            hess_hist = aggregated[off + n_hist:off + per_class].reshape(self.n_features, self.n_bins)
+            bg, bf, bb, G_total, H_total = self._best_split(grad_hist, hess_hist)
+            updates.append(self._build_stump(
+                base + c, c, grad_hist, hess_hist, G_total, H_total, bg, bf, bb
+            ))
+        self.current_tree += self.n_outputs
+        self.pending_stump_updates = updates
+
+        if self.current_tree < self.n_trees:
+            self._start_new_tree()
+            self.phase = "histogram"
+        else:
+            self._save_model()
+            self._save_history()
+            self.phase = "done"
+
+        return self._fixed_parameters(), {
+            "secure_batched_round": float(self.current_tree // self.n_outputs),
         }
 
     def _aggregate_split(self, results):
@@ -767,14 +859,18 @@ def server_fn(context: Context) -> ServerAppComponents:
             max_depth,
         )
         max_depth = 1
-    secure_single_round = secure_stump_boost and n_trees == 1 and max_depth == 1
-
-    # Multiclass trains one tree per class per round -> total = n_trees x n_outputs.
-    num_rounds = (
-        _compute_secure_num_rounds(n_trees * n_outputs)
-        if secure_stump_boost
-        else _compute_num_rounds(n_trees * n_outputs, max_depth)
+    secure_single_round = (
+        secure_stump_boost and n_trees == 1 and max_depth == 1 and n_outputs == 1
     )
+
+    # Round budget. Batched multiclass builds all K per-class stumps in ONE
+    # secure round, so it needs only n_trees (boosting) rounds instead of
+    # n_trees x n_outputs. Binary/regression keep n_trees rounds either way.
+    batched = secure_stump_boost and n_outputs > 1
+    if secure_stump_boost:
+        num_rounds = _compute_secure_num_rounds(n_trees if batched else n_trees * n_outputs)
+    else:
+        num_rounds = _compute_num_rounds(n_trees * n_outputs, max_depth)
 
     min_available = int(cfg.get("strategy-min_available_clients", 2))
     min_fit = int(cfg.get("strategy-min_fit_clients", 2))
