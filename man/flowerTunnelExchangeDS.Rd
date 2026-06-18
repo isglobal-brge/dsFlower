@@ -2,23 +2,25 @@
 % Please edit documentation in R/dsi_tunnel.R
 \name{flowerTunnelExchangeDS}
 \alias{flowerTunnelExchangeDS}
-\title{Bidirectional tunnel exchange in one fan-out call (DataSHIELD AGGREGATE)}
+\title{Idempotent bidirectional tunnel exchange in one fan-out call (AGGREGATE)}
 \usage{
-flowerTunnelExchangeDS(conn_id, downmap = "")
+flowerTunnelExchangeDS(conn_id, req = "")
 }
 \arguments{
 \item{conn_id}{Character; tunnel connection id.}
 
-\item{downmap}{Character; \code{.ds_encode}'d named list, or "" if none.}
+\item{req}{Character; \code{.ds_encode}'d named request map, or "".}
 }
 \value{
-URL-safe base64 of this node's new up bytes, or "" if none.
+list(sz, ud, ue) for this node.
 }
 \description{
-Combines push + poll so the researcher's relay needs a single
-\code{datashield.aggregate} round-trip per cycle instead of one poll plus a
-push per node. \code{downmap} is a \code{.ds_encode}'d named list mapping each
-node's federation name to its "B64:" down-bytes; each node appends only its
-own slice, then returns its drained up-bytes.
+The RELAY owns the byte offsets, so this method is loss-free and idempotent: a
+retried call re-delivers / re-reads the same byte ranges without duplication
+or loss. \code{req} is a \code{.ds_encode}'d named list keyed by node name;
+this node's entry is list(pa = down append-offset the relay believes,
+pd = "B64:" SuperLink->SuperNode bytes, pf = up read-offset). Returns this
+node's list(sz = new down.bin size, ud = "B64:" SuperNode->SuperLink bytes
+from pf, ue = new up.bin EOF).
 }
 \keyword{internal}

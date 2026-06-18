@@ -761,7 +761,7 @@
                           "pytorch_tcn", "pytorch_lstm",
                           "xgboost"),
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
-    max_concurrent_runs = as.integer(.dsf_option("max_concurrent_runs", 5))
+    max_concurrent_runs = as.numeric(.dsf_option("max_concurrent_runs", Inf))
   )
 }
 

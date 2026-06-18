@@ -307,6 +307,11 @@
       auth_args,
       transport_args,
       "--superlink", sl_addr,
+      # Self-terminate if the SuperLink is unreachable for this long (e.g. the
+      # researcher's run was killed and its tunnel is gone): a SuperNode would
+      # otherwise retry-connect forever and orphan, counting against the
+      # concurrent-SuperNode limit. Generous enough to survive tunnel reconnects.
+      "--max-wait-time", .dsf_option("supernode_max_wait", "180"),
       "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
       # ClientAppIO is loopback-only IPC between the SuperNode and its local
       # ClientApp on this data-holding node -- never dialed remotely.
