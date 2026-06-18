@@ -77,6 +77,7 @@ class SecureXGBoostStrategy(Strategy):
         secure_single_round: bool = False,
         secure_stump_boost: bool = False,
         fixed_bin_range: float = 4.0,
+        batch_multiclass: bool = False,
     ):
         super().__init__()
         self.multiclass = str(objective).startswith("multi")
@@ -110,7 +111,15 @@ class SecureXGBoostStrategy(Strategy):
         # vector, so the privacy guarantee is unchanged), cutting the number of
         # secure round-trips by a factor of K. Binary/regression (n_outputs == 1)
         # is the degenerate 1-class case and behaves exactly as before.
-        self.batched = self.secure_stump_boost and self.n_outputs > 1
+        #
+        # OPT-IN (default off): the protocol is validated in-process but the
+        # widened SecAgg+ vector has not yet passed end-to-end federated testing
+        # over the DSI tunnel (large vectors stress the relay; see notes). Until
+        # then the default path stays the per-class-per-round one. Enable with
+        # the `batch_multiclass` model param once federated-validated.
+        self.batched = (
+            self.secure_stump_boost and self.n_outputs > 1 and bool(batch_multiclass)
+        )
         self.pending_stump_updates = []
 
         # State machine
@@ -866,7 +875,9 @@ def server_fn(context: Context) -> ServerAppComponents:
     # Round budget. Batched multiclass builds all K per-class stumps in ONE
     # secure round, so it needs only n_trees (boosting) rounds instead of
     # n_trees x n_outputs. Binary/regression keep n_trees rounds either way.
-    batched = secure_stump_boost and n_outputs > 1
+    # Opt-in (default off) until federated SecAgg+ validation lands.
+    batch_multiclass = str(cfg.get("batch_multiclass", "false")).lower() == "true"
+    batched = secure_stump_boost and n_outputs > 1 and batch_multiclass
     if secure_stump_boost:
         num_rounds = _compute_secure_num_rounds(n_trees if batched else n_trees * n_outputs)
     else:
@@ -895,6 +906,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         secure_single_round=secure_single_round,
         secure_stump_boost=secure_stump_boost,
         fixed_bin_range=float(cfg.get("fixed-bin-range", 4.0)),
+        batch_multiclass=batch_multiclass,
     )
 
     config = ServerConfig(num_rounds=num_rounds)

@@ -16,7 +16,7 @@ from .privacy_utils import bucket_count
 class SecureXGBClient(NumPyClient):
     def __init__(self, X, y, privacy_config, n_bins=64,
                  learning_rate=0.3, reg_lambda=1.0, objective="binary:logistic",
-                 num_class=2, manifest_dir=None):
+                 num_class=2, manifest_dir=None, batch_multiclass=False):
         self.X = X.astype(np.float64)
         self.y = y.astype(np.float64)
         self.privacy_config = privacy_config
@@ -39,7 +39,7 @@ class SecureXGBClient(NumPyClient):
         # the server's `batched` flag; both gate on SecAgg + multiclass.
         self.batched = bool(
             privacy_config.get("require_secure_aggregation", False)
-        ) and self.n_outputs > 1
+        ) and self.n_outputs > 1 and bool(batch_multiclass)
         outputs = self.n_outputs if self.batched else 1
         self.vector_length = self.n_features * self.n_bins * 2 * outputs
 
@@ -457,6 +457,7 @@ def client_fn(context: Context) -> SecureXGBClient:
     reg_lambda = float(cfg.get("reg_lambda", 1.0))
     objective = cfg.get("objective", "binary:logistic")
     num_class = int(cfg.get("num_class", 2))
+    batch_multiclass = str(cfg.get("batch_multiclass", "false")).lower() == "true"
 
     return SecureXGBClient(
         X, y, privacy_config,
@@ -466,6 +467,7 @@ def client_fn(context: Context) -> SecureXGBClient:
         objective=objective,
         num_class=num_class,
         manifest_dir=manifest_dir,
+        batch_multiclass=batch_multiclass,
     )
 
 
