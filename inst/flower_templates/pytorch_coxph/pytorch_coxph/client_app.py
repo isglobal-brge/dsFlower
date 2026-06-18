@@ -88,10 +88,11 @@ class FlowerClient(NumPyClient):
         fit_metrics = {}
 
         if privacy_mode == "dp" and self.privacy_engine is not None:
-            dp_delta = self.privacy_config["delta"]
-            actual_epsilon = self.privacy_engine.get_epsilon(dp_delta)
-            fit_metrics["dp_epsilon"] = actual_epsilon
-
+            # Run DP accounting but do NOT return achieved epsilon: it
+            # depends on the DP-SGD step count (dataset size / batch), so
+            # exposing it would leak this node's sample count. The privacy
+            # budget is accounted server-side from the requested epsilon.
+            self.privacy_engine.get_epsilon(self.privacy_config["delta"])
         elif privacy_mode == "dp_update_level":
             cn = self.privacy_config["clipping_norm"]
             eps = self.privacy_config["epsilon"]

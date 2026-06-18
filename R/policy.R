@@ -730,7 +730,11 @@
   # Fallback: local power-of-two bucketing
   n <- as.integer(n)
   if (is.na(n) || n <= 0) return(0L)
-  if (n < 4) return(as.integer(n))
+  # Suppress small counts: returning 1/2/3 exactly discloses a near-empty
+  # stratum. Counts at or below the DataSHIELD subset filter report as 0.
+  thr <- as.integer(getOption("nfilter.subset",
+                              getOption("default.nfilter.subset", 3)))
+  if (n <= thr) return(0L)
   as.integer(2^round(log2(n)))
 }
 
