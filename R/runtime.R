@@ -159,7 +159,7 @@
 #' @keywords internal
 .supernode_ensure <- function(superlink_address, manifest_dir,
                               python_path = "python3", ca_cert_path = NULL,
-                              template_name = NULL) {
+                              template_name = NULL, insecure = FALSE) {
   # Policy check
   settings <- .flowerDisclosureSettings()
   if (!settings$allow_supernode_spawn) {
@@ -278,7 +278,10 @@
   clientappio_port <- NULL
   for (attempt in seq_len(3L)) {
     clientappio_port <- .random_available_port()
-    tls_args <- c("--root-certificates", ca_cert_path)
+    # DSI tunnel: the inner Flower gRPC runs insecure because the bytes already
+    # travel inside the (TLS) DataSHIELD channel; otherwise use TLS to the CA.
+    tls_args <- if (isTRUE(insecure)) "--insecure"
+                else c("--root-certificates", ca_cert_path)
     # SuperNode authentication: if the operator configured this node's auth
     # keypair, present it so the SuperLink admits us by KEY, not merely by CA
     # possession (CA alone must not be enough to join the federation).

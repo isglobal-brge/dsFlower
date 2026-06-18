@@ -573,8 +573,14 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   # instead of dialing the (NAT'd) researcher address directly. The remaining
   # checks then run against the loopback forwarder, which itself proves the
   # overlay path is reachable.
-  via_forwarder <- !is.null(.dsflower_env$overlay_socks_port)
-  if (via_forwarder) {
+  # DSI tunnel: the node-local tunnel forwarder (flowerTunnelUpDS) carries the
+  # SuperNode<->SuperLink bytes over DataSHIELD, so the SuperNode dials its own
+  # loopback forwarder and runs insecure (the DSI channel already provides TLS).
+  via_tunnel    <- !is.null(.dsflower_env$tunnel_forwarder_port)
+  via_forwarder <- via_tunnel || !is.null(.dsflower_env$overlay_socks_port)
+  if (via_tunnel) {
+    superlink_address <- paste0("127.0.0.1:", .dsflower_env$tunnel_forwarder_port)
+  } else if (via_forwarder) {
     superlink_address <- .overlay_start_forward(superlink_address)
   }
 
@@ -654,7 +660,11 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   # forwarder is active the address is the loopback forwarder WE created,
   # so probe it directly (the anti-SSRF guard in flowerCheckConnectivityDS
   # would otherwise reject our own legitimate loopback endpoint).
-  if (via_forwarder) {
+  if (via_tunnel) {
+    # The tunnel forwarder accepts exactly one connection (the SuperNode); a
+    # probe here would consume that slot, so trust it (we just started it).
+    conn_check <- list(reachable = TRUE)
+  } else if (via_forwarder) {
     fp <- strsplit(superlink_address, ":", fixed = TRUE)[[1]]
     conn_check <- .probe_tcp(fp[1], suppressWarnings(as.integer(fp[2])))
   } else {
@@ -674,7 +684,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     manifest_dir      = handle$staging_dir,
     python_path       = handle$python_path,
     ca_cert_path      = ca_cert_path,
-    template_name     = template_name
+    template_name     = template_name,
+    insecure          = via_tunnel
   )
 
   handle$superlink_address <- superlink_address

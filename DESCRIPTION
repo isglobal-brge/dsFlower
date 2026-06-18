@@ -41,8 +41,6 @@ AggregateMethods:
     flowerGetTemplateDS,
     flowerVerifyAppHashDS,
     flowerPrivacyBudgetDS,
-    flowerDsiStatsDS,
-    flowerDsiStepDS,
     flowerTunnelResetDS,
     flowerTunnelPollDS,
     flowerTunnelPushDS,

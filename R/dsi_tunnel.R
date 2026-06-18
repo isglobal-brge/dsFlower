@@ -139,6 +139,9 @@ flowerTunnelUpDS <- function(conn_id, listen_port) {
     stdout = file.path(spool, "fwd.log"), stderr = "2>&1",
     cleanup = FALSE, cleanup_tree = FALSE)
   .dsflower_env[[paste0("tunnel_fwd_", conn_id)]] <- p
+  # Signal to flowerEnsureSuperNodeDS that the SuperNode must dial this loopback
+  # forwarder (insecure) instead of a remote/Tor SuperLink address.
+  .dsflower_env$tunnel_forwarder_port <- as.integer(listen_port)
   ready <- FALSE
   for (i in 1:60) { if (file.exists(file.path(spool, "ready"))) { ready <- TRUE; break }; Sys.sleep(0.1) }
   list(ok = ready, listen = paste0("127.0.0.1:", as.integer(listen_port)))
@@ -182,6 +185,7 @@ flowerTunnelDownDS <- function(conn_id) {
     .dsflower_env[[paste0(k, conn_id)]] <- NULL
   }
   unlink(.tunnel_spool(conn_id), recursive = TRUE)
+  .dsflower_env$tunnel_forwarder_port <- NULL
   TRUE
 }
 

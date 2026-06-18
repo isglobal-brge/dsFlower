@@ -9,7 +9,8 @@
   manifest_dir,
   python_path = "python3",
   ca_cert_path = NULL,
-  template_name = NULL
+  template_name = NULL,
+  insecure = FALSE
 )
 }
 \arguments{
