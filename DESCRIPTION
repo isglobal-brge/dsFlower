@@ -41,6 +41,8 @@ AggregateMethods:
     flowerGetTemplateDS,
     flowerVerifyAppHashDS,
     flowerPrivacyBudgetDS,
+    flowerDsiStatsDS,
+    flowerDsiStepDS,
     c=base::c,
     list=base::list
 AssignMethods:
