@@ -649,10 +649,9 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 
   # Egress preflight: confirm this node can actually reach the SuperLink
   # before spawning a SuperNode that would otherwise fail to connect
-  # silently and time out 30s later on the client. When an overlay/Tor
-  # forwarder is active the address is the loopback forwarder WE created,
-  # so probe it directly (the anti-SSRF guard in flowerCheckConnectivityDS
-  # would otherwise reject our own legitimate loopback endpoint).
+  # silently and time out 30s later on the client. When the DSI tunnel is
+  # active the address is the node-local loopback forwarder WE created, so
+  # there is nothing external to probe.
   if (via_tunnel) {
     # The tunnel forwarder accepts exactly one connection (the SuperNode); a
     # probe here would consume that slot, so trust it (we just started it).

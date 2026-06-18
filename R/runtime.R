@@ -262,8 +262,8 @@
                else ""
   spawn_env <- .build_clean_python_env(venv_path, manifest_dir,
                                         extra_pypath = new_pypath)
-  # Keep more weight objects in flight to hide per-RTT latency on slow transports
-  # (Tor / overlay); ignored / harmless on a fast or local link.
+  # Keep more weight objects in flight to hide per-RTT latency on the DSI tunnel;
+  # ignored / harmless on a fast or local link.
   spawn_env <- c(spawn_env,
     FLWR_PRIVATE_MAX_CONCURRENT_OBJ_PUSHES = .dsf_option("max_obj_pushes", "16"),
     FLWR_PRIVATE_MAX_CONCURRENT_OBJ_PULLS  = .dsf_option("max_obj_pulls", "16"))
