@@ -184,3 +184,43 @@ flowerTunnelDownDS <- function(conn_id) {
   unlink(.tunnel_spool(conn_id), recursive = TRUE)
   TRUE
 }
+
+#' Start a Flower SuperNode pointed at the local tunnel forwarder (AGGREGATE)
+#'
+#' The SuperNode dials 127.0.0.1:forwarder_port (the forwarder), so its entire
+#' Fleet-API conversation with the SuperLink is carried over DSI -- no Tor, no
+#' public address. Flower + SecAgg+ run unchanged.
+#' @keywords internal
+#' @export
+flowerTunnelSupernodeDS <- function(conn_id, forwarder_port, clientappio_port = 19000L) {
+  spool <- .tunnel_spool(conn_id)
+  cands <- c(Sys.glob("/srv/dsflower/venvs/*/bin/flower-supernode"),
+             Sys.glob(file.path(tools::R_user_dir("dsFlower", "data"), "venvs", "*", "bin", "flower-supernode")),
+             Sys.which("flower-supernode"))
+  cands <- cands[nzchar(cands) & file.exists(cands)]
+  if (length(cands) == 0) stop("flower-supernode binary not found on node.", call. = FALSE)
+  sn <- cands[1]
+  p <- processx::process$new(
+    sn,
+    c("--insecure",
+      "--superlink", paste0("127.0.0.1:", as.integer(forwarder_port)),
+      "--clientappio-api-address", paste0("127.0.0.1:", as.integer(clientappio_port))),
+    stdout = file.path(spool, "sn.log"), stderr = "2>&1",
+    cleanup = FALSE, cleanup_tree = FALSE)
+  .dsflower_env[[paste0("tunnel_sn_", conn_id)]] <- p
+  Sys.sleep(1.5)
+  list(ok = p$is_alive(), supernode = sn)
+}
+
+#' Read a tunnel-related log tail (DataSHIELD AGGREGATE)
+#' @param conn_id Character; tunnel id.
+#' @param which One of "sn" (supernode), "fwd" (forwarder), "tc" (test client).
+#' @return Character; last lines of the log.
+#' @keywords internal
+#' @export
+flowerTunnelLogDS <- function(conn_id, which = "sn") {
+  base <- if (identical(which, "fwd")) "fwd" else if (identical(which, "tc")) "tc" else "sn"
+  f <- file.path(.tunnel_spool(conn_id), paste0(base, ".log"))
+  if (!file.exists(f)) return("")
+  paste(utils::tail(readLines(f, warn = FALSE), 40), collapse = "\n")
+}
