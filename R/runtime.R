@@ -233,8 +233,9 @@
   log_name <- gsub("[^a-zA-Z0-9._-]", "_", superlink_address)
   log_path <- file.path(log_dir, paste0(log_name, ".log"))
 
-  # TLS mode (always required)
-  if (is.null(ca_cert_path) || !file.exists(ca_cert_path)) {
+  # TLS mode requires a CA cert; the DSI tunnel runs insecure (the bytes already
+  # travel inside the TLS DataSHIELD channel) and needs none.
+  if (!isTRUE(insecure) && (is.null(ca_cert_path) || !file.exists(ca_cert_path))) {
     stop("CA certificate not found. The SuperLink must provide a TLS certificate.",
          call. = FALSE)
   }
