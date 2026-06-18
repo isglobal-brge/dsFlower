@@ -249,6 +249,38 @@ flowerTunnelTestResultDS <- function(conn_id) {
   list(done = TRUE, bytes = length(raw), data = .tunnel_enc(raw))
 }
 
+#' Reap orphaned tunnel SuperNodes + forwarders (DataSHIELD AGGREGATE)
+#'
+#' A clean slate for the DSI tunnel: kills any lingering flower-supernode /
+#' flower-superexec and dsi_tunnel_forward processes (e.g. from a researcher run
+#' that was killed without link.down -- Flower SuperNodes otherwise retry-connect
+#' forever) and clears their PID files + the in-session registry, so a fresh
+#' link.up never hits the concurrent-SuperNode limit or contends with stale
+#' processes. Called at link.up (clean slate) and link.down.
+#' @return list(ok, supernodes_killed, forwarders_killed).
+#' @keywords internal
+#' @export
+flowerTunnelReapDS <- function() {
+  me <- Sys.getpid()
+  pgrep_kill <- function(pat) {
+    pids <- tryCatch(suppressWarnings(as.integer(
+      system(paste("pgrep -f", shQuote(pat)), intern = TRUE, ignore.stderr = TRUE))),
+      error = function(e) integer())
+    pids <- pids[!is.na(pids) & pids != me]
+    for (p in pids) tryCatch(system(paste("kill -9", p), ignore.stderr = TRUE),
+                             error = function(e) NULL)
+    length(pids)
+  }
+  sn  <- pgrep_kill("flower-super")        # flower-supernode + flower-superexec (no superlink on a node)
+  fwd <- pgrep_kill("dsi_tunnel_forward")
+  pid_dir <- tryCatch(.supernode_pid_dir(), error = function(e) NULL)
+  if (!is.null(pid_dir))
+    unlink(list.files(pid_dir, pattern = "\\.pid$", full.names = TRUE))
+  tryCatch(rm(list = ls(.supernode_registry), envir = .supernode_registry),
+           error = function(e) NULL)
+  list(ok = TRUE, supernodes_killed = sn, forwarders_killed = fwd)
+}
+
 #' Stop the node-side tunnel forwarder/test processes and clean the spool (AGGREGATE)
 #' @keywords internal
 #' @export

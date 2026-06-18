@@ -84,7 +84,7 @@
     min_events                 = 10L
   ),
   clinical_default = list(
-    min_train_rows             = 20,
+    min_train_rows             = 100,
     allow_per_node_metrics     = FALSE,
     allow_exact_num_examples   = FALSE,
     require_secure_aggregation = TRUE,
@@ -93,9 +93,9 @@
     min_clients_per_round      = 2L,
     fixed_client_sampling      = TRUE,
     dp_scope                   = "none",
-    min_positive_examples      = 10L,
-    min_per_class              = 10L,
-    min_events                 = 10L
+    min_positive_examples      = 20L,
+    min_per_class              = 20L,
+    min_events                 = 20L
   ),
   clinical_hardened = list(
     min_train_rows             = 200,
@@ -169,12 +169,12 @@
 # Per-family minimum rows indexed by .PROFILE_ORDER.
 # NA = template family not supported under that profile.
 .FAMILY_MIN_ROWS <- list(
-  closed_form_linear = c(3L, 10L, 10L, 15L, 25L, NA_integer_, NA_integer_),
-  iterative_linear   = c(3L, 15L, 15L, 20L, 30L, 20L, 50L),
-  tabular_deep       = c(3L, 30L, 30L, 50L, 75L, 50L, 100L),
-  vision             = c(3L, 50L, 50L, 100L, 150L, 200L, 500L),
-  segmentation       = c(3L, 50L, 50L, 100L, 150L, 200L, 500L),
-  xgboost_histogram  = c(3L, 15L, 15L, 20L, 30L, 50L, NA_integer_)
+  closed_form_linear = c(3L, 50L, 50L, 100L, 200L, NA_integer_, NA_integer_),
+  iterative_linear   = c(3L, 100L, 100L, 200L, 300L, 200L, 500L),
+  tabular_deep       = c(3L, 250L, 250L, 500L, 750L, 500L, 1000L),
+  vision             = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
+  segmentation       = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
+  xgboost_histogram  = c(3L, 100L, 100L, 200L, 300L, 500L, NA_integer_)
 )
 
 # --- Template Metadata ---
@@ -442,6 +442,10 @@
 
   val <- min_rows_vec[profile_idx]
   if (is.na(val)) return(NULL)
+  # Admin/demo override per family so the production-safe defaults above are never
+  # silently weakened: e.g. options(dsflower.family_min_rows.iterative_linear = 20).
+  ov <- .dsf_option(paste0("family_min_rows.", family), NULL)
+  if (!is.null(ov)) { ovn <- suppressWarnings(as.numeric(ov)); if (!is.na(ovn)) val <- ovn }
   val
 }
 

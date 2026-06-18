@@ -48,6 +48,7 @@ AggregateMethods:
     flowerTunnelInjectDS,
     flowerTunnelDrainDS,
     flowerTunnelUpDS,
+    flowerTunnelReapDS,
     flowerTunnelTestClientDS,
     flowerTunnelTestResultDS,
     flowerTunnelDownDS,
