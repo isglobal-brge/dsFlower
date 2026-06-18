@@ -8,15 +8,6 @@
 # gradients (FedSGD) and takes a global step. SecAgg+ masking is layered on top
 # in a later phase; here the gradient is returned in the clear for validation.
 
-#' Decode a B64:-prefixed JSON payload argument
-#'
-#' DataSHIELD's restricted parser rejects raw JSON string literals (brackets and
-#' quotes break its lexer), so payloads cross the wire base64-encoded.
-#' @keywords internal
-.dsi_dec <- function(s) {
-  jsonlite::fromJSON(rawToChar(jsonlite::base64_dec(sub("^B64:", "", s))))
-}
-
 #' Federated feature statistics for standardization (DSI transport)
 #'
 #' DataSHIELD AGGREGATE method. Returns this site's per-feature sum, sum of
@@ -32,7 +23,7 @@
 flowerDsiStatsDS <- function(data_symbol, features_json, min_rows = 10L) {
   obj <- get(data_symbol, envir = parent.frame(), inherits = FALSE)
   df <- as.data.frame(obj)
-  features <- as.character(.dsi_dec(features_json))
+  features <- as.character(unlist(.ds_arg(features_json)))
   X <- data.matrix(df[, features, drop = FALSE])
   keep <- stats::complete.cases(X)
   X <- X[keep, , drop = FALSE]
@@ -66,8 +57,8 @@ flowerDsiStepDS <- function(data_symbol, target, features_json, weights_json,
   obj <- get(data_symbol, envir = parent.frame(), inherits = FALSE)
   df <- as.data.frame(obj)
 
-  features <- as.character(.dsi_dec(features_json))
-  w <- as.numeric(.dsi_dec(weights_json))
+  features <- as.character(unlist(.ds_arg(features_json)))
+  w <- as.numeric(unlist(.ds_arg(weights_json)))
 
   X <- data.matrix(df[, features, drop = FALSE])
   y <- as.numeric(df[[target]])
@@ -80,9 +71,9 @@ flowerDsiStepDS <- function(data_symbol, target, features_json, weights_json,
   }
 
   if (!is.null(stats_json) && is.character(stats_json) && nzchar(stats_json)) {
-    st <- .dsi_dec(stats_json)
-    X <- sweep(X, 2, as.numeric(st$mu), "-")
-    X <- sweep(X, 2, as.numeric(st$sd), "/")
+    st <- .ds_arg(stats_json)
+    X <- sweep(X, 2, as.numeric(unlist(st$mu)), "-")
+    X <- sweep(X, 2, as.numeric(unlist(st$sd)), "/")
   }
 
   Xb <- cbind(1, X)                       # intercept column first
