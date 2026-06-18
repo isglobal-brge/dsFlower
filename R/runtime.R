@@ -311,7 +311,7 @@
       # researcher's run was killed and its tunnel is gone): a SuperNode would
       # otherwise retry-connect forever and orphan, counting against the
       # concurrent-SuperNode limit. Generous enough to survive tunnel reconnects.
-      "--max-wait-time", .dsf_option("supernode_max_wait", "180"),
+      "--max-wait-time", as.character(.dsf_option("tunnel_loss_tolerance", "180")),
       "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
       # ClientAppIO is loopback-only IPC between the SuperNode and its local
       # ClientApp on this data-holding node -- never dialed remotely.

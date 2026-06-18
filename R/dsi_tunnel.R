@@ -137,6 +137,10 @@ flowerTunnelPushDS <- function(conn_id, data_b64) {
 #' @export
 flowerTunnelExchangeDS <- function(conn_id, req = "") {
   spool <- .tunnel_spool(conn_id)
+  # Relay heartbeat: the forwarder self-terminates if this stops updating (the
+  # researcher's relay died / lost connection), which lets its SuperNode notice
+  # the SuperLink is gone and self-terminate too.
+  cat(".", file = file.path(spool, "relay_hb"))
   nm <- .dsflower_env$tunnel_name
   pa <- NA; pd <- ""; pf <- 0
   if (is.character(req) && length(req) == 1L && nzchar(req)) {
@@ -205,13 +209,19 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "") {
   spool <- .tunnel_spool(conn_id)
   unlink(list.files(spool, full.names = TRUE))
   for (f in c("up.bin", "down.bin")) file.create(file.path(spool, f))
+  cat(".", file = file.path(spool, "relay_hb"))   # seed the relay heartbeat
   # Record this node's federation name so flowerTunnelExchangeDS can pick its
   # slice out of the single fan-out down-payload.
   if (is.character(node_name) && nzchar(node_name)) .dsflower_env$tunnel_name <- node_name
   fwd <- system.file("python", "dsi_tunnel_forward.py", package = "dsFlower")
+  # One configurable knob (default 180s) drives both the forwarder's relay-loss
+  # tolerance and the SuperNode's --max-wait-time; set per node via
+  # options(dsflower.tunnel_loss_tolerance = <seconds>).
+  ttl <- as.character(.dsf_option("tunnel_loss_tolerance", 180))
   p <- processx::process$new(
     .tunnel_python(),
     c(fwd, "--listen", paste0("127.0.0.1:", as.integer(listen_port)), "--spool", spool),
+    env = c("current", DSFLOWER_RELAY_TTL = ttl),
     stdout = file.path(spool, "fwd.log"), stderr = "2>&1",
     cleanup = FALSE, cleanup_tree = FALSE)
   .dsflower_env[[paste0("tunnel_fwd_", conn_id)]] <- p
