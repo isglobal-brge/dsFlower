@@ -200,15 +200,20 @@ flowerTunnelSupernodeDS <- function(conn_id, forwarder_port, clientappio_port = 
   cands <- cands[nzchar(cands) & file.exists(cands)]
   if (length(cands) == 0) stop("flower-supernode binary not found on node.", call. = FALSE)
   sn <- cands[1]
+  # The SuperNode spawns sibling binaries (flower-superexec); put the venv bin/
+  # on PATH so they are found.
+  child_env <- Sys.getenv()
+  child_env[["PATH"]] <- paste0(dirname(sn), ":", child_env[["PATH"]])
   p <- processx::process$new(
     sn,
     c("--insecure",
       "--superlink", paste0("127.0.0.1:", as.integer(forwarder_port)),
       "--clientappio-api-address", paste0("127.0.0.1:", as.integer(clientappio_port))),
+    env = child_env,
     stdout = file.path(spool, "sn.log"), stderr = "2>&1",
     cleanup = FALSE, cleanup_tree = FALSE)
   .dsflower_env[[paste0("tunnel_sn_", conn_id)]] <- p
-  Sys.sleep(1.5)
+  Sys.sleep(2.5)
   list(ok = p$is_alive(), supernode = sn)
 }
 
