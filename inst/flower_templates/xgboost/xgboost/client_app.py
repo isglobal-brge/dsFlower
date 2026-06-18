@@ -16,7 +16,7 @@ from .privacy_utils import bucket_count
 class SecureXGBClient(NumPyClient):
     def __init__(self, X, y, privacy_config, n_bins=64,
                  learning_rate=0.3, reg_lambda=1.0, objective="binary:logistic",
-                 manifest_dir=None):
+                 num_class=2, manifest_dir=None):
         self.X = X.astype(np.float64)
         self.y = y.astype(np.float64)
         self.privacy_config = privacy_config
@@ -24,12 +24,20 @@ class SecureXGBClient(NumPyClient):
         self.learning_rate = learning_rate
         self.reg_lambda = reg_lambda
         self.objective = objective
+        # Multiclass softmax boosting keeps one output column per class; binary
+        # and regression keep a single output. Each class is boosted by its own
+        # trees, but every per-class gradient histogram still flows through the
+        # SAME Secure Aggregation path -- the server only ever sees cross-site
+        # sums, never any single site's per-class histogram.
+        self.multiclass = str(objective).startswith("multi")
+        self.n_classes = int(num_class) if self.multiclass else 2
+        self.n_outputs = self.n_classes if self.multiclass else 1
         self.n_features = X.shape[1]
         self.vector_length = self.n_features * self.n_bins * 2
 
         # State maintained across rounds
         self.bin_edges = None  # (n_features, n_bins-1)
-        self.predictions = np.zeros(len(y), dtype=np.float64)
+        self.predictions = np.zeros((len(y), self.n_outputs), dtype=np.float64)
         self.node_assignments = np.zeros(len(y), dtype=np.int32)
         self.trees = []  # List of tree dicts for final model
         self.state_path = None
@@ -49,8 +57,12 @@ class SecureXGBClient(NumPyClient):
                 state["node_assignments"] if "node_assignments" in state.files else None
             )
             bin_edges = state["bin_edges"] if "bin_edges" in state.files else None
-            if predictions is not None and len(predictions) == len(self.y):
-                self.predictions = predictions.astype(np.float64)
+            if predictions is not None and predictions.shape[0] == len(self.y):
+                pred = predictions.astype(np.float64)
+                if pred.ndim == 1:
+                    pred = pred.reshape(-1, 1)
+                if pred.shape[1] == self.n_outputs:
+                    self.predictions = pred
             if node_assignments is not None and len(node_assignments) == len(self.y):
                 self.node_assignments = node_assignments.astype(np.int32)
             if bin_edges is not None and bin_edges.size:
@@ -60,7 +72,7 @@ class SecureXGBClient(NumPyClient):
         except Exception:
             # State can be rebuilt from the protocol messages. A corrupt cache
             # should not abort the run; it simply starts this client state fresh.
-            self.predictions = np.zeros(len(self.y), dtype=np.float64)
+            self.predictions = np.zeros((len(self.y), self.n_outputs), dtype=np.float64)
             self.node_assignments = np.zeros(len(self.y), dtype=np.int32)
             self.bin_edges = None
             self.last_applied_tree = -1
@@ -128,14 +140,28 @@ class SecureXGBClient(NumPyClient):
         else:
             return [self._ack_vector()], self._fit_num_examples(len(self.y)), {}
 
-    def _compute_gradients(self):
-        """Compute first and second order gradients for the objective."""
-        if self.objective == "binary:logistic":
-            probs = 1.0 / (1.0 + np.exp(-self.predictions))
+    def _softmax(self):
+        z = self.predictions - self.predictions.max(axis=1, keepdims=True)
+        expz = np.exp(z)
+        return expz / expz.sum(axis=1, keepdims=True)
+
+    def _compute_gradients(self, class_idx=0):
+        """First/second-order gradients for the active output.
+
+        Multiclass softmax: for class k, grad = p_k - 1{y==k}, hess = p_k(1-p_k);
+        each class's gradients are histogrammed and SecAgg-summed independently.
+        """
+        if self.multiclass:
+            probs = self._softmax()
+            p = probs[:, class_idx]
+            grad = p - (self.y == class_idx).astype(np.float64)
+            hess = p * (1.0 - p)
+        elif self.objective == "binary:logistic":
+            probs = 1.0 / (1.0 + np.exp(-self.predictions[:, 0]))
             grad = probs - self.y
             hess = probs * (1.0 - probs)
         else:  # squared error for regression
-            grad = self.predictions - self.y
+            grad = self.predictions[:, 0] - self.y
             hess = np.ones_like(grad)
         return grad, hess
 
@@ -148,6 +174,7 @@ class SecureXGBClient(NumPyClient):
         if tree_id <= self.last_applied_tree:
             return
 
+        class_idx = int(float(config.get("apply_class_idx", 0)))
         feature_idx = int(float(config.get("apply_feature", -1)))
         threshold = float(config.get("apply_threshold", 0.0))
         left_leaf = float(config.get("apply_left_leaf", 0.0))
@@ -157,7 +184,7 @@ class SecureXGBClient(NumPyClient):
             leaf = np.full(len(self.y), left_leaf, dtype=np.float64)
         else:
             leaf = np.where(self.X[:, feature_idx] <= threshold, left_leaf, right_leaf)
-        self.predictions += self.learning_rate * leaf
+        self.predictions[:, class_idx] += self.learning_rate * leaf
         self.last_applied_tree = tree_id
         self.node_assignments[:] = 0
         self._save_state()
@@ -217,6 +244,7 @@ class SecureXGBClient(NumPyClient):
             self.node_assignments[:] = 0
 
         node_id = int(config.get("node_id", "0"))
+        class_idx = int(float(config.get("class_idx", 0)))
 
         # Update bin edges if provided
         if len(parameters) > 0 and len(parameters[0]) > 0:
@@ -225,7 +253,7 @@ class SecureXGBClient(NumPyClient):
             if len(flat) >= edge_len:
                 self.bin_edges = flat[:edge_len].reshape(self.n_features, -1)
 
-        grad, hess = self._compute_gradients()
+        grad, hess = self._compute_gradients(class_idx)
         mask = self.node_assignments == node_id
 
         if not np.any(mask):
@@ -283,12 +311,13 @@ class SecureXGBClient(NumPyClient):
         if len(parameters) == 0 or len(parameters[0]) == 0:
             return [self._ack_vector()], self._fit_num_examples(len(self.y)), {}
 
+        class_idx = int(float(config.get("class_idx", 0)))
         leaf_values = parameters[0].astype(np.float64)
 
         for node_id in range(len(leaf_values)):
             mask = self.node_assignments == node_id
             if np.any(mask):
-                self.predictions[mask] += self.learning_rate * leaf_values[node_id]
+                self.predictions[mask, class_idx] += self.learning_rate * leaf_values[node_id]
 
         # Reset for next tree
         self.node_assignments[:] = 0
@@ -303,8 +332,15 @@ class SecureXGBClient(NumPyClient):
                 n = bucket_count(n)
             return 0.0, n, {}
 
-        if self.objective == "binary:logistic":
-            probs = 1.0 / (1.0 + np.exp(-self.predictions))
+        if self.multiclass:
+            probs = self._softmax()
+            preds = np.argmax(probs, axis=1)
+            accuracy = float(np.mean(preds == self.y))
+            idx = self.y.astype(int)
+            p_true = probs[np.arange(len(self.y)), idx]
+            loss = float(-np.mean(np.log(np.clip(p_true, 1e-7, 1))))
+        elif self.objective == "binary:logistic":
+            probs = 1.0 / (1.0 + np.exp(-self.predictions[:, 0]))
             preds = (probs > 0.5).astype(int)
             accuracy = float(np.mean(preds == self.y))
             loss = float(-np.mean(
@@ -313,7 +349,7 @@ class SecureXGBClient(NumPyClient):
             ))
         else:
             accuracy = 0.0
-            loss = float(np.mean((self.predictions - self.y) ** 2))
+            loss = float(np.mean((self.predictions[:, 0] - self.y) ** 2))
 
         n = len(self.y)
         if not self.privacy_config.get("allow_exact_num_examples", True):
@@ -332,6 +368,7 @@ def client_fn(context: Context) -> SecureXGBClient:
     learning_rate = float(cfg.get("eta", 0.3))
     reg_lambda = float(cfg.get("reg_lambda", 1.0))
     objective = cfg.get("objective", "binary:logistic")
+    num_class = int(cfg.get("num_class", 2))
 
     return SecureXGBClient(
         X, y, privacy_config,
@@ -339,6 +376,7 @@ def client_fn(context: Context) -> SecureXGBClient:
         learning_rate=learning_rate,
         reg_lambda=reg_lambda,
         objective=objective,
+        num_class=num_class,
         manifest_dir=manifest_dir,
     )
 

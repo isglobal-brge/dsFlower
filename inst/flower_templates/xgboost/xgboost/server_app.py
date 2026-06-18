@@ -67,6 +67,7 @@ class SecureXGBoostStrategy(Strategy):
         learning_rate: float = 0.3,
         min_child_weight: float = 1.0,
         objective: str = "binary:logistic",
+        num_class: int = 2,
         n_features: int = 0,
         results_dir: str = "/tmp/dsflower_results",
         min_available_clients: int = 2,
@@ -78,7 +79,14 @@ class SecureXGBoostStrategy(Strategy):
         fixed_bin_range: float = 4.0,
     ):
         super().__init__()
-        self.n_trees = n_trees
+        self.multiclass = str(objective).startswith("multi")
+        self.n_classes = int(num_class) if self.multiclass else 2
+        self.n_outputs = self.n_classes if self.multiclass else 1
+        # One tree per output (class) per boosting round; total = rounds x outputs.
+        # Every per-class tree is built from a SecAgg-summed histogram, so the
+        # privacy guarantee is identical to the binary case, applied K times.
+        self.n_boost_rounds = n_trees
+        self.n_trees = n_trees * self.n_outputs
         self.max_depth = max_depth
         self.n_bins = n_bins
         self.reg_lambda = reg_lambda
@@ -152,6 +160,7 @@ class SecureXGBoostStrategy(Strategy):
         """Export the current in-memory tree into the completed tree list."""
         tree_dict = {
             "tree_id": self.current_tree,
+            "class_idx": int(self.current_tree % self.n_outputs),
             "splits": {},
             "leaves": {},
         }
@@ -187,7 +196,12 @@ class SecureXGBoostStrategy(Strategy):
             min_num_clients=self.min_fit_clients,
         )
 
-        config: Dict[str, Scalar] = {"phase": self.phase}
+        # The active output/class for the tree currently being built. Cycles
+        # 0..K-1 across trees so each class is boosted in turn.
+        config: Dict[str, Scalar] = {
+            "phase": self.phase,
+            "class_idx": str(self.current_tree % self.n_outputs),
+        }
         fit_params = parameters
 
         if self.phase == "bin_edges":
@@ -203,6 +217,7 @@ class SecureXGBoostStrategy(Strategy):
                 if self.pending_stump_update is not None:
                     update = self.pending_stump_update
                     config["apply_tree_id"] = str(update["tree_id"])
+                    config["apply_class_idx"] = str(update.get("class_idx", 0))
                     config["apply_feature"] = str(update["feature"])
                     config["apply_threshold"] = str(update["threshold"])
                     config["apply_left_leaf"] = str(update["left_leaf"])
@@ -494,6 +509,7 @@ class SecureXGBoostStrategy(Strategy):
             self.tree_leaf_values[node_id] = leaf_value
             update = {
                 "tree_id": self.current_tree,
+                "class_idx": int(self.current_tree % self.n_outputs),
                 "feature": -1,
                 "threshold": 0.0,
                 "left_leaf": float(leaf_value),
@@ -522,6 +538,7 @@ class SecureXGBoostStrategy(Strategy):
             self.tree_leaf_values[right_child] = float(right_leaf)
             update = {
                 "tree_id": self.current_tree,
+                "class_idx": int(self.current_tree % self.n_outputs),
                 "feature": int(best_feature),
                 "threshold": threshold,
                 "left_leaf": float(left_leaf),
@@ -607,6 +624,9 @@ class SecureXGBoostStrategy(Strategy):
             "learning_rate": self.learning_rate,
             "reg_lambda": self.reg_lambda,
             "objective": self.objective,
+            "multiclass": self.multiclass,
+            "n_classes": self.n_classes,
+            "n_outputs": self.n_outputs,
             "n_features": self.n_features,
             "n_bins": self.n_bins,
             "trees": self.completed_trees,
@@ -729,6 +749,8 @@ def server_fn(context: Context) -> ServerAppComponents:
     learning_rate = float(cfg.get("eta", 0.3))
     min_child_weight = float(cfg.get("min_child_weight", 1.0))
     objective = cfg.get("objective", "binary:logistic")
+    num_class = int(cfg.get("num_class", 2))
+    n_outputs = num_class if str(objective).startswith("multi") else 1
     n_features = int(cfg.get("n_features", 0))
     results_dir = cfg.get("results-dir", "/tmp/dsflower_results")
     require_secagg = str(cfg.get("require-secure-aggregation", "false")).lower() == "true"
@@ -747,10 +769,11 @@ def server_fn(context: Context) -> ServerAppComponents:
         max_depth = 1
     secure_single_round = secure_stump_boost and n_trees == 1 and max_depth == 1
 
+    # Multiclass trains one tree per class per round -> total = n_trees x n_outputs.
     num_rounds = (
-        _compute_secure_num_rounds(n_trees)
+        _compute_secure_num_rounds(n_trees * n_outputs)
         if secure_stump_boost
-        else _compute_num_rounds(n_trees, max_depth)
+        else _compute_num_rounds(n_trees * n_outputs, max_depth)
     )
 
     min_available = int(cfg.get("strategy-min_available_clients", 2))
@@ -766,6 +789,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         learning_rate=learning_rate,
         min_child_weight=min_child_weight,
         objective=objective,
+        num_class=num_class,
         n_features=n_features,
         results_dir=results_dir,
         min_available_clients=min_available,
