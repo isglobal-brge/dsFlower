@@ -43,6 +43,11 @@ AggregateMethods:
     flowerPrivacyBudgetDS,
     flowerDsiStatsDS,
     flowerDsiStepDS,
+    flowerTunnelResetDS,
+    flowerTunnelPollDS,
+    flowerTunnelPushDS,
+    flowerTunnelInjectDS,
+    flowerTunnelDrainDS,
     c=base::c,
     list=base::list
 AssignMethods:
