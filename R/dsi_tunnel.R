@@ -110,3 +110,77 @@ flowerTunnelInjectDS <- function(conn_id, data_b64) {
 flowerTunnelDrainDS <- function(conn_id) {
   .tunnel_enc(.tunnel_drain(.tunnel_spool(conn_id), "down.bin", "down.read_offset"))
 }
+
+#' @keywords internal
+.tunnel_python <- function() {
+  py <- Sys.which("python3")
+  if (!nzchar(py)) py <- Sys.which("python")
+  if (!nzchar(py)) stop("python3 not found on this node for the DSI tunnel.", call. = FALSE)
+  py
+}
+
+#' Start the node-side tunnel forwarder (DataSHIELD AGGREGATE)
+#'
+#' Spawns dsi_tunnel_forward.py listening on 127.0.0.1:listen_port; the Flower
+#' SuperNode dials that local port and its bytes are bridged to the spool.
+#' @param conn_id Character; tunnel connection id.
+#' @param listen_port Integer; local port the SuperNode will dial.
+#' @return list(ok, listen).
+#' @keywords internal
+#' @export
+flowerTunnelUpDS <- function(conn_id, listen_port) {
+  spool <- .tunnel_spool(conn_id)
+  unlink(list.files(spool, full.names = TRUE))
+  for (f in c("up.bin", "down.bin")) file.create(file.path(spool, f))
+  fwd <- system.file("python", "dsi_tunnel_forward.py", package = "dsFlower")
+  p <- processx::process$new(
+    .tunnel_python(),
+    c(fwd, "--listen", paste0("127.0.0.1:", as.integer(listen_port)), "--spool", spool),
+    stdout = file.path(spool, "fwd.log"), stderr = "2>&1",
+    cleanup = FALSE, cleanup_tree = FALSE)
+  .dsflower_env[[paste0("tunnel_fwd_", conn_id)]] <- p
+  ready <- FALSE
+  for (i in 1:60) { if (file.exists(file.path(spool, "ready"))) { ready <- TRUE; break }; Sys.sleep(0.1) }
+  list(ok = ready, listen = paste0("127.0.0.1:", as.integer(listen_port)))
+}
+
+#' TEST: spawn a local client that round-trips through the forwarder (AGGREGATE)
+#' @keywords internal
+#' @export
+flowerTunnelTestClientDS <- function(conn_id, listen_port, msg = "HELLO-TUNNEL", nrep = 1000L) {
+  spool <- .tunnel_spool(conn_id)
+  out <- file.path(spool, "testclient.bin"); unlink(out)
+  cli <- system.file("python", "dsi_tunnel_testclient.py", package = "dsFlower")
+  p <- processx::process$new(
+    .tunnel_python(),
+    c(cli, "--port", as.integer(listen_port), "--msg", msg, "--nrep", as.integer(nrep), "--out", out),
+    stdout = file.path(spool, "tc.log"), stderr = "2>&1",
+    cleanup = FALSE, cleanup_tree = FALSE)
+  .dsflower_env[[paste0("tunnel_tc_", conn_id)]] <- p
+  list(ok = TRUE, expected_bytes = nchar(msg) * as.integer(nrep))
+}
+
+#' TEST: read the round-tripped bytes the client received (AGGREGATE)
+#' @keywords internal
+#' @export
+flowerTunnelTestResultDS <- function(conn_id) {
+  out <- file.path(.tunnel_spool(conn_id), "testclient.bin")
+  if (!file.exists(out)) return(list(done = FALSE, bytes = 0L, data = ""))
+  raw <- readBin(out, "raw", file.size(out))
+  list(done = TRUE, bytes = length(raw), data = .tunnel_enc(raw))
+}
+
+#' Stop the node-side tunnel forwarder/test processes and clean the spool (AGGREGATE)
+#' @keywords internal
+#' @export
+flowerTunnelDownDS <- function(conn_id) {
+  for (k in c("tunnel_fwd_", "tunnel_tc_", "tunnel_sn_")) {
+    p <- .dsflower_env[[paste0(k, conn_id)]]
+    if (!is.null(p) && inherits(p, "process")) {
+      tryCatch({ p$kill() }, error = function(e) NULL)
+    }
+    .dsflower_env[[paste0(k, conn_id)]] <- NULL
+  }
+  unlink(.tunnel_spool(conn_id), recursive = TRUE)
+  TRUE
+}

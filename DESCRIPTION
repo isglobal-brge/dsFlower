@@ -48,6 +48,10 @@ AggregateMethods:
     flowerTunnelPushDS,
     flowerTunnelInjectDS,
     flowerTunnelDrainDS,
+    flowerTunnelUpDS,
+    flowerTunnelTestClientDS,
+    flowerTunnelTestResultDS,
+    flowerTunnelDownDS,
     c=base::c,
     list=base::list
 AssignMethods:
