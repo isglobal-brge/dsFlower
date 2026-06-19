@@ -57,6 +57,43 @@ flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
   list(size = if (file.exists(bin)) file.size(bin) else 0)
 }
 
+#' Resolve a python (with stdlib ast) for the exfiltration scan.
+#' @keywords internal
+.scan_python <- function() {
+  cands <- c(Sys.which("python3"), Sys.which("python"),
+             Sys.glob("/srv/dsflower/venvs/*/bin/python"),
+             Sys.glob(file.path(tools::R_user_dir("dsFlower", "data"),
+                                "venvs", "*", "bin", "python")))
+  cands <- cands[nzchar(cands) & file.exists(cands)]
+  if (length(cands)) cands[1] else ""
+}
+
+#' Run the Tier-2 exfiltration scan on an unpacked app (fail-closed).
+#' @keywords internal
+.run_exfil_scan <- function(app_dir) {
+  scanner <- system.file("python", "exfil_scan.py", package = "dsFlower")
+  if (!nzchar(scanner) || !file.exists(scanner)) {
+    return(list(ok = FALSE, first = "scanner not installed"))
+  }
+  py <- .scan_python()
+  if (!nzchar(py)) return(list(ok = FALSE, first = "no python for scan"))
+  res <- tryCatch(
+    processx::run(py, c(scanner, app_dir), error_on_status = FALSE),
+    error = function(e) NULL)
+  if (is.null(res)) return(list(ok = FALSE, first = "scan failed to run"))
+  out <- tryCatch(jsonlite::fromJSON(res$stdout, simplifyVector = FALSE),
+                  error = function(e) NULL)
+  if (is.null(out) || is.null(out$ok)) {
+    return(list(ok = FALSE, first = "scan output unparseable"))
+  }
+  first <- ""
+  if (length(out$violations)) {
+    v <- out$violations[[1]]
+    first <- paste0(v$rule, ":", v$detail, " @ ", v$file, ":", v$line)
+  }
+  list(ok = isTRUE(out$ok), violations = out$violations, first = first)
+}
+
 #' Verify + unpack an uploaded FAB (DataSHIELD AGGREGATE)
 #'
 #' Enforces the size cap (\code{dsflower.max_fab_bytes}) and sha256 integrity
@@ -97,6 +134,16 @@ flowerAppInstallDS <- function(token, expected_sha256) {
   if (length(unpacked) == 0) {
     unlink(spool, recursive = TRUE)
     stop("Uploaded app is not a valid FAB archive; rejected.", call. = FALSE)
+  }
+
+  # Tier-2 exfiltration scan gates install (fail-closed): an app that imports
+  # network/process-escape modules or uses dynamic code is rejected before any
+  # data is touched. Defence-in-depth ahead of the sandbox + egress gate.
+  scan <- .run_exfil_scan(apps_dir)
+  if (!isTRUE(scan$ok)) {
+    unlink(spool, recursive = TRUE)
+    stop("Uploaded app failed the Tier-2 safety scan (", scan$first,
+         "); rejected.", call. = FALSE)
   }
   list(ok = TRUE, sha256 = actual, size = file.size(bin), path = apps_dir)
 }

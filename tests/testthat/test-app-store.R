@@ -54,6 +54,21 @@ test_that("install rejects a hash mismatch and destroys the spool", {
   expect_error(dsFlower::flowerAppInstallDS(token, "x"), "No uploaded app")
 })
 
+test_that("install rejects an app that fails the exfiltration scan", {
+  skip_if(!nzchar(dsFlower:::.scan_python()), "no python for scan")
+  dir <- withr::local_tempdir()
+  writeLines(c("import socket", "x = 1"), file.path(dir, "client_app.py"))
+  wd <- getwd(); setwd(dir); utils::zip("app.fab", files = "client_app.py", flags = "-q"); setwd(wd)
+  fab <- file.path(dir, "app.fab")
+  raw <- readBin(fab, "raw", file.size(fab))
+  sha <- digest::digest(file = fab, algo = "sha256")
+  token <- "test_appstore_scan"
+  withr::defer(dsFlower::flowerAppDeleteDS(token))
+
+  dsFlower::flowerAppPushDS(token, .enc_b64(raw), 0)
+  expect_error(dsFlower::flowerAppInstallDS(token, sha), "safety scan")
+})
+
 test_that("install enforces the max_fab_bytes cap", {
   dir <- withr::local_tempdir()
   fab <- .make_fab(dir)

@@ -54,6 +54,9 @@ AggregateMethods:
     flowerTunnelDownDS,
     flowerTunnelSupernodeDS,
     flowerTunnelLogDS,
+    flowerAppPushDS,
+    flowerAppInstallDS,
+    flowerAppDeleteDS,
     c=base::c,
     list=base::list
 AssignMethods:
