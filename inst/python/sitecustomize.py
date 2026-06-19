@@ -27,6 +27,22 @@ import sysconfig
 MANIFEST_DIR = os.environ.get("DSFLOWER_MANIFEST_DIR", "")
 EXPECTED_HASH_FILE = os.path.join(MANIFEST_DIR, "expected_hash.txt") if MANIFEST_DIR else ""
 EXPECTED_TEMPLATE_FILE = os.path.join(MANIFEST_DIR, "expected_template.txt") if MANIFEST_DIR else ""
+# Multi-package pinning (Tier-2): {package_name: sha256}. When present, EVERY
+# foreign package must be listed and hash-match (default-deny). This lets a run
+# pin a trusted runner package AND a separately-verified uploaded app package.
+PINNED_PACKAGES_FILE = os.path.join(MANIFEST_DIR, "pinned_packages.json") if MANIFEST_DIR else ""
+
+
+def _load_pinned_map():
+    if not PINNED_PACKAGES_FILE or not os.path.exists(PINNED_PACKAGES_FILE):
+        return None
+    try:
+        import json
+        with open(PINNED_PACKAGES_FILE) as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) and m else None
+    except Exception:
+        return {}  # present-but-unreadable -> deny everything (fail closed)
 
 # Top-level package names that are part of the trusted runtime and never
 # treated as "foreign" application code even if their path looks unusual.
@@ -117,9 +133,28 @@ def _read(path):
         return ""
 
 
+_PINNED_MAP = _load_pinned_map()
+
+
 def _verify_foreign(top_name, pkg_dir):
-    """Default-deny: a foreign code package must be the pinned, hash-matched
-    template, else the process is killed -- BEFORE the module body runs."""
+    """Default-deny: a foreign code package must be pinned + hash-matched, else
+    the process is killed -- BEFORE the module body runs."""
+    actual = _hash_package(pkg_dir)
+
+    # Multi-package mode (Tier-2): every foreign package must be listed in
+    # pinned_packages.json and hash-match. Lets a trusted runner package and a
+    # separately-verified uploaded app package both run, nothing else.
+    if _PINNED_MAP is not None:
+        expected = _PINNED_MAP.get(top_name)
+        if expected is None:
+            _abort("package '%s' is not in pinned_packages.json (default-deny)."
+                   % top_name)
+        if actual != expected:
+            _abort("code hash mismatch for '%s'\n  expected: %s\n  actual:   %s\n"
+                   "  package:  %s" % (top_name, expected, actual, pkg_dir))
+        return
+
+    # Legacy single-package mode (Tier-1 harness).
     if not EXPECTED_HASH_FILE or not os.path.exists(EXPECTED_HASH_FILE):
         _abort("foreign code package '%s' about to load but no "
                "expected_hash.txt to verify against." % top_name)
@@ -133,7 +168,6 @@ def _verify_foreign(top_name, pkg_dir):
         _abort("unexpected application package '%s' (server pinned '%s'). "
                "Only the pinned template may run." % (top_name, pinned))
 
-    actual = _hash_package(pkg_dir)
     if actual != expected:
         _abort("code hash mismatch for '%s'\n  expected: %s\n  actual:   %s\n"
                "  package:  %s" % (top_name, expected, actual, pkg_dir))
