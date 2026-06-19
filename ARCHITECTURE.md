@@ -260,14 +260,22 @@ together with the sandbox's filesystem/data-access model (a Tier-2 app reads the
 staged data, so `open` on the data mount must be permitted while everything else
 is denied).
 
-## 9. DataSHIELD options (all thresholds)
+## 9. DataSHIELD options (all node-side, the `.dsf_option` double-fallback chain)
 
-- **Inherited:** `nfilter.subset`, `nfilter.tab`, `nfilter.levels.max`
-  (standard `getOption("nfilter.x", getOption("default.nfilter.x", default))`).
-- **`dsflower.*`:** `dp_max_epsilon`, `dp_delta`, `dp_clip_norm`,
-  `dp_noise_multiplier_min`, `min_train_rows`, `min_cell_count`,
-  `default_rounds`, `max_rounds`, `max_fab_bytes`, `allow_app_upload`,
-  `sandbox_backend`, `relay_loss_tolerance`, `staging_root`, `max_concurrent_runs`.
+All read via `getOption("dsflower.X", getOption("default.dsflower.X", default))`,
+so a node operator sets them like any DataSHIELD option.
+
+- **Inherited disclosure filters:** `nfilter.subset` (min rows, default 3),
+  `nfilter.tab` (min cell count, default 3), `nfilter.levels.max` (default 40).
+- **DP budget / mechanism:** `dsflower.max_epsilon` (cumulative ε cap per dataset,
+  default 10), `dsflower.max_delta`, `dsflower.dp_epsilon_ceiling` (per-run ε
+  ceiling, default 10), `dsflower.privacy_ledger_path` / `dsflower.privacy_ledger_namespace`.
+- **Disclosure:** `dsflower.min_train_rows`, `dsflower.min_cell_count`.
+- **Run / upload limits:** `dsflower.max_rounds`, `dsflower.max_fab_bytes`
+  (Tier-2 upload cap, default 50 MiB), `dsflower.max_concurrent_runs`,
+  `dsflower.staging_root`, `dsflower.tunnel_loss_tolerance`, `dsflower.venv_root`,
+  `dsflower.max_obj_pulls` / `dsflower.max_obj_pushes`,
+  `dsflower.supernode_orphan_grace_minutes`.
 
 ## 10. Package module layout
 
