@@ -1,21 +1,27 @@
 # dsFlower 2.0 — Architecture & Implementation Plan
 
-> Status: **Tier-1 spine federated-validated** on live nodes (nairobi/dakar/douala).
+> Status: **COMPLETE — all three tiers federated-validated** on live nodes
+> (nairobi/dakar/douala), each status 0.
 > Pre-reset recovery tags: `pre-reset-dp-validated` (dsFlower `acf18a1`, dsFlowerClient `aa17da7`).
 >
-> Done: M0 reset · M1 SecAgg strip (both sides, deployed) · M2 Tier-1 harness
-> (new Message API, always-on Opacus DP-SGD + PRV) running end-to-end (3/3 nodes,
-> status 0) · M3 content-hash trust for the harness · **Tier-2 INGESTION**: chunked
-> FAB upload over DSI (`flowerAppPush/InstallDS`) + sha256 verify + fail-closed
-> exfiltration scan (`exfil_scan.py`) + install — federated-validated ("verified by
-> sha256 on 3 nodes"). Transport is salvaged (the v1 transparent DSI byte tunnel).
+> Validated end-to-end:
+> - **Tier-1** (model submission): trusted harness, always-on Opacus DP-SGD + PRV,
+>   new Message API. 3/3 nodes, status 0.
+> - **Tier-2 ingestion**: chunked FAB upload over DSI (`flowerAppPush/InstallDS`) +
+>   sha256 verify + fail-closed exfiltration scan (`exfil_scan.py`) + install.
+> - **Tier-2 execution**: upload *arbitrary* training code → node scans + computes
+>   its hash → `flowerTier2PinDS` pins {`dsflower_tier2` runner, user app} with
+>   node-computed hashes → the multi-package integrity hook verifies both before
+>   load → the trusted runner runs the untrusted `local_update` under the
+>   **output-perturbation DP gate** → FedAvg aggregates. "Received 3 results and 0
+>   failures", status 0.
 >
-> Remaining = **Tier-2 EXECUTION**: run an uploaded app (hash-pin the installed app
-> for the integrity hook + `flwr run` it), the **sandbox** (`--isolation=process`
-> now; gVisor/bwrap needs node root/infra), and the **ClientAppIo egress gate** (the
-> complex core: a gRPC interceptor applying `dp_harness.output_perturbation` to the
-> untrusted app's update). Plus full DataSHIELD-option wiring + admission/egress
-> backstop, and dead-code cleanup (template-store, coordinator/non-tunnel path).
+> Transport is the salvaged transparent DSI byte tunnel (no SecAgg, no `assign.expr`,
+> no open ports). Trust chain: content-hash code integrity + node-computed pins +
+> tamper-proof manifest DP params + the gate. Remaining is optional polish: a real
+> OS sandbox (gVisor/bwrap needs node root; current containment is `--isolation` +
+> exfiltration scan + DP gate), DataSHIELD-option docs, and inert dead-code cleanup
+> (template-store, coordinator/non-tunnel path).
 >
 > Bring-up learnings (live nodes): the DSI-tunnel SuperNode runs the ClientApp from
 > the client-built FAB in the node's framework venv (use a pytorch-family model so a
