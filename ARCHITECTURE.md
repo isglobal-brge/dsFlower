@@ -1,7 +1,10 @@
 # dsFlower 2.0 — Architecture & Implementation Plan
 
-> Status: design locked, implementation starting (from-scratch rewrite).
+> Status: design locked, implementation in progress (refactor-on-`v2-rewrite`).
 > Pre-reset recovery tags: `pre-reset-dp-validated` (dsFlower `acf18a1`, dsFlowerClient `aa17da7`).
+> M0 done (templates + SecAgg/Tor scope removed). Transport is **salvaged** (the v1
+> transparent DSI byte tunnel already meets every constraint), so the new effort is
+> the sandbox + egress gate + DP harness + app upload/validation.
 
 A system that lets researchers **upload their own Flower apps** which **install on
 DataSHIELD server nodes**, while **guaranteeing by construction** that:
@@ -54,26 +57,30 @@ the node*. The app can never touch the framework's enforcement machinery.
 
 ```
 [ NODE — data custodian's machine ]                          [ RESEARCHER ]
-  ClientApp (researcher's app, in SANDBOX: no net/FS)
-       │  emits one Flower Message (the update)
-       ▼  (ClientAppIo, local)
-  SuperNode (framework, trusted)
-       ▼
+  ClientApp (researcher's app / trusted Tier-1 harness, in SANDBOX: no net/FS)
+       │  emits one Flower Message (RecordDict / ArrayRecord)
+       ▼  (ClientAppIo gRPC, localhost)
   ┌─────────────────────────────────────────┐
-  │  TRUSTED DP + DISCLOSURE EGRESS GATE     │  ← the ONLY path off the node
-  │  (integrated into the DSI relay)         │
-  └─────────────────────────────────────────┘
+  │  TRUSTED DP + DISCLOSURE EGRESS GATE     │  ← ClientAppIo interceptor: the one
+  │  clip + noise + count-filter the Message │    place the update is in parseable
+  └─────────────────────────────────────────┘    RecordDict form. Sole gate off-node.
        │  sanitized Message only
-       ▼  DSI channel (datashield.aggregate)
+       ▼  (localhost)
+  SuperNode (framework, trusted)
+       │  Fleet-API gRPC bytes (HTTP/2 over TCP)
+       ▼  transparent byte tunnel over DSI (datashield.aggregate; no open ports)
                                               SuperLink + ServerApp (aggregation)
 ```
 
 - The researcher's **ClientApp runs sandboxed** (`--isolation=process` + gVisor /
   bubblewrap; no network, read-only data mount, scrubbed env, seccomp, cgroups).
-- The **egress gate is integrated into the node-side DSI relay** — our own
-  trusted framework code, the **sole** writer to the DataSHIELD channel. Mods are
-  rejected as an enforcement boundary because they run *in-process* with the
-  untrusted ClientApp and can be disabled by it.
+- The **egress gate is a ClientAppIo interceptor** — trusted framework code sitting
+  between the (untrusted, sandboxed) ClientApp and the SuperNode. This is where the
+  update is still a parseable Flower `RecordDict`, so the gate can clip + noise the
+  tensors and count-filter the metrics. It is a separate trusted process, **not** an
+  in-app Flower Mod (Mods run in-process with the untrusted ClientApp and can be
+  disabled by it). Everything downstream is post-gate, so the SuperNode↔SuperLink
+  transport stays a transparent byte tunnel — no need to parse Fleet RPCs.
 - The **SuperLink + ServerApp (aggregation)** run on the researcher side (standard
   Flower). They are not trusted for client-egress enforcement (the gate already
   sanitized everything before it left the node).
@@ -97,10 +104,13 @@ guarantees what comes out.
 
 ## 5. The egress gate — DP + disclosure, two tiers
 
-The gate is a trusted node-side component, sole writer to the transport,
-intercepting the Message **after** the sandbox produces it. It treats every
-Message as adversarial: wrong shape/dtype → reject; conforming tensors →
-**clipped + noised unconditionally**; metrics/sizes → deterministic backstop.
+The gate is a trusted node-side component at the **ClientAppIo boundary**,
+intercepting the Message **after** the sandbox produces it and **before** the
+SuperNode can ship it. It treats every Message as adversarial: wrong shape/dtype →
+reject; conforming tensors → **clipped + noised unconditionally**; metrics/sizes →
+deterministic backstop. For **Tier 1** the trusted harness already produced a
+DP-SGD update, so the gate is a backstop; for **Tier 2** the gate is where DP is
+actually applied (output perturbation on the whole update).
 
 **Tier 1 — submit a MODEL (best utility).** The app provides only a forward-pass
 `nn.Module` + declarative config. The trusted harness runs **Opacus DP-SGD**:
@@ -128,19 +138,34 @@ spent ε > `dsflower.dp_max_epsilon`.
 for any app (both are post-processing on enforced-bounded outputs). Boundary: a
 sandbox escape, a metric routed around the gate, or an over-large ε void it.
 
-## 6. Transport — DSI as an RPC-envelope relay (efficient)
+## 6. Transport — DSI as a transparent byte tunnel (salvaged)
 
-The **new Flower Fleet API is discrete request/response RPCs**
-(`RegisterNode`, `ActivateNode`, `PullMessages`, `PushMessages`, `GetRun`,
-`GetFab`, `PushObject`/`PullObject`, `SendNodeHeartbeat`) — gRPC byte-streaming
-was removed. So we relay **framed RPC envelopes** `{rpc, seq, body_b64}`, not raw
-socket bytes — a far better fit for DataSHIELD's request/response channel.
+**The DataSHIELD connection we are handed *is* the channel** — the researcher's R
+client cannot assume any open ports, and the node never dials out. All transport
+rides `datashield.aggregate` (request/response, researcher-initiated polling).
 
-- **Salvage** the loss-free, offset-based idempotent framing from the current
-  relay (`dsi_pump.R` / `dsi_tunnel.R`): relay owns offsets, generation counter
-  resets a node on restart, `relay_hb` heartbeat TTL, orphan reaper.
-- **Drop** the SuperNode↔forwarder TCP bridge (`dsi_tunnel_forward.py`).
-- **Synthesize heartbeats locally** on the node (TTL file) → 0 round-trips.
+**Mechanics (the hard constraint).** Payloads move as **base64 string arguments
+of `aggregate` function calls** (`flowerTunnelExchangeDS(cid, <b64>)`), never via
+`datashield.assign(assign.expr=…)` — building data into an assigned R expression
+hits R/Opal's expression-size ceiling and forces pathological chunking. The
+aggregate-with-direct-string path is the efficient one; we do our **own** offset
+framing on top of it for anything over a single call's ceiling.
+
+**Transparent, not RPC-parsing.** The new Fleet API is discrete RPCs, but on the
+wire it is still gRPC/HTTP-2 **over a TCP byte stream**. We tunnel those bytes
+verbatim — no need to parse `PullMessages`/`PushMessages`, because the egress gate
+already sanitized the update upstream at ClientAppIo (§5). This keeps the relay
+simple, Flower-version-agnostic, and protocol-agnostic.
+
+- **Salvage ~verbatim** the loss-free, offset-based idempotent relay
+  (`dsi_pump.R` researcher side / `dsi_tunnel.R` node side): the relay owns the
+  byte offsets (`up_off`/`down_sent`), one fan-out `flowerTunnelExchangeDS` per
+  cycle keeps all nodes lock-step, a generation counter resets a node on SuperNode
+  redial, `relay_hb` gives the forwarder a liveness TTL, orphan reaper cleans up.
+- **Keep** the node-side `dsi_tunnel_forward.py` TCP↔spool bridge: the SuperNode
+  must dial a local TCP endpoint, and the bridge is what moves those bytes into the
+  spool the relay drains. It is protocol-agnostic loopback IPC (not an open
+  cross-host port), so it satisfies the no-open-ports constraint.
 - **Few-round / one-shot default** (`dsflower.default_rounds = 1`): DP-SGD's RDP
   accounting composes over total local steps regardless of round count, so many
   local epochs in few rounds = same ε, far fewer expensive round-trips. The ~1-min
@@ -150,7 +175,8 @@ socket bytes — a far better fit for DataSHIELD's request/response channel.
 ## 7. App lifecycle: build → upload → install → validate → run
 
 1. Researcher: `flwr build` → **FAB** (zip) + **sha256**.
-2. `flowerAppPushDS(chunk, offset)` (assign-side, idempotent offset append) until
+2. `flowerAppPushDS(chunk_b64, offset)` (**aggregate**-side, idempotent offset
+   append — same direct-string discipline as the relay, never `assign.expr`) until
    complete → `flowerAppInstallDS(token, expected_hash)`.
 3. Node: reassemble, **verify sha256 == expected_hash** (reject mismatch), unpack
    into an isolated venv.
@@ -208,13 +234,14 @@ templates) · `staging.R` (salvaged manifest/descriptors) · `lifecycle.R`
   `.validateClassDistribution`, `.sanitizeMetrics`, `.bucket_count`) minus the
   `.TEMPLATE_*` matrices; `staging.R` manifest/zero-copy; the `.dsf_option` chain;
   the client-side orphan reaper fix.
-- **Refactor:** relay payload from raw socket bytes → framed Fleet-RPC envelopes.
 - **Rebuild (new):** `app_build/upload/store` + fab-hash; `sandbox.R`;
-  `egress_gate.R`; `dp_harness.R` (RDP/PRV); `validate.R`; `admission.R`.
+  `egress_gate.R` (ClientAppIo interceptor); `dp_harness.R` (RDP/PRV); `validate.R`;
+  `admission.R`.
 - **Delete:** all SecAgg paths; the `secure_aggregation` flag + `.resolve_secagg`
   + `use_secagg` plumbing; `.TEMPLATE_*` matrices + the 18 built-in templates;
   the legacy Strategy/compat (`start_grid`/`LegacyContext`) server entry; Tor /
-  remote-SuperLink addressing; `dsi_tunnel_forward.py`.
+  remote-SuperLink addressing. (The `dsi_tunnel_forward.py` bridge is **kept** — the
+  transparent tunnel needs it; only the RPC-envelope idea was dropped.)
 
 ## 12. Implementation milestones (incremental, recoverable)
 
@@ -235,7 +262,8 @@ templates) · `staging.R` (salvaged manifest/descriptors) · `lifecycle.R`
 
 ## 13. Key decisions (locked)
 
-- Egress gate **integrated into the trusted DSI relay** (no Flower fork).
+- Egress gate **at the ClientAppIo boundary** as a trusted interceptor (no Flower
+  fork, not an in-app Mod). Transport stays a transparent DSI byte tunnel.
 - Standard Flower **ServerApp aggregation on the researcher side** (revisit custom
   relay-side aggregation only if round-trips must be cut further).
 - **Tier-1 (model submission)** is the recommended path for good numbers;
