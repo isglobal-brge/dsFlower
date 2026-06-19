@@ -111,9 +111,7 @@ test_that(".stageData writes privacy settings from extra_config", {
 
   staging_dir <- dsFlower:::.stageData(
     data, token, "target", c("f1"),
-    extra_config = list(
-      require_secure_aggregation = TRUE
-    )
+    extra_config = list()
   )
   on.exit(unlink(staging_dir, recursive = TRUE))
 
@@ -122,7 +120,7 @@ test_that(".stageData writes privacy settings from extra_config", {
   expect_true(manifest$dp_enabled)
   expect_false(manifest$allow_per_node_metrics)
   expect_false(manifest$allow_exact_num_examples)
-  expect_true(manifest$require_secure_aggregation)
+  expect_true(manifest$fixed_client_sampling)
 })
 
 test_that(".stageData drops incomplete target/feature rows before manifesting", {

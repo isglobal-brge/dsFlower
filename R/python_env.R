@@ -301,124 +301,6 @@
   lib_dirs[basename(lib_dirs) == "site-packages"]
 }
 
-#' Detect whether Flower ServerAppComponents accepts a workflow argument
-#'
-#' dsFlower templates need server-side SecAggPlusWorkflow whenever a profile or
-#' template requires Secure Aggregation. Recent Flower releases expose this
-#' through DefaultWorkflow/SecAggPlusWorkflow rather than a workflow argument on
-#' ServerAppComponents. This check is deliberately file-based: Rserve child
-#' processes can hang when they spawn Python subprocesses.
-#' @keywords internal
-.serverapp_components_supports_workflow <- function(venv_path) {
-  site_dirs <- .venv_site_packages_dirs(venv_path)
-  for (site_dir in site_dirs) {
-    secagg_src <- file.path(
-      site_dir, "flwr", "server", "workflow", "secure_aggregation",
-      "secaggplus_workflow.py"
-    )
-    default_src <- file.path(
-      site_dir, "flwr", "server", "workflow", "default_workflows.py"
-    )
-    legacy_src <- file.path(
-      site_dir, "flwr", "server", "compat", "legacy_context.py"
-    )
-    if (file.exists(secagg_src) && file.exists(default_src) &&
-        file.exists(legacy_src)) {
-      return(TRUE)
-    }
-
-    src <- file.path(site_dir, "flwr", "server", "serverapp_components.py")
-    if (!file.exists(src)) next
-    lines <- tryCatch(readLines(src, warn = FALSE),
-                      error = function(e) character())
-    if (length(lines) == 0) next
-    if (any(grepl("^\\s*workflow\\s*:", lines))) return(TRUE)
-    if (any(grepl("workflow\\s*=", lines))) return(TRUE)
-  }
-  FALSE
-}
-
-#' Summarise server-side Secure Aggregation support
-#'
-#' @param template_name Optional Flower template name. When provided, only the
-#'   framework environment used by that template is checked.
-#' @return Named list with supported flag, reason, and per-environment details.
-#' @keywords internal
-.flower_server_secagg_capability <- function(template_name = NULL) {
-  framework <- NULL
-  if (!is.null(template_name)) {
-    meta <- .TEMPLATE_METADATA[[template_name]]
-    framework <- meta$framework %||% NULL
-  }
-
-  envs <- .list_python_envs()
-  if (!is.null(framework)) {
-    envs <- envs[envs$framework == framework, , drop = FALSE]
-  }
-
-  if (nrow(envs) == 0) {
-    return(list(
-      supported = FALSE,
-      reason = if (is.null(framework)) {
-        "no provisioned Python environments"
-      } else {
-        paste0("no provisioned Python environment for framework '",
-               framework, "'")
-      },
-      environments = envs
-    ))
-  }
-
-  rows <- lapply(seq_len(nrow(envs)), function(i) {
-    path <- envs$path[[i]]
-    data.frame(
-      framework = envs$framework[[i]],
-      path = path,
-      healthy = isTRUE(envs$healthy[[i]]),
-      flower_version = .read_venv_package_version(path, "flwr"),
-      server_workflow_supported = .serverapp_components_supports_workflow(path),
-      stringsAsFactors = FALSE
-    )
-  })
-  details <- do.call(rbind, rows)
-  supported <- nrow(details) > 0 &&
-    all(details$healthy & details$server_workflow_supported)
-
-  reason <- if (supported) {
-    "server-side SecAggPlusWorkflow is available"
-  } else if (any(!details$healthy)) {
-    "one or more Python environments are not healthy"
-  } else {
-    paste0(
-      "installed Flower runtime does not expose ",
-      "ServerAppComponents(workflow=...)"
-    )
-  }
-
-  list(supported = supported, reason = reason, environments = details)
-}
-
-#' Stop if Secure Aggregation is required but unsupported by the runtime
-#' @keywords internal
-.assert_secure_aggregation_runtime <- function(template_name, run_config = list()) {
-  if (is.null(template_name) || !nzchar(template_name)) return(invisible(TRUE))
-
-  rsa <- run_config[["require_secure_aggregation"]] %||%
-    run_config[["require-secure-aggregation"]] %||% FALSE
-  required <- isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
-  if (!required) return(invisible(TRUE))
-
-  cap <- .flower_server_secagg_capability(template_name)
-  if (isTRUE(cap$supported)) return(invisible(TRUE))
-
-  stop(
-    "Secure Aggregation was requested (>=3 nodes) but this server cannot enable ",
-    "server-side SecAgg+. ", cap$reason, ". Run with fewer than 3 nodes for ",
-    "local DP, or install a Flower runtime that supports SecAggPlusWorkflow.",
-    call. = FALSE
-  )
-}
-
 #' Summarise provisioned Python runtime without spawning subprocesses
 #' @keywords internal
 .python_runtime_capabilities <- function() {
@@ -428,8 +310,7 @@
     return(list(
       python_version = "not provisioned",
       flower_version = "not provisioned",
-      python_envs = envs,
-      secure_aggregation = .flower_server_secagg_capability()
+      python_envs = envs
     ))
   }
 
@@ -437,8 +318,7 @@
   list(
     python_version = .read_venv_python_version(first),
     flower_version = .read_venv_package_version(first, "flwr"),
-    python_envs = envs,
-    secure_aggregation = .flower_server_secagg_capability()
+    python_envs = envs
   )
 }
 

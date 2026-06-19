@@ -120,20 +120,6 @@ test_that("flowerPrepareRunDS blocks on insufficient samples", {
   )
 })
 
-test_that("secure aggregation runtime guard blocks unsupported server runtimes", {
-  local_mocked_bindings(
-    .flower_server_secagg_capability = function(template_name = NULL) {
-      list(supported = FALSE, reason = "mock runtime without workflow")
-    }
-  )
-
-  run_config <- list(require_secure_aggregation = TRUE)
-  expect_error(
-    dsFlower:::.assert_secure_aggregation_runtime("sklearn_logreg", run_config),
-    "Secure Aggregation"
-  )
-})
-
 # --- TLS ca.pem handling ---
 
 test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
@@ -265,9 +251,7 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("templates" %in% names(caps))
   expect_true("max_rounds" %in% names(caps))
   expect_true("min_samples" %in% names(caps))
-  expect_true("secure_aggregation_supported" %in% names(caps))
-  expect_true("secure_aggregation_runtime" %in% names(caps))
-  expect_type(caps$secure_aggregation_supported, "logical")
+  expect_false("secure_aggregation_supported" %in% names(caps))
 })
 
 test_that("flowerGetCapabilitiesDS includes is_docker and hostname", {

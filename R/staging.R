@@ -232,19 +232,15 @@
 #' @param run_token Character; the unique run token.
 #' Force the DP-always contract into a staging manifest.
 #'
-#' Differential privacy is always enforced and disclosure is non-disclosive by
-#' default, so every manifest carries dp_enabled + suppressed metrics/counts +
-#' fixed sampling. Secure Aggregation is requested by the client (>=3 nodes).
+#' Differential privacy is always enforced (local DP, no Secure Aggregation) and
+#' disclosure is non-disclosive by default, so every manifest carries dp_enabled
+#' + suppressed metrics/counts + fixed sampling.
 #' @keywords internal
 .normalize_dp_manifest <- function(manifest) {
-  rsa <- manifest[["require_secure_aggregation"]] %||%
-    manifest[["require-secure-aggregation"]] %||% FALSE
-  manifest[["dp_enabled"]]                 <- TRUE
-  manifest[["allow_per_node_metrics"]]     <- FALSE
-  manifest[["allow_exact_num_examples"]]   <- FALSE
-  manifest[["fixed_client_sampling"]]      <- TRUE
-  manifest[["require_secure_aggregation"]] <-
-    isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
+  manifest[["dp_enabled"]]               <- TRUE
+  manifest[["allow_per_node_metrics"]]   <- FALSE
+  manifest[["allow_exact_num_examples"]] <- FALSE
+  manifest[["fixed_client_sampling"]]    <- TRUE
   manifest
 }
 

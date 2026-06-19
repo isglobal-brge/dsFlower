@@ -250,18 +250,14 @@ flowerInitDS <- function(data_symbol) {
        call. = FALSE)
 }
 
-# Differential privacy is ALWAYS enforced and disclosure is non-disclosive by
-# default. Normalise the manifest run_config to the DP-always contract. Secure
-# Aggregation is requested by the client (>=3 nodes); we only record it.
+# Differential privacy is ALWAYS enforced (local DP, no Secure Aggregation) and
+# disclosure is non-disclosive by default. Normalise the manifest run_config to
+# the DP-always contract.
 .addDpConfigToRunConfig <- function(run_config) {
-  rsa <- run_config[["require-secure-aggregation"]] %||%
-    run_config[["require_secure_aggregation"]] %||% FALSE
-  run_config[["dp_enabled"]]                 <- TRUE
-  run_config[["allow_per_node_metrics"]]     <- FALSE
-  run_config[["allow_exact_num_examples"]]   <- FALSE
-  run_config[["fixed_client_sampling"]]      <- TRUE
-  run_config[["require_secure_aggregation"]] <-
-    isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
+  run_config[["dp_enabled"]]               <- TRUE
+  run_config[["allow_per_node_metrics"]]   <- FALSE
+  run_config[["allow_exact_num_examples"]] <- FALSE
+  run_config[["fixed_client_sampling"]]    <- TRUE
   run_config
 }
 
@@ -269,10 +265,8 @@ flowerInitDS <- function(data_symbol) {
 # unconditional; thresholds come from DataSHIELD options.
 .enforceDisclosureAndDp <- function(handle, target_column, template_name,
                                     n_samples, target_data, run_config) {
-  if (!is.null(template_name)) {
-    .validateTemplateHyperparameters(template_name, run_config)
-    .assert_secure_aggregation_runtime(template_name, run_config)
-  }
+  # Admission disclosure checks (input side): never train below the configured
+  # minimum rows / on a degenerate class distribution (DataSHIELD nfilter.*).
   .assertMinSamples(n_samples, min_n = .disclosure_min_rows())
   if (!is.null(target_data) && !is.null(target_column) && length(target_column) > 0) {
     .validateClassDistribution(
@@ -734,8 +728,6 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     python_version      = runtime$python_version,
     flower_version      = runtime$flower_version,
     python_envs         = runtime$python_envs,
-    secure_aggregation_supported = isTRUE(runtime$secure_aggregation$supported),
-    secure_aggregation_runtime = runtime$secure_aggregation,
     templates           = settings$allowed_templates,
     max_rounds          = settings$max_rounds,
     allow_custom_config = settings$allow_custom_config,
