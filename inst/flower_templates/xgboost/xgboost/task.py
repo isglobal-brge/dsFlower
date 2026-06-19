@@ -72,17 +72,16 @@ def load_privacy_config(context=None):
     manifest = _load_manifest(context)
 
     config = {
-        "privacy_profile": manifest.get("privacy_profile", manifest.get("privacy-mode", "research")),
-        "privacy_requested_mode": manifest.get("privacy-mode", "research"),
-        "privacy_mode": _privacy_execution_mode(manifest),
-        "dp_scope": manifest.get("dp_scope", "none"),
-        "allow_per_node_metrics": manifest.get("allow_per_node_metrics", True),
-        "allow_exact_num_examples": manifest.get("allow_exact_num_examples", True),
-        "require_secure_aggregation": manifest.get("require_secure_aggregation", False),
-        "dp_required": manifest.get("dp_required", False),
-        "epsilon": float(manifest.get("privacy-epsilon", 1.0)),
+        "privacy_mode": "dp",  # DP is ALWAYS enforced; there are no profiles.
+        "dp_enabled": True,
+        "epsilon": float(manifest.get("privacy-epsilon", 3.0)),
         "delta": float(manifest.get("privacy-delta", 1e-5)),
         "clipping_norm": float(manifest.get("privacy-clipping_norm", 1.0)),
+        "require_secure_aggregation": bool(manifest.get("require_secure_aggregation", False)),
+        "num_clients": int(manifest.get("num-clients", manifest.get("num_clients", 1))),
+        # Non-disclosive by default: suppress per-node metrics + exact counts.
+        "allow_per_node_metrics": False,
+        "allow_exact_num_examples": False,
         "n_samples": int(manifest.get("n_samples", 0)),
     }
 
