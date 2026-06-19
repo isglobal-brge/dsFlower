@@ -5,14 +5,17 @@
 >
 > Done: M0 reset · M1 SecAgg strip (both sides, deployed) · M2 Tier-1 harness
 > (new Message API, always-on Opacus DP-SGD + PRV) running end-to-end (3/3 nodes,
-> status 0) · M3 content-hash trust for the harness (node pins the canonical harness
-> hash; R `.compute_harness_hash` == Python `_hash_package`). Transport is salvaged
-> (the v1 transparent DSI byte tunnel meets every constraint).
+> status 0) · M3 content-hash trust for the harness · **Tier-2 INGESTION**: chunked
+> FAB upload over DSI (`flowerAppPush/InstallDS`) + sha256 verify + fail-closed
+> exfiltration scan (`exfil_scan.py`) + install — federated-validated ("verified by
+> sha256 on 3 nodes"). Transport is salvaged (the v1 transparent DSI byte tunnel).
 >
-> Remaining: Tier-2 (arbitrary app upload + sandbox + ClientAppIo egress gate),
-> the validation pipeline (AST + ModuleValidator + dry-run), full DataSHIELD-option
-> wiring + admission/egress disclosure backstop, and dead-code cleanup
-> (template-store fns, coordinator/non-tunnel path).
+> Remaining = **Tier-2 EXECUTION**: run an uploaded app (hash-pin the installed app
+> for the integrity hook + `flwr run` it), the **sandbox** (`--isolation=process`
+> now; gVisor/bwrap needs node root/infra), and the **ClientAppIo egress gate** (the
+> complex core: a gRPC interceptor applying `dp_harness.output_perturbation` to the
+> untrusted app's update). Plus full DataSHIELD-option wiring + admission/egress
+> backstop, and dead-code cleanup (template-store, coordinator/non-tunnel path).
 >
 > Bring-up learnings (live nodes): the DSI-tunnel SuperNode runs the ClientApp from
 > the client-built FAB in the node's framework venv (use a pytorch-family model so a
