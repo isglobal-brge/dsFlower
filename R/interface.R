@@ -538,17 +538,17 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 
   # template_name resolved: explicit > handle > runtime.json
 
-  # Write code verification artifacts to staging directory
-  if (!is.null(template_name) && nzchar(template_name %||% "")) {
-
-    # Compute expected hash from server's own template copy and write
-    # to staging directory. The sitecustomize.py hook (injected via
-    # PYTHONPATH) reads this file to verify code integrity at runtime.
-    template_hash <- .compute_template_hash(template_name)
-    writeLines(template_hash,
+  # Pin the trusted Tier-1 harness for the default-deny code-integrity hook
+  # (sitecustomize.py; ARCHITECTURE.md §7). The node writes the hash of its own
+  # node-resident canonical harness; the submitted FAB's `dsflower_harness`
+  # package may run only if it is byte-identical to it. This is the content-hash
+  # verification that makes the trusted training loop guaranteed, without trusting
+  # the researcher who provisioned the app.
+  harness_hash <- .compute_harness_hash()
+  if (nzchar(harness_hash)) {
+    writeLines(harness_hash,
                file.path(handle$staging_dir, "expected_hash.txt"))
-    # Pin the exact template the SuperNode is allowed to run (default-deny).
-    writeLines(template_name,
+    writeLines("dsflower_harness",
                file.path(handle$staging_dir, "expected_template.txt"))
   }
 
@@ -1239,6 +1239,32 @@ flowerVerifyAppHashDS <- function(handle_symbol, app_hash, template_name) {
   }
 
   list(verified = verified, expected = expected, received = app_hash)
+}
+
+#' Compute the canonical SHA-256 hash of the node-resident Tier-1 harness
+#'
+#' Hashes the \code{dsflower_harness} Python package shipped with this node
+#' package, byte-for-byte identically to \code{_hash_package} in
+#' sitecustomize.py and \code{.compute_template_hash}: forward-slash relative
+#' paths, radix sort, each as relpath + "\\n" + content + "\\x00", excluding
+#' compiled artifacts. Used to pin the trusted harness for code verification.
+#' @return Character; hex SHA-256, or "" if the harness is not installed.
+#' @keywords internal
+.compute_harness_hash <- function() {
+  pkg_dir <- system.file("flower_app", "dsflower_harness", package = "dsFlower")
+  if (!nzchar(pkg_dir) || !dir.exists(pkg_dir)) return("")
+  rel_files <- list.files(pkg_dir, recursive = TRUE, full.names = FALSE,
+                          all.files = TRUE, no.. = TRUE)
+  rel_files <- rel_files[!grepl("(^|/)__pycache__(/|$)", rel_files)]
+  rel_files <- rel_files[!grepl("\\.(pyc|pyo)$", rel_files)]
+  rel_files <- sort(rel_files, method = "radix")
+  blob <- raw(0)
+  for (rel in rel_files) {
+    full <- file.path(pkg_dir, rel)
+    content <- readBin(full, "raw", file.info(full)$size)
+    blob <- c(blob, charToRaw(rel), charToRaw("\n"), content, as.raw(0x00))
+  }
+  digest::digest(blob, algo = "sha256", serialize = FALSE)
 }
 
 #' Compute SHA-256 hash of a template's Python files

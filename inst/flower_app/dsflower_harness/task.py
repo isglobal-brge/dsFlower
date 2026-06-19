@@ -1,0 +1,85 @@
+"""Data loading + privacy config for the dsFlower Tier-1 harness.
+
+CRITICAL TRUST INVARIANT: all privacy enforcement (epsilon/delta/clip) and the
+data location are read from the SERVER-WRITTEN manifest.json, never from the
+client-controlled run config (pyproject). The server owns the staging directory,
+so the manifest is tamper-proof; the researcher cannot weaken DP through it.
+"""
+
+import json
+import os
+
+import numpy as np
+import pandas as pd
+
+_privacy_config = None
+
+
+def _get_manifest_dir(context=None):
+    manifest_dir = None
+    if context is not None:
+        manifest_dir = context.node_config.get("manifest-dir")
+    if manifest_dir is None:
+        manifest_dir = os.environ.get("DSFLOWER_MANIFEST_DIR")
+    if manifest_dir is None:
+        raise ValueError(
+            "No manifest directory found. Set 'manifest-dir' in node_config or "
+            "the DSFLOWER_MANIFEST_DIR environment variable."
+        )
+    return manifest_dir
+
+
+def _load_manifest(context=None):
+    manifest_path = os.path.join(_get_manifest_dir(context), "manifest.json")
+    with open(manifest_path) as f:
+        return json.load(f)
+
+
+def load_data(context=None):
+    """Load (X, y) for standard supervised training from the staged manifest."""
+    manifest = _load_manifest(context)
+    manifest_dir = _get_manifest_dir(context)
+    data_file = os.path.join(manifest_dir, manifest["data_file"])
+
+    if manifest.get("data_format", "csv") == "parquet":
+        import pyarrow.parquet as pq
+        df = pq.read_table(data_file).to_pandas()
+    else:
+        df = pd.read_csv(data_file)
+
+    target_col = manifest["target_column"]
+    feat_cols = manifest.get("feature_columns")
+    X = df[feat_cols].values if feat_cols else df.drop(columns=[target_col]).values
+
+    # Coerce the target to numeric {0,1,...}. Handles factor/string/bool labels
+    # (e.g. a DataSHIELD factor target) by stable label-encoding; numeric targets
+    # pass through unchanged.
+    y_series = df[target_col]
+    if y_series.dtype == object or y_series.dtype == bool or \
+            str(y_series.dtype).startswith("category"):
+        y = y_series.astype("category").cat.codes.values
+    else:
+        y = y_series.values
+    return X.astype(np.float32), np.asarray(y, dtype=np.float32)
+
+
+def load_privacy_config(context=None):
+    """Read the tamper-proof DP parameters from the server-written manifest.
+
+    DP is ALWAYS enforced — there is no 'off' path and no profiles. Counts and
+    per-node metrics are suppressed/bucketed by default (disclosure backstop).
+    """
+    global _privacy_config
+    if _privacy_config is not None:
+        return _privacy_config
+
+    manifest = _load_manifest(context)
+    _privacy_config = {
+        "epsilon": float(manifest.get("privacy-epsilon", 3.0)),
+        "delta": float(manifest.get("privacy-delta", 1e-5)),
+        "clipping_norm": float(manifest.get("privacy-clipping_norm", 1.0)),
+        "allow_per_node_metrics": False,
+        "allow_exact_num_examples": False,
+        "n_samples": int(manifest.get("n_samples", 0)),
+    }
+    return _privacy_config
