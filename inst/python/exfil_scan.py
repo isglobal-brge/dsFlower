@@ -73,9 +73,26 @@ def scan_source(src, filename):
             if root in _FORBIDDEN_IMPORTS:
                 add(node.lineno, "forbidden-import", root)
 
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-                and node.func.id in _FORBIDDEN_CALLS:
-            add(node.lineno, "forbidden-call", node.func.id)
+        # `from os import system, popen, ...` -- os root is allowed, the escape
+        # names are not.
+        if isinstance(node, ast.ImportFrom) and (node.module or "") == "os" \
+                and not (node.level and node.level > 0):
+            for a in node.names:
+                if a.name in _FORBIDDEN_OS_ATTRS:
+                    add(node.lineno, "os-escape", "os." + a.name)
+
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in _FORBIDDEN_CALLS:
+                add(node.lineno, "forbidden-call", node.func.id)
+            # getattr(x, "__globals__") / getattr(x, "system") -- string-based
+            # reflection that evades the attribute checks below.
+            if node.func.id in ("getattr", "setattr") and node.args \
+                    and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) \
+                    and isinstance(node.args[1].value, str):
+                name = node.args[1].value
+                if (name.startswith("__") and name.endswith("__")) \
+                        or name in _FORBIDDEN_OS_ATTRS:
+                    add(node.lineno, "reflection-getattr", name)
 
         # os.<escape>(...) — os itself is allowed, these attributes are not.
         if isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_OS_ATTRS \
