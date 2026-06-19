@@ -4,17 +4,17 @@
 \alias{.validateClassDistribution}
 \title{Validate target distribution against trust profile thresholds}
 \usage{
-.validateClassDistribution(data, target_column, trust, task_type = NULL)
+.validateClassDistribution(data, target_column, task_type = NULL)
 }
 \arguments{
 \item{data}{Data.frame or Arrow Table; the training data.}
 
 \item{target_column}{Character; name(s) of the target column(s).}
 
-\item{trust}{Named list; the trust profile settings.}
-
 \item{task_type}{Character task type ("classification", "regression",
 "survival", etc.) or NULL.}
+
+\item{trust}{Named list; the trust profile settings.}
 }
 \value{
 TRUE invisibly, or stops with an error.
@@ -22,9 +22,9 @@ TRUE invisibly, or stops with an error.
 \description{
 Uses the explicit task type when provided and otherwise infers a conservative
 classification/survival interpretation from the target column. Validates:
-- Binary (2 unique values): min(table(target)) >= trust$min_positive_examples
-- Multiclass (>2 unique): all(table(target) >= trust$min_per_class)
-- Survival (2-column target or event/status column): sum(events==1) >= trust$min_events
+- Binary (2 unique values): min(table(target)) >= .disclosure_min_cell()
+- Multiclass (>2 unique): all(table(target) >= .disclosure_min_cell())
+- Survival (2-column target or event/status column): sum(events==1) >= .disclosure_min_cell()
 - Regression/count targets: no class-count check is applied.
 }
 \details{

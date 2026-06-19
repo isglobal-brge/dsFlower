@@ -4,7 +4,7 @@
 \alias{.assert_secure_aggregation_runtime}
 \title{Stop if Secure Aggregation is required but unsupported by the runtime}
 \usage{
-.assert_secure_aggregation_runtime(template_name, trust)
+.assert_secure_aggregation_runtime(template_name, run_config = list())
 }
 \description{
 Stop if Secure Aggregation is required but unsupported by the runtime

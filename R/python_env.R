@@ -400,35 +400,21 @@
 
 #' Stop if Secure Aggregation is required but unsupported by the runtime
 #' @keywords internal
-.assert_secure_aggregation_runtime <- function(template_name, trust) {
+.assert_secure_aggregation_runtime <- function(template_name, run_config = list()) {
   if (is.null(template_name) || !nzchar(template_name)) return(invisible(TRUE))
 
-  meta <- .TEMPLATE_METADATA[[template_name]]
-  required_by_template <- isTRUE(meta$requires_secagg)
-  required_by_profile <- isTRUE(trust$require_secure_aggregation)
-  if (!required_by_template && !required_by_profile) return(invisible(TRUE))
+  rsa <- run_config[["require_secure_aggregation"]] %||%
+    run_config[["require-secure-aggregation"]] %||% FALSE
+  required <- isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
+  if (!required) return(invisible(TRUE))
 
   cap <- .flower_server_secagg_capability(template_name)
   if (isTRUE(cap$supported)) return(invisible(TRUE))
 
-  reason_bits <- character()
-  if (required_by_profile) {
-    reason_bits <- c(reason_bits,
-                     paste0("privacy profile '", trust$name, "'"))
-  }
-  if (required_by_template) {
-    reason_bits <- c(reason_bits,
-                     paste0("template '", template_name, "'"))
-  }
-
   stop(
-    "Secure Aggregation is required by ",
-    paste(reason_bits, collapse = " and "),
-    ", but this server cannot enable server-side SecAgg+. ",
-    cap$reason, ". ",
-    "Use a non-SecAgg profile such as 'trusted_internal' for trusted local ",
-    "demos, or install a Flower runtime/server app implementation that supports ",
-    "server-side SecAggPlusWorkflow.",
+    "Secure Aggregation was requested (>=3 nodes) but this server cannot enable ",
+    "server-side SecAgg+. ", cap$reason, ". Run with fewer than 3 nodes for ",
+    "local DP, or install a Flower runtime that supports SecAggPlusWorkflow.",
     call. = FALSE
   )
 }

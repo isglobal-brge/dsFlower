@@ -250,17 +250,48 @@ flowerInitDS <- function(data_symbol) {
        call. = FALSE)
 }
 
-.addTrustConfigToRunConfig <- function(run_config, trust) {
-  run_config[["privacy_profile"]]            <- trust$name
-  run_config[["allow_per_node_metrics"]]     <- trust$allow_per_node_metrics
-  run_config[["allow_exact_num_examples"]]   <- trust$allow_exact_num_examples
-  run_config[["require_secure_aggregation"]] <- trust$require_secure_aggregation
-  run_config[["dp_required"]]                <- trust$dp_required
-  run_config[["min_clients_per_round"]]      <- trust$min_clients_per_round
-  run_config[["fixed_client_sampling"]]      <- trust$fixed_client_sampling
-  run_config[["dp_scope"]]                   <- trust$dp_scope
-  run_config[["evaluation_only"]]            <- trust$evaluation_only
+# Differential privacy is ALWAYS enforced and disclosure is non-disclosive by
+# default. Normalise the manifest run_config to the DP-always contract. Secure
+# Aggregation is requested by the client (>=3 nodes); we only record it.
+.addDpConfigToRunConfig <- function(run_config) {
+  rsa <- run_config[["require-secure-aggregation"]] %||%
+    run_config[["require_secure_aggregation"]] %||% FALSE
+  run_config[["dp_enabled"]]                 <- TRUE
+  run_config[["allow_per_node_metrics"]]     <- FALSE
+  run_config[["allow_exact_num_examples"]]   <- FALSE
+  run_config[["fixed_client_sampling"]]      <- TRUE
+  run_config[["require_secure_aggregation"]] <-
+    isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
   run_config
+}
+
+# Shared disclosure + DP budget enforcement for both prepare paths. DP is
+# unconditional; thresholds come from DataSHIELD options.
+.enforceDisclosureAndDp <- function(handle, target_column, template_name,
+                                    n_samples, target_data, run_config) {
+  if (!is.null(template_name)) {
+    .validateTemplateHyperparameters(template_name, run_config)
+    .assert_secure_aggregation_runtime(template_name, run_config)
+  }
+  .assertMinSamples(n_samples, min_n = .disclosure_min_rows())
+  if (!is.null(target_data) && !is.null(target_column) && length(target_column) > 0) {
+    .validateClassDistribution(
+      target_data, target_column,
+      task_type = run_config[["task-type"]] %||% run_config[["task_type"]]
+    )
+  }
+  # DP budget check -- DP is always on.
+  dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 3.0)
+  dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
+  eps_ceiling <- suppressWarnings(as.numeric(.dsf_option("dp_epsilon_ceiling", 10)))
+  if (!is.na(eps_ceiling) && (is.na(dp_epsilon) || dp_epsilon > eps_ceiling)) {
+    stop("Requested DP epsilon (", dp_epsilon, ") exceeds this server's ceiling (",
+         eps_ceiling, "). Lower epsilon, or have the operator raise ",
+         "dsflower.dp_epsilon_ceiling.", call. = FALSE)
+  }
+  dataset_key <- .privacy_dataset_key(handle, target_column)
+  .check_budget(dataset_key, dp_epsilon, dp_delta)
+  invisible(TRUE)
 }
 
 #' Prepare a Training Run
@@ -306,9 +337,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     desc <- handle$descriptor
     run_token <- .generate_run_token()
 
-    # Enforce trust profile min_train_rows
-    trust <- .flowerTrustProfile()
-    run_config <- .addTrustConfigToRunConfig(run_config, trust)
+    run_config <- .addDpConfigToRunConfig(run_config)
 
     staging_dir <- .stageFromDescriptor(desc, run_token, target_column,
                                          feature_columns, run_config)
@@ -318,23 +347,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     staged_manifest <- jsonlite::fromJSON(manifest_path, simplifyVector = TRUE)
     n_samples <- staged_manifest$n_samples
 
-    effective_min <- max(trust$min_train_rows,
-                         .flowerDisclosureSettings()$nfilter_subset)
     template_name <- run_config[["template_name"]] %||% NULL
-    if (!is.null(template_name)) {
-      template_min <- .templateMinRows(template_name, trust$name)
-      if (!is.null(template_min)) {
-        effective_min <- max(effective_min, template_min)
-      }
-      .validateTemplateProfile(template_name, trust$name)
-      .validateTemplateHyperparameters(template_name, run_config)
-      .assert_secure_aggregation_runtime(template_name, trust)
-    }
-    .assertMinSamples(n_samples, min_n = effective_min)
-
-    # Class distribution validation (descriptor path: read target column only)
-    if (!is.null(target_column) && length(target_column) > 0 &&
-        trust$min_positive_examples > 0) {
+    # Read the target column (descriptor path) for class-distribution checks.
+    target_data <- NULL
+    if (!is.null(target_column) && length(target_column) > 0) {
       tryCatch({
         staged_data_path <- file.path(staging_dir, staged_manifest$data_file)
         if (file.exists(staged_data_path) &&
@@ -345,54 +361,11 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
         } else if (file.exists(staged_data_path)) {
           target_data <- utils::read.csv(staged_data_path,
                                           stringsAsFactors = FALSE)
-        } else {
-          target_data <- NULL
         }
-        if (!is.null(target_data)) {
-          .validateClassDistribution(
-            target_data, target_column, trust,
-            task_type = run_config[["task-type"]] %||% run_config[["task_type"]]
-          )
-        }
-      }, error = function(e) {
-        if (grepl("Disclosive", conditionMessage(e))) stop(e)
-      })
+      }, error = function(e) NULL)
     }
-
-    # DP enforcement
-    requested_mode <- run_config[["privacy-mode"]] %||% "clinical_default"
-    if (trust$dp_required &&
-        !requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
-      stop("Trust profile '", trust$name, "' requires differential privacy. ",
-           "Set privacy mode to 'clinical_update_noise' or 'high_sensitivity_dp'.",
-           call. = FALSE)
-    }
-    if (requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
-      # Validate template against the REQUESTED DP profile too
-      # (server profile might be less strict than what the client requested)
-      if (!is.null(template_name) &&
-          requested_mode == "high_sensitivity_dp") {
-        .validateTemplateProfile(template_name, "high_sensitivity_dp")
-      }
-      dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
-      dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
-      # Server-side epsilon ceiling: a client cannot request an arbitrarily
-      # large (i.e. effectively no) privacy budget.
-      eps_ceiling <- suppressWarnings(as.numeric(.dsf_option("dp_epsilon_ceiling", 10)))
-      if (!is.na(eps_ceiling) &&
-          (is.na(dp_epsilon) || dp_epsilon > eps_ceiling)) {
-        stop("Requested DP epsilon (", dp_epsilon, ") exceeds this server's ceiling (",
-             eps_ceiling, "). Lower epsilon, or have the operator raise ",
-             "dsflower.dp_epsilon_ceiling.", call. = FALSE)
-      }
-      dataset_key <- .privacy_dataset_key(handle, target_column)
-      .check_budget(dataset_key, dp_epsilon, dp_delta)
-    }
-
-    # evaluation_only handling
-    if (isTRUE(trust$evaluation_only)) {
-      run_config[["evaluation_only"]] <- TRUE
-    }
+    .enforceDisclosureAndDp(handle, target_column, template_name,
+                            n_samples, target_data, run_config)
 
     # Inject validated mask paths from dsImaging (segmentation tasks)
     seg_generation_id <- run_config[["segmentation_generation_id"]] %||% NULL
@@ -445,63 +418,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   }
   .validateDataSchema(data, target_column, feature_columns)
 
-  # Enforce trust profile min_train_rows (uses the higher of nfilter + profile)
-  trust <- .flowerTrustProfile()
-  effective_min <- max(trust$min_train_rows,
-                       .flowerDisclosureSettings()$nfilter_subset)
-
-  # Apply per-template minimum row count if stricter than profile default
+  run_config <- .addDpConfigToRunConfig(run_config)
   template_name <- run_config[["template_name"]] %||% NULL
-  if (!is.null(template_name)) {
-    template_min <- .templateMinRows(template_name, trust$name)
-    if (!is.null(template_min)) {
-      effective_min <- max(effective_min, template_min)
-    }
-    # Enforce template/profile compatibility
-    .validateTemplateProfile(template_name, trust$name)
-    .validateTemplateHyperparameters(template_name, run_config)
-    .assert_secure_aggregation_runtime(template_name, trust)
-  }
-
-  .assertMinSamples(nrow(data), min_n = effective_min)
-
-  # Class distribution validation (table path)
-  if (!is.null(target_column) && length(target_column) > 0 &&
-      trust$min_positive_examples > 0) {
-    .validateClassDistribution(
-      data, target_column, trust,
-      task_type = run_config[["task-type"]] %||% run_config[["task_type"]]
-    )
-  }
-
-  # Enforce DP requirement from trust profile
-  requested_mode <- run_config[["privacy-mode"]] %||% "clinical_default"
-  if (trust$dp_required &&
-      !requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
-    stop("Trust profile '", trust$name, "' requires differential privacy. ",
-         "Set privacy mode to 'clinical_update_noise' or 'high_sensitivity_dp'.",
-         call. = FALSE)
-  }
-
-  # Check privacy budget before staging when DP is required
-  if (requested_mode %in% c("clinical_update_noise", "high_sensitivity_dp", "dp")) {
-    if (!is.null(template_name) &&
-        requested_mode == "high_sensitivity_dp") {
-      .validateTemplateProfile(template_name, "high_sensitivity_dp")
-    }
-    dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 1.0)
-    dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
-    dataset_key <- .privacy_dataset_key(handle, target_column)
-    .check_budget(dataset_key, dp_epsilon, dp_delta)
-  }
-
-  # evaluation_only handling
-  if (isTRUE(trust$evaluation_only)) {
-    run_config[["evaluation_only"]] <- TRUE
-  }
-
-  # Write privacy config into run_config for manifest.
-  run_config <- .addTrustConfigToRunConfig(run_config, trust)
+  .enforceDisclosureAndDp(handle, target_column, template_name,
+                          nrow(data), data, run_config)
 
   # Stage data with manifest
   run_token <- .generate_run_token()
@@ -595,19 +515,22 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   sl_host <- sub(":.*", "", superlink_address)
   if (!.is_private_or_local_host(sl_host) &&
       !isTRUE(as.logical(.dsf_option("allow_untrusted_coordinator", FALSE)))) {
-    pmode <- ""
+    # DP is always enforced (individual records stay protected), but without
+    # Secure Aggregation a remote/public coordinator can observe each node's
+    # per-node update. Require SecAgg for remote coordinators unless overridden.
+    rsa <- FALSE
     mpath <- file.path(handle$staging_dir %||% "", "manifest.json")
     if (nzchar(mpath) && file.exists(mpath)) {
       m <- tryCatch(jsonlite::fromJSON(mpath, simplifyVector = TRUE),
                     error = function(e) NULL)
-      pmode <- (m[["privacy-mode"]] %||% m[["privacy_profile"]]) %||% ""
+      rsa <- isTRUE(m[["require_secure_aggregation"]])
     }
-    if (pmode %in% c("sandbox_open", "trusted_internal", "none", "")) {
+    if (!rsa) {
       stop("Refusing SuperNode: coordinator '", superlink_address, "' is remote/public ",
-           "but the run uses a weak privacy profile ('", pmode, "'). A remote ",
-           "coordinator can observe model updates; use a Secure Aggregation / DP ",
-           "profile (e.g. clinical_default or high_sensitivity_dp), or set ",
-           "dsflower.allow_untrusted_coordinator=TRUE to override.", call. = FALSE)
+           "but this run has no Secure Aggregation (e.g. fewer than 3 nodes). A ",
+           "remote coordinator could observe per-node updates. Use >=3 nodes for ",
+           "SecAgg, or set dsflower.allow_untrusted_coordinator=TRUE to override ",
+           "(DP still protects individual records).", call. = FALSE)
     }
   }
 
@@ -704,14 +627,8 @@ flowerCleanupRunDS <- function(handle_symbol) {
         jsonlite::fromJSON(manifest_path, simplifyVector = TRUE),
         error = function(e) NULL
       )
-      mode <- manifest[["privacy-mode"]] %||% manifest[["privacy_profile"]]
-      dp_scope <- manifest[["dp_scope"]] %||% "none"
-      is_dp_run <- !is.null(manifest) && (
-        mode %in% c("dp", "high_sensitivity_dp", "clinical_update_noise") ||
-          dp_scope %in% c("patient_level_dp_sgd", "update_noise_only") ||
-          isTRUE(manifest[["dp_required"]])
-      )
-      if (is_dp_run) {
+      # DP is always enforced, so every run spends from the privacy budget.
+      if (!is.null(manifest)) {
         dataset_key <- .privacy_dataset_key(
           handle,
           manifest$target_column %||% handle$target_column %||% "unknown"
@@ -806,9 +723,6 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
   # Disclosure settings
   settings <- .flowerDisclosureSettings()
 
-  # Trust profile
-  trust <- .flowerTrustProfile()
-
   # SuperNode status
   node_list <- .supernode_list()
 
@@ -826,11 +740,11 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     max_rounds          = settings$max_rounds,
     allow_custom_config = settings$allow_custom_config,
     min_samples         = settings$nfilter_subset,
+    min_clients_per_round = 1L,
+    dp_required         = TRUE,
     active_supernodes   = nrow(node_list[node_list$alive, , drop = FALSE]),
     is_docker           = is_docker,
-    hostname            = Sys.info()[["nodename"]],
-    privacy_profile     = trust$name,
-    trust_profile       = trust
+    hostname            = Sys.info()[["nodename"]]
   )
 
   # Add handle-specific info if symbol provided
@@ -939,9 +853,8 @@ flowerMetricsDS <- function(handle_symbol, since_round = 0L) {
   # Apply disclosure controls
   metrics <- .sanitizeMetrics(metrics)
 
-  # Apply trust profile metric suppression (defense in depth)
-  trust <- .flowerTrustProfile()
-  if (!trust$allow_per_node_metrics && nrow(metrics) > 0) {
+  # Non-disclosive by default: always strip per-node metrics + bucket counts.
+  if (nrow(metrics) > 0) {
     # Keep only aggregated metrics (loss, num_clients), strip per-node detail
     per_node_metrics <- c("accuracy", "f1", "f1_score", "precision",
                           "recall", "auc", "roc_auc", "mse", "mae",
@@ -951,7 +864,7 @@ flowerMetricsDS <- function(handle_symbol, since_round = 0L) {
                          , drop = FALSE]
     }
   }
-  if (!trust$allow_exact_num_examples && nrow(metrics) > 0) {
+  if (nrow(metrics) > 0) {
     if ("metric" %in% names(metrics) && "value" %in% names(metrics)) {
       ne_idx <- tolower(metrics$metric) == "num_examples"
       if (any(ne_idx)) {
@@ -1264,21 +1177,9 @@ flowerListTemplatesDS <- function() {
   }
   all_templates <- list.dirs(templates_dir, full.names = FALSE, recursive = FALSE)
 
-  # Filter: only return templates that support the active trust profile.
-  # Templates whose family has NA for the active profile are hidden.
-  profile <- tryCatch(.flowerTrustProfile(), error = function(e) {
-    list(name = "clinical_default")
-  })
-
-  Filter(function(t) {
-    family <- .TEMPLATE_FAMILIES[[t]]
-    if (is.null(family)) return(FALSE)
-    profile_idx <- match(profile$name, .PROFILE_ORDER)
-    if (is.na(profile_idx)) return(FALSE)
-    min_rows_vec <- .FAMILY_MIN_ROWS[[family]]
-    if (is.null(min_rows_vec)) return(FALSE)
-    !is.na(min_rows_vec[profile_idx])
-  }, all_templates)
+  # Return every known template (DP is always enforced; there are no profiles
+  # that hide templates). A template is "known" if it maps to a family.
+  Filter(function(t) !is.null(.TEMPLATE_FAMILIES[[t]]), all_templates)
 }
 
 #' Get a Template

@@ -1001,19 +1001,16 @@
     manifest <- c(manifest, extra_config)
   }
 
-  # Write privacy config into manifest
-  trust <- tryCatch(.flowerTrustProfile(), error = function(e) NULL)
-  if (!is.null(trust)) {
-    manifest[["privacy_profile"]]            <- trust$name
-    manifest[["allow_per_node_metrics"]]     <- trust$allow_per_node_metrics
-    manifest[["allow_exact_num_examples"]]   <- trust$allow_exact_num_examples
-    manifest[["require_secure_aggregation"]] <- trust$require_secure_aggregation
-    manifest[["dp_required"]]                <- trust$dp_required
-    manifest[["min_clients_per_round"]]      <- trust$min_clients_per_round
-    manifest[["fixed_client_sampling"]]      <- trust$fixed_client_sampling
-    manifest[["dp_scope"]]                   <- trust$dp_scope
-    manifest[["evaluation_only"]]            <- trust$evaluation_only
-  }
+  # Differential privacy is ALWAYS enforced; write the DP-always contract into
+  # the manifest (Secure Aggregation is requested by the client when >=3 nodes).
+  rsa <- manifest[["require_secure_aggregation"]] %||%
+    manifest[["require-secure-aggregation"]] %||% FALSE
+  manifest[["dp_enabled"]]                 <- TRUE
+  manifest[["allow_per_node_metrics"]]     <- FALSE
+  manifest[["allow_exact_num_examples"]]   <- FALSE
+  manifest[["fixed_client_sampling"]]      <- TRUE
+  manifest[["require_secure_aggregation"]] <-
+    isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
 
   manifest_path <- file.path(staging_dir, "manifest.json")
   jsonlite::write_json(manifest, manifest_path,

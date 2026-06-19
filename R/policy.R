@@ -5,142 +5,6 @@
 # following the DataSHIELD convention of double-fallback:
 #   getOption("dsflower.X", getOption("default.dsflower.X", hardcoded_default))
 
-# --- Profile Order ---
-# Canonical ordering of privacy profiles, from least to most restrictive.
-.PROFILE_ORDER <- c(
-  "sandbox_open",
-  "trusted_internal",
-  "consortium_internal",
-  "clinical_default",
-  "clinical_hardened",
-  "clinical_update_noise",
-  "high_sensitivity_dp"
-)
-
-# --- Trust Profiles ---
-# Server-controlled profiles that determine what privacy guarantees are
-# enforced. The client requests a profile and the server enforces it.
-#
-# IMPORTANT SECURITY NOTES:
-#
-# 1. model_release is "advisory_gated" (not "gated") in clinical profiles
-#    because it is NOT enforceable when the researcher controls the SuperLink.
-#    The final global model lives on the researcher's machine by design.
-#    For truly gated model release, the SuperLink must run on a trusted
-#    neutral host or TEE.
-#
-# 2. dp_scope has two levels:
-#    - "update_noise_only": weight delta clipping + Gaussian noise on updates.
-#      Provides meaningful obfuscation but NOT formal patient-level DP.
-#    - "patient_level_dp_sgd": per-example gradient clipping via Opacus.
-#      Provides formal patient-level differential privacy guarantees.
-#
-# 3. Secure aggregation (SecAgg+) protects individual weight updates from
-#    the SuperLink, but the final aggregated model is still visible to the
-#    researcher. Profiles/templates that require SecAgg must have both
-#    server-side SecAggPlusWorkflow support and client-side secaggplus_mod.
-
-.TRUST_PROFILES <- list(
-  sandbox_open = list(
-    min_train_rows             = 3,
-    allow_per_node_metrics     = TRUE,
-    allow_exact_num_examples   = TRUE,
-    require_secure_aggregation = FALSE,
-    dp_required                = FALSE,
-    model_release              = "allowed",
-    min_clients_per_round      = 1L,
-    fixed_client_sampling      = FALSE,
-    dp_scope                   = "none",
-    min_positive_examples      = 0L,
-    min_per_class              = 0L,
-    min_events                 = 0L
-  ),
-  trusted_internal = list(
-    min_train_rows             = 50,
-    allow_per_node_metrics     = TRUE,
-    allow_exact_num_examples   = FALSE,
-    require_secure_aggregation = FALSE,
-    dp_required                = FALSE,
-    model_release              = "allowed",
-    min_clients_per_round      = 1L,
-    fixed_client_sampling      = FALSE,
-    dp_scope                   = "none",
-    min_positive_examples      = 5L,
-    min_per_class              = 5L,
-    min_events                 = 5L
-  ),
-  consortium_internal = list(
-    min_train_rows             = 50,
-    allow_per_node_metrics     = FALSE,
-    allow_exact_num_examples   = FALSE,
-    require_secure_aggregation = TRUE,
-    dp_required                = FALSE,
-    model_release              = "advisory_gated",
-    min_clients_per_round      = 2L,
-    fixed_client_sampling      = TRUE,
-    dp_scope                   = "none",
-    min_positive_examples      = 10L,
-    min_per_class              = 10L,
-    min_events                 = 10L
-  ),
-  clinical_default = list(
-    min_train_rows             = 100,
-    allow_per_node_metrics     = FALSE,
-    allow_exact_num_examples   = FALSE,
-    require_secure_aggregation = TRUE,
-    dp_required                = FALSE,
-    model_release              = "advisory_gated",
-    min_clients_per_round      = 2L,
-    fixed_client_sampling      = TRUE,
-    dp_scope                   = "none",
-    min_positive_examples      = 20L,
-    min_per_class              = 20L,
-    min_events                 = 20L
-  ),
-  clinical_hardened = list(
-    min_train_rows             = 200,
-    allow_per_node_metrics     = FALSE,
-    allow_exact_num_examples   = FALSE,
-    require_secure_aggregation = TRUE,
-    dp_required                = FALSE,
-    model_release              = "advisory_gated",
-    min_clients_per_round      = 3L,
-    fixed_client_sampling      = TRUE,
-    dp_scope                   = "none",
-    min_positive_examples      = 30L,
-    min_per_class              = 30L,
-    min_events                 = 30L
-  ),
-  clinical_update_noise = list(
-    min_train_rows             = 200,
-    allow_per_node_metrics     = FALSE,
-    allow_exact_num_examples   = FALSE,
-    require_secure_aggregation = TRUE,
-    dp_required                = TRUE,
-    model_release              = "advisory_gated",
-    min_clients_per_round      = 2L,
-    fixed_client_sampling      = TRUE,
-    dp_scope                   = "update_noise_only",
-    min_positive_examples      = 30L,
-    min_per_class              = 30L,
-    min_events                 = 30L
-  ),
-  high_sensitivity_dp = list(
-    min_train_rows             = 500,
-    allow_per_node_metrics     = FALSE,
-    allow_exact_num_examples   = FALSE,
-    require_secure_aggregation = TRUE,
-    dp_required                = TRUE,
-    model_release              = "advisory_gated",
-    min_clients_per_round      = 3L,
-    fixed_client_sampling      = TRUE,
-    dp_scope                   = "patient_level_dp_sgd",
-    min_positive_examples      = 50L,
-    min_per_class              = 50L,
-    min_events                 = 50L
-  )
-)
-
 # --- Template Family Matrix ---
 # Maps each template to a family, and each family to per-profile minimum
 # row counts. NA means the template is NOT supported under that profile.
@@ -164,17 +28,6 @@
   pytorch_densenet121        = "vision",
   pytorch_unet2d             = "segmentation",
   xgboost                    = "xgboost_histogram"
-)
-
-# Per-family minimum rows indexed by .PROFILE_ORDER.
-# NA = template family not supported under that profile.
-.FAMILY_MIN_ROWS <- list(
-  closed_form_linear = c(3L, 50L, 50L, 100L, 200L, NA_integer_, NA_integer_),
-  iterative_linear   = c(3L, 100L, 100L, 200L, 300L, 200L, 500L),
-  tabular_deep       = c(3L, 250L, 250L, 500L, 750L, 500L, 1000L),
-  vision             = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
-  segmentation       = c(3L, 500L, 500L, 1000L, 1500L, 2000L, 5000L),
-  xgboost_histogram  = c(3L, 100L, 100L, 200L, 300L, 500L, NA_integer_)
 )
 
 # --- Template Metadata ---
@@ -334,290 +187,13 @@
   invisible(TRUE)
 }
 
-# Templates validated for patient-level DP-SGD (Opacus per-sample gradients).
-# Excluded: losses with inter-sample dependencies (Cox risk sets),
-# vision models (not yet validated with Opacus memory/correctness),
-# and xgboost (not gradient-based).
-# Strict whitelist: only templates with verified per-sample decomposable
-# losses AND no BatchNorm AND no non-standard LSTM. Validated means:
-# - Loss is a simple sum/mean over independent per-sample terms
-# - Model passes Opacus ModuleValidator.is_valid() or uses only
-#   DP-compatible layers (Linear, ReLU, Conv without BN)
-# - No inter-sample dependencies in loss computation
-.DP_SGD_VALIDATED_TEMPLATES <- c(
-  "pytorch_logreg",
-  "pytorch_linear_regression",
-  "pytorch_multiclass",
-  "pytorch_multilabel",
-  "pytorch_mlp",
-  "pytorch_poisson"
-)
-
-# Templates that are deliberately excluded from high_sensitivity_dp because
-# their current loss/model path has not been validated for Opacus per-example
-# gradients. Some can still run under clinical_update_noise, which is an
-# update/histogram hardening profile rather than a patient-level DP-SGD claim.
-.DP_SGD_PENDING_VALIDATION <- c(
-  "sklearn_sgd",               # No formal DP accountant in sklearn SGD
-  "pytorch_coxph",             # Cox partial likelihood has risk set dependencies
-  "pytorch_lognormal_aft",     # Censoring-aware loss needs validation
-  "pytorch_cause_specific_cox",# Same risk set issue as CoxPH
-  "pytorch_tcn",               # Uses BatchNorm (not DP-compatible per Opacus)
-  "pytorch_lstm",              # Needs DPLSTM or strict Opacus validation
-  "pytorch_resnet18",          # Vision: BN + memory not validated
-  "pytorch_densenet121",       # Vision: BN + memory not validated
-  "pytorch_unet2d"             # Vision: BN + memory not validated
-)
-
-#' Validate template compatibility with the active trust profile
-#'
-#' Rejects templates whose family has NA for the given profile index.
-#' Additionally enforces per-template DP-SGD validation: only templates
-#' with verified per-sample gradient support are allowed under
-#' \code{high_sensitivity_dp}.
-#'
-#' @param template_name Character; the template name.
-#' @param profile_name Character; the active trust profile name.
-#' @return TRUE invisibly, or stops with an error.
-#' @keywords internal
-.validateTemplateProfile <- function(template_name, profile_name) {
-  # Per-template DP-SGD restriction
-  if (profile_name == "high_sensitivity_dp") {
-    if (!template_name %in% .DP_SGD_VALIDATED_TEMPLATES) {
-      reason <- if (template_name %in% .DP_SGD_PENDING_VALIDATION) {
-        paste0("This template's loss function has not been validated for ",
-               "Opacus per-sample gradients (inter-sample dependencies such ",
-               "as Cox risk sets, censoring-aware objectives, sequence state ",
-               "or large vision models). Use 'clinical_update_noise' profile ",
-               "instead.")
-      } else {
-        "This template is not validated for patient-level DP-SGD."
-      }
-      stop("Template '", template_name, "' cannot be used with ",
-           "'high_sensitivity_dp' profile. ", reason, call. = FALSE)
-    }
-  }
-
-  family <- .TEMPLATE_FAMILIES[[template_name]]
-  if (is.null(family)) {
-    if (profile_name %in% c("clinical_update_noise", "high_sensitivity_dp")) {
-      stop("Template '", template_name, "' has no registered family. ",
-           "Cannot use with '", profile_name, "' profile (requires verified ",
-           "DP support).", call. = FALSE)
-    }
-    return(invisible(TRUE))
-  }
-
-  profile_idx <- match(profile_name, .PROFILE_ORDER)
-  if (is.na(profile_idx)) {
-    stop("Unknown profile '", profile_name, "' for template validation.",
-         call. = FALSE)
-  }
-
-  min_rows_vec <- .FAMILY_MIN_ROWS[[family]]
-  if (is.null(min_rows_vec) || is.na(min_rows_vec[profile_idx])) {
-    stop("Template '", template_name, "' (family '", family,
-         "') is not supported under the '", profile_name, "' profile.",
-         call. = FALSE)
-  }
-
-  invisible(TRUE)
-}
-
-#' Get the minimum row count for a template under a given profile
-#'
-#' @param template_name Character; the template name.
-#' @param profile_name Character; the active trust profile name.
-#' @return Integer; the minimum row count, or NULL if unknown template.
-#' @keywords internal
-.templateMinRows <- function(template_name, profile_name) {
-  family <- .TEMPLATE_FAMILIES[[template_name]]
-  if (is.null(family)) return(NULL)
-
-  profile_idx <- match(profile_name, .PROFILE_ORDER)
-  if (is.na(profile_idx)) return(NULL)
-
-  min_rows_vec <- .FAMILY_MIN_ROWS[[family]]
-  if (is.null(min_rows_vec)) return(NULL)
-
-  val <- min_rows_vec[profile_idx]
-  if (is.na(val)) return(NULL)
-  # Admin/demo override per family so the production-safe defaults above are never
-  # silently weakened: e.g. options(dsflower.family_min_rows.iterative_linear = 20).
-  ov <- .dsf_option(paste0("family_min_rows.", family), NULL)
-  if (!is.null(ov)) { ovn <- suppressWarnings(as.numeric(ov)); if (!is.na(ovn)) val <- ovn }
-  val
-}
-
-#' Enforce absolute floors on a trust profile
-#'
-#' These floors cannot be violated regardless of admin overrides:
-#' - min_train_rows >= 3
-#' - min_clients_per_round >= 1
-#'
-#' @param profile Named list; the trust profile settings.
-#' @return The profile with floors enforced.
-#' @keywords internal
-.enforce_absolute_floors <- function(profile) {
-  profile$min_train_rows <- max(profile$min_train_rows, 3)
-  profile$min_clients_per_round <- max(profile$min_clients_per_round, 1L)
-  if (isTRUE(profile$require_secure_aggregation)) {
-    profile$min_clients_per_round <- max(profile$min_clients_per_round, 3L)
-  }
-  profile
-}
-
-#' Get the effective trust profile
-#'
-#' Reads the \code{dsflower.privacy_profile} option (default "clinical_default")
-#' and returns the effective settings. Admin overrides via Opal options are
-#' authoritative (can both raise AND lower), with absolute floors enforced after.
-#'
-#' The "sandbox_open" profile requires explicit admin opt-in via
-#' \code{dsflower.allow_sandbox = TRUE}.
-#'
-#' DP-locked profiles (clinical_update_noise, high_sensitivity_dp) cannot have
-#' require_secure_aggregation or dp_required disabled via overrides.
-#'
-#' @return Named list of trust profile settings.
-#' @keywords internal
-.flowerTrustProfile <- function() {
-  profile_name <- .dsf_option("privacy_profile", "clinical_default")
-  if (!profile_name %in% names(.TRUST_PROFILES)) {
-    stop("Unknown privacy profile: '", profile_name,
-         "'. Valid profiles: ", paste(names(.TRUST_PROFILES), collapse = ", "),
-         call. = FALSE)
-  }
-
-  # sandbox_open requires explicit admin opt-in
-  if (identical(profile_name, "sandbox_open")) {
-    allow_sandbox <- as.logical(.dsf_option("allow_sandbox", FALSE))
-    if (!isTRUE(allow_sandbox)) {
-      stop("The 'sandbox_open' privacy profile requires explicit admin opt-in. ",
-           "It disables secure aggregation, exposes per-node metrics, and reveals ",
-           "exact sample counts -- all of which are disclosive under the DataSHIELD ",
-           "threat model. To enable, set: options(dsflower.allow_sandbox = TRUE). ",
-           "Default profile is 'clinical_default'.",
-           call. = FALSE)
-    }
-  }
-
-  profile <- .TRUST_PROFILES[[profile_name]]
-  profile$name <- profile_name
-
-  dp_locked <- profile_name %in% c("clinical_update_noise", "high_sensitivity_dp")
-
-  # --- Authoritative overrides (can raise AND lower) ---
-
-  raw_min_rows <- .dsf_option("min_train_rows", NULL)
-  if (!is.null(raw_min_rows)) {
-    override_val <- as.numeric(raw_min_rows)
-    if (!is.na(override_val)) {
-      profile$min_train_rows <- override_val
-    }
-  }
-
-  raw_per_node <- .dsf_option("allow_per_node_metrics", NULL)
-  if (!is.null(raw_per_node)) {
-    profile$allow_per_node_metrics <- as.logical(raw_per_node)
-  }
-
-  raw_exact <- .dsf_option("allow_exact_num_examples", NULL)
-  if (!is.null(raw_exact)) {
-    profile$allow_exact_num_examples <- as.logical(raw_exact)
-  }
-
-  raw_secagg <- .dsf_option("require_secure_aggregation", NULL)
-  if (!is.null(raw_secagg)) {
-    val <- as.logical(raw_secagg)
-    if (dp_locked && identical(val, FALSE)) {
-      warning("Cannot disable secure aggregation for DP-locked profile '",
-              profile_name, "'. Forcing require_secure_aggregation = TRUE.",
-              call. = FALSE)
-      profile$require_secure_aggregation <- TRUE
-    } else {
-      profile$require_secure_aggregation <- val
-    }
-  }
-
-  raw_dp <- .dsf_option("dp_required", NULL)
-  if (!is.null(raw_dp)) {
-    val <- as.logical(raw_dp)
-    if (dp_locked && identical(val, FALSE)) {
-      warning("Cannot disable DP for DP-locked profile '",
-              profile_name, "'. Forcing dp_required = TRUE.",
-              call. = FALSE)
-      profile$dp_required <- TRUE
-    } else {
-      profile$dp_required <- val
-    }
-  }
-
-  raw_min_clients <- .dsf_option("min_clients_per_round", NULL)
-  if (!is.null(raw_min_clients)) {
-    override_val <- as.integer(raw_min_clients)
-    if (!is.na(override_val)) {
-      profile$min_clients_per_round <- override_val
-    }
-  }
-
-  raw_fixed <- .dsf_option("fixed_client_sampling", NULL)
-  if (!is.null(raw_fixed)) {
-    profile$fixed_client_sampling <- as.logical(raw_fixed)
-  }
-
-  raw_dp_scope <- .dsf_option("dp_scope", NULL)
-  if (!is.null(raw_dp_scope)) {
-    profile$dp_scope <- as.character(raw_dp_scope)
-  }
-
-  raw_min_pos <- .dsf_option("min_positive_examples", NULL)
-  if (!is.null(raw_min_pos)) {
-    override_val <- as.integer(raw_min_pos)
-    if (!is.na(override_val)) {
-      profile$min_positive_examples <- override_val
-    }
-  }
-
-  raw_min_class <- .dsf_option("min_per_class", NULL)
-  if (!is.null(raw_min_class)) {
-    override_val <- as.integer(raw_min_class)
-    if (!is.na(override_val)) {
-      profile$min_per_class <- override_val
-    }
-  }
-
-  raw_min_ev <- .dsf_option("min_events", NULL)
-  if (!is.null(raw_min_ev)) {
-    override_val <- as.integer(raw_min_ev)
-    if (!is.na(override_val)) {
-      profile$min_events <- override_val
-    }
-  }
-
-  # evaluation_only modifier
-  raw_eval_only <- .dsf_option("evaluation_only", NULL)
-  if (!is.null(raw_eval_only) && isTRUE(as.logical(raw_eval_only))) {
-    profile$model_release <- "blocked"
-    profile$allow_per_node_metrics <- FALSE
-    profile$evaluation_only <- TRUE
-  } else {
-    profile$evaluation_only <- FALSE
-  }
-
-  # Enforce absolute floors
-  profile <- .enforce_absolute_floors(profile)
-
-  profile
-}
-
 #' Validate target distribution against trust profile thresholds
 #'
 #' Uses the explicit task type when provided and otherwise infers a conservative
 #' classification/survival interpretation from the target column. Validates:
-#' - Binary (2 unique values): min(table(target)) >= trust$min_positive_examples
-#' - Multiclass (>2 unique): all(table(target) >= trust$min_per_class)
-#' - Survival (2-column target or event/status column): sum(events==1) >= trust$min_events
+#' - Binary (2 unique values): min(table(target)) >= .disclosure_min_cell()
+#' - Multiclass (>2 unique): all(table(target) >= .disclosure_min_cell())
+#' - Survival (2-column target or event/status column): sum(events==1) >= .disclosure_min_cell()
 #' - Regression/count targets: no class-count check is applied.
 #'
 #' Error messages are deliberately generic to avoid leaking counts.
@@ -629,7 +205,7 @@
 #'   "survival", etc.) or NULL.
 #' @return TRUE invisibly, or stops with an error.
 #' @keywords internal
-.validateClassDistribution <- function(data, target_column, trust,
+.validateClassDistribution <- function(data, target_column,
                                        task_type = NULL) {
   if (is.null(target_column) || length(target_column) == 0) {
     return(invisible(TRUE))
@@ -660,7 +236,7 @@
     if (event_col %in% names(data)) {
       events <- data[[event_col]]
       n_events <- sum(events == 1, na.rm = TRUE)
-      if (n_events < trust$min_events) {
+      if (n_events < .disclosure_min_cell()) {
         stop("Disclosive: operation blocked -- insufficient event counts to ",
              "meet disclosure threshold. No further details available.",
              call. = FALSE)
@@ -685,7 +261,7 @@
   if (identical(task_type, "survival") ||
       tolower(tc) %in% c("event", "status", "dead", "died")) {
     n_events <- sum(target_vals == 1, na.rm = TRUE)
-    if (n_events < trust$min_events) {
+    if (n_events < .disclosure_min_cell()) {
       stop("Disclosive: operation blocked -- insufficient event counts to ",
            "meet disclosure threshold. No further details available.",
            call. = FALSE)
@@ -696,7 +272,7 @@
   if (n_unique == 2) {
     # Binary classification
     counts <- table(target_vals)
-    if (min(counts) < trust$min_positive_examples) {
+    if (min(counts) < .disclosure_min_cell()) {
       stop("Disclosive: operation blocked -- insufficient class counts to ",
            "meet disclosure threshold. No further details available.",
            call. = FALSE)
@@ -704,7 +280,7 @@
   } else {
     # Multiclass
     counts <- table(target_vals)
-    if (any(counts < trust$min_per_class)) {
+    if (any(counts < .disclosure_min_cell())) {
       stop("Disclosive: operation blocked -- insufficient class counts to ",
            "meet disclosure threshold. No further details available.",
            call. = FALSE)
@@ -748,9 +324,13 @@
 #' @keywords internal
 .flowerDisclosureSettings <- function() {
   list(
-    # --- Standard DataSHIELD thresholds ---
+    # --- Standard DataSHIELD thresholds (inherited, not redefined) ---
     nfilter_subset = as.numeric(getOption("nfilter.subset",
                         getOption("default.nfilter.subset", 3))),
+    nfilter_tab = as.numeric(getOption("nfilter.tab",
+                        getOption("default.nfilter.tab", 3))),
+    nfilter_levels_max = as.numeric(getOption("nfilter.levels.max",
+                        getOption("default.nfilter.levels.max", 40))),
     # --- dsFlower-specific settings ---
     max_rounds = as.numeric(.dsf_option("max_rounds", 500)),
     allow_custom_config = as.logical(.dsf_option("allow_custom_config", FALSE)),
@@ -769,6 +349,31 @@
   )
 }
 
+#' Minimum cell count for any returned class/event/stratum count.
+#'
+#' Small-cell rule: counts at or below this are disclosive. Inherits the
+#' standard DataSHIELD table filter (\code{nfilter.tab}, default 3); a server
+#' admin may raise it via \code{dsflower.min_cell_count}.
+#' @keywords internal
+.disclosure_min_cell <- function() {
+  base <- as.integer(getOption("nfilter.tab", getOption("default.nfilter.tab", 3)))
+  ov <- suppressWarnings(as.integer(.dsf_option("min_cell_count", NA)))
+  max(base, if (is.na(ov)) base else ov, na.rm = TRUE)
+}
+
+#' Minimum training rows to allow a run.
+#'
+#' Floors at the DataSHIELD subset filter (\code{nfilter.subset}, default 3); a
+#' server admin may raise it via \code{dsflower.min_train_rows} (e.g. for deep /
+#' vision models that need far more data for a meaningful DP guarantee).
+#' @keywords internal
+.disclosure_min_rows <- function() {
+  base <- as.integer(getOption("nfilter.subset",
+                               getOption("default.nfilter.subset", 3)))
+  ov <- suppressWarnings(as.integer(.dsf_option("min_train_rows", NA)))
+  max(base, if (is.na(ov)) base else ov, na.rm = TRUE)
+}
+
 #' Assert minimum training samples
 #'
 #' Prevents training on datasets too small to provide meaningful privacy
@@ -779,8 +384,7 @@
 #' @return TRUE invisibly, or stops with an error
 #' @keywords internal
 .assertMinSamples <- function(n_samples, min_n = NULL) {
-  settings <- .flowerDisclosureSettings()
-  threshold <- if (!is.null(min_n)) min_n else settings$nfilter_subset
+  threshold <- if (!is.null(min_n)) min_n else .disclosure_min_rows()
 
   n <- as.numeric(n_samples)
   if (is.na(n) || n < threshold) {
@@ -952,13 +556,3 @@
   invisible(TRUE)
 }
 
-#' Get the active trust profile
-#'
-#' Public wrapper for use by other dsFlower-framework packages
-#' (e.g. dsImaging disclosure controls).
-#'
-#' @return Named list with trust profile settings.
-#' @export
-flowerTrustProfile <- function() {
-  .flowerTrustProfile()
-}
