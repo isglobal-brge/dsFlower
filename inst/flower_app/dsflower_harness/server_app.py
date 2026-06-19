@@ -61,12 +61,13 @@ def _save_results(cfg, model, result) -> None:
 
     final_arrays = result.arrays.to_numpy_ndarrays()
     if not final_arrays:
-        # All client updates failed -> no aggregated model. Surface cleanly
-        # (the R relay reports a failed run from the missing model artifact)
-        # instead of crashing on an empty ArrayRecord.
-        with open(os.path.join(results_dir, "history.json"), "w") as f:
-            json.dump([], f)
-        return
+        # All client updates failed -> nothing aggregated. Raise so the run is
+        # reported as a failure (the R relay detects the ServerApp exception)
+        # rather than silently succeeding with an empty model.
+        raise RuntimeError(
+            "No client updates were aggregated (all ClientApps failed); "
+            "nothing to save. Check the node-side ClientApp logs."
+        )
 
     set_torch_params(model, final_arrays)
     torch.save(model.state_dict(), os.path.join(results_dir, "model.pt"))
