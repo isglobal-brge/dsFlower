@@ -57,6 +57,7 @@ AggregateMethods:
     flowerAppPushDS,
     flowerAppInstallDS,
     flowerAppDeleteDS,
+    flowerTier2PinDS,
     c=base::c,
     list=base::list
 AssignMethods:

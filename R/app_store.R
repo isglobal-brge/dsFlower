@@ -185,6 +185,56 @@ flowerAppInstallDS <- function(token, expected_sha256) {
        packages = pkg_hashes)
 }
 
+#' Hash a node-resident trusted app package (e.g. the dsflower_tier2 runner).
+#' @keywords internal
+.compute_app_pkg_hash <- function(pkg_name) {
+  pkg_dir <- system.file("flower_app", pkg_name, package = "dsFlower")
+  if (!nzchar(pkg_dir) || !dir.exists(pkg_dir)) return("")
+  .hash_pkg_dir(pkg_dir)
+}
+
+#' Pin a Tier-2 run: trusted runner + verified uploaded app (DataSHIELD AGGREGATE)
+#'
+#' Writes \code{pinned_packages.json} into the run's staging dir so the integrity
+#' hook (multi-package, default-deny) allows exactly the node-resident
+#' \code{dsflower_tier2} runner AND the uploaded user app — both pinned to
+#' \emph{node-computed} hashes, so a client cannot dictate what runs. Records the
+#' user app's import directory for the SuperNode PYTHONPATH. The uploaded app must
+#' already be pushed + installed (sha256-verified + exfiltration-scanned).
+#' @param handle_symbol Character; the prepared run handle.
+#' @param app_token Character; the uploaded app's token.
+#' @return list(ok, pinned, user_path).
+#' @keywords internal
+#' @export
+flowerTier2PinDS <- function(handle_symbol, app_token) {
+  handle <- .getHandle(handle_symbol)
+  if (is.null(handle$staging_dir) || !dir.exists(handle$staging_dir)) {
+    stop("Run is not prepared (no staging dir); call flowerPrepareRunDS first.",
+         call. = FALSE)
+  }
+  apps_dir <- file.path(.app_spool_dir(.ds_arg(app_token)), "unpacked")
+  if (!dir.exists(apps_dir)) {
+    stop("No installed app for that token; push + install the app first.",
+         call. = FALSE)
+  }
+  user_hashes <- .compute_pkg_hashes(apps_dir)
+  if (length(user_hashes) == 0) {
+    stop("Uploaded app contains no importable Python package to pin.",
+         call. = FALSE)
+  }
+  runner_hash <- .compute_app_pkg_hash("dsflower_tier2")
+  if (!nzchar(runner_hash)) {
+    stop("The Tier-2 runner (dsflower_tier2) is not installed on this node.",
+         call. = FALSE)
+  }
+  pinned <- c(list(dsflower_tier2 = runner_hash), user_hashes)
+  jsonlite::write_json(pinned,
+                       file.path(handle$staging_dir, "pinned_packages.json"),
+                       auto_unbox = TRUE)
+  writeLines(apps_dir, file.path(handle$staging_dir, "tier2_pythonpath.txt"))
+  list(ok = TRUE, pinned = names(pinned), user_path = apps_dir)
+}
+
 #' Remove an uploaded app's spool (DataSHIELD AGGREGATE)
 #' @param token Character; upload token.
 #' @return TRUE.

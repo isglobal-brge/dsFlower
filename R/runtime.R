@@ -256,6 +256,17 @@
     hook_dir
   }
 
+  # Tier-2: make the verified uploaded app importable by the trusted runner. The
+  # path is recorded by flowerTier2PinDS; the integrity hook (loaded from hook_dir
+  # first) verifies the app against the node-computed pin before it loads.
+  tier2_pp_file <- file.path(manifest_dir, "tier2_pythonpath.txt")
+  if (file.exists(tier2_pp_file)) {
+    extra <- trimws(readLines(tier2_pp_file, n = 1, warn = FALSE))
+    if (length(extra) == 1 && nzchar(extra) && dir.exists(extra)) {
+      new_pypath <- paste0(new_pypath, ":", extra)
+    }
+  }
+
   # Build clean Python environment (strips R's LD_LIBRARY_PATH etc.)
   venv_path <- if (!is.null(runtime_desc)) runtime_desc$venv_path
                else if (!is.null(env_info)) dirname(dirname(env_info$python))
