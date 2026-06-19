@@ -185,6 +185,23 @@ simple, Flower-version-agnostic, and protocol-agnostic.
 5. Run executes **only the validated FAB, by hash** — the researcher cannot run
    un-validated code.
 
+**How the node runs *trusted* code without Flower node-pinning.** In Flower
+deployment the SuperNode runs the ClientApp from the **submitted FAB** (even under
+`--isolation=process`), so we cannot simply substitute a node-local app. Instead we
+use **content-hash verification** (`flowerVerifyAppHashDS`, already present):
+
+- **Tier 1 (model submission).** The node ships the canonical harness app + its
+  content hash. The client builds a bit-identical copy and submits it; the node
+  **verifies the submitted app's content hash == its trusted harness hash** and
+  rejects any mismatch. The Opacus DP-SGD loop is therefore guaranteed to be the
+  trusted one. The model architecture + hyperparameters arrive **only via the
+  server-written, tamper-proof manifest** (`model_zoo` builds the module from the
+  spec) — the client ships *no* training code.
+- **Tier 2 (arbitrary app).** The submitted FAB's hash will not match the harness,
+  so it is treated as untrusted: AST + ModuleValidator + dry-run validation, then
+  run in the **sandbox** behind the **ClientAppIo egress gate** (output-perturbation
+  DP). Code is contained + every release is gated, so node-trust is not required.
+
 ## 8. App validation pipeline (before any real data is touched)
 
 1. **AST scan** (Python `ast`): reject `os.system`/`subprocess`/`socket`/`eval`/
