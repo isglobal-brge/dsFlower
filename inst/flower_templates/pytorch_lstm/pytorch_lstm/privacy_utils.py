@@ -97,27 +97,22 @@ def bucket_count(n):
 
 
 def make_private_opacus(model, optimizer, trainloader, clipping_norm,
-                        epsilon, delta, epochs, noise_multiplier=None):
+                        epsilon, delta, epochs, noise_multiplier=None,
+                        num_rounds=1, num_clients=1, distributed=False,
+                        n_samples=None, batch_size=None):
     """Wrap model/optimizer/dataloader with Opacus PrivacyEngine for DP-SGD.
 
-    This provides REAL per-example differential privacy, not update-level noise.
-    Opacus validates the model architecture and automatically replaces
-    incompatible modules (e.g. BatchNorm -> GroupNorm, LSTM -> DPLSTM).
+    Provides REAL per-example differential privacy. Opacus validates the model
+    and replaces incompatible modules (BatchNorm -> GroupNorm, LSTM -> DPLSTM).
 
-    Args:
-        model: PyTorch module.
-        optimizer: PyTorch optimizer (will be recreated if model is fixed).
-        trainloader: DataLoader for training data.
-        clipping_norm: Maximum per-example gradient L2 norm.
-        epsilon: Target privacy budget (used to derive noise_multiplier
-            when noise_multiplier is not provided).
-        delta: Privacy failure probability.
-        epochs: Number of training epochs (for accountant reference).
-        noise_multiplier: Explicit noise scale. If None, derived from
-            epsilon/delta via the Gaussian mechanism formula.
+    The noise scale is calibrated to the target (epsilon, delta) over ALL
+    federated steps (num_rounds * local epochs) via Opacus' RDP accountant.
 
-    Returns:
-        Tuple of (model, optimizer, trainloader, privacy_engine).
+    Distributed DP: when ``distributed`` is set (>=3 nodes under Secure
+    Aggregation), each node adds only its 1/sqrt(N) share of the noise; the
+    SecAgg-summed aggregate then carries the full target noise, giving
+    central-DP-quality utility without a trusted aggregator. With <3 nodes each
+    node adds the full noise (local DP): same target epsilon, more noise.
     """
     from opacus import PrivacyEngine
     from opacus.validators import ModuleValidator
@@ -129,7 +124,28 @@ def make_private_opacus(model, optimizer, trainloader, clipping_norm,
     privacy_engine = PrivacyEngine()
 
     if noise_multiplier is None:
-        noise_multiplier = math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon
+        try:
+            from opacus.accountants.utils import get_noise_multiplier
+            n = int(n_samples) if n_samples else len(trainloader.dataset)
+            bs = int(batch_size) if batch_size else (
+                getattr(trainloader, "batch_size", None) or max(1, n))
+            sample_rate = min(1.0, float(bs) / max(1, n))
+            total_epochs = max(1, int(num_rounds)) * max(1, int(epochs))
+            noise_multiplier = get_noise_multiplier(
+                target_epsilon=float(epsilon),
+                target_delta=float(delta),
+                sample_rate=sample_rate,
+                epochs=total_epochs,
+                accountant="rdp",
+            )
+        except Exception:
+            # Fallback: analytic Gaussian mechanism (conservative single-shot).
+            noise_multiplier = math.sqrt(2.0 * math.log(1.25 / float(delta))) / float(epsilon)
+
+    # Distributed-DP noise split: variances add under the SecAgg sum, so each of
+    # N nodes adds sigma/sqrt(N) and the aggregate carries sigma.
+    if distributed and int(num_clients) >= 3:
+        noise_multiplier = noise_multiplier / math.sqrt(int(num_clients))
 
     model, optimizer, trainloader = privacy_engine.make_private(
         module=model,

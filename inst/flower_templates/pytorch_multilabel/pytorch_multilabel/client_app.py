@@ -180,6 +180,7 @@ def client_fn(context: Context) -> FlowerClient:
             epsilon=privacy_config["epsilon"],
             delta=privacy_config["delta"],
             epochs=local_epochs,
+            num_rounds=int(context.run_config.get("num-server-rounds", 1)), num_clients=int(privacy_config.get("num_clients", 1)), distributed=bool(privacy_config.get("require_secure_aggregation", False)), n_samples=len(trainloader.dataset), batch_size=getattr(trainloader, "batch_size", None)
         )
 
     return FlowerClient(
