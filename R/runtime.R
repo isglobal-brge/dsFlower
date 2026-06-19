@@ -118,6 +118,21 @@
   )
 }
 
+#' Resolve the SuperNode runtime for a framework directly (no template).
+#' Used for the dsFlower trusted runners (harness / tier2), which are torch apps.
+#' @keywords internal
+.resolve_framework_runtime <- function(framework) {
+  venv_path <- file.path(.venv_root(), framework)
+  python <- file.path(venv_path, "bin", "python")
+  cmd <- file.path(venv_path, "bin", "flower-supernode")
+  if (!dir.exists(venv_path))
+    stop("Venv not found: ", venv_path, ". Run dsFlower configure.", call. = FALSE)
+  if (!file.exists(cmd))
+    stop("flower-supernode not found: ", cmd, call. = FALSE)
+  list(framework = framework, venv_path = venv_path,
+       supernode_cmd = cmd, python = python)
+}
+
 #' Build a clean Python environment for subprocess launch
 #'
 #' Strips R's LD_LIBRARY_PATH and other variables that conflict
@@ -222,8 +237,14 @@
       flower_supernode = supernode_cmd,
       source = "venv")
   } else {
-    stop("No runtime.json and no template_name. Cannot resolve SuperNode binary.",
-         call. = FALSE)
+    # No template (Tier-2 uploaded app, or a harness run without a template): the
+    # dsFlower trusted runners are torch apps, so default to the pytorch venv.
+    runtime_desc <- .resolve_framework_runtime("pytorch")
+    supernode_cmd <- runtime_desc$supernode_cmd
+    env_info <- list(
+      python = runtime_desc$python,
+      flower_supernode = supernode_cmd,
+      source = "venv")
   }
 
   # Create log directory
