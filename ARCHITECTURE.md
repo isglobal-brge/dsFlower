@@ -1,10 +1,26 @@
 # dsFlower 2.0 — Architecture & Implementation Plan
 
-> Status: design locked, implementation in progress (refactor-on-`v2-rewrite`).
+> Status: **Tier-1 spine federated-validated** on live nodes (nairobi/dakar/douala).
 > Pre-reset recovery tags: `pre-reset-dp-validated` (dsFlower `acf18a1`, dsFlowerClient `aa17da7`).
-> M0 done (templates + SecAgg/Tor scope removed). Transport is **salvaged** (the v1
-> transparent DSI byte tunnel already meets every constraint), so the new effort is
-> the sandbox + egress gate + DP harness + app upload/validation.
+>
+> Done: M0 reset · M1 SecAgg strip (both sides, deployed) · M2 Tier-1 harness
+> (new Message API, always-on Opacus DP-SGD + PRV) running end-to-end (3/3 nodes,
+> status 0) · M3 content-hash trust for the harness (node pins the canonical harness
+> hash; R `.compute_harness_hash` == Python `_hash_package`). Transport is salvaged
+> (the v1 transparent DSI byte tunnel meets every constraint).
+>
+> Remaining: Tier-2 (arbitrary app upload + sandbox + ClientAppIo egress gate),
+> the validation pipeline (AST + ModuleValidator + dry-run), full DataSHIELD-option
+> wiring + admission/egress disclosure backstop, and dead-code cleanup
+> (template-store fns, coordinator/non-tunnel path).
+>
+> Bring-up learnings (live nodes): the DSI-tunnel SuperNode runs the ClientApp from
+> the client-built FAB in the node's framework venv (use a pytorch-family model so a
+> torch+opacus venv is selected); `sitecustomize.py` is **default-deny** and must pin
+> the harness (not a template) hash or it kills the ClientApp; the DP budget ledger
+> (`~/.local/share/dsFlower/privacy/`, cap `dsflower.max_epsilon`=10) accumulates per
+> dataset across *all* runs incl. failed ones — reset it or raise the cap for repeated
+> testing/demos.
 
 A system that lets researchers **upload their own Flower apps** which **install on
 DataSHIELD server nodes**, while **guaranteeing by construction** that:
