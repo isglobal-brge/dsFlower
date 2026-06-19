@@ -57,6 +57,39 @@ flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
   list(size = if (file.exists(bin)) file.size(bin) else 0)
 }
 
+#' Hash a Python package dir, byte-identically to sitecustomize.py _hash_package
+#' (and .compute_harness_hash): radix-sorted relpaths, relpath+"\n"+content+"\x00",
+#' excluding compiled artifacts. This is the hash the integrity hook pins against.
+#' @keywords internal
+.hash_pkg_dir <- function(pkg_dir) {
+  rel_files <- list.files(pkg_dir, recursive = TRUE, full.names = FALSE,
+                          all.files = TRUE, no.. = TRUE)
+  rel_files <- rel_files[!grepl("(^|/)__pycache__(/|$)", rel_files)]
+  rel_files <- rel_files[!grepl("\\.(pyc|pyo)$", rel_files)]
+  rel_files <- sort(rel_files, method = "radix")
+  blob <- raw(0)
+  for (rel in rel_files) {
+    full <- file.path(pkg_dir, rel)
+    content <- readBin(full, "raw", file.info(full)$size)
+    blob <- c(blob, charToRaw(rel), charToRaw("\n"), content, as.raw(0x00))
+  }
+  digest::digest(blob, algo = "sha256", serialize = FALSE)
+}
+
+#' Node-computed hashes of each top-level Python package in an unpacked app.
+#' These are the trust anchors the integrity hook pins (the node computes them
+#' itself, so a client cannot forge what is allowed to run).
+#' @keywords internal
+.compute_pkg_hashes <- function(apps_dir) {
+  subdirs <- list.dirs(apps_dir, recursive = FALSE, full.names = TRUE)
+  is_pkg <- vapply(subdirs, function(d)
+    length(list.files(d, pattern = "\\.py$")) > 0, logical(1))
+  pkgs <- subdirs[is_pkg]
+  hashes <- list()
+  for (p in pkgs) hashes[[basename(p)]] <- .hash_pkg_dir(p)
+  hashes
+}
+
 #' Resolve a python (with stdlib ast) for the exfiltration scan.
 #' @keywords internal
 .scan_python <- function() {
@@ -145,7 +178,11 @@ flowerAppInstallDS <- function(token, expected_sha256) {
     stop("Uploaded app failed the Tier-2 safety scan (", scan$first,
          "); rejected.", call. = FALSE)
   }
-  list(ok = TRUE, sha256 = actual, size = file.size(bin), path = apps_dir)
+  # Node-computed per-package hashes -> the integrity hook's trust anchors for a
+  # Tier-2 run (so the client cannot dictate what is allowed to run).
+  pkg_hashes <- .compute_pkg_hashes(apps_dir)
+  list(ok = TRUE, sha256 = actual, size = file.size(bin), path = apps_dir,
+       packages = pkg_hashes)
 }
 
 #' Remove an uploaded app's spool (DataSHIELD AGGREGATE)
