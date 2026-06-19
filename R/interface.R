@@ -1153,99 +1153,12 @@ flowerGetCoordinatorDS <- function() {
   )
 }
 
-# --- Template serving methods ---
-
-#' List Available Templates
-#'
-#' DataSHIELD AGGREGATE method. Returns the names of all Flower app
-#' templates installed on this server.
-#'
-#' @return Character vector of template names.
-#' @export
-flowerListTemplatesDS <- function() {
-  templates_dir <- system.file("flower_templates", package = "dsFlower")
-  if (!nzchar(templates_dir) || !dir.exists(templates_dir)) {
-    return(character(0))
-  }
-  all_templates <- list.dirs(templates_dir, full.names = FALSE, recursive = FALSE)
-
-  # Return every known template (DP is always enforced; there are no profiles
-  # that hide templates). A template is "known" if it maps to a family.
-  Filter(function(t) !is.null(.TEMPLATE_FAMILIES[[t]]), all_templates)
-}
-
-#' Get a Template
-#'
-#' DataSHIELD AGGREGATE method. Returns the Python source files for a
-#' specific Flower app template. The server controls which templates are
-#' available -- if a template is not installed, the request is denied.
-#'
-#' @param template_name Character; name of the template (e.g. "sklearn_logreg").
-#' @return Named list with \code{name} and \code{files} (a named list mapping
-#'   relative file paths to their contents as character strings).
-#' @export
-flowerGetTemplateDS <- function(template_name) {
-  # Validate template exists
-  available <- flowerListTemplatesDS()
-  if (!template_name %in% available) {
-    stop("Template '", template_name, "' is not available on this server. ",
-         "Available: ", paste(available, collapse = ", "), ".",
-         call. = FALSE)
-  }
-
-  # Read all files from the template
-  template_dir <- system.file("flower_templates", template_name,
-                               package = "dsFlower")
-  all_files <- list.files(template_dir, recursive = TRUE, full.names = FALSE)
-
-  files <- list()
-  for (f in all_files) {
-    full_path <- file.path(template_dir, f)
-    files[[f]] <- paste(readLines(full_path, warn = FALSE), collapse = "\n")
-  }
-
-  hash <- .compute_template_hash(template_name)
-  list(name = template_name, files = files, hash = hash)
-}
-
-#' Verify App Hash
-#'
-#' DataSHIELD AGGREGATE method. Compares the hash of the Flower app built
-#' by the client against the server's expected hash for that template.
-#' If the hashes do not match, the staging directory is destroyed so that
-#' the SuperNode cannot access any training data.
-#'
-#' @param handle_symbol Character; symbol of the handle.
-#' @param app_hash Character; SHA-256 hash of the app computed by the client.
-#' @param template_name Character; name of the template.
-#' @return Named list with \code{verified}, \code{expected}, \code{received}.
-#' @export
-flowerVerifyAppHashDS <- function(handle_symbol, app_hash, template_name) {
-  handle <- .getHandle(handle_symbol)
-
-  if (is.null(handle$staging_dir) || !dir.exists(handle$staging_dir)) {
-    return(list(verified = FALSE, error = "No staging directory"))
-  }
-
-  expected <- .compute_template_hash(template_name)
-  verified <- identical(app_hash, expected)
-
-  if (!verified) {
-    # Destroy staging data -- no training possible with tampered code
-    unlink(handle$staging_dir, recursive = TRUE)
-    warning("CODE VERIFICATION FAILED. Staging data destroyed. ",
-            "Expected: ", expected, ", received: ", app_hash,
-            call. = FALSE)
-  }
-
-  list(verified = verified, expected = expected, received = app_hash)
-}
 
 #' Compute the canonical SHA-256 hash of the node-resident Tier-1 harness
 #'
 #' Hashes the \code{dsflower_harness} Python package shipped with this node
 #' package, byte-for-byte identically to \code{_hash_package} in
-#' sitecustomize.py and \code{.compute_template_hash}: forward-slash relative
+#' sitecustomize.py and \code{.hash_pkg_dir}: forward-slash relative
 #' paths, radix sort, each as relpath + "\\n" + content + "\\x00", excluding
 #' compiled artifacts. Used to pin the trusted harness for code verification.
 #' @return Character; hex SHA-256, or "" if the harness is not installed.
@@ -1267,36 +1180,3 @@ flowerVerifyAppHashDS <- function(handle_symbol, app_hash, template_name) {
   digest::digest(blob, algo = "sha256", serialize = FALSE)
 }
 
-#' Compute SHA-256 hash of a template's Python files
-#'
-#' Reads all .py files from the template package directory, sorts by
-#' filename, and computes a deterministic SHA-256 hash. This must match
-#' the Python-side algorithm in \code{_dsflower_verify.py}.
-#'
-#' @param template_name Character; template name.
-#' @return Character; hex-encoded SHA-256 hash.
-#' @keywords internal
-.compute_template_hash <- function(template_name) {
-  template_dir <- system.file("flower_templates", template_name,
-                               package = "dsFlower")
-  pkg_dir <- file.path(template_dir, template_name)
-
-  # Recurse over ALL shipped files (so an injected sub-package / .so / .pth is
-  # detected), excluding environment-specific compiled artifacts. Must match
-  # _hash_package in sitecustomize.py byte-for-byte: forward-slash relative
-  # paths, codepoint (radix) sort, each as relpath + "\n" + content + "\x00".
-  rel_files <- list.files(pkg_dir, recursive = TRUE, full.names = FALSE,
-                          all.files = TRUE, no.. = TRUE)
-  rel_files <- rel_files[!grepl("(^|/)__pycache__(/|$)", rel_files)]
-  rel_files <- rel_files[!grepl("\\.(pyc|pyo)$", rel_files)]
-  rel_files <- sort(rel_files, method = "radix")
-
-  blob <- raw(0)
-  for (rel in rel_files) {
-    full <- file.path(pkg_dir, rel)
-    content <- readBin(full, "raw", file.info(full)$size)
-    blob <- c(blob, charToRaw(rel), charToRaw("\n"), content, as.raw(0x00))
-  }
-
-  digest::digest(blob, algo = "sha256", serialize = FALSE)
-}
