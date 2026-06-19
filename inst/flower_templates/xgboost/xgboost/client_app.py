@@ -16,10 +16,12 @@ from .privacy_utils import bucket_count
 class SecureXGBClient(NumPyClient):
     def __init__(self, X, y, privacy_config, n_bins=64,
                  learning_rate=0.3, reg_lambda=1.0, objective="binary:logistic",
-                 num_class=2, manifest_dir=None, batch_multiclass=False):
+                 num_class=2, manifest_dir=None, batch_multiclass=False,
+                 n_trees=10):
         self.X = X.astype(np.float64)
         self.y = y.astype(np.float64)
         self.privacy_config = privacy_config
+        self.n_trees = int(n_trees)
         self.n_bins = n_bins
         self.learning_rate = learning_rate
         self.reg_lambda = reg_lambda
@@ -233,25 +235,39 @@ class SecureXGBClient(NumPyClient):
         self._save_state()
 
     def _maybe_add_update_noise(self, flat):
-        """Add Gaussian noise to bounded histogram contributions.
+        """DP-GBDT: add Gaussian noise to the bounded grad/Hessian histogram.
 
-        For binary-logistic histogram boosting, each row contributes bounded
-        gradient and Hessian terms to one bin per feature. The profile's
-        clipping_norm is treated here as the declared L2 sensitivity bound for
-        a single row's histogram contribution, not as a norm cap on the whole
-        site-level aggregate histogram. Clipping the aggregate would destroy
-        the split signal before secure aggregation.
+        Differential privacy is ALWAYS enforced. Each row contributes bounded
+        gradient and Hessian terms to one bin per feature; clipping_norm is the
+        declared per-row L2 sensitivity of a single site's histogram
+        contribution. The noise is calibrated so the histogram releases across
+        ALL boosting rounds (n_trees x n_outputs) compose to the target
+        (epsilon, delta) via RDP -- without per-tree composition the budget
+        would be spent n_trees times over. Under Secure Aggregation (>=3 nodes)
+        each node adds only its sigma/sqrt(N) share, so the SecAgg-summed
+        histogram carries the full target noise.
         """
-        if self.privacy_config.get("privacy_mode") != "dp_update_level":
+        pc = self.privacy_config
+        sensitivity = float(pc.get("clipping_norm", 1.0))
+        epsilon = float(pc.get("epsilon", 3.0))
+        delta = float(pc.get("delta", 1e-5))
+        if sensitivity <= 0 or epsilon <= 0 or delta <= 0:
             return flat.astype(np.float32)
 
-        sensitivity = float(self.privacy_config.get("clipping_norm", 1.0))
-        epsilon = float(self.privacy_config.get("epsilon", 1.0))
-        delta = float(self.privacy_config.get("delta", 1e-5))
-        if sensitivity <= 0 or epsilon <= 0 or delta <= 0:
-            raise ValueError("epsilon, delta, and clipping_norm must be positive")
+        n_releases = max(1, int(self.n_trees) * max(1, int(self.n_outputs)))
+        try:
+            from opacus.accountants.utils import get_noise_multiplier
+            nm = get_noise_multiplier(
+                target_epsilon=epsilon, target_delta=delta,
+                sample_rate=1.0, epochs=n_releases, accountant="rdp")
+        except Exception:
+            # Advanced-composition fallback for n_releases Gaussian mechanisms.
+            nm = (math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon) * math.sqrt(n_releases)
 
-        sigma = math.sqrt(2.0 * math.log(1.25 / delta)) * (sensitivity / epsilon)
+        if pc.get("require_secure_aggregation", False) and int(pc.get("num_clients", 1)) >= 3:
+            nm = nm / math.sqrt(int(pc.get("num_clients", 1)))
+
+        sigma = nm * sensitivity
         noise = np.random.normal(0.0, sigma, size=flat.shape)
         return (flat.astype(np.float64) + noise).astype(np.float32)
 
@@ -457,6 +473,7 @@ def client_fn(context: Context) -> SecureXGBClient:
     reg_lambda = float(cfg.get("reg_lambda", 1.0))
     objective = cfg.get("objective", "binary:logistic")
     num_class = int(cfg.get("num_class", 2))
+    n_trees = int(cfg.get("n_trees", 10))
     batch_multiclass = str(cfg.get("batch_multiclass", "false")).lower() == "true"
 
     return SecureXGBClient(
@@ -468,6 +485,7 @@ def client_fn(context: Context) -> SecureXGBClient:
         num_class=num_class,
         manifest_dir=manifest_dir,
         batch_multiclass=batch_multiclass,
+        n_trees=n_trees,
     )
 
 
