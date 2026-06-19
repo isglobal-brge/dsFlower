@@ -230,6 +230,24 @@
 #'
 #' @param data Data.frame of training data.
 #' @param run_token Character; the unique run token.
+#' Force the DP-always contract into a staging manifest.
+#'
+#' Differential privacy is always enforced and disclosure is non-disclosive by
+#' default, so every manifest carries dp_enabled + suppressed metrics/counts +
+#' fixed sampling. Secure Aggregation is requested by the client (>=3 nodes).
+#' @keywords internal
+.normalize_dp_manifest <- function(manifest) {
+  rsa <- manifest[["require_secure_aggregation"]] %||%
+    manifest[["require-secure-aggregation"]] %||% FALSE
+  manifest[["dp_enabled"]]                 <- TRUE
+  manifest[["allow_per_node_metrics"]]     <- FALSE
+  manifest[["allow_exact_num_examples"]]   <- FALSE
+  manifest[["fixed_client_sampling"]]      <- TRUE
+  manifest[["require_secure_aggregation"]] <-
+    isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
+  manifest
+}
+
 #' @param target_column Character; name of the target column.
 #' @param feature_columns Character vector or NULL; names of feature columns.
 #' @param extra_config Named list of additional configuration to include in manifest.
@@ -283,6 +301,7 @@
   }
 
   # Write manifest
+  manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
   jsonlite::write_json(manifest, manifest_path,
                        auto_unbox = TRUE, pretty = TRUE, null = "null")
@@ -388,6 +407,7 @@
     manifest <- c(manifest, extra_config)
   }
 
+  manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
   jsonlite::write_json(manifest, manifest_path,
                        auto_unbox = TRUE, pretty = TRUE, null = "null")
@@ -567,6 +587,7 @@
     manifest <- c(manifest, extra_config)
   }
 
+  manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
   jsonlite::write_json(manifest, manifest_path,
                        auto_unbox = TRUE, pretty = TRUE, null = "null")
@@ -1001,17 +1022,7 @@
     manifest <- c(manifest, extra_config)
   }
 
-  # Differential privacy is ALWAYS enforced; write the DP-always contract into
-  # the manifest (Secure Aggregation is requested by the client when >=3 nodes).
-  rsa <- manifest[["require_secure_aggregation"]] %||%
-    manifest[["require-secure-aggregation"]] %||% FALSE
-  manifest[["dp_enabled"]]                 <- TRUE
-  manifest[["allow_per_node_metrics"]]     <- FALSE
-  manifest[["allow_exact_num_examples"]]   <- FALSE
-  manifest[["fixed_client_sampling"]]      <- TRUE
-  manifest[["require_secure_aggregation"]] <-
-    isTRUE(rsa) || identical(tolower(as.character(rsa)), "true")
-
+  manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
   jsonlite::write_json(manifest, manifest_path,
                        auto_unbox = TRUE, pretty = TRUE, null = "null")

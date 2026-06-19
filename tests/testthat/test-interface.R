@@ -127,10 +127,10 @@ test_that("secure aggregation runtime guard blocks unsupported server runtimes",
     }
   )
 
-  trust <- list(name = "clinical_default", require_secure_aggregation = TRUE)
+  run_config <- list(require_secure_aggregation = TRUE)
   expect_error(
-    dsFlower:::.assert_secure_aggregation_runtime("sklearn_logreg", trust),
-    "Secure Aggregation is required"
+    dsFlower:::.assert_secure_aggregation_runtime("sklearn_logreg", run_config),
+    "Secure Aggregation"
   )
 })
 

@@ -112,19 +112,17 @@ test_that(".stageData writes privacy settings from extra_config", {
   staging_dir <- dsFlower:::.stageData(
     data, token, "target", c("f1"),
     extra_config = list(
-      allow_per_node_metrics = FALSE,
-      allow_exact_num_examples = FALSE,
-      require_secure_aggregation = TRUE,
-      privacy_profile = "clinical_default"
+      require_secure_aggregation = TRUE
     )
   )
   on.exit(unlink(staging_dir, recursive = TRUE))
 
   manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  # DP-always contract: DP enabled, suppression + fixed sampling forced on.
+  expect_true(manifest$dp_enabled)
   expect_false(manifest$allow_per_node_metrics)
   expect_false(manifest$allow_exact_num_examples)
   expect_true(manifest$require_secure_aggregation)
-  expect_equal(manifest$privacy_profile, "clinical_default")
 })
 
 test_that(".stageData drops incomplete target/feature rows before manifesting", {
