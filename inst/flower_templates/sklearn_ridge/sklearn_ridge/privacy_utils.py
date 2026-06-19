@@ -158,6 +158,56 @@ def make_private_opacus(model, optimizer, trainloader, clipping_norm,
     return model, optimizer, trainloader, privacy_engine
 
 
+def dp_sgd_linear(X, y, n_outputs, epsilon, delta, clipping_norm,
+                  lr=0.5, local_epochs=5, batch_size=64, num_rounds=1,
+                  num_clients=1, distributed=False, multiclass=False,
+                  init_coef=None, init_intercept=None):
+    """Train a linear model with formal per-example DP-SGD (Opacus) and return
+    (coef, intercept) in sklearn's shape.
+
+    Gives sklearn linear models the SAME Opacus-grade (epsilon, delta)-DP and
+    distributed sigma/sqrt(N) noise split as the PyTorch templates, instead of
+    update-level noise. Warm-started from the incoming global weights.
+    """
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import TensorDataset, DataLoader
+
+    n, d = X.shape
+    out = max(1, int(n_outputs))
+    model = nn.Linear(d, out)
+    if init_coef is not None:
+        with torch.no_grad():
+            model.weight.copy_(torch.tensor(
+                np.asarray(init_coef, dtype=np.float32).reshape(out, d)))
+            if init_intercept is not None:
+                model.bias.copy_(torch.tensor(
+                    np.asarray(init_intercept, dtype=np.float32).reshape(out)))
+    yt = torch.tensor(y, dtype=torch.long if multiclass else torch.float32)
+    ds = TensorDataset(torch.tensor(X, dtype=torch.float32), yt)
+    dl = DataLoader(ds, batch_size=max(1, min(int(batch_size), n)), shuffle=True)
+    opt = torch.optim.SGD(model.parameters(), lr=float(lr))
+
+    model, opt, dl, _ = make_private_opacus(
+        model, opt, dl, clipping_norm, epsilon, delta, local_epochs,
+        num_rounds=num_rounds, num_clients=num_clients, distributed=distributed,
+        n_samples=n, batch_size=batch_size,
+    )
+
+    criterion = nn.CrossEntropyLoss() if multiclass else nn.BCEWithLogitsLoss()
+    model.train()
+    for _ in range(int(local_epochs)):
+        for xb, yb in dl:
+            opt.zero_grad()
+            o = model(xb)
+            loss = criterion(o, yb if multiclass else yb.unsqueeze(1))
+            loss.backward()
+            opt.step()
+    m = getattr(model, "_module", model)
+    return (m.weight.detach().numpy().astype(np.float64),
+            m.bias.detach().numpy().astype(np.float64))
+
+
 # --- FedBN helpers ---
 
 def is_bn_key(key):

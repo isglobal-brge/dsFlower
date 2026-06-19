@@ -11,7 +11,7 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import log_loss, accuracy_score, hinge_loss
 
 from .task import load_data, load_privacy_config
-from .privacy_utils import clip_weights, add_gaussian_noise, compute_sigma, bucket_count
+from .privacy_utils import dp_sgd_linear, bucket_count
 
 
 def _resolve_classes(y, n_classes=None):
@@ -72,27 +72,39 @@ class FlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        old_weights = [p.copy() for p in parameters]
+        pc = self.privacy_config
+        multiclass = len(self.classes) > 2
+        n_outputs = len(self.classes) if multiclass else 1
 
-        _fit_with_class_anchors(self.model, self.X, self.y, self.classes)
-        new_weights = self.get_parameters(config)
+        if multiclass:
+            idx = {c: i for i, c in enumerate(self.classes)}
+            y_enc = np.array([idx.get(v, 0) for v in self.y], dtype=np.int64)
+        else:
+            y_enc = (np.asarray(self.y) == self.classes[-1]).astype(np.float32)
 
-        # Update-level clipping/noise (NOT patient-level DP-SGD)
-        if self.privacy_config.get("privacy_mode") == "dp":
-            cn = self.privacy_config["clipping_norm"]
-            eps = self.privacy_config["epsilon"]
-            delta = self.privacy_config["delta"]
-            n = self.privacy_config["n_samples"]
-
-            new_weights = clip_weights(new_weights, old_weights, cn)
-            sigma = compute_sigma(eps, delta, cn, n)
-            new_weights = add_gaussian_noise(new_weights, old_weights, sigma, cn)
+        # Formal per-example DP-SGD (Opacus) via a torch linear surrogate,
+        # warm-started from the global model. Real (epsilon, delta)-DP +
+        # distributed sqrt(N) noise split, like the PyTorch templates.
+        coef, intercept = dp_sgd_linear(
+            np.asarray(self.X, dtype=np.float32), y_enc, n_outputs,
+            epsilon=pc["epsilon"], delta=pc["delta"],
+            clipping_norm=pc["clipping_norm"],
+            lr=float(config.get("learning_rate", 0.5)),
+            local_epochs=int(config.get("local_epochs", 5)),
+            batch_size=int(config.get("batch_size", 64)),
+            num_rounds=int(config.get("num-server-rounds", 1)),
+            num_clients=int(pc.get("num_clients", 1)),
+            distributed=bool(pc.get("require_secure_aggregation", False)),
+            multiclass=multiclass,
+            init_coef=self.model.coef_, init_intercept=self.model.intercept_,
+        )
+        self.model.coef_ = coef
+        self.model.intercept_ = intercept
 
         n_examples = len(self.X)
-        if not self.privacy_config.get("allow_exact_num_examples", True):
+        if not pc.get("allow_exact_num_examples", True):
             n_examples = bucket_count(n_examples)
-
-        return new_weights, n_examples, {}
+        return self.get_parameters(config), n_examples, {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
