@@ -36,7 +36,6 @@ AggregateMethods:
     flowerMetricsDS,
     flowerLogDS,
     flowerCheckConnectivityDS,
-    flowerGetCoordinatorDS,
     flowerPrivacyBudgetDS,
     flowerTunnelResetDS,
     flowerTunnelPollDS,

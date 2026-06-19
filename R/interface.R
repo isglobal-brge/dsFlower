@@ -579,8 +579,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   if (!isTRUE(conn_check$reachable)) {
     stop("This node has no outbound egress to the SuperLink at '",
          superlink_address, "' (", conn_check$error %||% "unreachable", "). ",
-         "Open outbound access from this server to that host:port, or point ",
-         "the federation at a reachable coordinator (see flowerGetCoordinatorDS).",
+         "Open outbound access from this server to that host:port (v2 transport ",
+         "is the DataSHIELD tunnel, so this path is normally unused).",
          call. = FALSE)
   }
 
@@ -1109,48 +1109,6 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
   }, error = function(e) {
     list(reachable = FALSE, error = conditionMessage(e))
   })
-}
-
-#' Get Configured Coordinator (Public SuperLink)
-#'
-#' DataSHIELD AGGREGATE method. Returns the publicly reachable SuperLink
-#' ("coordinator") this node has been configured to dial, so the client can
-#' auto-discover it and attach with zero manual address/certificate handling.
-#'
-#' The node operator configures it once via options or environment:
-#' \itemize{
-#'   \item \code{dsflower.coordinator_address} / \code{DSFLOWER_COORDINATOR_ADDRESS}
-#'         -- the Fleet API address SuperNodes dial (e.g. "coordinator.datashield.live:9092").
-#'   \item \code{dsflower.coordinator_control_address} /
-#'         \code{DSFLOWER_COORDINATOR_CONTROL_ADDRESS} -- the Control API the
-#'         researcher's \code{flwr run} dials (e.g. "coordinator.datashield.live:9093").
-#'   \item \code{dsflower.coordinator_ca} / \code{DSFLOWER_COORDINATOR_CA} --
-#'         path to the coordinator's CA certificate PEM.
-#' }
-#'
-#' @return Named list with \code{configured} (logical); when configured, also
-#'   \code{address}, \code{control_address}, and \code{ca_cert_pem}.
-#' @export
-flowerGetCoordinatorDS <- function() {
-  addr <- .dsf_option("coordinator_address",
-                      Sys.getenv("DSFLOWER_COORDINATOR_ADDRESS", ""))
-  if (is.null(addr) || !nzchar(addr)) {
-    return(list(configured = FALSE))
-  }
-  ctrl <- .dsf_option("coordinator_control_address",
-                      Sys.getenv("DSFLOWER_COORDINATOR_CONTROL_ADDRESS", ""))
-  ca_path <- .dsf_option("coordinator_ca",
-                         Sys.getenv("DSFLOWER_COORDINATOR_CA", ""))
-  ca_pem <- NULL
-  if (!is.null(ca_path) && nzchar(ca_path) && file.exists(ca_path)) {
-    ca_pem <- paste(readLines(ca_path, warn = FALSE), collapse = "\n")
-  }
-  list(
-    configured      = TRUE,
-    address         = addr,
-    control_address = if (!is.null(ctrl) && nzchar(ctrl)) ctrl else NULL,
-    ca_cert_pem     = ca_pem
-  )
 }
 
 

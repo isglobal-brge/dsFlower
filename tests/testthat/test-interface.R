@@ -149,11 +149,17 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
   local_mocked_bindings(
     .supernode_ensure = function(superlink_address, manifest_dir,
                                  python_path, ca_cert_path = NULL,
-                                 template_name = NULL) {
+                                 template_name = NULL, insecure = FALSE) {
       list(process = NULL, superlink_address = superlink_address,
            ca_cert_path = ca_cert_path)
     }
   )
+
+  # v2 transport is the DSI tunnel, which skips the connectivity preflight.
+  .env <- getFromNamespace(".dsflower_env", "dsFlower")
+  old_fp <- .env$tunnel_forwarder_port
+  .env$tunnel_forwarder_port <- 18080L
+  on.exit(.env$tunnel_forwarder_port <- old_fp, add = TRUE)
 
   updated <- flowerEnsureSuperNodeDS("test_tls", "127.0.0.1:9092",
                                       "fl-test", encoded)
@@ -183,11 +189,16 @@ test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)"
   local_mocked_bindings(
     .supernode_ensure = function(superlink_address, manifest_dir,
                                  python_path, ca_cert_path = NULL,
-                                 template_name = NULL) {
+                                 template_name = NULL, insecure = FALSE) {
       list(process = NULL, superlink_address = superlink_address,
            ca_cert_path = ca_cert_path)
     }
   )
+
+  .env <- getFromNamespace(".dsflower_env", "dsFlower")
+  old_fp <- .env$tunnel_forwarder_port
+  .env$tunnel_forwarder_port <- 18080L
+  on.exit(.env$tunnel_forwarder_port <- old_fp, add = TRUE)
 
   updated <- flowerEnsureSuperNodeDS("test_no_tls", "127.0.0.1:9092", "fl-test")
   expect_null(updated$ca_cert_path)
