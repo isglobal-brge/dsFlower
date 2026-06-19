@@ -214,23 +214,42 @@ use **content-hash verification** (`flowerVerifyAppHashDS`, already present):
   server-written, tamper-proof manifest** (`model_zoo` builds the module from the
   spec) — the client ships *no* training code.
 - **Tier 2 (arbitrary app).** The submitted FAB's hash will not match the harness,
-  so it is treated as untrusted: AST + ModuleValidator + dry-run validation, then
-  run in the **sandbox** behind the **ClientAppIo egress gate** (output-perturbation
-  DP). Code is contained + every release is gated, so node-trust is not required.
+  so it is treated as untrusted: the **exfiltration scan** (§8) gates install, then
+  it runs in the **sandbox** behind the **ClientAppIo egress gate**
+  (output-perturbation DP). Code is contained + every release is gated, so
+  node-trust is not required.
 
-## 8. App validation pipeline (before any real data is touched)
+## 8. Validation pipeline (before any real data is touched)
 
-1. **AST scan** (Python `ast`): reject `os.system`/`subprocess`/`socket`/`eval`/
-   `exec`/`__import__`/dunder reflection / network+file-escape imports / custom
-   training loops calling `.backward`/`.grad` / `torch.no_grad` / in-place grad
-   mutation; restricted unpickler.
-2. **Opacus `ModuleValidator.is_valid`** — hard reject if false (do **not**
-   auto-`fix()` the researcher's architecture silently). Rejects DP-incompatible
-   layers (BatchNorm couples samples → unbounded sensitivity).
-3. **Synthetic dry-run**: one round in the sandbox on tiny synthetic data;
-   confirm per-sample grads attach (`.grad_sample` per param), the output shape
-   is fixed and row-independent, and only allow-listed records are emitted. This
-   catches batch-coupled losses (Cox risk sets, contrastive) the AST misses.
+Validation differs by tier, because the tiers carry DP differently. (These are
+distinct checks — do **not** apply Tier-1's per-sample-gradient rules to a Tier-2
+app, which legitimately runs its own `.backward`.)
+
+**Tier 1 (model submission) — MODEL validation.** The researcher ships only an
+`nn.Module` + config; the trusted harness owns the loop, so we validate the
+*architecture* is DP-SGD-compatible:
+1. **Opacus `ModuleValidator.is_valid`** — hard reject if false (no silent
+   `fix()`). DP-incompatible layers (BatchNorm couples samples) break the
+   per-sample sensitivity bound.
+2. **Synthetic dry-run** in the harness on tiny synthetic data: confirm per-sample
+   grads attach (`.grad_sample` per param) and the output is a fixed,
+   row-independent shape — catches batch-coupled losses (Cox risk sets,
+   contrastive) that silently break the bound.
+
+**Tier 2 (arbitrary app) — EXFILTRATION scan.** The app trains itself and the
+egress gate applies output-perturbation DP, so the app *may* call `.backward`
+freely; validation is purely about containment (defence-in-depth for the sandbox,
+which is the real boundary):
+1. **AST scan** (Python `ast`): reject dynamic-code / process-escape / network-exfil
+   constructs — `eval`/`exec`/`compile`/`__import__`, dunder reflection, and imports
+   of `os`/`subprocess`/`socket`/`ctypes`/`requests`/`urllib`/`pickle`/`marshal`.
+2. **Hash-pin the reviewed FAB** (§7): only the exact validated bytes may run.
+
+The scan only closes trivial bypasses; the sandbox (M4) + egress gate (DP +
+disclosure) are the actual guarantees. The exact import allow/deny list is settled
+together with the sandbox's filesystem/data-access model (a Tier-2 app reads the
+staged data, so `open` on the data mount must be permitted while everything else
+is denied).
 
 ## 9. DataSHIELD options (all thresholds)
 
