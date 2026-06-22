@@ -247,9 +247,10 @@ provision_framework "sklearn" "sklearn" \
 provision_framework "pytorch" "torch" \
   "torch>=2.0.0" "opacus>=1.4.0"
 
-provision_framework "pytorch_vision" "torchvision nibabel pydicom nrrd" \
-  "torch>=2.0.0" "torchvision>=0.15.0" "Pillow>=9.0.0" \
-  "nibabel>=5.0.0" "pydicom>=2.4.0" "pynrrd>=1.0.0"
+provision_framework "pytorch_vision" "torchvision opacus nibabel nrrd SimpleITK monai" \
+  "torch>=2.0.0" "opacus>=1.4.0" "torchvision>=0.15.0" "Pillow>=9.0.0" \
+  "nibabel>=5.0.0" "pydicom>=2.4.0" "pynrrd>=1.0.0" \
+  "SimpleITK>=2.2.0" "monai>=1.3.0"
 
 provision_framework "xgboost" "xgboost" \
   "xgboost>=1.7.0"

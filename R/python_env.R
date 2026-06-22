@@ -16,16 +16,23 @@
 .FRAMEWORK_PYTHON_DEPS <- list(
   sklearn = c("scikit-learn>=1.0.0"),
   pytorch = c("torch>=2.0.0", "opacus>=1.4.0"),
-  pytorch_vision = c("torch>=2.0.0", "torchvision>=0.15.0",
+  # opacus: the trusted harness applies DP-SGD to the vision head (REQUIRED, the
+  # vision DP run fails at import without it). monai: the 3D/volumetric backbone.
+  # SimpleITK: the harness reads .mha/.mhd/.dcm through it. Keep this list aligned
+  # with the FAB vision deps in dsFlowerClient::.harness_dependencies(vision=TRUE).
+  pytorch_vision = c("torch>=2.0.0", "opacus>=1.4.0", "torchvision>=0.15.0",
                      "Pillow>=9.0.0", "nibabel>=5.0.0",
-                     "pydicom>=2.4.0", "pynrrd>=1.0.0"),
+                     "pydicom>=2.4.0", "pynrrd>=1.0.0",
+                     "SimpleITK>=2.2.0", "monai>=1.3.0"),
   xgboost = c("xgboost>=1.7.0")
 )
 
 .FRAMEWORK_HEALTH_IMPORT <- list(
   sklearn = "sklearn",
   pytorch = "torch",
-  pytorch_vision = "torchvision",
+  # comma-separated single import: a venv missing opacus (DP) or monai (3D) is
+  # then reported unhealthy and re-provisioned, not silently accepted.
+  pytorch_vision = "torchvision, opacus, monai",
   xgboost = "xgboost"
 )
 
