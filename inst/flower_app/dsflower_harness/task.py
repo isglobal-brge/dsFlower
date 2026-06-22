@@ -63,6 +63,47 @@ def load_data(context=None):
     return X, np.asarray(y, dtype=np.float32)
 
 
+def is_image_run(context=None):
+    """True if the staged manifest is an image collection (data_type=='image')."""
+    return _load_manifest(context).get("data_type") == "image"
+
+
+def load_image_collection(context=None):
+    """Resolve a staged dsImaging collection to (image_paths, y).
+
+    The R side (.stageFromDescriptor_image) already resolved the dsImaging dataset
+    to a local image root + a samples table with a per-sample path column; here we
+    only join images_root + relative_path and read the label. Pixels stay on disk
+    (read lazily during feature extraction); the samples table never enters the
+    trainable tensors except the label, so sample_id / metadata are not features.
+    """
+    manifest = _load_manifest(context)
+    manifest_dir = _get_manifest_dir(context)
+    samples_file = os.path.join(manifest_dir, manifest["samples_file"])
+    if samples_file.lower().endswith(".parquet"):
+        import pyarrow.parquet as pq
+        df = pq.read_table(samples_file).to_pandas()
+    else:
+        df = pd.read_csv(samples_file)
+
+    assets = manifest.get("assets", {}) or {}
+    images = assets.get("images", {}) or {}
+    images_root = images.get("root") or manifest["data_root"]
+    path_col = images.get("path_col", "relative_path")
+    if path_col not in df.columns:
+        raise ValueError(
+            f"image samples table is missing the path column '{path_col}'")
+    paths = [os.path.join(images_root, str(p)) for p in df[path_col]]
+
+    target_col = manifest["target_column"]
+    y_series = df[target_col]
+    if pd.api.types.is_numeric_dtype(y_series):
+        y = y_series.to_numpy()
+    else:
+        y = y_series.astype("category").cat.codes.to_numpy()
+    return paths, np.asarray(y, dtype=np.float32)
+
+
 def load_privacy_config(context=None):
     """Read the tamper-proof DP parameters from the server-written manifest.
 

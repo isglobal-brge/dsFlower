@@ -163,6 +163,64 @@ spent ε > `dsflower.dp_max_epsilon`.
 for any app (both are post-processing on enforced-bounded outputs). Boundary: a
 sandbox escape, a metric routed around the gate, or an over-large ε void it.
 
+## 5b. Images (dsImaging collections) — DP linear-probing on frozen features
+
+Image inputs arrive as **dsImaging collections**, not pixel tables: a manifest +
+a samples metadata table (`sample_id`, a per-sample `relative_path`, the label,
+optional `patient_id`) over a zero-copy image root. The R staging
+(`.stageFromDescriptor_image`) resolves the collection to a local root + samples
+table; the harness reads **paths + labels only** — pixels stay on disk and are
+read lazily during feature extraction. Image bytes never leave the node.
+
+**Why not naive DP-SGD on the pixels.** DP-SGD noise scales `~ σ·C·√d`; a full
+vision net has enormous `d`, so naive vision DP-SGD is poor (literature: ~61% at
+ε≈47). So the harness **freezes a pretrained backbone** (resnet18/50/densenet121;
+MONAI 3D opt-in) — no gradients, `eval`, no-grad extraction — and DP-trains **only
+a small linear head** on the extracted features. Tiny effective `d` ⇒ small noise
+(last-layer / linear-probe DP, the dominant practical recipe). The frozen
+backbone's BatchNorm never enters the trainable graph, so Opacus' per-sample
+requirement is met without touching it.
+
+**The disclosure vector for images is the model UPDATE.** Gradient-inversion
+attacks (DLG / Inverting-Gradients / GradInversion) reconstruct *training images*
+from a single update; batches `<32` are unsafe, and **dsFlower has no Secure
+Aggregation**, so the per-node **local DP gate is the sole defense**. Mitigations:
+(1) the communicated update is a **low-dim feature-space head gradient**, far
+harder to invert into pixels than a full-network gradient; (2) Opacus **noises**
+it; (3) vision batch size is **floored to ≥32** (clamped up, never down) before
+training. Raw pixels never transit.
+
+**2D/3D, auto + plug-and-play.** File format and dimensionality are auto-detected
+at read time (`.nii/.nii.gz`→nibabel, `.nrrd`→pynrrd, `.mha/.mhd/.dcm`→SimpleITK,
+else PIL). The default **2D backbone handles both** 2D images directly and 3D
+volumes via a representative middle slice; `volumetric=TRUE` opts into a true-3D
+MONAI backbone for precision. `feature_dim` is **fixed per backbone**, so the
+ServerApp builds the head **without any images** and every node shares the same
+feature space (a **pinned** weights enum, not the version-dependent `DEFAULT`) ⇒
+FedAvg over heads is valid. Segmentation (U-Net) is **rejected** — linear-probing
+is classification only. *Air-gap, fail-closed:* 2D backbone weights come from the
+torchvision cache and the 3D backbone needs MONAI; if either is missing the
+harness raises a **clear error** rather than silently substituting random weights
+— a per-node random init would put nodes in different feature spaces and make
+FedAvg over heads invalid. An offline node must pre-seed `TORCH_HOME` / install
+MONAI; all nodes must match.
+
+**Disclosure unit = the PATIENT (admission).** Image collections hold one row per
+*image*, but several images can share a patient. Admission auto-detects a
+patient/subject column (or `dsflower.patient_column`) and counts **distinct
+patients** for both the minimum collection size *and* the minimum per-class count
+(`.imageDisclosureUnits` dedups to one row per `(patient,label)`). This catches
+the "many images, few patients" leak that per-image counting misses (e.g. 18-vs-12
+*images* but only 2 *patients* in a class → refused). No patient column → per-image.
+
+**DP unit = the IMAGE (caveat, documented).** Admission groups by patient, but the
+Opacus DP-SGD noise is applied **per-image example**, so the formal DP unit is the
+image. A patient contributing `k` images therefore has a per-patient guarantee
+weaker by up to a factor `k` (group privacy). This is the **decided** design
+(per-patient admission + per-image DP); the natural future upgrade to true
+per-patient DP is to **mean-pool features per patient** before the DP head step
+(one DP example per patient), at the cost of assuming patient-level labels.
+
 ## 6. Transport — DSI as a transparent byte tunnel (salvaged)
 
 **The DataSHIELD connection we are handed *is* the channel** — the researcher's R

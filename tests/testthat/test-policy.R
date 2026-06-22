@@ -68,3 +68,46 @@ test_that("trust-profile API has been removed", {
   expect_false(exists(".flowerTrustProfile", where = ns, inherits = FALSE))
   expect_false(exists(".validateTemplateProfile", where = ns, inherits = FALSE))
 })
+
+test_that(".detectPatientColumn finds common identifiers + honours overrides", {
+  expect_equal(
+    dsFlower:::.detectPatientColumn(data.frame(patient_id = 1, x = 2)),
+    "patient_id")
+  expect_equal(
+    dsFlower:::.detectPatientColumn(data.frame(SubjectID = 1, x = 2)),
+    "SubjectID")  # case-insensitive
+  expect_null(dsFlower:::.detectPatientColumn(data.frame(x = 1, y = 2)))
+  # run_config override picks a non-standard column name
+  expect_equal(
+    dsFlower:::.detectPatientColumn(data.frame(subj = 1, x = 2),
+                                    list(patient_column = "subj")),
+    "subj")
+})
+
+test_that(".imageDisclosureUnits groups disclosure by distinct patient", {
+  # 5 patients x 6 slices; patient-level label, 3 in class 0, 2 in class 1.
+  pid <- rep(paste0("P", 1:5), each = 6)
+  lab <- rep(c(0, 0, 0, 1, 1), each = 6)
+  sm  <- data.frame(patient_id = pid, y = lab)
+  grp <- dsFlower:::.imageDisclosureUnits(sm, "y")
+  expect_equal(grp$n_patients, 5)                 # patients, not 30 images
+  expect_equal(nrow(grp$data), 5)                 # one row per (patient,label)
+  expect_equal(as.integer(table(grp$data$y)), c(3L, 2L))  # distinct patients/class
+})
+
+test_that(".imageDisclosureUnits excludes NA/empty patient ids (no count inflation)", {
+  # class 1 has ONE real patient (P5) + 3 NA-patient slices; the NA rows must not
+  # inflate the per-class count (regression for the dedup-key NA leak).
+  sm <- data.frame(
+    patient_id = c(rep("P1", 4), rep("P2", 4), rep("P3", 4), rep("P4", 4),
+                   "P5", NA, NA, NA),
+    y = c(rep(0, 16), 1, 1, 1, 1))
+  grp <- dsFlower:::.imageDisclosureUnits(sm, "y")
+  expect_equal(grp$n_patients, 5)                 # NA is not a patient
+  expect_equal(as.integer(table(grp$data$y)), c(4L, 1L))  # class 1 == 1, not 4
+})
+
+test_that(".imageDisclosureUnits returns NULL when no patient column (per-image)", {
+  expect_null(dsFlower:::.imageDisclosureUnits(
+    data.frame(sample_id = 1:3, y = c(0, 1, 0)), "y"))
+})

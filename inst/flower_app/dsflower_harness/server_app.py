@@ -22,19 +22,31 @@ from .model_zoo import build_model, get_torch_params, set_torch_params
 app = ServerApp()
 
 
-@app.main()
-def main(grid: Grid, context: Context) -> None:
-    cfg = context.run_config
-    num_rounds = int(cfg.get("num-server-rounds", 1))
+def _build_initial_model(cfg):
+    """Build the global model the nodes will train. For an image run this is the
+    small HEAD over frozen-backbone features (feature_dim fixed by the backbone, so
+    the ServerApp needs no images); for tabular it is the configured model."""
+    if str(cfg.get("data-kind", "")).lower() == "image":
+        from . import vision
+        backbone = vision.normalize_backbone(cfg.get("backbone", cfg.get("model", "resnet18")))
+        n_classes = int(cfg.get("num-classes", 2))
+        return vision.build_head(vision.feature_dim_for(backbone), n_classes)
     n_features = int(cfg.get("num-features", 0))
     if n_features <= 0:
         raise ValueError(
             "num-features must be set in the run config "
             "(the researcher passes len(feature_columns))."
         )
+    return build_model(cfg, input_dim=n_features)
+
+
+@app.main()
+def main(grid: Grid, context: Context) -> None:
+    cfg = context.run_config
+    num_rounds = int(cfg.get("num-server-rounds", 1))
     min_nodes = int(cfg.get("min-train-nodes", 2))
 
-    model = build_model(cfg, input_dim=n_features)
+    model = _build_initial_model(cfg)
     initial = ArrayRecord(numpy_ndarrays=get_torch_params(model))
 
     strategy = FedAvg(

@@ -264,13 +264,28 @@ flowerInitDS <- function(data_symbol) {
 # Shared disclosure + DP budget enforcement for both prepare paths. DP is
 # unconditional; thresholds come from DataSHIELD options.
 .enforceDisclosureAndDp <- function(handle, target_column, template_name,
-                                    n_samples, target_data, run_config) {
+                                    n_samples, target_data, run_config,
+                                    data_type = "tabular") {
   # Admission disclosure checks (input side): never train below the configured
   # minimum rows / on a degenerate class distribution (DataSHIELD nfilter.*).
-  .assertMinSamples(n_samples, min_n = .disclosure_min_rows())
-  if (!is.null(target_data) && !is.null(target_column) && length(target_column) > 0) {
+  #
+  # Image collections: group the admission unit by PATIENT when a patient/subject
+  # column is present (a patient with many slices counts once) so both the
+  # minimum collection size and the minimum per-class count are over distinct
+  # patients. Falls back to per-image when no patient column exists.
+  n_for_min <- n_samples
+  class_dist_data <- target_data
+  if (identical(data_type, "image")) {
+    grp <- .imageDisclosureUnits(target_data, target_column, run_config)
+    if (!is.null(grp)) {
+      n_for_min <- grp$n_patients
+      class_dist_data <- grp$data
+    }
+  }
+  .assertMinSamples(n_for_min, min_n = .disclosure_min_rows())
+  if (!is.null(class_dist_data) && !is.null(target_column) && length(target_column) > 0) {
     .validateClassDistribution(
-      target_data, target_column,
+      class_dist_data, target_column,
       task_type = run_config[["task-type"]] %||% run_config[["task_type"]]
     )
   }
@@ -342,24 +357,41 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     n_samples <- staged_manifest$n_samples
 
     template_name <- run_config[["template_name"]] %||% NULL
-    # Read the target column (descriptor path) for class-distribution checks.
+    data_type <- staged_manifest$data_type %||% "tabular"
+    # Read the target frame (descriptor path) for class-distribution + patient
+    # grouping. For image collections this is the small samples metadata table
+    # (sample_id, relative_path, label, patient_id, ...); for tabular runs we
+    # select only the target column(s) to avoid loading wide feature matrices.
     target_data <- NULL
     if (!is.null(target_column) && length(target_column) > 0) {
       tryCatch({
-        staged_data_path <- file.path(staging_dir, staged_manifest$data_file)
-        if (file.exists(staged_data_path) &&
-            grepl("\\.parquet$", staged_data_path, ignore.case = TRUE)) {
-          target_data <- as.data.frame(
-            arrow::read_parquet(staged_data_path, col_select = target_column)
-          )
-        } else if (file.exists(staged_data_path)) {
-          target_data <- utils::read.csv(staged_data_path,
-                                          stringsAsFactors = FALSE)
+        if (identical(data_type, "image")) {
+          staged_data_path <- file.path(staging_dir,
+                                        staged_manifest$samples_file)
+          if (file.exists(staged_data_path) &&
+              grepl("\\.parquet$", staged_data_path, ignore.case = TRUE)) {
+            target_data <- as.data.frame(arrow::read_parquet(staged_data_path))
+          } else if (file.exists(staged_data_path)) {
+            target_data <- utils::read.csv(staged_data_path,
+                                           stringsAsFactors = FALSE)
+          }
+        } else {
+          staged_data_path <- file.path(staging_dir, staged_manifest$data_file)
+          if (file.exists(staged_data_path) &&
+              grepl("\\.parquet$", staged_data_path, ignore.case = TRUE)) {
+            target_data <- as.data.frame(
+              arrow::read_parquet(staged_data_path, col_select = target_column)
+            )
+          } else if (file.exists(staged_data_path)) {
+            target_data <- utils::read.csv(staged_data_path,
+                                            stringsAsFactors = FALSE)
+          }
         }
       }, error = function(e) NULL)
     }
     .enforceDisclosureAndDp(handle, target_column, template_name,
-                            n_samples, target_data, run_config)
+                            n_samples, target_data, run_config,
+                            data_type = data_type)
 
     # Inject validated mask paths from dsImaging (segmentation tasks)
     seg_generation_id <- run_config[["segmentation_generation_id"]] %||% NULL
@@ -415,7 +447,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   run_config <- .addDpConfigToRunConfig(run_config)
   template_name <- run_config[["template_name"]] %||% NULL
   .enforceDisclosureAndDp(handle, target_column, template_name,
-                          nrow(data), data, run_config)
+                          nrow(data), data, run_config,
+                          data_type = run_config[["data_type"]] %||% "tabular")
 
   # Stage data with manifest
   run_token <- .generate_run_token()

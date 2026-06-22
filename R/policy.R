@@ -241,6 +241,83 @@
   invisible(TRUE)
 }
 
+#' Auto-detect a patient / subject identifier column for imaging disclosure
+#'
+#' Image collections hold one row per IMAGE, but several images can belong to the
+#' same patient. The right disclosure unit for medical imaging is the PATIENT, so
+#' we group by a patient identifier when one is present. Detection is
+#' case-insensitive over common identifiers; a server admin may pin an exact
+#' column with \code{dsflower.patient_column} (or the run_config
+#' \code{patient_column}/\code{group_column}).
+#'
+#' @param df Data.frame; the samples / training metadata table.
+#' @param run_config Named list; the run configuration (optional override).
+#' @return Character column name, or NULL when no patient column is found.
+#' @keywords internal
+.detectPatientColumn <- function(df, run_config = list()) {
+  if (is.null(df) || !is.data.frame(df) || !ncol(df)) return(NULL)
+  explicit <- run_config[["patient_column"]] %||% run_config[["group_column"]] %||%
+    .dsf_option("patient_column", NA)
+  if (!is.null(explicit) && !is.na(explicit) && nzchar(as.character(explicit)) &&
+      as.character(explicit) %in% names(df)) {
+    return(as.character(explicit))
+  }
+  candidates <- c("patient_id", "patientid", "patient", "subject_id",
+                  "subjectid", "subject", "participant_id", "case_id",
+                  "person_id", "pid", "mrn")
+  lc <- tolower(names(df))
+  for (cand in candidates) {
+    hit <- which(lc == cand)
+    if (length(hit)) return(names(df)[hit[1]])
+  }
+  NULL
+}
+
+#' Reduce an image samples table to its disclosure UNIT (distinct patients)
+#'
+#' When a patient column exists, the admission checks should count distinct
+#' PATIENTS (a patient with many slices counts once) for both the minimum
+#' collection size and the minimum per-class count. Returns the distinct-patient
+#' count plus a frame with one row per (patient, label) so the existing
+#' class-distribution check counts patients-per-class. Returns NULL when no
+#' patient column is found, so the caller falls back to per-image counts.
+#'
+#' NOTE: this groups the DISCLOSURE/ADMISSION unit by patient. The DP-SGD noise
+#' in the trusted harness is applied per-IMAGE example, so the formal DP unit
+#' remains the image; a patient contributing k images has a per-patient guarantee
+#' weaker by up to a factor k (group privacy). This is documented in ARCHITECTURE.
+#'
+#' @param samples Data.frame; the image samples metadata table.
+#' @param target_column Character; label column name(s).
+#' @param run_config Named list; run configuration (for the column override).
+#' @return list(n_patients, data) or NULL.
+#' @keywords internal
+.imageDisclosureUnits <- function(samples, target_column, run_config = list()) {
+  if (is.null(samples) || !is.data.frame(samples) || !nrow(samples)) return(NULL)
+  pcol <- .detectPatientColumn(samples, run_config)
+  if (is.null(pcol)) return(NULL)
+
+  pid <- as.character(samples[[pcol]])
+  # NA / empty patient ids are NOT patients: exclude them from the distinct-patient
+  # count AND from the per-class frame, else `paste(NA, label)` yields a unique key
+  # ("NA\rlabel") that survives dedup and inflates a class count, letting a class
+  # with too few real patients pass the min-per-class check.
+  valid <- !is.na(pid) & nzchar(pid)
+  n_patients <- length(unique(pid[valid]))
+
+  tc <- if (!is.null(target_column) && length(target_column) >= 1 &&
+            target_column[[1]] %in% names(samples)) target_column[[1]] else NULL
+  if (is.null(tc)) {
+    keep <- valid & !duplicated(pid)
+    return(list(n_patients = n_patients, data = samples[keep, , drop = FALSE]))
+  }
+  # One row per (patient, label): class-distribution then counts DISTINCT
+  # patients per class (a patient with many same-label slices counts once).
+  key <- paste(pid, as.character(samples[[tc]]), sep = "\r")
+  keep <- valid & !duplicated(key)
+  list(n_patients = n_patients, data = samples[keep, , drop = FALSE])
+}
+
 #' Sanitize training metrics before returning through DataSHIELD
 #'
 #' Only round-level aggregate metrics (loss, accuracy, F1, precision,
