@@ -33,7 +33,14 @@ def train(msg: Message, context: Context) -> Message:
     user_mod = load_user_module(user_module)
 
     global_arrays = msg.content["arrays"].to_numpy_ndarrays()
-    gated = gated_local_update(user_mod, global_arrays, X, y, dict(cfg), pcfg)
+    # Compose the DP budget over rounds (DP-FedAvg): each round's output
+    # perturbation spends epsilon / num_rounds, so the TOTAL across all rounds
+    # stays within the requested epsilon. Without this, N rounds at the full
+    # epsilon leak ~N x the budget (e.g. 5 rounds at eps=3 -> eps=15).
+    num_rounds = max(1, int(cfg.get("num-server-rounds", 1)))
+    pcfg_round = dict(pcfg)
+    pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
+    gated = gated_local_update(user_mod, global_arrays, X, y, dict(cfg), pcfg_round)
 
     n_examples = dp_harness.bucket_count(len(X))
     reply = RecordDict({

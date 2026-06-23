@@ -62,7 +62,14 @@ def calibrate_noise_multiplier(epsilon, delta, sample_rate, total_epochs):
     except Exception:
         pass
     # Analytic Gaussian mechanism (conservative, single-shot).
-    return math.sqrt(2.0 * math.log(1.25 / float(delta))) / float(epsilon)
+    # PRV/RDP both failed (should not happen with opacus installed). Do NOT fall
+    # back to the single-shot analytic Gaussian sigma: applied per step over the
+    # many DP-SGD steps it UNDER-noises (composes to >> the target epsilon) -> a
+    # privacy violation. Fail closed rather than train with a wrong guarantee.
+    raise RuntimeError(
+        "Could not calibrate DP-SGD noise via the PRV/RDP accountant. Refusing to "
+        "train rather than risk under-noising; ensure opacus is installed and "
+        "(epsilon, delta, sample_rate, epochs) are valid.")
 
 
 def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
