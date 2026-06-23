@@ -179,12 +179,25 @@ install_deps() {
   local name="$1"; shift
   local venv_path="${VENV_ROOT}/${name}"
   local venv_python="${venv_path}/bin/python"
-  # CPU-only torch: Rock nodes have no GPU, so the CUDA build's bundled
-  # nvidia/triton libs (~3.5GB/venv) are dead weight. --torch-backend cpu pulls
-  # the +cpu wheels (no-op when no torch is requested) -> ~70% smaller venvs,
-  # identical computation.
+  # Adaptive torch backend. Most DataSHIELD/Rock nodes have NO GPU, where the CUDA
+  # build's nvidia/triton libs (~3.5GB/venv) are dead weight -> use CPU wheels.
+  # When an NVIDIA GPU IS visible to this container, use uv 'auto' so it installs
+  # the matching CUDA build and the GPU is actually usable. We do NOT use 'auto'
+  # unconditionally: on a GPU-less Intel host uv 'auto' picks the huge +xpu build
+  # (~8GB, still unusable). Operator can pin via DSFLOWER_TORCH_BACKEND (e.g. cu126).
   local torch_flag=""
-  case " $* " in *torch*) torch_flag="--torch-backend cpu" ;; esac
+  case " $* " in *torch*)
+    local backend="${DSFLOWER_TORCH_BACKEND:-}"
+    if [ -z "${backend}" ]; then
+      if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        backend="auto"
+      else
+        backend="cpu"
+      fi
+    fi
+    torch_flag="--torch-backend ${backend}"
+    ;;
+  esac
   log_info "  ${name}: installing $*"
   if [ "${USE_UV}" = true ]; then
     # shellcheck disable=SC2086

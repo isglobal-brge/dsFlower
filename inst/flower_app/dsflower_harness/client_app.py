@@ -36,13 +36,16 @@ app = ClientApp()
 
 
 def _dp_fit(model, X, y, pcfg, cfg, n_classes, msg):
-    """Opacus DP-SGD fit shared by the tabular + image (head) paths."""
+    """Opacus DP-SGD fit shared by the tabular + image (head) paths. Trains on the
+    GPU when one is available (model + batches on the same device), else CPU."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lr = float(cfg.get("learning-rate", 0.01))
     batch_size = int(cfg.get("batch-size", 32))
     local_epochs = int(cfg.get("local-epochs", 1))
     num_rounds = int(cfg.get("num-server-rounds", 1))
     multiclass = int(n_classes) > 2
 
+    model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     y_t = torch.from_numpy(y).long() if multiclass else torch.from_numpy(y).float()
     dataset = TensorDataset(torch.from_numpy(X).float(), y_t)
@@ -60,6 +63,7 @@ def _dp_fit(model, X, y, pcfg, cfg, n_classes, msg):
     model.train()
     for _ in range(local_epochs):
         for xb, yb in trainloader:
+            xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             out = model(xb)
             loss = criterion(out, yb) if multiclass else criterion(out, yb.unsqueeze(1))

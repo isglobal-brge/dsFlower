@@ -48,6 +48,25 @@
   .dsf_option("venv_root", "/var/lib/dsflower/venvs")
 }
 
+#' Choose the uv torch backend for this environment.
+#'
+#' "auto" only when an NVIDIA GPU is actually visible to the process (so uv
+#' installs the matching CUDA build and the GPU is usable); otherwise "cpu",
+#' which keeps the venv small AND avoids uv's "auto" picking the large +xpu
+#' build on GPU-less Intel hosts. Override with the \code{DSFLOWER_TORCH_BACKEND}
+#' env var or the \code{dsflower.torch_backend} option (e.g. "cu126").
+#' @keywords internal
+.torch_backend <- function() {
+  ov <- Sys.getenv("DSFLOWER_TORCH_BACKEND",
+                   unset = getOption("dsflower.torch_backend", ""))
+  if (nzchar(ov)) return(ov)
+  has_gpu <- nzchar(Sys.which("nvidia-smi")) &&
+    isTRUE(tryCatch(
+      system2("nvidia-smi", "-L", stdout = FALSE, stderr = FALSE) == 0L,
+      error = function(e) FALSE))
+  if (has_gpu) "auto" else "cpu"
+}
+
 #' Get all pip dependencies for a framework
 #' @keywords internal
 .python_deps_for_framework <- function(framework) {
@@ -197,13 +216,12 @@
     if (rc != 0L)
       stop("Failed to create venv at ", venv_path, call. = FALSE)
 
-    # Install deps via uv. CPU-only torch: DataSHIELD Rock nodes have no GPU, so
-    # the default CUDA torch build's bundled nvidia/triton libs (~3.5 GB/venv) are
-    # pure dead weight. --torch-backend cpu pulls the +cpu wheels (no-op when the
-    # framework has no torch) -> identical computation, ~70% smaller venvs.
+    # Install deps via uv with an ADAPTIVE torch backend (CUDA when a GPU is
+    # visible, else CPU; see .torch_backend). CPU avoids the CUDA build's unused
+    # ~3.5 GB nvidia/triton libs on GPU-less nodes.
     deps <- .python_deps_for_framework(framework)
     torch_flag <- if (any(grepl("torch", deps, fixed = TRUE)))
-      c("--torch-backend", "cpu") else character(0)
+      c("--torch-backend", .torch_backend()) else character(0)
     message("  Installing: ", paste(deps, collapse = ", "))
     venv_python <- file.path(venv_path, "bin", "python")
     result <- processx::run(

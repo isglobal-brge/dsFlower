@@ -212,9 +212,21 @@ def build_head(feature_dim, n_classes):
     return nn.Linear(int(feature_dim), out)
 
 
-def extract_features(backbone, images_np, device="cpu", batch=32):
-    """Run the frozen backbone over a stack of images (no grad) -> feature matrix."""
+def pick_device():
+    """cuda when a usable GPU is present (and torch is the CUDA build), else cpu —
+    so the SAME harness runs on CPU-only DataSHIELD nodes and transparently uses a
+    GPU when one exists. The backbone conv pass is the part that benefits most."""
     import torch
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def extract_features(backbone, images_np, device=None, batch=32):
+    """Run the frozen backbone over a stack of images (no grad) -> feature matrix.
+    device=None auto-selects GPU when available; features come back on CPU (numpy)."""
+    import torch
+    if device is None:
+        device = pick_device()
+    backbone = backbone.to(device)
     feats = []
     with torch.no_grad():
         for i in range(0, len(images_np), batch):
