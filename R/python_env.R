@@ -13,8 +13,12 @@
 .BASE_PYTHON_DEPS <- c("flwr>=1.13.0", "numpy>=1.21.0", "pandas>=1.3.0",
                         "pyarrow>=10.0.0")
 
+# Provisioned frameworks: torch (linear/MLP + DP-SGD), pytorch_vision (imaging),
+# xgboost (gradient-boosted trees — the one model class torch cannot express).
+# sklearn was dropped: its linear models are redundant with pytorch_logreg (and
+# torch gives rigorous Opacus DP-SGD), and its tree models have no federated
+# protocol. Each torch/xgboost build is GPU- or CPU-adaptive (see .gpu_present).
 .FRAMEWORK_PYTHON_DEPS <- list(
-  sklearn = c("scikit-learn>=1.0.0"),
   pytorch = c("torch>=2.0.0", "opacus>=1.4.0"),
   # opacus: the trusted harness applies DP-SGD to the vision head (REQUIRED, the
   # vision DP run fails at import without it). monai: the 3D/volumetric backbone.
@@ -24,11 +28,11 @@
                      "Pillow>=9.0.0", "nibabel>=5.0.0",
                      "pydicom>=2.4.0", "pynrrd>=1.0.0",
                      "SimpleITK>=2.2.0", "monai>=1.3.0"),
+  # xgboost build (CPU-only vs full GPU) is chosen in .python_deps_for_framework.
   xgboost = c("xgboost>=1.7.0")
 )
 
 .FRAMEWORK_HEALTH_IMPORT <- list(
-  sklearn = "sklearn",
   pytorch = "torch",
   # comma-separated single import: a venv missing opacus (DP) or monai (3D) is
   # then reported unhealthy and re-provisioned, not silently accepted.
@@ -48,30 +52,48 @@
   .dsf_option("venv_root", "/var/lib/dsflower/venvs")
 }
 
+#' TRUE when a usable NVIDIA GPU is visible to this process.
+#'
+#' The single GPU check used to pick CUDA-vs-CPU builds for BOTH torch and
+#' xgboost, so "is the GPU applied" is decided consistently. In a container the
+#' GPU is visible only if it was started GPU-enabled (nvidia runtime / --gpus),
+#' so this correctly reflects what the node can actually use. Force with
+#' \code{DSFLOWER_FORCE_GPU=1} / \code{0}.
+#' @keywords internal
+.gpu_present <- function() {
+  ov <- Sys.getenv("DSFLOWER_FORCE_GPU", "")
+  if (nzchar(ov)) return(tolower(ov) %in% c("1", "true", "yes"))
+  nzchar(Sys.which("nvidia-smi")) &&
+    isTRUE(tryCatch(
+      system2("nvidia-smi", "-L", stdout = FALSE, stderr = FALSE) == 0L,
+      error = function(e) FALSE))
+}
+
 #' Choose the uv torch backend for this environment.
 #'
-#' "auto" only when an NVIDIA GPU is actually visible to the process (so uv
-#' installs the matching CUDA build and the GPU is usable); otherwise "cpu",
-#' which keeps the venv small AND avoids uv's "auto" picking the large +xpu
-#' build on GPU-less Intel hosts. Override with the \code{DSFLOWER_TORCH_BACKEND}
-#' env var or the \code{dsflower.torch_backend} option (e.g. "cu126").
+#' "auto" only when an NVIDIA GPU is present (so uv installs the matching CUDA
+#' build and the GPU is usable); otherwise "cpu", which keeps the venv small AND
+#' avoids uv's "auto" picking the large +xpu build on GPU-less Intel hosts.
+#' Override with \code{DSFLOWER_TORCH_BACKEND} / \code{dsflower.torch_backend} (e.g. "cu126").
 #' @keywords internal
 .torch_backend <- function() {
   ov <- Sys.getenv("DSFLOWER_TORCH_BACKEND",
                    unset = getOption("dsflower.torch_backend", ""))
   if (nzchar(ov)) return(ov)
-  has_gpu <- nzchar(Sys.which("nvidia-smi")) &&
-    isTRUE(tryCatch(
-      system2("nvidia-smi", "-L", stdout = FALSE, stderr = FALSE) == 0L,
-      error = function(e) FALSE))
-  if (has_gpu) "auto" else "cpu"
+  if (.gpu_present()) "auto" else "cpu"
 }
 
-#' Get all pip dependencies for a framework
+#' Get all pip dependencies for a framework (GPU/CPU-adaptive)
 #' @keywords internal
 .python_deps_for_framework <- function(framework) {
   extra <- .FRAMEWORK_PYTHON_DEPS[[framework]]
   if (is.null(extra)) return(.BASE_PYTHON_DEPS)
+  if (identical(framework, "xgboost")) {
+    # GPU-less nodes get the CPU-only build (~18MB) instead of the full GPU wheel
+    # (~1GB of bundled CUDA); both import identically as `xgboost`. GPU node ->
+    # full xgboost so device="cuda" works.
+    extra <- if (.gpu_present()) "xgboost>=1.7.0" else "xgboost-cpu>=1.7.0"
+  }
   c(.BASE_PYTHON_DEPS, extra)
 }
 

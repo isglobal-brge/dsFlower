@@ -175,6 +175,17 @@ create_venv() {
   fi
 }
 
+# TRUE when a usable NVIDIA GPU is visible to this container (the single check
+# used to pick CUDA-vs-CPU builds for torch AND xgboost). Force with
+# DSFLOWER_FORCE_GPU=1/0. Mirrors R .gpu_present.
+gpu_present() {
+  case "$(printf '%s' "${DSFLOWER_FORCE_GPU:-}" | tr 'A-Z' 'a-z')" in
+    1|true|yes) return 0 ;;
+    0|false|no) return 1 ;;
+  esac
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+}
+
 install_deps() {
   local name="$1"; shift
   local venv_path="${VENV_ROOT}/${name}"
@@ -189,11 +200,7 @@ install_deps() {
   case " $* " in *torch*)
     local backend="${DSFLOWER_TORCH_BACKEND:-}"
     if [ -z "${backend}" ]; then
-      if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        backend="auto"
-      else
-        backend="cpu"
-      fi
+      if gpu_present; then backend="auto"; else backend="cpu"; fi
     fi
     torch_flag="--torch-backend ${backend}"
     ;;
@@ -261,9 +268,6 @@ provision_framework() {
 log_info "Provisioning Python environments for ML frameworks..."
 echo ""
 
-provision_framework "sklearn" "sklearn" \
-  "scikit-learn>=1.0.0"
-
 provision_framework "pytorch" "torch" \
   "torch>=2.0.0" "opacus>=1.4.0"
 
@@ -272,8 +276,11 @@ provision_framework "pytorch_vision" "torchvision opacus nibabel nrrd SimpleITK 
   "nibabel>=5.0.0" "pydicom>=2.4.0" "pynrrd>=1.0.0" \
   "SimpleITK>=2.2.0" "monai>=1.3.0"
 
-provision_framework "xgboost" "xgboost" \
-  "xgboost>=1.7.0"
+# xgboost: CPU-only build (~18MB) on GPU-less nodes vs the full GPU wheel (~1GB);
+# both import as `xgboost`. (sklearn dropped: redundant with pytorch_logreg, and
+# torch gives it rigorous Opacus DP-SGD.)
+if gpu_present; then XGB_DEP="xgboost>=1.7.0"; else XGB_DEP="xgboost-cpu>=1.7.0"; fi
+provision_framework "xgboost" "xgboost" "${XGB_DEP}"
 
 # Fix Python permissions (Rock runs as non-root 'rock' user)
 if [ -d "/root/.local/share/uv/python" ]; then
@@ -286,7 +293,7 @@ echo ""
 log_info "Python environment setup complete."
 log_info "Venvs stored in: ${VENV_ROOT}"
 
-for fw in sklearn pytorch pytorch_vision xgboost; do
+for fw in pytorch pytorch_vision xgboost; do
   venv="${VENV_ROOT}/${fw}"
   if [ -f "${venv}/.dsflower_ready" ]; then
     size=$(du -sh "${venv}" 2>/dev/null | cut -f1)
