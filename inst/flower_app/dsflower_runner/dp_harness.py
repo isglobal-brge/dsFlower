@@ -330,6 +330,10 @@ def per_sample_independence_probe(model, criterion, x_sample, y_sample):
     gs = GradSampleModule(model)
 
     def per_sample_grad(x, y):
+        # Seed identically each pass so stochastic layers (dropout) draw the SAME mask,
+        # isolating the row-i perturbation; without this, dropout's per-pass randomness
+        # would look like cross-sample coupling and false-positive a valid model.
+        torch.manual_seed(0)
         gs.zero_grad(set_to_none=True)
         loss = criterion(gs(x), y)
         loss.backward()
@@ -340,24 +344,30 @@ def per_sample_independence_probe(model, criterion, x_sample, y_sample):
         raise ValueError("per-sample-independence probe could not read a "
                          "grad_sample; refusing the custom model (fail closed).")
 
-    g0 = per_sample_grad(x_sample, y_sample)
-    n = x_sample.shape[0]
-    # Perturb EVERY row (not just row 0): a forward that couples via the mean of the
-    # OTHER rows (e.g. x - x[1:].mean(0)) leaves row 0 invariant but is exposed the
-    # moment any other row is perturbed. For each i, ONLY row i's per-sample gradient
-    # may change; if perturbing row i moves another row's gradient, samples couple.
-    for i in range(n):
-        x2 = x_sample.clone()
-        x2[i] = x2[i] + 1.0
-        gi = per_sample_grad(x2, y_sample)
-        if n > 1:
-            other = torch.arange(n) != i
-            if not torch.allclose(g0[other], gi[other], atol=1e-5):
-                raise ValueError(
-                    "submitted forward graph COUPLES samples (perturbing row %d "
-                    "changed another row's per-sample gradient): its DP-SGD "
-                    "guarantee would be wrong. Use a per-sample architecture or "
-                    "the egress fallback." % i)
+    # The probe's seeding must NOT leak into training (DP noise must stay random):
+    # snapshot the global RNG and restore it once the probe is done.
+    rng_state = torch.get_rng_state()
+    try:
+        g0 = per_sample_grad(x_sample, y_sample)
+        n = x_sample.shape[0]
+        # Perturb EVERY row (not just row 0): a forward that couples via the mean of the
+        # OTHER rows (e.g. x - x[1:].mean(0)) leaves row 0 invariant but is exposed the
+        # moment any other row is perturbed. For each i, ONLY row i's per-sample gradient
+        # may change; if perturbing row i moves another row's gradient, samples couple.
+        for i in range(n):
+            x2 = x_sample.clone()
+            x2[i] = x2[i] + 1.0
+            gi = per_sample_grad(x2, y_sample)
+            if n > 1:
+                other = torch.arange(n) != i
+                if not torch.allclose(g0[other], gi[other], atol=1e-5):
+                    raise ValueError(
+                        "submitted forward graph COUPLES samples (perturbing row %d "
+                        "changed another row's per-sample gradient): its DP-SGD "
+                        "guarantee would be wrong. Use a per-sample architecture or "
+                        "the egress fallback." % i)
+    finally:
+        torch.set_rng_state(rng_state)
 
 
 # --------------------------------------------------------------------------- #

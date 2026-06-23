@@ -123,6 +123,12 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
     return get_torch_params(model), len(dataset)
 
 
+# Only classification losses constrain labels to [0, n_classes); regression (mse) and
+# count (poisson_nll) targets are continuous, and multilabel targets are 2D -- none of
+# them carry a class-range invariant, so the label-range check must not run for them.
+_CLASSIFICATION_LOSSES = ("bce_logits", "cross_entropy")
+
+
 def _assert_label_range(y, n_classes):
     """The head width is fixed by num-classes; verify the labels fit it. Generic
     message (no exact counts -> no disclosure)."""
@@ -177,7 +183,8 @@ def _train_neural(msg, context, cfg, pcfg, pins):
         image_size = int(cfg.get("image-size", 224))
         paths, y, groups = load_image_collection(context)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
-        _assert_label_range(y, n_classes)
+        if pins["loss_name"] in _CLASSIFICATION_LOSSES:
+            _assert_label_range(y, n_classes)
         encoder, feat_dim = vision.build_backbone(backbone)
         read = vision.read_image_3d if vision.is_3d_backbone(backbone) else vision.read_image_2d
         try:
@@ -200,7 +207,8 @@ def _train_neural(msg, context, cfg, pcfg, pins):
     else:
         X, y = load_data(context)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
-        _assert_label_range(y, n_classes)
+        if pins["loss_name"] in _CLASSIFICATION_LOSSES:
+            _assert_label_range(y, n_classes)
         groups = load_tabular_patient_ids(context)
         if groups is not None:
             Xp, yp, pooled = _pool_by_patient(X, y, groups)
