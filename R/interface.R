@@ -298,6 +298,22 @@ flowerInitDS <- function(data_symbol) {
          eps_ceiling, "). Lower epsilon, or have the operator raise ",
          "dsflower.dp_epsilon_ceiling.", call. = FALSE)
   }
+  # delta + clip have ceilings too: otherwise a client keeps epsilon under the cap
+  # yet injects a near-1 delta (a vacuous guarantee) or an absurd clip. The node
+  # re-asserts these (task.load_privacy_config) as the fail-closed backstop; this is
+  # the early, clear-error layer so a too-weak request never reaches the manifest.
+  dp_clip <- as.numeric(run_config[["privacy-clipping_norm"]] %||% 1.0)
+  delta_ceiling <- suppressWarnings(as.numeric(.dsf_option("dp_delta_ceiling", 1e-3)))
+  clip_ceiling  <- suppressWarnings(as.numeric(.dsf_option("dp_clip_ceiling", 100)))
+  if (!is.na(delta_ceiling) && (is.na(dp_delta) || dp_delta > delta_ceiling)) {
+    stop("Requested DP delta (", dp_delta, ") exceeds this server's ceiling (",
+         delta_ceiling, "); a delta near 1 makes the (eps,delta) guarantee vacuous.",
+         call. = FALSE)
+  }
+  if (!is.na(clip_ceiling) && (is.na(dp_clip) || dp_clip > clip_ceiling)) {
+    stop("Requested DP clipping_norm (", dp_clip, ") exceeds this server's ceiling (",
+         clip_ceiling, ").", call. = FALSE)
+  }
   dataset_key <- .privacy_dataset_key(handle, target_column)
   .check_budget(dataset_key, dp_epsilon, dp_delta)
   invisible(TRUE)

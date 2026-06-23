@@ -82,4 +82,10 @@ def load_user_model(cfg, input_dim, *, input_key="num-features", allow_custom=Fa
             "model is not DP-compatible (Opacus ModuleValidator): %s"
             % ModuleValidator.validate(model, strict=False))
     dp_harness.assert_releasable(model)
+    # Snapshot the EXACT releasable key-set now (post-validation, pre-training).
+    # The release gate in client_app._dp_fit re-checks this immediately before
+    # shipping: a buffer / frozen param / new parameter registered lazily DURING
+    # the researcher's forward (i.e. after this gate, where Opacus would never noise
+    # it) grows the state_dict and is rejected before it can leave the node.
+    model._dsflower_release_keys = tuple(model.state_dict().keys())
     return model

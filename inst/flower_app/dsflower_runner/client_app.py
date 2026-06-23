@@ -92,8 +92,20 @@ def _dp_fit(model, X, y, pcfg, pins, msg):
             loss = criterion(model(xb), yb)
             loss.backward()
             optimizer.step()
-    # Release ONLY the DP-trained params (assert_releasable already proved there are
-    # no buffers / frozen params, so the unwrapped state_dict carries nothing un-noised).
+    # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
+    # a buffer / frozen param / new parameter registered lazily inside the
+    # researcher's forward appears only AFTER load, and Opacus noises ONLY the
+    # gradients of the parameters that existed when make_private was called -- so a
+    # lazily-stashed tensor would ship raw + un-noised in the state_dict). Re-assert
+    # releasability on the ACTUAL post-training module AND require its released
+    # key-set to be EXACTLY the set validated at load. Fail closed on any drift.
+    released = getattr(model, "_module", model)
+    dp_harness.assert_releasable(released)
+    expected = getattr(released, "_dsflower_release_keys", None)
+    if expected is None or tuple(released.state_dict().keys()) != tuple(expected):
+        raise RuntimeError(
+            "released tensor set changed during training (weight-stash channel: a "
+            "lazily-added buffer or parameter); refusing to release un-noised data.")
     return get_torch_params(model), len(dataset)
 
 
@@ -181,13 +193,18 @@ def _train_neural(msg, context, cfg, pcfg, pins):
                 X, y = Xp, yp
         model = load_user_model(cfg, X.shape[1], input_key="num-features", allow_custom=allow_custom)
 
-    if allow_custom:
-        # Best-effort coupling probe before training (the default path is vetted code).
-        k = min(8, len(X))
-        xb = torch.from_numpy(X[:k]).float()
-        yb = _prep_target(y[:k], pins["loss_name"])
-        dp_harness.per_sample_independence_probe(
-            model, dp_harness.loss_from_allowlist(pins["loss_name"]), xb, yb)
+    # ALWAYS probe per-sample independence before training. Every neural model here
+    # is researcher-shipped build_model SOURCE (even first-party generators are
+    # emitted + run on the node), so there is no trusted-by-construction forward: a
+    # forward that couples samples in plain tensor ops (x - x.mean(0), batch
+    # attention, cdist(x, x)) passes ModuleValidator's layer-type denylist yet
+    # silently breaks the per-sample DP-SGD sensitivity bound. The probe is cheap
+    # and fails closed; a vetted Linear/ReLU head passes it trivially.
+    k = min(8, len(X))
+    xb = torch.from_numpy(X[:k]).float()
+    yb = _prep_target(y[:k], pins["loss_name"])
+    dp_harness.per_sample_independence_probe(
+        model, dp_harness.loss_from_allowlist(pins["loss_name"]), xb, yb)
 
     return _dp_fit(model, X, y, pcfg, pins, msg)
 

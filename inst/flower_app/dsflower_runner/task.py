@@ -156,13 +156,25 @@ def load_privacy_config(context=None):
     epsilon = float(manifest.get("privacy-epsilon", 3.0))
     delta = float(manifest.get("privacy-delta", 1e-5))
     clipping_norm = float(manifest.get("privacy-clipping_norm", 1.0))
-    # The manifest is server-written + tamper-proof, but validate the DP params
-    # are in legal ranges so a corrupted manifest fails closed (not silently
-    # producing infinite/zero noise that would void the guarantee).
+    # The manifest is server-written, but during the staging transition it may
+    # still carry client-PROPOSED DP params (the run_config is merged in at stage
+    # time), so the node treats them as untrusted. First: legal ranges (a corrupted
+    # value must not silently produce zero/infinite noise that voids the guarantee).
     if not (epsilon > 0 and 0.0 < delta < 1.0 and clipping_norm > 0):
         raise ValueError(
             "invalid DP parameters in manifest (need epsilon>0, 0<delta<1, "
             "clipping_norm>0)")
+    # Then: HARDCODED node ceilings (NOT manifest-derived -- a client-influenced
+    # manifest cannot raise its own ceiling). Reject anything weaker than policy; an
+    # inflated epsilon or a near-1 delta would void the (epsilon, delta) guarantee
+    # even with DP-SGD running. (Defaults eps=3, delta=1e-5, clip=1 pass with margin.)
+    if epsilon > 10.0:
+        raise ValueError("privacy epsilon %.4g exceeds the node ceiling (10)" % epsilon)
+    if delta > 1e-3:
+        raise ValueError("privacy delta %.4g exceeds the node ceiling (1e-3)" % delta)
+    if clipping_norm > 100.0:
+        raise ValueError(
+            "privacy clipping_norm %.4g exceeds the node ceiling (100)" % clipping_norm)
     _privacy_config = {
         "epsilon": epsilon,
         "delta": delta,
