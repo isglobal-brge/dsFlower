@@ -10,7 +10,7 @@
 
 # --- Framework dependency map ---
 
-.BASE_PYTHON_DEPS <- c("flwr>=1.13.0", "numpy>=1.21.0", "pandas>=1.3.0",
+.BASE_PYTHON_DEPS <- c("flwr>=1.31.0", "numpy>=1.21.0", "pandas>=1.3.0",
                         "pyarrow>=10.0.0")
 
 # Provisioned frameworks: torch (linear/MLP + DP-SGD), pytorch_vision (imaging),

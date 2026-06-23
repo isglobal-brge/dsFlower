@@ -25,7 +25,7 @@ import torch
 
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg
-from flwr.common import ArrayRecord, Context, RecordDict
+from flwr.common import ArrayRecord, Context, Message, RecordDict
 
 from .params import get_torch_params, set_torch_params
 
@@ -104,7 +104,11 @@ def _run_trees(grid, cfg):
     # Each node trains its FULL local DP-GBDT in one round (the booster's n_trees is
     # the node-internal boosting; one message exchange suffices). No init model.
     empty = RecordDict({"arrays": ArrayRecord(numpy_ndarrays=[np.zeros(1, dtype=np.float64)])})
-    messages = [grid.create_message(empty, "train", nid, group_id="dsflower-trees")
+    # Build messages with the modern Message constructor (mirrors FedAvg's
+    # _construct_messages) -- NOT the deprecated Grid.create_message, whose shim
+    # builds a message the 1.3x SuperNodes don't route (the round-trip then hangs).
+    messages = [Message(content=empty, message_type="train",
+                        dst_node_id=nid, group_id="dsflower-trees")
                 for nid in node_ids]
     replies = grid.send_and_receive(
         messages, timeout=float(cfg.get("round-timeout", 3600)))
