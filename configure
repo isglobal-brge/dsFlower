@@ -179,9 +179,16 @@ install_deps() {
   local name="$1"; shift
   local venv_path="${VENV_ROOT}/${name}"
   local venv_python="${venv_path}/bin/python"
+  # CPU-only torch: Rock nodes have no GPU, so the CUDA build's bundled
+  # nvidia/triton libs (~3.5GB/venv) are dead weight. --torch-backend cpu pulls
+  # the +cpu wheels (no-op when no torch is requested) -> ~70% smaller venvs,
+  # identical computation.
+  local torch_flag=""
+  case " $* " in *torch*) torch_flag="--torch-backend cpu" ;; esac
   log_info "  ${name}: installing $*"
   if [ "${USE_UV}" = true ]; then
-    "${UV}" pip install --python "${venv_python}" --quiet "$@" 2>&1 | tail -5
+    # shellcheck disable=SC2086
+    "${UV}" pip install --python "${venv_python}" --quiet ${torch_flag} "$@" 2>&1 | tail -5
   else
     "${venv_path}/bin/pip" install --quiet --no-cache-dir "$@" 2>&1 | tail -5
   fi
