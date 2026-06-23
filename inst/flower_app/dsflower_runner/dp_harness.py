@@ -244,10 +244,17 @@ def assert_stock_architecture(model):
                 "module %r has an instance-level forward override (a stash / "
                 "sample-coupling channel); not allowed on the DP-SGD track."
                 % cls.__name__)
-        if getattr(m, "_forward_hooks", None) or getattr(m, "_forward_pre_hooks", None):
+        # Forbid ALL hook registrations (not just forward): a _backward_hook can
+        # CAPTURE the raw input Opacus stashes on the module during backward, and a
+        # _state_dict_hook can REWRITE the noised weights with it at release -- both
+        # survive DP-SGD and the value-blind release gates. Enumerate every
+        # *_hooks dict on the instance so new torch hook types are covered too.
+        hook_attrs = [a for a, v in vars(m).items() if a.endswith("_hooks") and v]
+        if hook_attrs:
             raise ValueError(
-                "module %r has forward hooks (a stash / sample-coupling channel); "
-                "not allowed on the DP-SGD track." % cls.__name__)
+                "module %r has registered hooks %r: a data-capture (backward) / "
+                "release-rewrite (state_dict) channel that survives DP-SGD; not "
+                "allowed on the DP-SGD track." % (cls.__name__, hook_attrs))
 
 
 _LOSS_ALLOWLIST = {

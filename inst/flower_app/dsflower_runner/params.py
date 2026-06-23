@@ -9,33 +9,42 @@ before any training.
 """
 
 import importlib
-from collections import OrderedDict
 
 
 def get_torch_params(model):
-    """Model parameters as a list of numpy arrays.
+    """Trainable parameters as numpy arrays, read via the UNBOUND stock
+    ``nn.Module.named_parameters`` -- deliberately NOT ``module.state_dict()``.
 
-    Unwraps Opacus' GradSampleModule (``._module``) so the state_dict keys/shapes
-    match the un-wrapped model the ServerApp initialized. Safe to release ONLY
-    after ``dp_harness.assert_releasable`` has confirmed there are no buffers and
-    no frozen parameters (so every entry here is a DP-SGD-trained, noised tensor).
+    state_dict() runs any registered ``_state_dict_hooks``; a researcher hook there
+    can REWRITE the DP-noised weights with captured raw data AT RELEASE (after
+    DP-SGD, after the param-restore) and the value-blind release gates never see it.
+    An instance override of ``named_parameters`` could do the same. Calling the
+    stock CLASS method on the (assert_stock_architecture-vetted) module reads the
+    real DP-SGD-trained ``_parameters`` storage directly and ignores any instance
+    tampering. No buffers exist (assert_releasable), so this is the full releasable
+    set; ``._module`` Opacus-unwraps.
     """
+    import torch.nn as nn
     module = getattr(model, "_module", model)
-    return [v.detach().cpu().numpy() for v in module.state_dict().values()]
+    return [p.detach().cpu().numpy() for _, p in nn.Module.named_parameters(module)]
 
 
 def set_torch_params(model, arrays):
-    """Load a list of numpy arrays into the model (Opacus-aware), strict match."""
+    """Load numpy arrays into the trainable parameters via the stock
+    ``nn.Module.named_parameters`` -- NOT ``load_state_dict`` (which runs
+    ``_load_state_dict_pre_hooks``). In-place copy into the real param storage.
+    """
     import torch
-
+    import torch.nn as nn
     module = getattr(model, "_module", model)
-    keys = list(module.state_dict().keys())
-    if len(keys) != len(arrays):
+    params = list(nn.Module.named_parameters(module))
+    if len(params) != len(arrays):
         raise ValueError(
-            "parameter count mismatch: model has %d tensors, received %d"
-            % (len(keys), len(arrays)))
-    sd = OrderedDict((k, torch.tensor(v)) for k, v in zip(keys, arrays))
-    module.load_state_dict(sd, strict=True)
+            "parameter count mismatch: model has %d params, received %d"
+            % (len(params), len(arrays)))
+    with torch.no_grad():
+        for (_, p), a in zip(params, arrays):
+            p.copy_(torch.as_tensor(a, dtype=p.dtype, device=p.device))
 
 
 def load_user_model(cfg, input_dim, *, input_key="num-features", allow_custom=False):
@@ -88,5 +97,6 @@ def load_user_model(cfg, input_dim, *, input_key="num-features", allow_custom=Fa
     # shipping: a buffer / frozen param / new parameter registered lazily DURING
     # the researcher's forward (i.e. after this gate, where Opacus would never noise
     # it) grows the state_dict and is rejected before it can leave the node.
-    model._dsflower_release_keys = tuple(model.state_dict().keys())
+    model._dsflower_release_keys = tuple(
+        n for n, _ in torch.nn.Module.named_parameters(model))
     return model

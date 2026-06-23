@@ -111,7 +111,8 @@ def _dp_fit(model, X, y, pcfg, pins, msg):
     released = getattr(model, "_module", model)
     dp_harness.assert_releasable(released)
     expected = getattr(released, "_dsflower_release_keys", None)
-    if expected is None or tuple(released.state_dict().keys()) != tuple(expected):
+    current = tuple(n for n, _ in torch.nn.Module.named_parameters(released))
+    if expected is None or current != tuple(expected):
         raise RuntimeError(
             "released tensor set changed during training (weight-stash channel: a "
             "lazily-added buffer or parameter); refusing to release un-noised data.")
