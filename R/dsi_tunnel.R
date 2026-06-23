@@ -277,8 +277,14 @@ flowerTunnelReapDS <- function() {
       system(paste("pgrep -f", shQuote(pat)), intern = TRUE, ignore.stderr = TRUE))),
       error = function(e) integer())
     pids <- pids[!is.na(pids) & pids != me]
-    for (p in pids) tryCatch(system(paste("kill -9", p), ignore.stderr = TRUE),
+    # SIGTERM first so a live SuperNode reaps its own SuperExec children before
+    # exiting (otherwise they orphan as zombies under the container's non-reaping
+    # PID 1 and never clear); then SIGKILL any straggler still alive.
+    for (p in pids) tryCatch(system(paste("kill -TERM", p), ignore.stderr = TRUE),
                              error = function(e) NULL)
+    Sys.sleep(0.5)
+    for (p in pids) if (isTRUE(tryCatch(.pid_is_alive(p), error = function(e) FALSE)))
+      tryCatch(system(paste("kill -9", p), ignore.stderr = TRUE), error = function(e) NULL)
     length(pids)
   }
   sn  <- pgrep_kill("flower-super")        # flower-supernode + flower-superexec (no superlink on a node)
@@ -288,7 +294,22 @@ flowerTunnelReapDS <- function() {
     unlink(list.files(pid_dir, pattern = "\\.pid$", full.names = TRUE))
   tryCatch(rm(list = ls(.supernode_registry), envir = .supernode_registry),
            error = function(e) NULL)
-  list(ok = TRUE, supernodes_killed = sn, forwarders_killed = fwd)
+  # GC orphaned app spools: a researcher run killed before flowerAppDeleteDS leaves
+  # its uploaded package on disk. Delete spool dirs older than the TTL so disk
+  # residue self-cleans the same way the processes do (cleanliness by design).
+  gc_spools <- 0L
+  spool_root <- file.path(tempdir(), "dsflower_appstore")
+  if (dir.exists(spool_root)) {
+    ttl <- as.numeric(.dsf_option("spool_ttl_seconds", 7200))
+    for (d in list.dirs(spool_root, recursive = FALSE, full.names = TRUE)) {
+      age <- tryCatch(as.numeric(difftime(Sys.time(), file.info(d)$mtime, units = "secs")),
+                      error = function(e) NA_real_)
+      if (is.finite(age) && age > ttl) {
+        unlink(d, recursive = TRUE); gc_spools <- gc_spools + 1L
+      }
+    }
+  }
+  list(ok = TRUE, supernodes_killed = sn, forwarders_killed = fwd, spools_gc = gc_spools)
 }
 
 #' Stop the node-side tunnel forwarder/test processes and clean the spool (AGGREGATE)

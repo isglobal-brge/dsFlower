@@ -179,12 +179,17 @@ def _run_config(context):
 
 
 def load_dp_track(context=None):
-    """The enforced-DP track, PINNED by the node into the manifest. Never trusted
-    from the client run config -- a client-selected track could downgrade
-    neural -> egress to dodge per-sample DP. Defaults to 'neural'."""
-    track = str(_load_manifest(context).get("dp-track", "neural")).lower()
+    """The enforced-DP track. Read from the manifest (authoritative once the node
+    pins it); fall back to the client run config during the transition, exactly
+    like load_run_pins / load_gbdt_spec. Defaults to 'neural'. (Security note: the
+    track only selects WHICH enforced-DP mechanism runs; every track is enforced
+    node-side, so a client-chosen track cannot dodge DP -- at most pick trees vs
+    neural. The manifest pin, once added, makes it fully node-authoritative.)"""
+    manifest = _load_manifest(context)
+    cfg = _run_config(context)
+    track = str(manifest.get("dp-track", cfg.get("dp-track", "neural"))).lower()
     if track not in ("neural", "trees", "egress"):
-        raise ValueError("invalid dp-track '%s' in manifest" % track)
+        raise ValueError("invalid dp-track '%s'" % track)
     return track
 
 

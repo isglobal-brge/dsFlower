@@ -84,11 +84,23 @@ def _bag_boosters(boosters):
 
 
 def _run_trees(grid, cfg):
+    import time
     min_nodes = int(cfg.get("min-train-nodes", 2))
-    node_ids = [n for n in grid.get_node_ids()]
+    timeout = float(cfg.get("round-timeout", 600))
+    # SuperNodes dial in shortly AFTER the run starts. FedAvg waits for them
+    # internally; the manual trees loop must too -- otherwise get_node_ids()
+    # returns empty at t=0 and the run aborts (and, with the tunnel pump driven by
+    # the client run wait-loop, can leave the run hanging). Poll until enough connect.
+    node_ids, waited = [], 0.0
+    while waited < timeout:
+        node_ids = [n for n in grid.get_node_ids()]
+        if len(node_ids) >= min_nodes:
+            break
+        time.sleep(2.0)
+        waited += 2.0
     if len(node_ids) < min_nodes:
-        raise RuntimeError("only %d node(s) available, need >= %d for the trees run"
-                           % (len(node_ids), min_nodes))
+        raise RuntimeError("only %d node(s) connected after %ds, need >= %d"
+                           % (len(node_ids), int(waited), min_nodes))
     # Each node trains its FULL local DP-GBDT in one round (the booster's n_trees is
     # the node-internal boosting; one message exchange suffices). No init model.
     empty = RecordDict({"arrays": ArrayRecord(numpy_ndarrays=[np.zeros(1, dtype=np.float64)])})
