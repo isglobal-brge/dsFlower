@@ -506,8 +506,23 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
                                      federation_id = NULL,
                                      ca_cert_pem = NULL,
-                                     template_name = NULL) {
+                                     template_name = NULL,
+                                     torch_backend = NULL) {
   handle <- .getHandle(handle_symbol)
+
+  # Per-run torch backend the researcher requested (cpu/gpu/auto). Recorded so
+  # .resolve_backend / .framework_venv select the cpu vs gpu venv for THIS run's
+  # SuperNode (default NULL -> "auto"). The node still validates GPU availability
+  # (.gpu_present) -- the client can REQUEST gpu but only a node that actually has
+  # one, with its CUDA venv built, will run it.
+  if (!is.null(torch_backend)) {
+    tb <- .ds_arg(torch_backend)
+    if (is.list(tb)) tb <- tb[[1]]
+    tb <- as.character(tb)[1]
+    .dsflower_runtime$torch_backend <- if (!is.na(tb) && nzchar(tb)) tb else NULL
+  } else {
+    .dsflower_runtime$torch_backend <- NULL
+  }
 
   if (!handle$prepared) {
     stop("Handle is not prepared. Call flowerPrepareRunDS first.", call. = FALSE)

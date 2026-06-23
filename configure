@@ -187,22 +187,17 @@ gpu_present() {
 }
 
 install_deps() {
-  local name="$1"; shift
+  local name="$1"; local backend="$2"; shift 2
   local venv_path="${VENV_ROOT}/${name}"
   local venv_python="${venv_path}/bin/python"
-  # Adaptive torch backend. Most DataSHIELD/Rock nodes have NO GPU, where the CUDA
-  # build's nvidia/triton libs (~3.5GB/venv) are dead weight -> use CPU wheels.
-  # When an NVIDIA GPU IS visible to this container, use uv 'auto' so it installs
-  # the matching CUDA build and the GPU is actually usable. We do NOT use 'auto'
-  # unconditionally: on a GPU-less Intel host uv 'auto' picks the huge +xpu build
-  # (~8GB, still unusable). Operator can pin via DSFLOWER_TORCH_BACKEND (e.g. cu126).
+  # The torch backend is chosen by the CALLER: "cpu" for the universal `pytorch`
+  # venv (CPU wheels -> none of the CUDA build's ~3.5GB nvidia/triton dead weight),
+  # "auto" for the `pytorch-gpu` venv (uv installs the matching CUDA build). Both
+  # can coexist so the run-time client param picks one. An operator can still pin
+  # via DSFLOWER_TORCH_BACKEND (e.g. cu126).
   local torch_flag=""
   case " $* " in *torch*)
-    local backend="${DSFLOWER_TORCH_BACKEND:-}"
-    if [ -z "${backend}" ]; then
-      if gpu_present; then backend="auto"; else backend="cpu"; fi
-    fi
-    torch_flag="--torch-backend ${backend}"
+    torch_flag="--torch-backend ${DSFLOWER_TORCH_BACKEND:-${backend}}"
     ;;
   esac
   log_info "  ${name}: installing $*"
@@ -219,7 +214,7 @@ mark_ready() {
 }
 
 provision_framework() {
-  local name="$1"; local check_modules="$2"; shift 2; local deps="$*"
+  local name="$1"; local backend="$2"; local check_modules="$3"; shift 3; local deps="$*"
   local venv_path="${VENV_ROOT}/${name}"
   local base_deps="flwr>=1.31.0 numpy>=1.21.0 pandas>=1.3.0 pyarrow>=10.0.0"
   local expected_hash
@@ -248,7 +243,7 @@ provision_framework() {
   fi
 
   # shellcheck disable=SC2086
-  install_deps "${name}" ${base_deps} ${deps} || {
+  install_deps "${name}" "${backend}" ${base_deps} ${deps} || {
     log_warn "  ${name}: install failed."; rm -rf "${venv_path}"; return 0
   }
 
@@ -268,12 +263,23 @@ provision_framework() {
 log_info "Provisioning Python environments for ML frameworks..."
 echo ""
 
-# ONE torch venv for BOTH tabular and vision (vision deps are a superset; the
-# "pytorch_vision" framework aliases to this venv via R .framework_venv).
-provision_framework "pytorch" "torchvision opacus nibabel nrrd SimpleITK monai" \
-  "torch>=2.0.0" "opacus>=1.4.0" "torchvision>=0.15.0" "Pillow>=9.0.0" \
-  "nibabel>=5.0.0" "pydicom>=2.4.0" "pynrrd>=1.0.0" \
-  "SimpleITK>=2.2.0" "monai>=1.3.0"
+# ONE torch venv for BOTH tabular and vision (vision deps are a superset). The cpu
+# and gpu venvs install the SAME packages; only --torch-backend differs.
+PYTORCH_CHECK="torchvision opacus nibabel nrrd SimpleITK monai"
+PYTORCH_DEPS="torch>=2.0.0 opacus>=1.4.0 torchvision>=0.15.0 Pillow>=9.0.0 nibabel>=5.0.0 pydicom>=2.4.0 pynrrd>=1.0.0 SimpleITK>=2.2.0 monai>=1.3.0"
+
+# `pytorch` (cpu): the universal default -- built on every node, no CUDA dead weight.
+# shellcheck disable=SC2086
+provision_framework "pytorch" "cpu" "${PYTORCH_CHECK}" ${PYTORCH_DEPS}
+
+# `pytorch-gpu` (cuda): built ONLY when a GPU is visible at (re)provision, so the
+# backend is never locked in at first install. The run-time client param selects it;
+# a GPU added later is picked up by a re-provision (this branch builds it then).
+if gpu_present; then
+  log_info "GPU visible -> also building the CUDA torch venv (pytorch-gpu)."
+  # shellcheck disable=SC2086
+  provision_framework "pytorch-gpu" "auto" "${PYTORCH_CHECK}" ${PYTORCH_DEPS}
+fi
 
 # Remove venvs from dropped frameworks so no obsolete venv lingers (clean by
 # design): the trees track's DP-GBDT is pure numpy in the torch venv, so xgboost
@@ -296,7 +302,7 @@ echo ""
 log_info "Python environment setup complete."
 log_info "Venvs stored in: ${VENV_ROOT}"
 
-for fw in pytorch; do
+for fw in pytorch pytorch-gpu; do
   venv="${VENV_ROOT}/${fw}"
   if [ -f "${venv}/.dsflower_ready" ]; then
     size=$(du -sh "${venv}" 2>/dev/null | cut -f1)

@@ -38,13 +38,52 @@
   pytorch = "torchvision, opacus, monai"
 )
 
-#' Normalize a framework / dp-track to its venv. dsFlower runs in ONE venv: the
-#' torch venv (torch + opacus + torchvision + monai + numpy). Every dp-track runs
-#' there -- neural via Opacus DP-SGD, trees via the pure-numpy DP-GBDT (no xgboost
-#' library), egress via output-perturbation. So everything resolves to "pytorch".
+#' Resolve the effective torch backend for THIS run. GPU presence is detected at
+#' RUN time via a timeout-bounded processx nvidia-smi (\code{.gpu_present}, which is
+#' Rserve-safe), so a GPU handed to the container AFTER install is seen. We only
+#' SELECT among already-built venvs, though -- the multi-GB CUDA venv is built by
+#' (re)provision, not lazily in a live DS session -- so if a GPU is visible but its
+#' venv isn't built yet, we say so and the operator re-provisions.
+#'
+#'   * Source: per-run override \code{.dsflower_runtime$torch_backend} (set by
+#'     flowerEnsureSuperNodeDS from the researcher's call) or the node option
+#'     \code{dsflower.torch_backend}; default "auto".
+#'   * "auto" -> "gpu" iff a GPU is visible now AND pytorch-gpu is built, else "cpu".
+#'   * "cpu"  -> "cpu".
+#'   * "gpu"/"cuda"/"cuNNN" -> "gpu", or a clear error (no GPU visible / venv not built).
 #' @keywords internal
-.framework_venv <- function(framework) {
-  "pytorch"
+.resolve_backend <- function(requested = NULL) {
+  req <- requested %||% .dsflower_runtime$torch_backend %||%
+    .dsf_option("torch_backend", "auto")
+  req <- tolower(as.character(req)[1])
+  if (identical(req, "cpu")) return("cpu")
+  gpu_venv <- dir.exists(file.path(.venv_root(), "pytorch-gpu"))
+  if (req %in% c("", "auto"))
+    return(if (gpu_venv && .gpu_present()) "gpu" else "cpu")
+  if (req %in% c("gpu", "cuda") || startsWith(req, "cu")) {
+    if (!.gpu_present())
+      stop("torch_backend='", req, "' but no GPU is visible to this node ",
+           "(nvidia-smi found none). Give the container GPU access at the node ",
+           "(nvidia runtime / --gpus).", call. = FALSE)
+    if (!gpu_venv)
+      stop("A GPU is visible but the CUDA torch venv is not built on this node. ",
+           "Re-provision (the configure builds pytorch-gpu when a GPU is visible); ",
+           "the multi-GB CUDA venv is not built lazily mid-session.", call. = FALSE)
+    return("gpu")
+  }
+  "cpu"
+}
+
+#' Normalize a framework / dp-track to its venv. dsFlower runs in ONE torch venv
+#' (torch + opacus + torchvision + monai + numpy); every dp-track runs there --
+#' neural via Opacus DP-SGD, trees via the pure-numpy DP-GBDT (no xgboost library),
+#' egress via output-perturbation. The backend picks WHICH copy: "pytorch" (cpu,
+#' the universal default) or "pytorch-gpu" (cuda), resolved as late as possible
+#' (run time) so a GPU added AFTER install is usable with just a re-provision (to
+#' build pytorch-gpu) -- no code change, no install-time backend lock-in.
+#' @keywords internal
+.framework_venv <- function(framework, backend = .resolve_backend()) {
+  if (identical(backend, "gpu")) "pytorch-gpu" else "pytorch"
 }
 
 .dsflower_runtime <- new.env(parent = emptyenv())
@@ -70,10 +109,18 @@
 .gpu_present <- function() {
   ov <- Sys.getenv("DSFLOWER_FORCE_GPU", "")
   if (nzchar(ov)) return(tolower(ov) %in% c("1", "true", "yes"))
-  nzchar(Sys.which("nvidia-smi")) &&
-    isTRUE(tryCatch(
-      system2("nvidia-smi", "-L", stdout = FALSE, stderr = FALSE) == 0L,
-      error = function(e) FALSE))
+  nvidia <- Sys.which("nvidia-smi")
+  if (!nzchar(nvidia)) return(FALSE)
+  # processx (not a bare system2): fd-/signal-safe AND timeout-bounded, so it is
+  # safe to call inside a Rock DS session -- a 5s-bounded processx cannot hang,
+  # whereas a bare system2 can deadlock on inherited pipes/fds. `nvidia-smi -L` is
+  # instant and emits "GPU 0: ..." per visible device, so a GPU given to the
+  # container AFTER install is detected here at run time.
+  res <- tryCatch(
+    processx::run(nvidia, "-L", error_on_status = FALSE, timeout = 5),
+    error = function(e) NULL)
+  !is.null(res) && isTRUE(res$status == 0L) &&
+    isTRUE(grepl("GPU [0-9]", res$stdout %||% ""))
 }
 
 #' Choose the uv torch backend for this environment.
@@ -93,10 +140,10 @@
 #' Get all pip dependencies for a framework (GPU/CPU-adaptive)
 #' @keywords internal
 .python_deps_for_framework <- function(framework) {
-  framework <- .framework_venv(framework)   # everything -> the single pytorch venv
-  extra <- .FRAMEWORK_PYTHON_DEPS[[framework]]
-  if (is.null(extra)) return(.BASE_PYTHON_DEPS)
-  c(.BASE_PYTHON_DEPS, extra)
+  # cpu and gpu venvs share the SAME dependency set (torch etc.); the backend is a
+  # uv install FLAG, not a dep, so the deps-hash marker stays backend-independent
+  # and identical across pytorch / pytorch-gpu (matches the configure's deps_hash).
+  c(.BASE_PYTHON_DEPS, .FRAMEWORK_PYTHON_DEPS[["pytorch"]])
 }
 
 #' Compute a hash of the dependency list for staleness detection
