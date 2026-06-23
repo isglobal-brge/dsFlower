@@ -229,7 +229,6 @@ def load_run_pins(context=None):
         "num_rounds": pin("num-server-rounds", 1, int),
         "n_classes": pin("num-classes", 2, int),
         "learning_rate": float(cfg.get("learning-rate", manifest.get("learning-rate", 0.01))),
-        "allow_custom_model_code": bool(manifest.get("allow-custom-model-code", False)),
     }
 
 

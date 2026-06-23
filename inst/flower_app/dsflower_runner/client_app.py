@@ -1,8 +1,9 @@
 """dsFlower unified trusted ClientApp (node side) — always-on enforced DP.
 
-The researcher ships only a model SPEC (an nn.Module's build_model, or an XGBoost
-data-spec) + hyperparameters; this trusted, node-resident harness owns every
-DP-critical step, so the guarantee cannot be bypassed by the submitted app. The
+The researcher ships only a model SPEC (a declarative nn.Module architecture, or
+an XGBoost data-spec) + hyperparameters -- DATA, never code, so nothing the
+researcher submits executes in this interpreter; this trusted, node-resident
+harness owns every DP-critical step, so the guarantee cannot be bypassed. The
 node-written, tamper-proof manifest pins the enforced-DP TRACK and all privacy +
 sampling parameters; the client run config can only request, never weaken them.
 
@@ -54,7 +55,7 @@ def _prep_target(y, loss_name):
     return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson)
 
 
-def _dp_fit(model, X, y, pcfg, pins, msg):
+def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
@@ -69,9 +70,12 @@ def _dp_fit(model, X, y, pcfg, pins, msg):
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=float(pins["learning_rate"]))
     dataset = TensorDataset(torch.from_numpy(X).float(), _prep_target(y, loss_name))
-    # n_samples authoritative from the manifest; assert the staged frame matches so
-    # the accountant's sample_rate = batch/n denominator cannot be shrunk.
-    if pcfg.get("n_samples") and int(pcfg["n_samples"]) != len(dataset):
+    # Anti-shrink: the manifest n_samples is the server-recorded count of the STAGED
+    # (pre-pool) frame; assert it matches so the client can't shrink the accountant
+    # denominator. The accountant below uses len(dataset) (POST-pool = per-patient DP
+    # unit), the correct DP n; n_staged is pre-pool and equals the manifest, so legit
+    # per-patient pooling (which reduces len(dataset)) does not trip this check.
+    if pcfg.get("n_samples") and int(pcfg["n_samples"]) != int(n_staged):
         raise RuntimeError("staged sample count != manifest n_samples (fail closed)")
     trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -166,13 +170,13 @@ def _train_neural(msg, context, cfg, pcfg, pins):
             + ("an image collection" if manifest_image else "tabular")
             + ". Use a vision model for imaging collections, a tabular model otherwise.")
     n_classes = int(pins["n_classes"])
-    allow_custom = bool(pins.get("allow_custom_model_code", False))
 
     if manifest_image:
         from . import vision
         backbone = vision.normalize_backbone(cfg.get("backbone", cfg.get("model", "resnet18")))
         image_size = int(cfg.get("image-size", 224))
         paths, y, groups = load_image_collection(context)
+        n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
         _assert_label_range(y, n_classes)
         encoder, feat_dim = vision.build_backbone(backbone)
         read = vision.read_image_3d if vision.is_3d_backbone(backbone) else vision.read_image_2d
@@ -190,26 +194,26 @@ def _train_neural(msg, context, cfg, pcfg, pins):
             Xp, yp, pooled = _pool_by_patient(X, y, groups)
             if pooled:
                 X, y = Xp, yp
-        # The trainable head is the client's build_model(cfg) with feature-dim injected
-        # (default generator = nn.Linear(feature_dim, out), identical to the old head).
-        model = load_user_model(cfg, feat_dim, input_key="feature-dim", allow_custom=allow_custom)
+        # The trainable head is node-built from the researcher's spec, with the
+        # frozen-backbone feature dim as @in (default spec = nn.Linear(feat_dim, @out)).
+        model = load_user_model(cfg, feat_dim, pins["loss_name"])
     else:
         X, y = load_data(context)
+        n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
         _assert_label_range(y, n_classes)
         groups = load_tabular_patient_ids(context)
         if groups is not None:
             Xp, yp, pooled = _pool_by_patient(X, y, groups)
             if pooled:
                 X, y = Xp, yp
-        model = load_user_model(cfg, X.shape[1], input_key="num-features", allow_custom=allow_custom)
+        model = load_user_model(cfg, X.shape[1], pins["loss_name"])
 
-    # ALWAYS probe per-sample independence before training. Every neural model here
-    # is researcher-shipped build_model SOURCE (even first-party generators are
-    # emitted + run on the node), so there is no trusted-by-construction forward: a
-    # forward that couples samples in plain tensor ops (x - x.mean(0), batch
-    # attention, cdist(x, x)) passes ModuleValidator's layer-type denylist yet
-    # silently breaks the per-sample DP-SGD sensitivity bound. The probe is cheap
-    # and fails closed; a vetted Linear/ReLU head passes it trivially.
+    # Defense in depth: probe per-sample independence before training. The model is
+    # node-built from the allowlisted spec vocabulary (all per-sample-safe), so this
+    # passes by construction -- but it stays as a fail-closed backstop against a
+    # build_from_spec bug ever admitting a layer that couples samples (x - x.mean(0),
+    # batch attention, cdist(x, x)) and silently breaking the per-sample DP-SGD
+    # sensitivity bound. Cheap; a Linear/ReLU head passes it trivially.
     import copy
     k = min(8, len(X))
     xb = torch.from_numpy(X[:k]).float()
@@ -220,7 +224,7 @@ def _train_neural(msg, context, cfg, pcfg, pins):
     dp_harness.per_sample_independence_probe(
         copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"]), xb, yb)
 
-    return _dp_fit(model, X, y, pcfg, pins, msg)
+    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged)
 
 
 # --------------------------------------------------------------------------- #

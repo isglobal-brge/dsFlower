@@ -16,7 +16,6 @@ Final artifacts go to results-dir for the R relay's watchdog: model.pt + history
 (neural/egress), or booster.json + history (trees).
 """
 
-import importlib
 import json
 import os
 
@@ -33,28 +32,35 @@ app = ServerApp()
 
 
 # --------------------------------------------------------------------------- #
-# Initial model (neural) — import the client's build_model for the array shapes.
+# Initial model (neural) — node-built from the researcher's spec (DATA, no code).
 # --------------------------------------------------------------------------- #
 
 def _build_initial_model(cfg):
-    """Build the global model the nodes will train, from the client-shipped
-    build_model (bundled in the FAB). Researcher-side + untrusted: this only seeds
-    the initial array SHAPES (random init); the node enforces all DP + hardening."""
-    mod = importlib.import_module(str(cfg["model-module"]))
-    bcfg = dict(cfg)
+    """Seed the global model's array SHAPES from the researcher's declarative spec
+    (DATA, node-built by model_spec). Researcher-side + untrusted: random init only;
+    the nodes rebuild from the same spec and enforce all DP + hardening. No
+    researcher code is imported here."""
+    try:
+        import model_spec
+    except ImportError:
+        from . import model_spec
     if str(cfg.get("data-kind", "")).lower() == "image":
         from . import vision
         backbone = vision.normalize_backbone(cfg.get("backbone", cfg.get("model", "resnet18")))
-        bcfg["feature-dim"] = int(vision.feature_dim_for(backbone))
+        in_dim = int(vision.feature_dim_for(backbone))
     else:
-        n = int(cfg.get("num-features", 0))
-        if n <= 0:
+        in_dim = int(cfg.get("num-features", 0))
+        if in_dim <= 0:
             raise ValueError("num-features must be set in the run config "
                              "(the researcher passes len(feature_columns)).")
-        bcfg["num-features"] = n
-    model = mod.build_model(bcfg)
+    spec = model_spec.read_spec(cfg)
+    loss_name = str(cfg.get("loss-name", "bce_logits"))
+    out_dim = model_spec.output_width(loss_name, cfg)
+    num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None
+    model = model_spec.build_from_spec(spec, in_dim=in_dim, out_dim=out_dim,
+                                       num_labels=num_labels)
     if not isinstance(model, torch.nn.Module):
-        raise ValueError("build_model must return a torch.nn.Module")
+        raise ValueError("build_from_spec must return a torch.nn.Module")
     return model
 
 

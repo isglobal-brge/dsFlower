@@ -1,14 +1,12 @@
-"""Parameter (de)serialization + trusted client-model loading for dsflower_runner.
+"""Parameter (de)serialization + trusted node-side model construction.
 
-``get_torch_params`` / ``set_torch_params`` were the only non-catalog part of the
-deleted ``model_zoo`` — they are trusted plumbing (the Opacus-unwrapping
-positional state_dict contract), kept here. ``load_user_model`` is the neural
-track's gate: it imports the client-shipped ``build_model`` (architecture ONLY)
-behind the integrity hook and enforces the DP-compatibility + no-stash invariants
-before any training.
+``get_torch_params`` / ``set_torch_params`` are trusted plumbing (the
+Opacus-unwrapping positional contract). ``load_user_model`` builds the neural
+model NODE-SIDE from the researcher's declarative spec (see ``model_spec``): no
+researcher code runs in this interpreter, so the trusted release path cannot be
+subverted by import-time monkeypatching of torch globals. The stock-architecture
++ releasable invariants are re-checked as defense in depth before any training.
 """
-
-import importlib
 
 
 def get_torch_params(model):
@@ -47,24 +45,22 @@ def set_torch_params(model, arrays):
             p.copy_(torch.as_tensor(a, dtype=p.dtype, device=p.device))
 
 
-def load_user_model(cfg, input_dim, *, input_key="num-features", allow_custom=False):
-    """Import the client-shipped model module and build its nn.Module.
+def load_user_model(cfg, input_dim, loss_name):
+    """Build the neural model NODE-SIDE from the researcher's declarative spec.
 
-    The client supplies ONLY ``build_model(cfg) -> nn.Module`` (the forward graph);
-    never the training loop, the loss, or the optimizer — those are harness-owned.
-    The module name comes from ``cfg["model-module"]`` (node-verified to equal the
-    single uploaded package basename), and is imported behind the integrity hook,
-    which has already verified the package bytes against the node-computed pin.
+    The researcher ships ONLY a spec (DATA, decoded + built by ``model_spec``);
+    never source, a training loop, a loss, or an optimizer -- all harness-owned.
+    ``input_dim`` (@in) and the loss-derived output width (@out) are node-decided,
+    so the researcher controls only the hidden structure. Because no researcher
+    code runs here, the trusted release path is safe by construction; the gates
+    below are defense in depth -- a node-built module from the stock allowlist
+    passes them trivially, but they fail closed on any builder bug:
 
-    Hardening gates, in order (all fail closed):
-      1. ``build_model`` exists and returns an ``nn.Module``.
-      2. Opacus ``ModuleValidator`` — REJECT (never ``.fix()``) DP-incompatible
-         layers (BatchNorm etc.) that would couple samples.
-      3. ``assert_releasable`` — no buffers, no frozen parameters, so the released
-         state_dict cannot carry un-noised raw data.
-    The DEFAULT path emits vetted, stash-free architectures; ``allow_custom`` (a
-    custodian opt-in) additionally triggers the per-sample-independence probe at
-    the call site before training.
+      1. ``build_from_spec`` -- only allowlisted, per-sample-DP-safe stock layers.
+      2. Opacus ``ModuleValidator`` -- REJECT (never ``.fix()``) any DP-incompatible
+         layer (BatchNorm etc.) that would couple samples.
+      3. ``assert_stock_architecture`` / ``assert_releasable`` -- no researcher
+         forward, no buffers, no frozen params (nothing to carry un-noised data).
     """
     import torch
     from opacus.validators import ModuleValidator
@@ -72,31 +68,28 @@ def load_user_model(cfg, input_dim, *, input_key="num-features", allow_custom=Fa
         import dp_harness
     except ImportError:
         from . import dp_harness
+    try:
+        import model_spec
+    except ImportError:
+        from . import model_spec
 
-    module_name = str(cfg["model-module"])
-    mod = importlib.import_module(module_name)
-    build = getattr(mod, "build_model", None)
-    if not callable(build):
-        raise ValueError(
-            "model module '%s' must define build_model(cfg) -> nn.Module"
-            % module_name)
+    spec = model_spec.read_spec(cfg)
+    out_dim = model_spec.output_width(loss_name, cfg)
+    num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None
+    model = model_spec.build_from_spec(
+        spec, in_dim=int(input_dim), out_dim=out_dim, num_labels=num_labels)
 
-    bcfg = dict(cfg)
-    bcfg[input_key] = int(input_dim)
-    model = build(bcfg)
     if not isinstance(model, torch.nn.Module):
-        raise ValueError("build_model must return a torch.nn.Module")
+        raise ValueError("build_from_spec must return a torch.nn.Module")
     if not ModuleValidator.is_valid(model):
         raise ValueError(
             "model is not DP-compatible (Opacus ModuleValidator): %s"
             % ModuleValidator.validate(model, strict=False))
-    dp_harness.assert_stock_architecture(model)   # no researcher forward (root gate)
+    dp_harness.assert_stock_architecture(model)   # node-built => stock (belt + suspenders)
     dp_harness.assert_releasable(model)
-    # Snapshot the EXACT releasable key-set now (post-validation, pre-training).
-    # The release gate in client_app._dp_fit re-checks this immediately before
-    # shipping: a buffer / frozen param / new parameter registered lazily DURING
-    # the researcher's forward (i.e. after this gate, where Opacus would never noise
-    # it) grows the state_dict and is rejected before it can leave the node.
+    # Snapshot the EXACT releasable key-set now (post-build, pre-training). The
+    # release gate in client_app._dp_fit re-checks it immediately before shipping,
+    # so nothing registered lazily during forward can grow the released state_dict.
     model._dsflower_release_keys = tuple(
         n for n, _ in torch.nn.Module.named_parameters(model))
     return model
