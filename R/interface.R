@@ -569,9 +569,9 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 
   # template_name resolved: explicit > handle > runtime.json
 
-  # Pin the trusted Tier-1 harness for the default-deny code-integrity hook
+  # Pin the trusted runner for the default-deny code-integrity hook
   # (sitecustomize.py; ARCHITECTURE.md §7). The node writes the hash of its own
-  # node-resident canonical harness; the submitted FAB's `dsflower_harness`
+  # node-resident canonical runner; the submitted FAB's `dsflower_runner`
   # package may run only if it is byte-identical to it. This is the content-hash
   # verification that makes the trusted training loop guaranteed, without trusting
   # the researcher who provisioned the app.
@@ -579,7 +579,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   if (nzchar(harness_hash)) {
     writeLines(harness_hash,
                file.path(handle$staging_dir, "expected_hash.txt"))
-    writeLines("dsflower_harness",
+    writeLines("dsflower_runner",
                file.path(handle$staging_dir, "expected_template.txt"))
   }
 
@@ -1145,15 +1145,15 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
 
 #' Compute the canonical SHA-256 hash of the node-resident Tier-1 harness
 #'
-#' Hashes the \code{dsflower_harness} Python package shipped with this node
+#' Hashes the \code{dsflower_runner} Python package shipped with this node
 #' package, byte-for-byte identically to \code{_hash_package} in
 #' sitecustomize.py and \code{.hash_pkg_dir}: forward-slash relative
 #' paths, radix sort, each as relpath + "\\n" + content + "\\x00", excluding
-#' compiled artifacts. Used to pin the trusted harness for code verification.
-#' @return Character; hex SHA-256, or "" if the harness is not installed.
+#' compiled artifacts. Used to pin the trusted runner for code verification.
+#' @return Character; hex SHA-256, or "" if the runner is not installed.
 #' @keywords internal
 .compute_harness_hash <- function() {
-  pkg_dir <- system.file("flower_app", "dsflower_harness", package = "dsFlower")
+  pkg_dir <- system.file("flower_app", "dsflower_runner", package = "dsFlower")
   if (!nzchar(pkg_dir) || !dir.exists(pkg_dir)) return("")
   rel_files <- list.files(pkg_dir, recursive = TRUE, full.names = FALSE,
                           all.files = TRUE, no.. = TRUE)

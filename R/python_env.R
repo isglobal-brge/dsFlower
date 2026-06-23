@@ -26,24 +26,25 @@
   # with the FAB vision deps in dsFlowerClient::.harness_dependencies(vision=TRUE).
   pytorch = c("torch>=2.0.0", "opacus>=1.4.0", "torchvision>=0.15.0",
               "Pillow>=9.0.0", "nibabel>=5.0.0", "pydicom>=2.4.0",
-              "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0"),
-  # xgboost build (CPU-only vs full GPU) is chosen in .python_deps_for_framework.
-  xgboost = c("xgboost>=1.7.0")
+              "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0")
+  # No xgboost venv: the trees track's DP-GBDT (S-GBDT mechanism) is pure numpy,
+  # which the torch venv already provides, so the xgboost LIBRARY is never imported
+  # node-side. One venv runs every dp-track (deps: nothing more than needed).
 )
 
 .FRAMEWORK_HEALTH_IMPORT <- list(
   # comma-separated single import: a venv missing opacus (DP) / torchvision / monai
   # is then reported unhealthy and re-provisioned, not silently accepted.
-  pytorch = "torchvision, opacus, monai",
-  xgboost = "xgboost"
+  pytorch = "torchvision, opacus, monai"
 )
 
-#' Normalize a framework name to its venv. pytorch_vision is MERGED into the
-#' single torch venv (a superset that runs both tabular and vision), so it
-#' resolves to "pytorch". Used everywhere a framework -> venv path is built.
+#' Normalize a framework / dp-track to its venv. dsFlower runs in ONE venv: the
+#' torch venv (torch + opacus + torchvision + monai + numpy). Every dp-track runs
+#' there -- neural via Opacus DP-SGD, trees via the pure-numpy DP-GBDT (no xgboost
+#' library), egress via output-perturbation. So everything resolves to "pytorch".
 #' @keywords internal
 .framework_venv <- function(framework) {
-  if (identical(framework, "pytorch_vision")) "pytorch" else framework
+  "pytorch"
 }
 
 .dsflower_runtime <- new.env(parent = emptyenv())
@@ -92,15 +93,9 @@
 #' Get all pip dependencies for a framework (GPU/CPU-adaptive)
 #' @keywords internal
 .python_deps_for_framework <- function(framework) {
-  framework <- .framework_venv(framework)   # pytorch_vision -> pytorch
+  framework <- .framework_venv(framework)   # everything -> the single pytorch venv
   extra <- .FRAMEWORK_PYTHON_DEPS[[framework]]
   if (is.null(extra)) return(.BASE_PYTHON_DEPS)
-  if (identical(framework, "xgboost")) {
-    # GPU-less nodes get the CPU-only build (~18MB) instead of the full GPU wheel
-    # (~1GB of bundled CUDA); both import identically as `xgboost`. GPU node ->
-    # full xgboost so device="cuda" works.
-    extra <- if (.gpu_present()) "xgboost>=1.7.0" else "xgboost-cpu>=1.7.0"
-  }
   c(.BASE_PYTHON_DEPS, extra)
 }
 
