@@ -97,7 +97,7 @@
 
   framework <- caps$framework
   venv_root <- .venv_root()
-  venv_path <- file.path(venv_root, framework)
+  venv_path <- file.path(venv_root, .framework_venv(framework))
   python <- file.path(venv_path, "bin", "python")
   cmd <- file.path(venv_path, "bin", "flower-supernode")
 
@@ -122,7 +122,7 @@
 #' Used for the dsFlower trusted runners (harness / tier2), which are torch apps.
 #' @keywords internal
 .resolve_framework_runtime <- function(framework) {
-  venv_path <- file.path(.venv_root(), framework)
+  venv_path <- file.path(.venv_root(), .framework_venv(framework))
   python <- file.path(venv_path, "bin", "python")
   cmd <- file.path(venv_path, "bin", "flower-supernode")
   if (!dir.exists(venv_path))

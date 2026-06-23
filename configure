@@ -268,10 +268,9 @@ provision_framework() {
 log_info "Provisioning Python environments for ML frameworks..."
 echo ""
 
-provision_framework "pytorch" "torch" \
-  "torch>=2.0.0" "opacus>=1.4.0"
-
-provision_framework "pytorch_vision" "torchvision opacus nibabel nrrd SimpleITK monai" \
+# ONE torch venv for BOTH tabular and vision (vision deps are a superset; the
+# "pytorch_vision" framework aliases to this venv via R .framework_venv).
+provision_framework "pytorch" "torchvision opacus nibabel nrrd SimpleITK monai" \
   "torch>=2.0.0" "opacus>=1.4.0" "torchvision>=0.15.0" "Pillow>=9.0.0" \
   "nibabel>=5.0.0" "pydicom>=2.4.0" "pynrrd>=1.0.0" \
   "SimpleITK>=2.2.0" "monai>=1.3.0"
@@ -293,7 +292,7 @@ echo ""
 log_info "Python environment setup complete."
 log_info "Venvs stored in: ${VENV_ROOT}"
 
-for fw in pytorch pytorch_vision xgboost; do
+for fw in pytorch xgboost; do
   venv="${VENV_ROOT}/${fw}"
   if [ -f "${venv}/.dsflower_ready" ]; then
     size=$(du -sh "${venv}" 2>/dev/null | cut -f1)

@@ -19,26 +19,32 @@
 # torch gives rigorous Opacus DP-SGD), and its tree models have no federated
 # protocol. Each torch/xgboost build is GPU- or CPU-adaptive (see .gpu_present).
 .FRAMEWORK_PYTHON_DEPS <- list(
-  pytorch = c("torch>=2.0.0", "opacus>=1.4.0"),
-  # opacus: the trusted harness applies DP-SGD to the vision head (REQUIRED, the
-  # vision DP run fails at import without it). monai: the 3D/volumetric backbone.
-  # SimpleITK: the harness reads .mha/.mhd/.dcm through it. Keep this list aligned
+  # ONE torch venv serves BOTH tabular (logreg/mlp) and vision — pytorch_vision is
+  # a superset, so it's merged in (the "pytorch_vision" framework aliases to this
+  # venv via .framework_venv). opacus: DP-SGD (REQUIRED). torchvision/monai: 2D/3D
+  # backbones. SimpleITK: .mha/.mhd/.dcm. nibabel/pynrrd: .nii/.nrrd. Keep aligned
   # with the FAB vision deps in dsFlowerClient::.harness_dependencies(vision=TRUE).
-  pytorch_vision = c("torch>=2.0.0", "opacus>=1.4.0", "torchvision>=0.15.0",
-                     "Pillow>=9.0.0", "nibabel>=5.0.0",
-                     "pydicom>=2.4.0", "pynrrd>=1.0.0",
-                     "SimpleITK>=2.2.0", "monai>=1.3.0"),
+  pytorch = c("torch>=2.0.0", "opacus>=1.4.0", "torchvision>=0.15.0",
+              "Pillow>=9.0.0", "nibabel>=5.0.0", "pydicom>=2.4.0",
+              "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0"),
   # xgboost build (CPU-only vs full GPU) is chosen in .python_deps_for_framework.
   xgboost = c("xgboost>=1.7.0")
 )
 
 .FRAMEWORK_HEALTH_IMPORT <- list(
-  pytorch = "torch",
-  # comma-separated single import: a venv missing opacus (DP) or monai (3D) is
-  # then reported unhealthy and re-provisioned, not silently accepted.
-  pytorch_vision = "torchvision, opacus, monai",
+  # comma-separated single import: a venv missing opacus (DP) / torchvision / monai
+  # is then reported unhealthy and re-provisioned, not silently accepted.
+  pytorch = "torchvision, opacus, monai",
   xgboost = "xgboost"
 )
+
+#' Normalize a framework name to its venv. pytorch_vision is MERGED into the
+#' single torch venv (a superset that runs both tabular and vision), so it
+#' resolves to "pytorch". Used everywhere a framework -> venv path is built.
+#' @keywords internal
+.framework_venv <- function(framework) {
+  if (identical(framework, "pytorch_vision")) "pytorch" else framework
+}
 
 .dsflower_runtime <- new.env(parent = emptyenv())
 
@@ -86,6 +92,7 @@
 #' Get all pip dependencies for a framework (GPU/CPU-adaptive)
 #' @keywords internal
 .python_deps_for_framework <- function(framework) {
+  framework <- .framework_venv(framework)   # pytorch_vision -> pytorch
   extra <- .FRAMEWORK_PYTHON_DEPS[[framework]]
   if (is.null(extra)) return(.BASE_PYTHON_DEPS)
   if (identical(framework, "xgboost")) {
@@ -143,6 +150,7 @@
 #' @return Named list with \code{python} and \code{flower_supernode} paths.
 #' @keywords internal
 .ensure_python_env <- function(framework, timeout_secs = 600) {
+  framework <- .framework_venv(framework)  # pytorch_vision -> merged pytorch venv
   # Fast path: check venv FIRST (avoids system() calls that hang in Rserve)
   root <- .venv_root()
   venv_path <- file.path(root, framework)
