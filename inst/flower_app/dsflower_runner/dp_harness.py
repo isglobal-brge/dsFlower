@@ -218,43 +218,76 @@ def assert_releasable(model):
 
 
 def assert_stock_architecture(model):
-    """ROOT defense behind assert_releasable + the per-sample probe: reject ANY
-    researcher-authored forward. DP-SGD assumes the forward is a pure, per-sample
-    function of stock layers; a CUSTOM forward can instead (a) overwrite a trainable
-    param's ``.data`` with raw input under ``no_grad`` (a stash the gradient noise
-    never covers -> verbatim raw-data exfiltration), or (b) couple samples in the
-    batch (breaking Opacus' per-sample sensitivity bound). So require EVERY module to
-    be a stock ``torch.nn`` class with NO instance-level forward override and NO
-    forward hooks -- there is then no researcher forward at all. The first-party
-    generators emit only nn.Sequential / nn.Linear / nn.ReLU / ... so they pass; a
-    genuinely custom forward must use the egress track (whole-update output
-    perturbation assumes nothing about the forward). Call at LOAD (pre-Opacus) so
-    Opacus' own grad-sample hooks are absent.
+    """ROOT defense: the researcher's model object is UNTRUSTED, so allow only a pure
+    composition of stock torch.nn layers with NO researcher-injected behaviour at all.
+    Successive red-team passes each found a different injection facet -- a custom
+    forward (param-.data stash / sample coupling), a lazy buffer, backward/state_dict
+    hooks, and an instance ``named_modules`` override that substitutes raw data for
+    the noised weights at the release read -- so the gate is exhaustive over the
+    object's surface: stock class, NO callable in the instance __dict__ (no method
+    override of any kind), NO hooks, stock param containers + stock nn.Parameter/Tensor
+    params (no tensor-subclass). The first-party generators (nn.Sequential / nn.Linear
+    / nn.ReLU / ...) pass; a genuinely custom model must use the egress track (whole-
+    update output perturbation assumes nothing about the model). Call at LOAD.
+
+    CRUCIAL: traverse the RAW ``_modules`` storage, never ``model.modules()`` /
+    ``named_modules`` -- those route through the very instance-overridable methods we
+    are validating, so the gate itself must not call them (else the override hides).
     """
-    for m in model.modules():
+    import torch
+    import torch.nn as nn
+    from collections import OrderedDict
+    _STOCK_DICT = (dict, OrderedDict)
+
+    def _walk(m):
+        yield m
+        kids = getattr(m, "_modules", None)
+        if type(kids) not in _STOCK_DICT:
+            raise ValueError("module %r has a non-stock _modules container (a "
+                             "traversal-subversion channel)." % type(m).__name__)
+        for child in kids.values():
+            if child is not None:
+                yield from _walk(child)
+
+    for m in _walk(model):
         cls = type(m)
         if not cls.__module__.startswith("torch.nn"):
             raise ValueError(
-                "non-stock module %r on the DP-SGD track: only stock torch.nn "
-                "modules are allowed (a custom forward could stash raw data or "
-                "couple samples). Build from torch.nn layers, or use egress."
-                % cls.__name__)
-        if "forward" in vars(m):
+                "non-stock module %r on the DP-SGD track: only stock torch.nn modules "
+                "are allowed (a custom class is researcher code). Build from torch.nn "
+                "layers, or use the egress track." % cls.__name__)
+        # No instance-level method override: a stock module stores only params /
+        # buffers / submodules / config in its __dict__, never a callable. Any callable
+        # there is a method override -- `forward` (stash / sample-coupling) or
+        # `named_modules`/`named_parameters`/`parameters`/... which the release path
+        # traverses through, letting it substitute raw data for the noised weights.
+        overrides = sorted(a for a, v in vars(m).items() if callable(v))
+        if overrides:
             raise ValueError(
-                "module %r has an instance-level forward override (a stash / "
-                "sample-coupling channel); not allowed on the DP-SGD track."
-                % cls.__name__)
-        # Forbid ALL hook registrations (not just forward): a _backward_hook can
-        # CAPTURE the raw input Opacus stashes on the module during backward, and a
-        # _state_dict_hook can REWRITE the noised weights with it at release -- both
-        # survive DP-SGD and the value-blind release gates. Enumerate every
-        # *_hooks dict on the instance so new torch hook types are covered too.
-        hook_attrs = [a for a, v in vars(m).items() if a.endswith("_hooks") and v]
+                "module %r has instance-level method override(s) %r (a stash / "
+                "release-substitution channel); not allowed on the DP-SGD track."
+                % (cls.__name__, overrides))
+        # No hooks of any kind: a backward hook CAPTURES the raw input Opacus stashes
+        # during backward; a state_dict hook REWRITES the noised weights at release.
+        hook_attrs = sorted(a for a, v in vars(m).items() if a.endswith("_hooks") and v)
         if hook_attrs:
             raise ValueError(
                 "module %r has registered hooks %r: a data-capture (backward) / "
-                "release-rewrite (state_dict) channel that survives DP-SGD; not "
-                "allowed on the DP-SGD track." % (cls.__name__, hook_attrs))
+                "release-rewrite (state_dict) channel; not allowed on the DP-SGD "
+                "track." % (cls.__name__, hook_attrs))
+        # Every parameter must be a STOCK nn.Parameter wrapping a STOCK Tensor: a
+        # Parameter/tensor SUBCLASS could intercept .detach()/.cpu()/.numpy() via
+        # __torch_function__ and return raw data at the release read.
+        pdict = getattr(m, "_parameters", None)
+        if type(pdict) not in _STOCK_DICT:
+            raise ValueError("module %r has a non-stock _parameters container."
+                             % cls.__name__)
+        for pname, p in pdict.items():
+            if p is not None and (type(p) is not nn.Parameter
+                                  or type(p.data) is not torch.Tensor):
+                raise ValueError(
+                    "module %r parameter %r is not a stock nn.Parameter/Tensor (a "
+                    "tensor-subclass exfil channel); not allowed." % (cls.__name__, pname))
 
 
 _LOSS_ALLOWLIST = {
