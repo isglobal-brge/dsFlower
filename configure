@@ -176,7 +176,7 @@ create_venv() {
 }
 
 # TRUE when a usable NVIDIA GPU is visible to this container (the single check
-# used to pick CUDA-vs-CPU builds for torch AND xgboost). Force with
+# used to pick CUDA-vs-CPU builds for torch). Force with
 # DSFLOWER_FORCE_GPU=1/0. Mirrors R .gpu_present.
 gpu_present() {
   case "$(printf '%s' "${DSFLOWER_FORCE_GPU:-}" | tr 'A-Z' 'a-z')" in
@@ -221,7 +221,7 @@ mark_ready() {
 provision_framework() {
   local name="$1"; local check_modules="$2"; shift 2; local deps="$*"
   local venv_path="${VENV_ROOT}/${name}"
-  local base_deps="flwr>=1.13.0 numpy>=1.21.0 pandas>=1.3.0 pyarrow>=10.0.0"
+  local base_deps="flwr>=1.31.0 numpy>=1.21.0 pandas>=1.3.0 pyarrow>=10.0.0"
   local expected_hash
   # shellcheck disable=SC2086
   expected_hash="$(deps_hash ${base_deps} ${deps})"
@@ -275,11 +275,15 @@ provision_framework "pytorch" "torchvision opacus nibabel nrrd SimpleITK monai" 
   "nibabel>=5.0.0" "pydicom>=2.4.0" "pynrrd>=1.0.0" \
   "SimpleITK>=2.2.0" "monai>=1.3.0"
 
-# xgboost: CPU-only build (~18MB) on GPU-less nodes vs the full GPU wheel (~1GB);
-# both import as `xgboost`. (sklearn dropped: redundant with pytorch_logreg, and
-# torch gives it rigorous Opacus DP-SGD.)
-if gpu_present; then XGB_DEP="xgboost>=1.7.0"; else XGB_DEP="xgboost-cpu>=1.7.0"; fi
-provision_framework "xgboost" "xgboost" "${XGB_DEP}"
+# Remove venvs from dropped frameworks so no obsolete venv lingers (clean by
+# design): the trees track's DP-GBDT is pure numpy in the torch venv, so xgboost
+# is never provisioned; sklearn was dropped for pytorch_logreg + Opacus DP-SGD.
+for _obsolete in xgboost sklearn; do
+  if [ -d "${VENV_ROOT}/${_obsolete}" ]; then
+    log_info "  removing obsolete venv: ${_obsolete}"
+    rm -rf "${VENV_ROOT}/${_obsolete}"
+  fi
+done
 
 # Fix Python permissions (Rock runs as non-root 'rock' user)
 if [ -d "/root/.local/share/uv/python" ]; then
@@ -292,7 +296,7 @@ echo ""
 log_info "Python environment setup complete."
 log_info "Venvs stored in: ${VENV_ROOT}"
 
-for fw in pytorch xgboost; do
+for fw in pytorch; do
   venv="${VENV_ROOT}/${fw}"
   if [ -f "${venv}/.dsflower_ready" ]; then
     size=$(du -sh "${venv}" 2>/dev/null | cut -f1)
