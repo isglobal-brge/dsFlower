@@ -116,12 +116,12 @@ def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta)
 
 
 def bucket_count(n):
-    """Round a count to the nearest power of two (counts < 4 are exact)."""
+    """Round a count to the nearest power of two; counts <= 3 (the nfilter.subset
+    default) are SUPPRESSED to 0 so a near-empty node never leaks an exact small
+    size. Mirrors the R .bucket_count suppression (policy.R)."""
     n = int(n)
-    if n <= 0:
+    if n <= 3:
         return 0
-    if n < 4:
-        return n
     return int(2 ** round(math.log2(n)))
 
 

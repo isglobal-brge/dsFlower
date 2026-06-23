@@ -89,8 +89,12 @@ def _to_2d_slice(arr):
     HxWxD volumes). 2D input passes through."""
     if arr.ndim <= 2:
         return arr
-    if arr.ndim == 3 and arr.shape[-1] in (3, 4) and arr.shape[0] > 4:
-        return arr[..., :3]  # already HxWxC RGB(A)
+    # HxWxC RGB(A): a trailing 3/4 channel axis. (No min-height guard: a small
+    # e.g. 4x4x3 image must stay RGB, not be read as a 4-slice volume.) Remaining
+    # ambiguity (which axis is the slice direction for a true volume) is documented
+    # as "smallest-extent axis"; metadata-driven orientation is future work.
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        return arr[..., :3]
     axis = int(np.argmin(arr.shape))
     return np.take(arr, arr.shape[axis] // 2, axis=axis)
 

@@ -213,13 +213,16 @@ patients** for both the minimum collection size *and* the minimum per-class coun
 the "many images, few patients" leak that per-image counting misses (e.g. 18-vs-12
 *images* but only 2 *patients* in a class → refused). No patient column → per-image.
 
-**DP unit = the IMAGE (caveat, documented).** Admission groups by patient, but the
-Opacus DP-SGD noise is applied **per-image example**, so the formal DP unit is the
-image. A patient contributing `k` images therefore has a per-patient guarantee
-weaker by up to a factor `k` (group privacy). This is the **decided** design
-(per-patient admission + per-image DP); the natural future upgrade to true
-per-patient DP is to **mean-pool features per patient** before the DP head step
-(one DP example per patient), at the cost of assuming patient-level labels.
+**DP unit = the PATIENT when grouped (implemented), else the image.** When a
+patient/subject column is present **and** labels are patient-level, the harness
+**mean-pools the frozen features per patient** before the DP head step, so the DP
+example *is* the patient and the formal DP unit matches the per-patient admission
+unit — no group-privacy gap, and the Opacus sample-rate/accountant automatically
+use the patient count. It stays **per-image** only when there is no patient column,
+or when a patient mixes labels (slice-level labels, where pooling would corrupt
+them); then a patient with `k` images has a per-patient guarantee weaker by up to
+`k` (group privacy). The pooling column is the **same** one admission grouped by
+(pinned in the manifest as `patient_column`), so the two never diverge.
 
 ## 6. Transport — DSI as a transparent byte tunnel (salvaged)
 

@@ -388,7 +388,10 @@
   }
   Sys.chmod(staged_samples, "0600")
 
-  # Build manifest
+  # Build manifest (patient_column pins the per-patient DP unit to the admission
+  # grouping column when samples are in-memory; the harness auto-detects otherwise).
+  patient_column <- if (is.data.frame(samples_data))
+    .detectPatientColumn(samples_data, extra_config) else NULL
   manifest <- list(
     run_token    = run_token,
     data_type    = "image",
@@ -396,6 +399,7 @@
     samples_file = samples_basename,
     n_samples    = n_samples,
     target_column = target_column,
+    patient_column = patient_column,
     staged_at    = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
@@ -998,7 +1002,10 @@
   .writeStagedSamples(samples_df, staged_samples)
   n_samples <- nrow(samples_df)
 
-  # Build manifest
+  # Build manifest. patient_column is the column the disclosure admission grouped
+  # by (.detectPatientColumn); pinning it here makes the harness train per-PATIENT
+  # on the SAME column, so the DP unit matches the admission unit.
+  patient_column <- .detectPatientColumn(samples_df, extra_config)
   manifest <- list(
     run_token     = run_token,
     data_type     = "image",
@@ -1008,6 +1015,7 @@
     n_input_samples = prepared$n_input_samples,
     dropped_missing = prepared$dropped_missing,
     target_column = target_column,
+    patient_column = patient_column,
     dataset_id    = desc$dataset_id,
     source_kind   = "image_bundle",
     assets        = validated_assets,

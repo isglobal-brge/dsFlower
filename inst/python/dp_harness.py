@@ -169,10 +169,8 @@ def bucket_count(n):
     Used so released sample counts (num_examples) never leak an exact node size.
     """
     n = int(n)
-    if n <= 0:
+    if n <= 3:
         return 0
-    if n < 4:
-        return n
     return int(2 ** round(math.log2(n)))
 
 

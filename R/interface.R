@@ -364,30 +364,28 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     # select only the target column(s) to avoid loading wide feature matrices.
     target_data <- NULL
     if (!is.null(target_column) && length(target_column) > 0) {
-      tryCatch({
-        if (identical(data_type, "image")) {
-          staged_data_path <- file.path(staging_dir,
-                                        staged_manifest$samples_file)
-          if (file.exists(staged_data_path) &&
-              grepl("\\.parquet$", staged_data_path, ignore.case = TRUE)) {
-            target_data <- as.data.frame(arrow::read_parquet(staged_data_path))
-          } else if (file.exists(staged_data_path)) {
-            target_data <- utils::read.csv(staged_data_path,
-                                           stringsAsFactors = FALSE)
+      staged_data_path <- if (identical(data_type, "image"))
+        file.path(staging_dir, staged_manifest$samples_file %||% "")
+      else file.path(staging_dir, staged_manifest$data_file %||% "")
+      if (nzchar(staged_data_path) && file.exists(staged_data_path)) {
+        # Fail-CLOSED: a read error here must NOT silently leave target_data NULL,
+        # which would skip the class-distribution admission check (a disclosure
+        # bypass). For images load the whole (small) samples table; for tabular
+        # select only the target column(s) to avoid loading wide feature matrices.
+        target_data <- tryCatch({
+          if (grepl("\\.parquet$", staged_data_path, ignore.case = TRUE)) {
+            if (identical(data_type, "image"))
+              as.data.frame(arrow::read_parquet(staged_data_path))
+            else
+              as.data.frame(arrow::read_parquet(staged_data_path,
+                                                 col_select = target_column))
+          } else {
+            utils::read.csv(staged_data_path, stringsAsFactors = FALSE)
           }
-        } else {
-          staged_data_path <- file.path(staging_dir, staged_manifest$data_file)
-          if (file.exists(staged_data_path) &&
-              grepl("\\.parquet$", staged_data_path, ignore.case = TRUE)) {
-            target_data <- as.data.frame(
-              arrow::read_parquet(staged_data_path, col_select = target_column)
-            )
-          } else if (file.exists(staged_data_path)) {
-            target_data <- utils::read.csv(staged_data_path,
-                                            stringsAsFactors = FALSE)
-          }
-        }
-      }, error = function(e) NULL)
+        }, error = function(e)
+          stop("Could not read staged data for the disclosure class-distribution ",
+               "check: ", conditionMessage(e), call. = FALSE))
+      }
     }
     .enforceDisclosureAndDp(handle, target_column, template_name,
                             n_samples, target_data, run_config,

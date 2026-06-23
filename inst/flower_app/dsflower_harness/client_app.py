@@ -68,6 +68,45 @@ def _dp_fit(model, X, y, pcfg, cfg, n_classes, msg):
     return get_torch_params(model), len(dataset)
 
 
+def _assert_label_range(y, n_classes):
+    """The head width is fixed by num-classes; verify the labels fit it. Generic
+    message (no exact counts -> no disclosure): binary BCE would SILENTLY mislearn
+    a stray label (e.g. 1-indexed {1,2}); multiclass CE would throw cryptically."""
+    if not len(y):
+        raise RuntimeError("no labelled samples to train on")
+    max_label = int(np.nanmax(y))
+    n_distinct = int(np.unique(y[np.isfinite(y)]).size)
+    if int(n_classes) <= 2:
+        if max_label > 1 or n_distinct > 2:
+            raise RuntimeError(
+                "label/num-classes mismatch: a binary model but the labels are "
+                "not in {0,1}. Set the model's n_classes to your class count.")
+    elif max_label >= int(n_classes):
+        raise RuntimeError(
+            "label/num-classes mismatch: a label exceeds num-classes. Set the "
+            "model's n_classes to at least your class count.")
+
+
+def _pool_by_patient(X, y, groups):
+    """Per-PATIENT DP: mean-pool features per patient (one DP example per patient).
+    Returns (X_pooled, y_pooled, True) when labels are patient-level (one label per
+    patient); returns (None, None, False) when any patient mixes labels (slice-level
+    labels -> pooling would corrupt them, so keep per-image). A missing patient id
+    becomes a singleton (that image trains as its own per-image unit)."""
+    g = [("" if gv is None else str(gv)) for gv in groups]
+    g = np.asarray([gv if (gv and gv.lower() != "nan") else f"__img_{i}"
+                    for i, gv in enumerate(g)], dtype=object)
+    Xp, yp = [], []
+    for key in dict.fromkeys(g.tolist()):
+        m = g == key
+        labs = np.unique(y[m])
+        if labs.size > 1:
+            return None, None, False
+        Xp.append(X[m].mean(axis=0))
+        yp.append(labs[0])
+    return np.stack(Xp), np.asarray(yp, dtype=y.dtype), True
+
+
 @app.train()
 def train(msg: Message, context: Context) -> Message:
     cfg = dict(context.run_config)
@@ -102,33 +141,37 @@ def train(msg: Message, context: Context) -> Message:
         if int(cfg.get("batch-size", 32)) < floor:
             cfg["batch-size"] = floor
 
-        paths, y = load_image_collection(context)        # paths + labels only
-
-        # The head width is fixed by num-classes (config); verify the labels fit it.
-        # Without this, binary BCE would SILENTLY mislearn a stray label>=2, and
-        # multiclass CE would throw a cryptic index error deep in the loop.
-        n_distinct = int(np.unique(y).size) if len(y) else 0
-        max_label = int(y.max()) if len(y) else 0
-        if n_classes <= 2:
-            if n_distinct > 2 or max_label > 1:
-                raise RuntimeError(
-                    f"num-classes={n_classes} (binary) but the labels have "
-                    f"{n_distinct} distinct values (max {max_label}); set the "
-                    "model's n_classes to match your label set.")
-        elif max_label >= n_classes:
-            raise RuntimeError(
-                f"num-classes={n_classes} but a label value {max_label} was found; "
-                "set the model's n_classes to at least the number of distinct labels.")
+        paths, y, groups = load_image_collection(context)   # paths + labels + patient ids
+        _assert_label_range(y, n_classes)
 
         encoder, feat_dim = vision.build_backbone(backbone)
         read = vision.read_image_3d if vision.is_3d_backbone(backbone) else vision.read_image_2d
-        images = [read(p, image_size) for p in paths]    # the ONLY pass over pixels
+        try:
+            images = [read(p, image_size) for p in paths]    # the ONLY pass over pixels
+        except Exception as e:
+            raise RuntimeError(f"failed to read an image in the collection: {e}")
+        if not images:
+            raise RuntimeError("no images could be read from the collection")
         X = vision.extract_features(encoder, images)     # frozen, no grad -> features
         del images
+        if not np.all(np.isfinite(X)):
+            raise RuntimeError(
+                "non-finite features extracted (corrupt backbone weights or inputs?)")
+
+        # Per-PATIENT DP: when a patient column is present and labels are
+        # patient-level, mean-pool features per patient so the DP example IS the
+        # patient -> the formal DP unit matches the per-patient admission unit
+        # (closes the group-privacy gap). Slice-level labels keep per-image.
+        if groups is not None:
+            Xp, yp, pooled = _pool_by_patient(X, y, groups)
+            if pooled:
+                X, y = Xp, yp
+
         model = vision.build_head(feat_dim, n_classes)   # the only trainable/communicated module
         new_arrays, n = _dp_fit(model, X, y, pcfg, cfg, n_classes, msg)
     else:
         X, y = load_data(context)
+        _assert_label_range(y, 2)                        # tabular harness models are binary
         model = build_model(cfg, input_dim=X.shape[1])
         new_arrays, n = _dp_fit(model, X, y, pcfg, cfg, n_classes=2, msg=msg)
 
