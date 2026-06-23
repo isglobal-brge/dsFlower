@@ -81,6 +81,7 @@ def load_user_model(cfg, input_dim, *, input_key="num-features", allow_custom=Fa
         raise ValueError(
             "model is not DP-compatible (Opacus ModuleValidator): %s"
             % ModuleValidator.validate(model, strict=False))
+    dp_harness.assert_stock_architecture(model)   # no researcher forward (root gate)
     dp_harness.assert_releasable(model)
     # Snapshot the EXACT releasable key-set now (post-validation, pre-training).
     # The release gate in client_app._dp_fit re-checks this immediately before

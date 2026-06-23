@@ -217,6 +217,39 @@ def assert_releasable(model):
             "trainable on the DP-SGD track." % frozen[:8])
 
 
+def assert_stock_architecture(model):
+    """ROOT defense behind assert_releasable + the per-sample probe: reject ANY
+    researcher-authored forward. DP-SGD assumes the forward is a pure, per-sample
+    function of stock layers; a CUSTOM forward can instead (a) overwrite a trainable
+    param's ``.data`` with raw input under ``no_grad`` (a stash the gradient noise
+    never covers -> verbatim raw-data exfiltration), or (b) couple samples in the
+    batch (breaking Opacus' per-sample sensitivity bound). So require EVERY module to
+    be a stock ``torch.nn`` class with NO instance-level forward override and NO
+    forward hooks -- there is then no researcher forward at all. The first-party
+    generators emit only nn.Sequential / nn.Linear / nn.ReLU / ... so they pass; a
+    genuinely custom forward must use the egress track (whole-update output
+    perturbation assumes nothing about the forward). Call at LOAD (pre-Opacus) so
+    Opacus' own grad-sample hooks are absent.
+    """
+    for m in model.modules():
+        cls = type(m)
+        if not cls.__module__.startswith("torch.nn"):
+            raise ValueError(
+                "non-stock module %r on the DP-SGD track: only stock torch.nn "
+                "modules are allowed (a custom forward could stash raw data or "
+                "couple samples). Build from torch.nn layers, or use egress."
+                % cls.__name__)
+        if "forward" in vars(m):
+            raise ValueError(
+                "module %r has an instance-level forward override (a stash / "
+                "sample-coupling channel); not allowed on the DP-SGD track."
+                % cls.__name__)
+        if getattr(m, "_forward_hooks", None) or getattr(m, "_forward_pre_hooks", None):
+            raise ValueError(
+                "module %r has forward hooks (a stash / sample-coupling channel); "
+                "not allowed on the DP-SGD track." % cls.__name__)
+
+
 _LOSS_ALLOWLIST = {
     "bce_logits":     ("BCEWithLogitsLoss", {}),
     "cross_entropy":  ("CrossEntropyLoss", {}),
@@ -268,17 +301,23 @@ def per_sample_independence_probe(model, criterion, x_sample, y_sample):
                          "grad_sample; refusing the custom model (fail closed).")
 
     g0 = per_sample_grad(x_sample, y_sample)
-    x2 = x_sample.clone()
-    x2[0] = x2[0] + 1.0
-    g1 = per_sample_grad(x2, y_sample)
-    if x_sample.shape[0] > 1:
-        other = torch.arange(x_sample.shape[0]) != 0
-        if not torch.allclose(g0[other], g1[other], atol=1e-5):
-            raise ValueError(
-                "submitted forward graph COUPLES samples (perturbing one row "
-                "changed another row's per-sample gradient): its DP-SGD guarantee "
-                "would be wrong. Use a per-sample architecture or the egress "
-                "fallback.")
+    n = x_sample.shape[0]
+    # Perturb EVERY row (not just row 0): a forward that couples via the mean of the
+    # OTHER rows (e.g. x - x[1:].mean(0)) leaves row 0 invariant but is exposed the
+    # moment any other row is perturbed. For each i, ONLY row i's per-sample gradient
+    # may change; if perturbing row i moves another row's gradient, samples couple.
+    for i in range(n):
+        x2 = x_sample.clone()
+        x2[i] = x2[i] + 1.0
+        gi = per_sample_grad(x2, y_sample)
+        if n > 1:
+            other = torch.arange(n) != i
+            if not torch.allclose(g0[other], gi[other], atol=1e-5):
+                raise ValueError(
+                    "submitted forward graph COUPLES samples (perturbing row %d "
+                    "changed another row's per-sample gradient): its DP-SGD "
+                    "guarantee would be wrong. Use a per-sample architecture or "
+                    "the egress fallback." % i)
 
 
 # --------------------------------------------------------------------------- #

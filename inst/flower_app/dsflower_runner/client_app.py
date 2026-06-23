@@ -88,9 +88,18 @@ def _dp_fit(model, X, y, pcfg, pins, msg):
     for _ in range(local_epochs):
         for xb, yb in trainloader:
             xb, yb = xb.to(device), yb.to(device)
+            clean = [p.detach().clone() for p in model.parameters()]
             optimizer.zero_grad()
             loss = criterion(model(xb), yb)
             loss.backward()
+            # Defense-in-depth for the param-stash (A1): undo ANY in-place write the
+            # forward made to the leaf params BEFORE the optimizer steps, so weights
+            # evolve ONLY via the (noised) DP-SGD update, never a forward side effect.
+            # (assert_stock_architecture already forbids custom forwards; this guards
+            # a missed vector -- the grad_sample Opacus uses is untouched by .data.)
+            with torch.no_grad():
+                for p, c in zip(model.parameters(), clean):
+                    p.copy_(c)
             optimizer.step()
     # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
     # a buffer / frozen param / new parameter registered lazily inside the
@@ -200,11 +209,15 @@ def _train_neural(msg, context, cfg, pcfg, pins):
     # attention, cdist(x, x)) passes ModuleValidator's layer-type denylist yet
     # silently breaks the per-sample DP-SGD sensitivity bound. The probe is cheap
     # and fails closed; a vetted Linear/ReLU head passes it trivially.
+    import copy
     k = min(8, len(X))
     xb = torch.from_numpy(X[:k]).float()
     yb = _prep_target(y[:k], pins["loss_name"])
+    # Probe a DEEPCOPY: the probe wraps the model with Opacus to read per-sample
+    # gradients, which leaves grad-sample hooks behind; the real model must reach
+    # make_private clean (else Opacus raises "Trying to add hooks twice").
     dp_harness.per_sample_independence_probe(
-        model, dp_harness.loss_from_allowlist(pins["loss_name"]), xb, yb)
+        copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"]), xb, yb)
 
     return _dp_fit(model, X, y, pcfg, pins, msg)
 
