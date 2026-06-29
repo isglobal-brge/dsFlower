@@ -173,6 +173,37 @@ a non-sequential graph (U-Net skips) is **automatically routed to the Tier-2
 output-perturbation floor** — the gateway never grants tight DP it cannot
 guarantee by construction, and never fails open.
 
+**Server-authoritative DP (the trust boundary).** The node is the only trusted
+party; the client (researcher) is untrusted. The client submits only WHAT to
+compute — the node decides and enforces ALL of how-private, and the client cannot
+weaken it (nor even request stronger — the budget is the custodian's resource):
+
+- *Mechanism* is node-pinned and routed by code identity: the DP-SGD path only ever
+  runs the hash-verified harness on a data-only spec; an uploaded user-module is
+  forced to the output-perturbation floor (`client_app.train`). A client cannot
+  route its own code to the tight track.
+- *Parameters* (ε / δ / clip) come from this node's options
+  (`dp_epsilon`/`dp_delta`/`dp_clipping_norm`), OVERRIDING anything the client sends
+  (`.addDpConfigToRunConfig`), bounded by ceilings and an RDP/PRV budget ledger.
+- *Budget* is keyed by DATA identity (table fingerprint + target), never the
+  client-chosen assign symbol — so a sybil client cannot reset the budget by
+  re-assigning the same data to a fresh symbol.
+- *Noise* is drawn from a fresh OS-entropy generator (`np.random.default_rng`),
+  isolated from any global seeding (predictable noise would void DP).
+- The output-perturbation floor calibrates Gaussian noise to the C-ball DIAMETER
+  **2C** (arbitrary code's true L2 sensitivity), not C.
+
+Corroborated by an independent design review (Codex) and a multi-source deep-research
+pass: server-authoritative / client-untrusted enforcement is established prior art
+(DataSHIELD custodian-only parameters; Google Confidential Federated Computations); a
+verifiable budget ledger is essential (re-runs average the noise out); and a
+declarative DSL + Opacus covers conv/RNN/LSTM/GRU/attention — but ONLY with the node's
+OWN per-sample-independence gate, because Opacus' ModuleValidator is non-exhaustive (it
+cannot see `x - x.mean(0)`, batch attention, or Cox risk-set coupling). That gate is
+`per_sample_independence_probe` + `assert_stock_architecture`. Sample-and-aggregate and
+PATE are not worth adding as a universal floor in few-site cross-silo; the Gaussian
+output-perturbation floor remains the universal mechanism.
+
 **DataSHIELD backstop (deterministic).** Independent of DP, every release passes
 minimum-count control: counts ≤ threshold are suppressed/bucketed; `num_examples`
 / sizes are count-bucketed. *Any metric not noised-or-bucketed is an exfiltration
