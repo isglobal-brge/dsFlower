@@ -37,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import dp_harness as dh
+import model_spec
 import tier2_lib
 
 torch.manual_seed(0)
@@ -169,6 +170,31 @@ class CountHead(nn.Module):
 xct = torch.randn(8, 3); yct = torch.randint(0, 6, (8, 1)).float()
 check("negbin_nll model passes the per-sample independence probe",
       not rejects(lambda: dh.per_sample_independence_probe(CountHead(), nb, xct, yct)))
+
+# --------------------------------------------------------------------------- #
+print("== custom loss factory: gamma NLL (per-sample, DP-SGD-safe) ==")
+gm = dh.loss_from_allowlist("gamma_nll", {"gamma-shape": 1.0})
+check("loss_from_allowlist('gamma_nll', cfg) returns a callable", callable(gm))
+# Numerics, INDEPENDENT: gamma(shape=1) == exponential NLL z + y*exp(-z).
+zg = torch.tensor([0.3, 1.1]).reshape(-1, 1).double()
+yg = torch.tensor([0.5, 2.0]).reshape(-1, 1).double()
+expo = float((zg + yg * torch.exp(-zg)).mean())
+check("gamma_nll(shape=1) == exponential NLL", abs(float(gm(zg, yg)) - expo) < 1e-9)
+check("gamma_nll rejects shape <= 0 (fail closed)",
+      rejects(lambda: dh.loss_from_allowlist("gamma_nll", {"gamma-shape": -1.0})))
+class PosHead(nn.Module):
+    def __init__(s): super().__init__(); s.lin = nn.Linear(3, 1)
+    def forward(s, x): return s.lin(x)
+check("gamma_nll model passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          PosHead(), gm, torch.randn(8, 3), torch.rand(8, 1) + 0.1)))
+
+# --------------------------------------------------------------------------- #
+print("== ordinal (CORN): node-decided K-1 width + stock per-sample BCE ==")
+check("ordinal output_width = K-1", model_spec.output_width("ordinal", {"num-classes": 4}) == 3)
+check("ordinal degenerate (K=2) width = 1", model_spec.output_width("ordinal", {"num-classes": 2}) == 1)
+check("ordinal loss is stock BCEWithLogitsLoss",
+      type(dh.loss_from_allowlist("ordinal")).__name__ == "BCEWithLogitsLoss")
 
 # --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")

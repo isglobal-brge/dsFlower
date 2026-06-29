@@ -46,13 +46,21 @@ app = ClientApp()
 # Neural track (Opacus DP-SGD)
 # --------------------------------------------------------------------------- #
 
-def _prep_target(y, loss_name):
-    """Target tensor shaped for the harness-owned loss."""
+def _prep_target(y, loss_name, n_classes):
+    """Target tensor shaped for the harness-owned loss. n_classes is node-pinned and
+    only used by encodings that need the class/level count (ordinal)."""
     if loss_name in ("cross_entropy", "hinge"):
         return torch.from_numpy(y).long()              # [N], multi-logit output (CE / hinge-SVM)
     if loss_name == "multilabel_bce":
         return torch.from_numpy(y).float()             # [N, L]
-    return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson)
+    if loss_name == "ordinal":
+        # CORN cumulative encoding: K-1 binary tasks, column j = 1{level > j}. The
+        # head emits K-1 logits; the node builds the target so the client sends only
+        # the ordinal level (0..K-1) and cannot mis-shape it.
+        levels = torch.from_numpy(y).long().reshape(-1)              # [N] in 0..K-1
+        thresholds = torch.arange(max(2, int(n_classes)) - 1)       # [K-1]
+        return (levels.unsqueeze(1) > thresholds.unsqueeze(0)).float()   # [N, K-1]
+    return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson/count/gamma)
 
 
 def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
@@ -69,7 +77,8 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
 
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=float(pins["learning_rate"]))
-    dataset = TensorDataset(torch.from_numpy(X).float(), _prep_target(y, loss_name))
+    dataset = TensorDataset(torch.from_numpy(X).float(),
+                            _prep_target(y, loss_name, int(pins["n_classes"])))
     # Anti-shrink: the manifest n_samples is the server-recorded count of the STAGED
     # (pre-pool) frame; assert it matches so the client can't shrink the accountant
     # denominator. The accountant below uses len(dataset) (POST-pool = per-patient DP
@@ -126,7 +135,7 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
 # Only classification losses constrain labels to [0, n_classes); regression (mse) and
 # count (poisson_nll) targets are continuous, and multilabel targets are 2D -- none of
 # them carry a class-range invariant, so the label-range check must not run for them.
-_CLASSIFICATION_LOSSES = ("bce_logits", "cross_entropy", "hinge")
+_CLASSIFICATION_LOSSES = ("bce_logits", "cross_entropy", "hinge", "ordinal")
 
 
 def _assert_label_range(y, n_classes):
@@ -225,7 +234,7 @@ def _train_neural(msg, context, cfg, pcfg, pins):
     import copy
     k = min(8, len(X))
     xb = torch.from_numpy(X[:k]).float()
-    yb = _prep_target(y[:k], pins["loss_name"])
+    yb = _prep_target(y[:k], pins["loss_name"], int(pins["n_classes"]))
     # Probe a DEEPCOPY: the probe wraps the model with Opacus to read per-sample
     # gradients, which leaves grad-sample hooks behind; the real model must reach
     # make_private clean (else Opacus raises "Trying to add hooks twice").

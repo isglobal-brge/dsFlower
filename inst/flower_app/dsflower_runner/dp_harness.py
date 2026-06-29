@@ -297,6 +297,7 @@ _LOSS_ALLOWLIST = {
     "poisson_nll":    ("PoissonNLLLoss", {"log_input": True}),
     "multilabel_bce": ("BCEWithLogitsLoss", {}),
     "hinge":          ("MultiMarginLoss", {}),  # linear SVM (multiclass margin), per-sample
+    "ordinal":        ("BCEWithLogitsLoss", {}),  # ordinal regression via K-1 cumulative tasks (CORN)
 }
 
 
@@ -325,6 +326,27 @@ def _negbin_nll_factory(cfg):
     return negbin_nll
 
 
+def _gamma_nll_factory(cfg):
+    """Gamma GLM negative log-likelihood, log-link, PER-SAMPLE. pred = log-mean
+    [N,1]; target = strictly-positive continuous [N,1] (cost, concentration, length
+    of stay). The shape k (variance = mu^2 / k) is a harmless run-config hyperparameter
+    -- it shapes the loss, never the clip/noise, so it is no DP lever. Mean reduction;
+    decomposes per sample -> DP-SGD-safe. At k=1 this is the exponential NLL z + y*exp(-z)."""
+    k = float(cfg.get("gamma-shape", 1.0))
+    if not math.isfinite(k) or k <= 0.0:
+        raise ValueError("gamma-shape must be a positive finite float, got %r" % (k,))
+    lgamma_k, log_k = math.lgamma(k), math.log(k)
+
+    def gamma_nll(pred, target):
+        import torch
+        z = pred.reshape(-1)                       # log-mean (log-link)
+        y = target.reshape(-1).to(z.dtype)         # strictly positive continuous
+        ll = ((k - 1.0) * torch.log(y) - k * y * torch.exp(-z)
+              - k * (z - log_k) - lgamma_k)
+        return (-ll).mean()
+    return gamma_nll
+
+
 # Custom TRUSTED per-sample losses (node code, never client code): name -> factory(cfg).
 # Each MUST decompose per sample with mean reduction so the DP-SGD sensitivity bound
 # holds; enforced by per_sample_independence_probe + the DP safety suite. Hyperparams
@@ -332,6 +354,7 @@ def _negbin_nll_factory(cfg):
 # lever. This is how tight DP is GROWN (vetted node losses), not by trusting client code.
 _CUSTOM_LOSS_FACTORY = {
     "negbin_nll": _negbin_nll_factory,
+    "gamma_nll": _gamma_nll_factory,
 }
 
 
