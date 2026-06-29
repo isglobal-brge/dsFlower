@@ -48,8 +48,8 @@ app = ClientApp()
 
 def _prep_target(y, loss_name):
     """Target tensor shaped for the harness-owned loss."""
-    if loss_name == "cross_entropy":
-        return torch.from_numpy(y).long()              # [N], multi-logit output
+    if loss_name in ("cross_entropy", "hinge"):
+        return torch.from_numpy(y).long()              # [N], multi-logit output (CE / hinge-SVM)
     if loss_name == "multilabel_bce":
         return torch.from_numpy(y).float()             # [N, L]
     return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson)
@@ -126,7 +126,7 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
 # Only classification losses constrain labels to [0, n_classes); regression (mse) and
 # count (poisson_nll) targets are continuous, and multilabel targets are 2D -- none of
 # them carry a class-range invariant, so the label-range check must not run for them.
-_CLASSIFICATION_LOSSES = ("bce_logits", "cross_entropy")
+_CLASSIFICATION_LOSSES = ("bce_logits", "cross_entropy", "hinge")
 
 
 def _assert_label_range(y, n_classes):

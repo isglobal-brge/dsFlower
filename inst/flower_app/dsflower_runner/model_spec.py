@@ -50,8 +50,8 @@ def output_width(loss_name, cfg):
     the node fills it in from the loss it pinned, so a mis-sized head is impossible.
     Mirrors the historical generator logic, but server-authoritative."""
     nc = int(cfg.get("num-classes", 2))
-    if loss_name == "cross_entropy":
-        return max(2, nc)                      # one logit per class (>=2, softmax-CE)
+    if loss_name in ("cross_entropy", "hinge"):
+        return max(2, nc)                      # one logit per class (softmax-CE / margin-SVM)
     if loss_name == "multilabel_bce":
         return int(cfg["num-labels"])          # one independent logit per label
     if loss_name in ("mse", "poisson_nll"):

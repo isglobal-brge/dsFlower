@@ -296,6 +296,7 @@ _LOSS_ALLOWLIST = {
     "mse":            ("MSELoss", {}),
     "poisson_nll":    ("PoissonNLLLoss", {"log_input": True}),
     "multilabel_bce": ("BCEWithLogitsLoss", {}),
+    "hinge":          ("MultiMarginLoss", {}),  # linear SVM (multiclass margin), per-sample
 }
 
 
