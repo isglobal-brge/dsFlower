@@ -292,6 +292,13 @@ def train(msg: Message, context: Context) -> Message:
     cfg = dict(context.run_config)
     pcfg = load_privacy_config(context)
     track = load_dp_track(context)                 # node-pinned, NOT trusted from pyproject
+    # Server-DERIVED routing (defense in depth over the code-identity hash gate):
+    # uploaded foreign code (a user-module) ALWAYS gets the output-perturbation floor,
+    # never DP-SGD -- a client cannot route its own code to the tight track. The
+    # neural/DP-SGD track only ever runs the node's hash-verified harness on a
+    # data-only spec, so foreign code cannot impersonate it either way.
+    if cfg.get("user-module"):
+        track = "egress"
 
     if track == "trees":
         new_arrays, n = _train_trees(context, pcfg)

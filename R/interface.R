@@ -258,6 +258,17 @@ flowerInitDS <- function(data_symbol) {
   run_config[["allow_per_node_metrics"]]   <- FALSE
   run_config[["allow_exact_num_examples"]] <- FALSE
   run_config[["fixed_client_sampling"]]    <- TRUE
+  # Server-AUTHORITATIVE DP policy: epsilon / delta / clip come from THIS node's
+  # options (the data custodian's governance), OVERRIDING anything the client sent.
+  # The client decides only WHAT to compute; the node alone decides how-private.
+  # A client cannot weaken -- nor even strengthen -- the DP: the privacy budget is
+  # the custodian's resource, not an analyst knob. This single choke point runs in
+  # both prepare paths before the budget check and before the manifest is written,
+  # so every downstream reader (budget ledger, manifest, node load_privacy_config)
+  # sees the node's values, never the client's.
+  run_config[["privacy-epsilon"]]       <- as.numeric(.dsf_option("dp_epsilon", 3.0))
+  run_config[["privacy-delta"]]         <- as.numeric(.dsf_option("dp_delta", 1e-5))
+  run_config[["privacy-clipping_norm"]] <- as.numeric(.dsf_option("dp_clipping_norm", 1.0))
   run_config
 }
 
