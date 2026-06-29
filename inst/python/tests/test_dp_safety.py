@@ -148,5 +148,28 @@ check("Tier-2 shape-mismatch smuggling REJECTED",
       rejects(lambda: tier2_lib.gated_local_update(WrongShape(), g, Xraw, np.zeros(8), {}, pcfg)))
 
 # --------------------------------------------------------------------------- #
+print("== custom loss factory: negative-binomial NLL (per-sample, DP-SGD-safe) ==")
+nb = dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": 2.0})
+check("loss_from_allowlist('negbin_nll', cfg) returns a callable", callable(nb))
+# Numerics, INDEPENDENT cross-check: NB2 -> exact Poisson NLL as dispersion -> inf.
+# float64 so the check probes the FORMULA's limit, not float32 cancellation at huge r.
+zc = torch.tensor([0.2, 0.8, 1.5]).reshape(-1, 1).double()
+yc = torch.tensor([0.0, 2.0, 4.0]).reshape(-1, 1).double()
+pois_exact = float((zc.exp() - yc * zc + torch.lgamma(yc + 1.0)).mean())
+nb_big = dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": 1e7})
+check("negbin_nll -> exact Poisson NLL as dispersion -> inf",
+      abs(float(nb_big(zc, yc)) - pois_exact) < 1e-2)
+check("negbin_nll rejects dispersion <= 0 (fail closed)",
+      rejects(lambda: dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": 0.0})))
+check("negbin_nll rejects non-finite dispersion (fail closed)",
+      rejects(lambda: dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": float("inf")})))
+class CountHead(nn.Module):
+    def __init__(s): super().__init__(); s.lin = nn.Linear(3, 1)
+    def forward(s, x): return s.lin(x)
+xct = torch.randn(8, 3); yct = torch.randint(0, 6, (8, 1)).float()
+check("negbin_nll model passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(CountHead(), nb, xct, yct)))
+
+# --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
 sys.exit(1 if fail else 0)

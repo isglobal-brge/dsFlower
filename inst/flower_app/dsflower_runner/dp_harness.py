@@ -300,20 +300,59 @@ _LOSS_ALLOWLIST = {
 }
 
 
-def loss_from_allowlist(name):
+def _negbin_nll_factory(cfg):
+    """Negative-binomial (NB2) negative log-likelihood, log-link, PER-SAMPLE.
+    pred = log-mean [N,1]; target = non-negative counts [N,1]. The dispersion
+    'size' r (variance = mu + mu^2 / r) is a harmless modelling hyperparameter
+    read from the run config: it shapes the loss but NOT the DP guarantee --
+    per-sample gradients are clipped to C and noised regardless of the loss, so a
+    hostile r can only hurt the client's own fit, never privacy. Mean reduction
+    (Opacus calibrates noise assuming it). Decomposes per sample -> DP-SGD-safe."""
+    r = float(cfg.get("nb-dispersion", 1.0))
+    if not math.isfinite(r) or r <= 0.0:
+        raise ValueError("nb-dispersion must be a positive finite float, got %r" % (r,))
+    log_r, lgamma_r = math.log(r), math.lgamma(r)
+
+    def negbin_nll(pred, target):
+        import torch
+        z = pred.reshape(-1)                       # log-mean (log-link)
+        y = target.reshape(-1).to(z.dtype)         # non-negative counts
+        log_r_plus_mu = torch.logaddexp(torch.full_like(z, log_r), z)   # log(r + exp(z)), overflow-safe
+        ll = (torch.lgamma(y + r) - lgamma_r - torch.lgamma(y + 1.0)
+              - r * torch.nn.functional.softplus(z - log_r)   # r*log(r/(r+mu)); stable in both limits
+              + y * (z - log_r_plus_mu))
+        return (-ll).mean()
+    return negbin_nll
+
+
+# Custom TRUSTED per-sample losses (node code, never client code): name -> factory(cfg).
+# Each MUST decompose per sample with mean reduction so the DP-SGD sensitivity bound
+# holds; enforced by per_sample_independence_probe + the DP safety suite. Hyperparams
+# come from the run config but can only shape the loss, never the clip/noise -> no DP
+# lever. This is how tight DP is GROWN (vetted node losses), not by trusting client code.
+_CUSTOM_LOSS_FACTORY = {
+    "negbin_nll": _negbin_nll_factory,
+}
+
+
+def loss_from_allowlist(name, cfg=None):
     """Instantiate a per-sample-decomposable loss from the node allowlist, with
     reduction='mean'. The loss is NEVER taken from client code: Opacus computes
     per-sample gradients via backward hooks but never inspects the loss, so a
     sample-coupling loss (contrastive / Cox partial-likelihood / a hand-rolled
     ``loss/batch.mean()``) yields well-formed but WRONG per-sample gradients that
     silently defeat the clip-to-C sensitivity bound. Mean reduction is required
-    because Opacus calibrates the noise assuming it."""
+    because Opacus calibrates the noise assuming it. Stock losses come from the
+    allowlist; vetted custom per-sample losses from _CUSTOM_LOSS_FACTORY (cfg
+    supplies only DP-irrelevant shape hyperparameters)."""
     import torch.nn as nn
-    if name not in _LOSS_ALLOWLIST:
-        raise ValueError("loss '%s' is not on the node allowlist %r"
-                         % (name, sorted(_LOSS_ALLOWLIST)))
-    cls_name, kw = _LOSS_ALLOWLIST[name]
-    return getattr(nn, cls_name)(reduction="mean", **kw)
+    if name in _LOSS_ALLOWLIST:
+        cls_name, kw = _LOSS_ALLOWLIST[name]
+        return getattr(nn, cls_name)(reduction="mean", **kw)
+    if name in _CUSTOM_LOSS_FACTORY:
+        return _CUSTOM_LOSS_FACTORY[name](cfg or {})
+    raise ValueError("loss '%s' is not on the node allowlist %r"
+                     % (name, sorted(list(_LOSS_ALLOWLIST) + list(_CUSTOM_LOSS_FACTORY))))
 
 
 def per_sample_independence_probe(model, criterion, x_sample, y_sample):

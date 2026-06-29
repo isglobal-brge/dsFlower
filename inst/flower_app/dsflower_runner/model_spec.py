@@ -54,8 +54,8 @@ def output_width(loss_name, cfg):
         return max(2, nc)                      # one logit per class (softmax-CE / margin-SVM)
     if loss_name == "multilabel_bce":
         return int(cfg["num-labels"])          # one independent logit per label
-    if loss_name in ("mse", "poisson_nll"):
-        return 1                               # scalar regression / log-rate
+    if loss_name in ("mse", "poisson_nll", "negbin_nll"):
+        return 1                               # scalar regression / log-rate / log-mean
     return 1 if nc <= 2 else nc                # bce_logits: binary, or one-vs-rest
 
 

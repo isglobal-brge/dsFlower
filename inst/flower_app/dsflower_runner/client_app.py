@@ -55,7 +55,7 @@ def _prep_target(y, loss_name):
     return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson)
 
 
-def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
+def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
@@ -87,7 +87,7 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
 
     set_torch_params(model, msg.content["arrays"].to_numpy_ndarrays())
 
-    criterion = dp_harness.loss_from_allowlist(loss_name)   # node allowlist, mean reduction
+    criterion = dp_harness.loss_from_allowlist(loss_name, cfg)   # node allowlist, mean reduction
     model.train()
     for _ in range(local_epochs):
         for xb, yb in trainloader:
@@ -230,9 +230,9 @@ def _train_neural(msg, context, cfg, pcfg, pins):
     # gradients, which leaves grad-sample hooks behind; the real model must reach
     # make_private clean (else Opacus raises "Trying to add hooks twice").
     dp_harness.per_sample_independence_probe(
-        copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"]), xb, yb)
+        copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"], cfg), xb, yb)
 
-    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged)
+    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg)
 
 
 # --------------------------------------------------------------------------- #
