@@ -197,5 +197,36 @@ check("ordinal loss is stock BCEWithLogitsLoss",
       type(dh.loss_from_allowlist("ordinal")).__name__ == "BCEWithLogitsLoss")
 
 # --------------------------------------------------------------------------- #
+print("== conv ops: node-shaped CNN, per-sample, stock + Opacus grad_sample ==")
+import copy as _copy
+_cnn_spec = {"kind": "sequential", "layers": [
+    {"op": "reshape", "shape": [1, 8, 8]},
+    {"op": "conv2d", "out_channels": 8, "kernel_size": 3, "padding": 1}, {"op": "relu"},
+    {"op": "maxpool2d", "kernel_size": 2},
+    {"op": "adaptiveavgpool2d", "output_size": [1, 1]}, {"op": "flatten"},
+    {"op": "linear", "out": "@out"}]}
+_cnn = model_spec.build_from_spec(_cnn_spec, 64, 3)
+check("CNN spec builds to a stock module with output width == out_dim",
+      tuple(_cnn(torch.randn(4, 64)).shape) == (4, 3))
+check("CNN has no buffers (assert_releasable holds)",
+      not rejects(lambda: dh.assert_releasable(_cnn)))
+check("CNN passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _copy.deepcopy(_cnn), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+check("conv2d on a flat (un-reshaped) input REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+        {"op": "conv2d", "out_channels": 8}, {"op": "flatten"},
+        {"op": "linear", "out": "@out"}]}, 64, 2)))
+check("reshape that changes element count REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+        {"op": "reshape", "shape": [1, 8, 8]}, {"op": "flatten"},
+        {"op": "linear", "out": "@out"}]}, 30, 1)))
+check("conv out_channels over cap REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+        {"op": "reshape", "shape": [1, 8, 8]}, {"op": "conv2d", "out_channels": 99999},
+        {"op": "flatten"}, {"op": "linear", "out": "@out"}]}, 64, 2)))
+
+# --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
 sys.exit(1 if fail else 0)
