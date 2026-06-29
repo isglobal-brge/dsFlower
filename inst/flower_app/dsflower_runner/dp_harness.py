@@ -148,22 +148,32 @@ def clip_update(new_weights, old_weights, clipping_norm):
     return [np.asarray(o) + d for o, d in zip(old_weights, delta)]
 
 
-def add_gaussian_noise(weights, old_weights, sigma, clipping_norm):
-    """Add N(0, (sigma*clipping_norm)^2) noise to the (clipped) weight delta."""
+def add_gaussian_noise(weights, old_weights, std):
+    """Add N(0, std^2) noise to the (already clipped) weight delta. `std` is the FULL
+    Gaussian-mechanism standard deviation (sensitivity * sqrt(2 ln(1.25/delta)) / eps),
+    with the sensitivity already folded in by the caller. No implicit re-scaling here:
+    a prior version multiplied by clipping_norm AGAIN, double-counting C whenever the
+    clip != 1 (masked only because C defaults to 1)."""
     out = []
     for w, o in zip(weights, old_weights):
         w = np.asarray(w); o = np.asarray(o)
         delta = w - o
-        noise = np.random.normal(0.0, sigma * float(clipping_norm), size=delta.shape)
+        noise = np.random.normal(0.0, float(std), size=delta.shape)
         out.append(o + delta + noise.astype(delta.dtype))
     return out
 
 
 def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta):
-    """Tier-2 DP in one call: clip the update to C, then add calibrated noise."""
+    """Tier-2 / universal-floor DP in one call: clip the update to C, then add Gaussian
+    noise calibrated to the L2 SENSITIVITY of a C-clipped release, which is 2*C -- NOT C.
+    Two adjacent datasets each yield an update inside the C-ball, so they can differ by
+    up to the ball's diameter 2C; for ARBITRARY code the update is not a sum of
+    per-record bounded terms, so the per-record bound is the diameter, not C. (DP-SGD's
+    per-sample-gradient SUM is sensitivity C and is accounted separately by Opacus; this
+    floor is the only release where the 2C diameter applies.)"""
     clipped = clip_update(new_weights, old_weights, clipping_norm)
-    sigma = compute_output_sigma(epsilon, delta, clipping_norm)
-    return add_gaussian_noise(clipped, old_weights, sigma, clipping_norm)
+    std = compute_output_sigma(epsilon, delta, 2.0 * clipping_norm)   # full Gaussian std for sensitivity 2C
+    return add_gaussian_noise(clipped, old_weights, std)
 
 
 # --------------------------------------------------------------------------- #

@@ -80,6 +80,16 @@ rel = np.concatenate([(o2 - o1).ravel() for o2, o1 in zip(out, old)])
 check("output-perturbation DESTROYS raw-data exfil (1e6 -> O(sigma))",
       np.max(np.abs(rel)) < 50)
 
+# The floor's L2 sensitivity is the C-ball DIAMETER = 2C (arbitrary code), so the noise
+# std must be 2*sigma(C), NOT sigma(C). Test at C=1 AND C=4: C=4 also catches the
+# double-C regression (a prior version multiplied the clip in twice -> std ~ C^2).
+for Cx in (1.0, 4.0):
+    s1 = dh.compute_output_sigma(eps, delta, Cx)                  # k*Cx/eps (sensitivity Cx)
+    z = [np.zeros(300000, np.float32)]
+    emp = float(np.std(dh.output_perturbation(z, z, clipping_norm=Cx, epsilon=eps, delta=delta)[0]))
+    check("floor noise std == 2*sigma(C) for C=%g (2C sensitivity, no double-C)" % Cx,
+          abs(emp - 2.0 * s1) < 0.05 * (2.0 * s1))
+
 # --------------------------------------------------------------------------- #
 print("== loss allowlist: only stock per-sample-decomposable losses ==")
 for nm in ("bce_logits", "cross_entropy", "mse", "poisson_nll", "multilabel_bce"):
