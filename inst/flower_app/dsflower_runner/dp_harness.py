@@ -158,7 +158,10 @@ def add_gaussian_noise(weights, old_weights, std):
     for w, o in zip(weights, old_weights):
         w = np.asarray(w); o = np.asarray(o)
         delta = w - o
-        noise = np.random.normal(0.0, float(std), size=delta.shape)
+        # Draw DP noise from a FRESH OS-entropy generator, never the shared global
+        # np.random: isolates the noise from any deterministic global seeding elsewhere
+        # (predictable noise would void DP) and reseeds from os.urandom each call.
+        noise = np.random.default_rng().normal(0.0, float(std), size=delta.shape)
         out.append(o + delta + noise.astype(delta.dtype))
     return out
 
