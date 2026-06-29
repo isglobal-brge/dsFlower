@@ -75,8 +75,19 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
     local_epochs = int(pins["local_epochs"])
     num_rounds = int(pins["num_rounds"])
 
+    lr = float(pins["learning_rate"])
+    # Penalized regression (ridge / lasso / elastic-net): L2 (weight_decay) is applied
+    # INSIDE the optimizer to the NOISED grad + PUBLIC weights; L1 as a proximal
+    # soft-threshold on the PUBLIC weights after the step. Both are post-processing of
+    # already-DP quantities -> no privacy lever (DP is immune to post-processing).
+    # Validated non-negative; both 0 -> identical to the plain path.
+    weight_decay = float(cfg.get("weight-decay", 0.0))
+    l1_penalty = float(cfg.get("l1-penalty", 0.0))
+    if not (np.isfinite(weight_decay) and weight_decay >= 0.0
+            and np.isfinite(l1_penalty) and l1_penalty >= 0.0):
+        raise RuntimeError("weight-decay and l1-penalty must be finite and >= 0")
     model = model.to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=float(pins["learning_rate"]))
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     dataset = TensorDataset(torch.from_numpy(X).float(),
                             _prep_target(y, loss_name, int(pins["n_classes"])))
     # Anti-shrink: the manifest n_samples is the server-recorded count of the STAGED
@@ -114,6 +125,11 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
                 for p, c in zip(model.parameters(), clean):
                     p.copy_(c)
             optimizer.step()
+            if l1_penalty > 0.0:        # lasso / elastic-net: proximal on PUBLIC weights
+                thr = l1_penalty * lr
+                with torch.no_grad():
+                    for p in model.parameters():
+                        p.copy_(torch.sign(p) * torch.clamp(p.abs() - thr, min=0.0))
     # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
     # a buffer / frozen param / new parameter registered lazily inside the
     # researcher's forward appears only AFTER load, and Opacus noises ONLY the
