@@ -151,6 +151,28 @@ whole returned update to L2 norm `C` and adds Gaussian noise calibrated to
 by ~√(model-dim)). Use when arbitrary client code is required and the utility
 cost is accepted.
 
+**The built-in Tier-1 suite (tight DP by construction).** The node builds every
+Tier-1 model from a declarative SPEC over a fixed, per-sample-safe op + loss
+allowlist — no researcher code runs, so DP-SGD is sound by construction:
+
+- *GLM / tabular:* logistic, linear, multiclass, multilabel, Poisson, **negative
+  binomial**, **gamma**, **ordinal (CORN)**, **linear SVM (hinge)**.
+- *Penalized:* **ridge (L2)**, **lasso (L1)**, **elastic-net** — applied as
+  post-processing of the already-DP update (no privacy lever).
+- *Deep:* MLP, **2D CNN**, **TCN (dilated conv1d)** via the shape-threaded spec
+  vocabulary (`reshape → conv1d/conv2d/maxpool2d/adaptiveavgpool2d/flatten →
+  linear`); frozen-backbone vision heads (ResNet-18, DenseNet-121); DP-GBDT trees.
+
+Tight DP is GROWN by enriching this vetted allowlist — never by trusting client
+code. Two sound extension points: the **custom-loss factory**
+(`_CUSTOM_LOSS_FACTORY` — vetted node-side per-sample losses; cfg supplies only
+DP-irrelevant shape hyperparameters) and the **op allowlist** (every op
+per-sample, asserted by `per_sample_independence_probe`). Anything that would need
+a cross-sample loss (Cox partial likelihood), a custom forward (RNN take-last), or
+a non-sequential graph (U-Net skips) is **automatically routed to the Tier-2
+output-perturbation floor** — the gateway never grants tight DP it cannot
+guarantee by construction, and never fails open.
+
 **DataSHIELD backstop (deterministic).** Independent of DP, every release passes
 minimum-count control: counts ≤ threshold are suppressed/bucketed; `num_examples`
 / sizes are count-bucketed. *Any metric not noised-or-bucketed is an exfiltration
