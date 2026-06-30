@@ -102,6 +102,18 @@ Opal/Rock may run cleanup in a different process than the one that launched a Su
 the package records process metadata on disk and reaps stale staging dirs and orphan
 SuperNodes (fork-free, to stay safe under the FL runtime's threads).
 
+**Zombie prevention (subreaper wrapper).** The rock container's PID 1 is the Opal JVM, which
+never `waitpid()`s reparented orphans — so any process orphaned to it becomes a permanent
+zombie (a zombie is cleared only by its parent's `wait()`; `kill -9` does nothing to it).
+flwr's `flower-supernode` spawns per-run `flower-superexec`/`flwr-clientapp` grandchildren;
+killing the supernode by PID would orphan them to the JVM and leak a zombie per run. The
+SuperNode is therefore launched under `inst/python/supernode_reaper.py`, a tiny **subreaper**
+(`PR_SET_CHILD_SUBREAPER`) that runs the supernode in its own session, adopts and `waitpid()`s
+the whole subtree, and on SIGTERM drains its group then exits — so no FL descendant can ever
+reach PID 1. Cleanup signals the *wrapper* (with a generous drain grace before any SIGKILL).
+Pre-existing leaked zombies (parented to the JVM) can only be cleared by restarting the
+container; `.count_zombies()` reports the count for monitoring.
+
 ## Minimal client-side example
 
 Researchers use `dsFlowerClient`, not this package directly:
