@@ -84,12 +84,37 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
     return model, optimizer, trainloader, privacy_engine
 
 
+def _std_normal_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
 def compute_output_sigma(epsilon, delta, clipping_norm):
-    """Analytic Gaussian-mechanism noise scale for a single bounded release."""
+    """Minimal Gaussian std for an (epsilon, delta)-DP release of L2 sensitivity
+    `clipping_norm`, via the ANALYTIC Gaussian mechanism (Balle & Wang 2018). Exact for ALL
+    epsilon -- the classic sqrt(2 ln(1.25/delta))*S/epsilon bound only holds for epsilon<=1
+    and under-noises above it (at epsilon=10, delta=1e-5 it leaks ~2.3x the target delta).
+    sigma scales linearly in the sensitivity, preserving the sample-and-aggregate 2C/k
+    ratio."""
     if epsilon <= 0 or delta <= 0 or clipping_norm <= 0:
         raise ValueError("epsilon, delta, and clipping_norm must be positive")
-    return math.sqrt(2.0 * math.log(1.25 / float(delta))) * (
-        float(clipping_norm) / float(epsilon))
+
+    def _delta_of_sigma(sigma):
+        a = float(clipping_norm) / (2.0 * sigma)
+        b = float(epsilon) * sigma / float(clipping_norm)
+        return _std_normal_cdf(a - b) - math.exp(float(epsilon)) * _std_normal_cdf(-a - b)
+
+    lo, hi = 1e-12, max(float(clipping_norm), 1.0)
+    while _delta_of_sigma(hi) > delta:
+        hi *= 2.0
+        if hi > 1e15:
+            break
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if _delta_of_sigma(mid) > delta:
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
 
 def clip_update(new_weights, old_weights, clipping_norm):
@@ -127,6 +152,36 @@ def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta)
     clipped = clip_update(new_weights, old_weights, clipping_norm)
     std = compute_output_sigma(epsilon, delta, 2.0 * clipping_norm)   # full std for sensitivity 2C
     return add_gaussian_noise(clipped, old_weights, std)
+
+
+def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, delta):
+    """Improved universal floor (Nissim-Raskhodnikova-Smith sample-and-aggregate): given
+    the user's black-box update computed INDEPENDENTLY on each of k DISJOINT, data-
+    independent blocks of the private data, release the clip-and-average aggregate under
+    the Gaussian mechanism.
+
+    Soundness + utility: each record lives in exactly ONE block, so under replace-one
+    adjacency one record perturbs exactly ONE block update. Every block delta is clipped
+    into the C-ball, so one block moves by at most the diameter 2C; the k-block MEAN moves
+    by at most 2C/k. The released L2 sensitivity is 2C/k -- a k-fold reduction vs the plain
+    floor's 2C (k-times-smaller noise at the SAME epsilon, delta), still an ordinary
+    per-round Gaussian release in the ledger. The CALLER must build the partition
+    independently of the data values and map failed/non-finite blocks to a zero delta
+    (both leak-safe: zero is inside the C-ball; a data-independent partition encodes
+    nothing)."""
+    k = len(block_updates)
+    if k < 1:
+        raise ValueError("sample_and_aggregate needs at least one block update")
+    old = [np.asarray(o, dtype=np.float64) for o in old_weights]
+    mean_delta = [np.zeros_like(o) for o in old]
+    for bu in block_updates:
+        clipped = clip_update(bu, old, clipping_norm)          # old + delta, ||delta||_2 <= C
+        for i, (c, o) in enumerate(zip(clipped, old)):
+            mean_delta[i] = mean_delta[i] + (np.asarray(c) - o)
+    mean_delta = [md / float(k) for md in mean_delta]
+    mean_new = [o + md for o, md in zip(old, mean_delta)]
+    std = compute_output_sigma(epsilon, delta, 2.0 * float(clipping_norm) / float(k))  # sensitivity 2C/k
+    return add_gaussian_noise(mean_new, old, std)
 
 
 def bucket_count(n):

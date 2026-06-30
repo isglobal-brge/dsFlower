@@ -139,18 +139,46 @@ def resolve_dp_track(run_config, manifest_track):
     return "egress"
 
 
+def _std_normal_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
 def compute_output_sigma(epsilon, delta, clipping_norm):
-    """Analytic Gaussian-mechanism noise scale for a single bounded release.
+    """Minimal Gaussian std `sigma` such that releasing f(D) + N(0, sigma^2 I) with L2
+    sensitivity `clipping_norm` is (epsilon, delta)-DP, via the ANALYTIC Gaussian mechanism
+    (Balle & Wang 2018, "Improving the Gaussian Mechanism..."). Exact for ALL epsilon.
 
-    sigma = sqrt(2 * ln(1.25 / delta)) * (clipping_norm / epsilon).
+    The classic sigma = sqrt(2 ln(1.25/delta)) * S / epsilon is only valid for epsilon <= 1
+    and UNDER-noises above it -- at epsilon=10, delta=1e-5 it leaks ~2.3x the target delta,
+    a real hole since the node ceiling allows epsilon up to 10. The analytic mechanism has
+    no such gap. sigma still scales LINEARLY in the sensitivity, so the sample-and-aggregate
+    2C/k-vs-2C ratio (k-fold less noise) is preserved exactly.
 
-    For multi-round Tier-2 training the caller must compose epsilon over rounds
-    (DP-FedAvg, McMahan et al. 2018) before passing the per-round epsilon here.
+    For multi-round Tier-2 training the caller must compose epsilon over rounds (DP-FedAvg,
+    McMahan et al. 2018) before passing the per-round epsilon here.
     """
     if epsilon <= 0 or delta <= 0 or clipping_norm <= 0:
         raise ValueError("epsilon, delta, and clipping_norm must be positive")
-    return math.sqrt(2.0 * math.log(1.25 / float(delta))) * (
-        float(clipping_norm) / float(epsilon))
+
+    def _delta_of_sigma(sigma):
+        a = float(clipping_norm) / (2.0 * sigma)
+        b = float(epsilon) * sigma / float(clipping_norm)
+        return _std_normal_cdf(a - b) - math.exp(float(epsilon)) * _std_normal_cdf(-a - b)
+
+    # delta(sigma) is monotic decreasing from 1 (sigma->0) to 0 (sigma->inf); bisect for
+    # the smallest sigma whose analytic delta does not exceed the target.
+    lo, hi = 1e-12, max(float(clipping_norm), 1.0)
+    while _delta_of_sigma(hi) > delta:
+        hi *= 2.0
+        if hi > 1e15:
+            break
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if _delta_of_sigma(mid) > delta:
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
 
 def clip_update(new_weights, old_weights, clipping_norm):
@@ -194,6 +222,40 @@ def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta)
     clipped = clip_update(new_weights, old_weights, clipping_norm)
     std = compute_output_sigma(epsilon, delta, 2.0 * clipping_norm)   # full Gaussian std for sensitivity 2C
     return add_gaussian_noise(clipped, old_weights, std)
+
+
+def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, delta):
+    """Improved universal floor (Nissim-Raskhodnikova-Smith sample-and-aggregate): given
+    the user's black-box update computed INDEPENDENTLY on each of k DISJOINT, data-
+    independent blocks of the private data, release the clip-and-average aggregate under
+    the Gaussian mechanism.
+
+    Why it is sound AND tighter than `output_perturbation`: each record lives in exactly
+    ONE block, so under replace-one adjacency one record perturbs exactly ONE block
+    update. Every block delta is clipped into the C-ball, so that one block can move by at
+    most the diameter 2C; the k-block MEAN therefore moves by at most 2C/k. The released
+    L2 sensitivity is 2C/k -- a k-fold reduction vs the plain floor's 2C, i.e. k-times-
+    smaller noise for the SAME (epsilon, delta), and it still composes as an ordinary
+    per-round Gaussian release in the RDP/PRV ledger (same epsilon spent, better utility).
+
+    The CALLER must (1) build the block partition independently of the data VALUES (a
+    random permutation of row indices -- never sorted/stratified by a feature/label) and
+    (2) map any failed/non-finite block to a zero delta. Both are leak-safe: a zero delta
+    is inside the C-ball, so it cannot escape the 2C/k bound, and a data-independent
+    partition cannot encode the data."""
+    k = len(block_updates)
+    if k < 1:
+        raise ValueError("sample_and_aggregate needs at least one block update")
+    old = [np.asarray(o, dtype=np.float64) for o in old_weights]
+    mean_delta = [np.zeros_like(o) for o in old]
+    for bu in block_updates:
+        clipped = clip_update(bu, old, clipping_norm)          # old + delta, ||delta||_2 <= C
+        for i, (c, o) in enumerate(zip(clipped, old)):
+            mean_delta[i] = mean_delta[i] + (np.asarray(c) - o)
+    mean_delta = [md / float(k) for md in mean_delta]
+    mean_new = [o + md for o, md in zip(old, mean_delta)]
+    std = compute_output_sigma(epsilon, delta, 2.0 * float(clipping_norm) / float(k))  # sensitivity 2C/k
+    return add_gaussian_noise(mean_new, old, std)
 
 
 # --------------------------------------------------------------------------- #

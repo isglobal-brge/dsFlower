@@ -304,7 +304,14 @@ def train(msg: Message, context: Context) -> Message:
         X, y = load_data(context)
         user_mod = tier2_lib.load_user_module(str(cfg["user-module"]))
         old = msg.content["arrays"].to_numpy_ndarrays()
-        new_arrays = tier2_lib.gated_local_update(user_mod, old, X, y, cfg, pcfg)
+        # Compose the DP budget over rounds (DP-FedAvg): each round spends epsilon /
+        # num_rounds so the TOTAL across rounds stays within the requested epsilon. The
+        # standalone Tier-2 app does the same split; without it N rounds at the egress
+        # floor would leak ~N x the budget.
+        num_rounds = max(1, int(cfg.get("num-server-rounds", 1)))
+        pcfg_round = dict(pcfg)
+        pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
+        new_arrays = tier2_lib.gated_local_update(user_mod, old, X, y, cfg, pcfg_round)
         n = len(y)
     else:  # neural (tabular or image)
         pins = load_run_pins(context)

@@ -65,8 +65,12 @@ def rejects(fn):
 print("== output-perturbation floor: analytic Gaussian + sensitivity bound ==")
 C, eps, delta = 1.0, 1.0, 1e-5
 sigma = dh.compute_output_sigma(eps, delta, C)
-check("sigma = sqrt(2 ln(1.25/delta)) * C/eps",
-      abs(sigma - math.sqrt(2 * math.log(1.25 / delta)) * (C / eps)) < 1e-9)
+def _analytic_delta(s, ep, sens):
+    a, b = sens / (2 * s), ep * s / sens
+    return (0.5 * (1 + math.erf((a - b) / math.sqrt(2)))
+            - math.exp(ep) * 0.5 * (1 + math.erf((-a - b) / math.sqrt(2))))
+check("compute_output_sigma returns the analytic-Gaussian sigma meeting the target delta",
+      _analytic_delta(sigma, eps, C) <= delta * 1.001)
 check("compute_output_sigma rejects eps<=0", rejects(lambda: dh.compute_output_sigma(0, delta, C)))
 
 old = [np.zeros((4, 3), np.float32), np.zeros(3, np.float32)]
@@ -155,8 +159,10 @@ ex = tier2_lib.gated_local_update(Exfil(), g, Xraw, np.zeros(8), {}, pcfg)
 exrel = np.concatenate([(o - gg).ravel() for o, gg in zip(ex, g)])
 check("Tier-2 exfil via weights DESTROYED by the gate (1e6 raw -> O(sigma))",
       np.max(np.abs(exrel)) < 100)
-check("Tier-2 shape-mismatch smuggling REJECTED",
-      rejects(lambda: tier2_lib.gated_local_update(WrongShape(), g, Xraw, np.zeros(8), {}, pcfg)))
+_ws = tier2_lib.gated_local_update(WrongShape(), g, Xraw, np.zeros(8), {}, pcfg)
+check("Tier-2 shape-mismatch smuggling NEUTRALIZED (validate-or-zero -> global shape, no raw escape)",
+      len(_ws) == len(g) and all(a.shape == o.shape for a, o in zip(_ws, g))
+      and all(np.all(np.isfinite(a)) for a in _ws))
 
 # --------------------------------------------------------------------------- #
 print("== custom loss factory: negative-binomial NLL (per-sample, DP-SGD-safe) ==")
@@ -347,6 +353,77 @@ _hooked = nn.Sequential(nn.Linear(3, 1))
 _hooked[0].register_forward_hook(lambda m, i, o: o)
 check("gate STILL rejects ANY module carrying a hook (sanitize did NOT weaken it)",
       rejects(lambda: dh.assert_stock_architecture(_hooked)))
+
+# --------------------------------------------------------------------------- #
+print("== improved floor: sample-and-aggregate (NRS) -- sensitivity 2C/k, server-routed ==")
+_saC, _saK = 4.0, 5
+_saOld = [np.zeros(10), np.zeros(3)]
+_saRng = np.random.default_rng(0)
+def _sa_ru(scale):
+    return [_saOld[0] + _saRng.normal(0, scale, 10), _saOld[1] + _saRng.normal(0, scale, 3)]
+def _sa_clipmean(blocks):
+    md = [np.zeros_like(o) for o in _saOld]
+    for bu in blocks:
+        cl = dh.clip_update(bu, _saOld, _saC)
+        for i, (c, o) in enumerate(zip(cl, _saOld)):
+            md[i] = md[i] + (np.asarray(c) - o)
+    return [m / len(blocks) for m in md]
+_saWorst = 0.0
+for _ in range(1000):
+    _saA = [_sa_ru(10.0) for _ in range(_saK)]
+    _saB = [(_saA[i] if i != 2 else _sa_ru(50.0)) for i in range(_saK)]
+    _dA, _dB = _sa_clipmean(_saA), _sa_clipmean(_saB)
+    _saWorst = max(_saWorst, float(np.linalg.norm(
+        np.concatenate([(a - b).ravel() for a, b in zip(_dA, _dB)]))))
+check("sample-and-aggregate L2 sensitivity <= 2C/k for ANY one-block neighbor",
+      _saWorst <= 2 * _saC / _saK + 1e-9)
+_saEps, _saDelta = 1.0, 1e-5
+_saZero = [[o.copy() for o in _saOld] for _ in range(_saK)]
+_saRel = np.array([np.concatenate([a.ravel() for a in
+                   dh.sample_and_aggregate(_saZero, _saOld, _saC, _saEps, _saDelta)])
+                   for _ in range(3000)])
+_saTheo = dh.compute_output_sigma(_saEps, _saDelta, 2 * _saC / _saK)  # analytic Gaussian, sens 2C/k
+check("sample-and-aggregate noise std matches the analytic-Gaussian sigma for sensitivity 2C/k",
+      abs(_saRel.std() - _saTheo) / _saTheo < 0.12)
+# analytic Gaussian must actually MEET the target delta at high epsilon (the classic
+# sqrt(2 ln(1.25/delta)) S/eps bound leaks ~2.3x here -- the bug this fixes).
+_agS = dh.compute_output_sigma(10.0, 1e-5, 2.0)
+_agA, _agB = 2.0 / (2 * _agS), 10.0 * _agS / 2.0
+_agDelta = (0.5 * (1 + math.erf((_agA - _agB) / math.sqrt(2)))
+            - math.exp(10.0) * 0.5 * (1 + math.erf((-_agA - _agB) / math.sqrt(2))))
+check("analytic Gaussian sigma meets the (eps=10, delta=1e-5) target (classic bound would leak)",
+      _agDelta <= 1e-5 * 1.001)
+
+class _SaFakeMod:
+    def __init__(self): self.seen = []
+    def local_update(self, g, X, y, cfg):
+        self.seen.append(np.asarray(X).ravel().copy()); return [g[0] + 0.1, g[1] + 0.1]
+_saPcfg = dict(clipping_norm=_saC, epsilon=2.0, delta=1e-5,
+               sample_aggregate=True, sa_min_block=10, sa_max_blocks=8)  # explicit opt-in (default OFF)
+_saX = np.arange(100).reshape(100, 1).astype(float); _saY = np.arange(100).astype(float)
+_saFm = _SaFakeMod(); tier2_lib.gated_local_update(_saFm, _saOld, _saX, _saY, {}, _saPcfg)
+check("server routes n=100 to k=8 disjoint blocks covering every row exactly once",
+      len(_saFm.seen) == 8 and
+      np.array_equal(np.sort(np.concatenate(_saFm.seen)), np.sort(_saX.ravel())))
+check("block partition is RANDOM (not contiguous) -> data-independent",
+      not all(np.array_equal(np.sort(s), np.arange(int(s.min()), int(s.min()) + len(s)))
+              for s in _saFm.seen))
+_saFm2 = _SaFakeMod(); tier2_lib.gated_local_update(_saFm2, _saOld, _saX[:8], _saY[:8], {}, _saPcfg)
+_saFm3 = _SaFakeMod(); tier2_lib.gated_local_update(_saFm3, _saOld, _saX, _saY, {},
+                                                    dict(_saPcfg, sample_aggregate=False))
+_saFm4 = _SaFakeMod(); tier2_lib.gated_local_update(  # no SAA keys at all -> default OFF
+    _saFm4, _saOld, _saX, _saY, {}, dict(clipping_norm=_saC, epsilon=2.0, delta=1e-5))
+check("small n, policy-off, AND default (no key) all fall back to the plain 2C floor",
+      len(_saFm2.seen) == 1 and len(_saFm3.seen) == 1 and len(_saFm4.seen) == 1)
+
+class _SaBadMod:
+    def local_update(self, g, X, y, cfg):
+        if int(np.asarray(X)[0, 0]) % 2 == 0:
+            raise RuntimeError("data-dependent boom")
+        return [g[0] * np.nan, g[1]]
+check("validate-or-zero: data-dependent crash/NaN blocks -> finite release (no crash/leak)",
+      all(np.all(np.isfinite(a)) for a in
+          tier2_lib.gated_local_update(_SaBadMod(), _saOld, _saX, _saY, {}, _saPcfg)))
 
 # --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
