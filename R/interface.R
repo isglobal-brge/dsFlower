@@ -360,6 +360,8 @@ flowerInitDS <- function(data_symbol) {
 #' @export
 flowerPrepareRunDS <- function(handle_symbol, target_column,
                                 feature_columns = NULL, run_config = "{}") {
+  target_column <- .ds_arg(target_column)   # decode (B64 for multi-col survival targets;
+                                            # .ds_arg passes a raw single string through)
   feature_columns <- .ds_arg(feature_columns)
   run_config <- .ds_arg(run_config)
   if (is.character(run_config) && length(run_config) == 1 &&
@@ -997,9 +999,14 @@ flowerLogDS <- function(handle_symbol, last_n = 50L) {
 #' @param handle_symbol Character; symbol of the handle.
 #' @return Named list with spent/remaining epsilon and delta.
 #' @export
-flowerPrivacyBudgetDS <- function(handle_symbol) {
+flowerPrivacyBudgetDS <- function(handle_symbol, target_column = NULL) {
   handle <- .getHandle(handle_symbol)
-  target <- handle$target_column %||% "unknown"
+  # The budget is keyed by (data fingerprint + target). A standalone query uses a transient
+  # handle that was never prepared, so its target is unset -- accept the target explicitly so
+  # the right per-target key is read. Falls back to the handle's target (mid-lifecycle calls).
+  # This only READS the ledger; it never debits.
+  target <- if (!is.null(target_column) && nzchar(as.character(target_column)))
+    as.character(target_column) else (handle$target_column %||% "unknown")
   dataset_key <- .privacy_dataset_key(handle, target)
   .get_budget(dataset_key)
 }
