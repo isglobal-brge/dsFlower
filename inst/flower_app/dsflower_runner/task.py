@@ -239,6 +239,29 @@ def load_run_pins(context=None):
     }
 
 
+def _decode_feature_norm(cfg, n_features):
+    """Decode the client's GLOBAL feature mean/SD from the run config (same b64 JSON
+    the neural track standardizes with). Returns (mean, sd) float arrays of length
+    n_features, or None if absent / malformed / length-mismatched (caller falls back
+    to the [0,1] binning prior). SDs are floored to a positive value."""
+    raw = cfg.get("feature-norm-b64")
+    if not raw:
+        return None
+    import base64
+    import json as _json
+    try:
+        norm = _json.loads(base64.b64decode(str(raw), validate=True).decode("utf-8"))
+        mean = np.asarray(norm["means"], dtype=np.float64)
+        sd = np.asarray(norm["sds"], dtype=np.float64)
+    except Exception:
+        return None
+    if mean.shape[0] != int(n_features) or sd.shape[0] != int(n_features):
+        return None
+    sd = np.where(np.isfinite(sd) & (sd > 1e-8), sd, 1.0)
+    mean = np.where(np.isfinite(mean), mean, 0.0)
+    return mean, sd
+
+
 def load_gbdt_spec(context=None):
     """Validated, manifest-authoritative XGBoost spec for the trees track.
 
@@ -271,7 +294,23 @@ def load_gbdt_spec(context=None):
         if n_features <= 0:
             X, _ = load_data(context)            # shape only (schema), not content
             n_features = int(X.shape[1])
-        feature_ranges = [[0.0, 1.0]] * n_features   # default binning prior
+        # Binning prior for the random-split thresholds. The DP-GBDT draws each
+        # threshold from a DATA-INDEPENDENT range; a fixed [0,1] collapses every
+        # feature whose values exceed 1 (area, perimeter, ...) to a single leaf, so
+        # the booster learns nothing (-> majority baseline). The client ships the
+        # GLOBAL feature mean/SD (a sanctioned low-sensitivity aggregate, not data
+        # quantiles), and we centre the prior at [mu-4sd, mu+4sd] -- ~all of a
+        # roughly-normal feature, so the random thresholds land in the real range.
+        # This depends on data ONLY through the already-released mu/sd (pure
+        # post-processing -> no extra privacy cost). Absent stats -> [0,1] fallback.
+        norm = _decode_feature_norm(cfg, n_features)
+        if norm is not None:
+            mean, sd = norm
+            R = 4.0
+            feature_ranges = [[float(mean[j] - R * sd[j]),
+                               float(mean[j] + R * sd[j])] for j in range(n_features)]
+        else:
+            feature_ranges = [[0.0, 1.0]] * n_features
     return {"objective": objective, "max_depth": max_depth, "n_trees": n_trees,
             "learning_rate": learning_rate, "reg_lambda": reg_lambda,
             "n_bins": n_bins, "run_token": run_token,
