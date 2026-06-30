@@ -250,5 +250,46 @@ check("unrecognized track -> fail-closed to the floor",
       dh.resolve_dp_track({}, "weird") == "egress")
 
 # --------------------------------------------------------------------------- #
+print("== typed graph (DAG): residual/skip/concat, per-sample, gate-admitted ==")
+import copy as _cp2
+_resnet = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "img", "op": "reshape", "in": ["@in"], "shape": [1, 8, 8]},
+    {"name": "c1", "op": "conv2d", "in": ["img"], "out_channels": 4, "kernel_size": 3, "padding": 1},
+    {"name": "r1", "op": "relu", "in": ["c1"]},
+    {"name": "c2", "op": "conv2d", "in": ["r1"], "out_channels": 4, "kernel_size": 3, "padding": 1},
+    {"name": "res", "op": "add", "in": ["c1", "c2"]},          # residual skip
+    {"name": "pool", "op": "adaptiveavgpool2d", "in": ["res"], "output_size": [1, 1]},
+    {"name": "flat", "op": "flatten", "in": ["pool"]},
+    {"name": "out", "op": "linear", "in": ["flat"], "out": "@out"}]}
+check("DAG ResNet block (residual conv) builds, output width == out_dim",
+      tuple(model_spec.build_from_spec(_resnet, 64, 3)(torch.randn(4, 64)).shape) == (4, 3))
+check("DAG GraphModule admitted by assert_stock_architecture",
+      not rejects(lambda: dh.assert_stock_architecture(model_spec.build_from_spec(_resnet, 64, 3))))
+check("DAG ResNet block has no buffers (releasable)",
+      not rejects(lambda: dh.assert_releasable(model_spec.build_from_spec(_resnet, 64, 3))))
+check("DAG ResNet block passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _cp2.deepcopy(model_spec.build_from_spec(_resnet, 64, 3)), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+check("DAG concat (2 branches) builds with summed feature width",
+      tuple(model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+          {"name": "b1", "op": "linear", "in": ["@in"], "out": 8},
+          {"name": "b2", "op": "linear", "in": ["@in"], "out": 8},
+          {"name": "cat", "op": "concat", "in": ["b1", "b2"], "axis": 0},
+          {"name": "out", "op": "linear", "in": ["cat"], "out": "@out"}]}, 16, 2)(
+          torch.randn(4, 16)).shape) == (4, 2))
+check("DAG add with mismatched per-sample shapes REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "h1", "op": "linear", "in": ["@in"], "out": 8},
+        {"name": "h2", "op": "linear", "in": ["@in"], "out": 16},
+        {"name": "bad", "op": "add", "in": ["h1", "h2"]},
+        {"name": "out", "op": "linear", "in": ["bad"], "out": "@out"}]}, 16, 2)))
+check("DAG forward-referenced input (non-topological) REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "a", "op": "relu", "in": ["b"]},
+        {"name": "b", "op": "linear", "in": ["@in"], "out": 4},
+        {"name": "out", "op": "linear", "in": ["a"], "out": "@out"}]}, 8, 2)))
+
+# --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
 sys.exit(1 if fail else 0)

@@ -247,6 +247,23 @@ def assert_releasable(model):
             "trainable on the DP-SGD track." % frozen[:8])
 
 
+# Vetted NODE-OWNED classes the researcher NEVER supplies (specs are DATA, not code):
+# the model_spec graph interpreter. Since the researcher can only name allowlisted ops,
+# the only non-torch.nn class ever instantiated on the DP-SGD path is this trusted,
+# node-built interpreter. Admitted by EXACT name+module (not isinstance -> no subclass
+# smuggling). The Opacus DP layers (DPLSTM/DPGRU/DPMultiheadAttention) will be added
+# here when wired, with their hook/cell_type tolerance handled explicitly.
+_VETTED_NODE_CLASSES = frozenset({"GraphModule"})
+
+
+def _is_node_owned_class(cls):
+    """True iff cls is a stock torch.nn layer or an EXACT vetted node-owned class."""
+    if cls.__module__.startswith("torch.nn"):
+        return True
+    return (cls.__module__.rsplit(".", 1)[-1] == "model_spec"
+            and cls.__name__ in _VETTED_NODE_CLASSES)
+
+
 def assert_stock_architecture(model):
     """ROOT defense: the researcher's model object is UNTRUSTED, so allow only a pure
     composition of stock torch.nn layers with NO researcher-injected behaviour at all.
@@ -281,11 +298,12 @@ def assert_stock_architecture(model):
 
     for m in _walk(model):
         cls = type(m)
-        if not cls.__module__.startswith("torch.nn"):
+        if not _is_node_owned_class(cls):
             raise ValueError(
-                "non-stock module %r on the DP-SGD track: only stock torch.nn modules "
-                "are allowed (a custom class is researcher code). Build from torch.nn "
-                "layers, or use the egress track." % cls.__name__)
+                "non-stock module %r on the DP-SGD track: only stock torch.nn layers and "
+                "node-owned vetted classes (%s) are allowed (a custom class is researcher "
+                "code). Build from the allowlist, or use the egress track."
+                % (cls.__name__, ", ".join(sorted(_VETTED_NODE_CLASSES))))
         # No instance-level method override: a stock module stores only params /
         # buffers / submodules / config in its __dict__, never a callable. Any callable
         # there is a method override -- `forward` (stash / sample-coupling) or

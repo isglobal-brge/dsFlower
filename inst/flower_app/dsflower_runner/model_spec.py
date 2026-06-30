@@ -271,8 +271,11 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None):
     -> linear head), and the final shape must equal ``(out_dim,)``."""
     if not isinstance(spec, dict):
         raise ValueError("spec must be a JSON object, got %s" % type(spec).__name__)
-    if spec.get("kind", "sequential") != "sequential":
-        raise ValueError("unsupported spec kind %r (only 'sequential')" % (spec.get("kind"),))
+    kind = spec.get("kind", "sequential")
+    if kind == "graph":
+        return build_from_graph(spec, in_dim, out_dim, num_labels=num_labels)
+    if kind != "sequential":
+        raise ValueError("unsupported spec kind %r (only 'sequential' or 'graph')" % (kind,))
     layers = spec.get("layers")
     if not isinstance(layers, list) or not layers:
         raise ValueError("spec.layers must be a non-empty list")
@@ -304,3 +307,141 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None):
                          % (shape, out_dim))
 
     return modules[0] if len(modules) == 1 else nn.Sequential(*modules)
+
+
+# --------------------------------------------------------------------------- #
+# Typed computation GRAPH (DAG): named tensors, multi-input ops, fan-out -> skip /
+# residual / concat. Strictly more expressive than the sequential form (covers
+# ResNet / U-Net / DenseNet / multi-branch topologies) while staying DATA: the node
+# builds ONE trusted GraphModule interpreter from allowlisted, per-sample-safe ops.
+# Every op is samplewise or within-sample-reduce; the batch dim is NEVER reduced or
+# mixed (concat/add operate on per-sample axes only). The researcher submits only op
+# enums + attributes -- no class paths, no code. assert_stock_architecture admits the
+# GraphModule class by exact identity (see dp_harness).
+# --------------------------------------------------------------------------- #
+
+class GraphModule(nn.Module):
+    """Node-owned executor for a declarative DAG. The graph (a list of node dicts) and
+    the output name are DATA attributes; all trainable state lives in the stock
+    submodules in ``_mods``. The forward is a FIXED interpreter over allowlisted ops --
+    never researcher code -- with no hooks, no instance method overrides and no
+    non-stock parameters."""
+
+    def __init__(self, graph, output_name, mods):
+        super().__init__()
+        self._dsflower_graph = graph              # data (list of {name, op, inputs, ...})
+        self._dsflower_output = str(output_name)  # data
+        self._mods = nn.ModuleDict(mods)          # stock op modules (params live here)
+
+    def forward(self, x):
+        env = {"@in": x}
+        for nd in self._dsflower_graph:
+            ins = [env[t] for t in nd["inputs"]]
+            mod = nd.get("module")
+            if mod is not None:                    # single-input param/stock op
+                env[nd["name"]] = self._mods[mod](ins[0])
+                continue
+            op = nd["op"]
+            if op == "add":
+                t = ins[0]
+                for o in ins[1:]:
+                    t = t + o
+                env[nd["name"]] = t
+            elif op == "mul":
+                t = ins[0]
+                for o in ins[1:]:
+                    t = t * o
+                env[nd["name"]] = t
+            elif op == "concat":
+                env[nd["name"]] = torch.cat(ins, dim=nd["axis"] + 1)   # +1: never the batch dim
+            else:
+                raise ValueError("graph forward: unsupported functional op %r" % (op,))
+        return env[self._dsflower_output]
+
+
+def _g_add(nd, in_shapes):
+    if len(in_shapes) < 2 or any(s != in_shapes[0] for s in in_shapes):
+        raise ValueError("add needs >=2 inputs of identical per-sample shape, got %r" % (in_shapes,))
+    return in_shapes[0]
+
+
+def _g_mul(nd, in_shapes):
+    if len(in_shapes) < 2 or any(s != in_shapes[0] for s in in_shapes):
+        raise ValueError("mul needs >=2 inputs of identical per-sample shape, got %r" % (in_shapes,))
+    return in_shapes[0]
+
+
+def _g_concat(nd, in_shapes):
+    axis = nd.get("axis", 0)                       # per-sample axis (0 = first non-batch dim)
+    if isinstance(axis, bool) or not isinstance(axis, int) or axis < 0:
+        raise ValueError("concat 'axis' must be a non-negative per-sample axis, got %r" % (axis,))
+    if len(in_shapes) < 2:
+        raise ValueError("concat needs >=2 inputs")
+    rank = len(in_shapes[0])
+    if axis >= rank or any(len(s) != rank for s in in_shapes):
+        raise ValueError("concat: equal-rank inputs and axis in range required, got %r axis=%d"
+                         % (in_shapes, axis))
+    for j in range(rank):
+        if j != axis and any(s[j] != in_shapes[0][j] for s in in_shapes):
+            raise ValueError("concat: shapes must match except on axis %d, got %r" % (axis, in_shapes))
+    out = list(in_shapes[0]); out[axis] = sum(s[axis] for s in in_shapes)
+    return tuple(out)
+
+
+# Multi-input / functional graph ops: (node, [in_shapes]) -> out_shape. All per-sample
+# (operate on per-sample axes; the batch dim is never touched).
+_GRAPH_OPS = {"add": _g_add, "mul": _g_mul, "concat": _g_concat}
+
+
+def build_from_graph(spec, in_dim, out_dim, *, num_labels=None):
+    """Build a node-owned GraphModule from a declarative DAG. Nodes must be listed in
+    TOPOLOGICAL order (every input already defined). Single-input ops come from the
+    sequential allowlist ``_OPS``; multi-input/functional ops from ``_GRAPH_OPS``. The
+    output tensor must be a final ``linear`` projection to ``@out`` (raw logits at the
+    loss-decided width)."""
+    nodes = spec.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("graph spec needs a non-empty 'nodes' list")
+    if len(nodes) > _MAX_LAYERS:
+        raise ValueError("graph has %d nodes (cap %d)" % (len(nodes), _MAX_LAYERS))
+    output_name = spec.get("output")
+    if not isinstance(output_name, str) or not output_name:
+        raise ValueError("graph spec needs an 'output' tensor name")
+
+    dims = {"@in": int(in_dim), "@out": int(out_dim)}
+    if num_labels is not None:
+        dims["@nlabels"] = int(num_labels)
+
+    shapes = {"@in": (int(in_dim),)}
+    graph, mods = [], {}
+    for i, nd in enumerate(nodes):
+        if not isinstance(nd, dict):
+            raise ValueError("graph node %d must be an object" % i)
+        name, op, ins = nd.get("name"), nd.get("op"), nd.get("in", [])
+        if not isinstance(name, str) or not name or name in shapes:
+            raise ValueError("graph node %d needs a unique non-empty 'name' (got %r)" % (i, name))
+        if not isinstance(ins, list) or not ins or any(t not in shapes for t in ins):
+            raise ValueError("graph node %r has an undefined/forward input (list nodes in "
+                             "topological order): %r" % (name, ins))
+        if op in _OPS:
+            if len(ins) != 1:
+                raise ValueError("op %r (node %r) takes exactly 1 input, got %d" % (op, name, len(ins)))
+            m, out_shape = _OPS[op](nd, shapes[ins[0]], dims)
+            mods[name] = m
+            graph.append({"name": name, "op": op, "inputs": ins, "module": name})
+        elif op in _GRAPH_OPS:
+            out_shape = _GRAPH_OPS[op](nd, [shapes[t] for t in ins])
+            graph.append({"name": name, "op": op, "inputs": ins, "axis": int(nd.get("axis", 0))})
+        else:
+            raise ValueError("graph node %r has unknown op %r (allowed: %s)"
+                             % (name, op, ", ".join(sorted(list(_OPS) + list(_GRAPH_OPS)))))
+        shapes[name] = out_shape
+
+    if output_name not in shapes:
+        raise ValueError("graph 'output' %r is not produced by any node" % (output_name,))
+    if shapes[output_name] != (int(out_dim),):
+        raise ValueError("graph output shape %r != required (%d,) (end with a linear to @out)"
+                         % (shapes[output_name], out_dim))
+    if nodes[-1].get("name") != output_name or nodes[-1].get("op") != "linear":
+        raise ValueError("the final node must be the 'linear' projection to @out (emits raw logits)")
+    return GraphModule(graph, output_name, mods)
