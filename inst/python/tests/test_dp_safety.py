@@ -201,6 +201,22 @@ check("Tier-2 shape-mismatch NEUTRALIZED (validate-or-zero -> global shape, no r
 _cr = tier2_lib.gated_local_update("t2_crash", g, Xraw, yraw, {}, pcfg)
 check("Tier-2 crashing/data-dependent upload -> finite release (validate-or-zero)",
       all(np.all(np.isfinite(a)) for a in _cr) and all(a.shape == o.shape for a, o in zip(_cr, g)))
+_mkmod("t2_huge", """
+        def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
+        def local_update(g, X, y, cfg): return [np.zeros(5_000_000, np.float64)]
+        """)
+_mkmod("t2_count", """
+        def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
+        def local_update(g, X, y, cfg): return [np.asarray(g[0]), np.zeros(3)]
+        """)
+_hr = tier2_lib.gated_local_update("t2_huge", g, Xraw, yraw, {}, pcfg)
+check("Tier-2 oversized result rejected by the size cap -> validate-or-zero (no parent OOM)",
+      len(_hr) == len(g) and all(a.shape == o.shape for a, o in zip(_hr, g)))
+_wc = tier2_lib.gated_local_update("t2_count", g, Xraw, yraw, {}, pcfg)
+check("Tier-2 wrong array-count rejected (count checked before any load) -> validate-or-zero",
+      len(_wc) == len(g) and all(np.all(np.isfinite(a)) for a in _wc))
+check("gated_local_update refuses a non-str module (the node never imports an object)",
+      rejects(lambda: tier2_lib.gated_local_update(object(), g, Xraw, yraw, {}, pcfg)))
 
 # --------------------------------------------------------------------------- #
 print("== custom loss factory: negative-binomial NLL (per-sample, DP-SGD-safe) ==")

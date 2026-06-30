@@ -33,16 +33,29 @@ import tempfile
 
 import numpy as np
 
-try:
-    import dp_harness            # node-resident trusted copy
-except ImportError:
-    from . import dp_harness     # bundled fallback
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _trusted_import(name):
+    """Load a co-located trusted node module by EXPLICIT path, bypassing sys.path order so
+    a malicious entry earlier on sys.path cannot shadow it and execute code in the trusted
+    parent. (Plain `import dp_harness` would honour sys.path; the upload's dir may be on it.)"""
+    import importlib.util
+    path = os.path.join(_HERE, name + ".py")
+    spec = importlib.util.spec_from_file_location("_dsftrusted_" + name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+dp_harness = _trusted_import("dp_harness")
 
 
 _REQUIRED_HOOKS = ("initial_arrays", "local_update")
-_CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "egress_child.py")
+_CHILD = os.path.join(_HERE, "egress_child.py")
 _FSIZE_LIMIT = 1024 * 1024 * 1024     # 1 GiB cap on child file writes
 _DEFAULT_TIMEOUT = 900                 # wall-clock seconds per child run
+_NPY_HEADER_SLACK = 4096               # bytes of .npy header allowed above the array payload
 
 
 def load_user_module(module_name):
@@ -74,13 +87,16 @@ def _take_rows(D, idx):
 
 def _sanitize_cfg(cfg):
     """Hand the untrusted child only inert scalar cfg values; strip DP params, the module
-    pointer, and anything non-scalar (no secrets, no paths, no objects)."""
+    pointer, non-scalars, and any string that looks like a path/secret/blob (so a config key
+    can't smuggle a filesystem path or token to the child)."""
     out = {}
     for k, v in dict(cfg or {}).items():
         ks = str(k)
         if ks == "user-module" or ks.startswith(("privacy-", "dp_", "dp-")):
             continue
-        if v is None or isinstance(v, (str, int, float, bool)):
+        if v is None or isinstance(v, (bool, int, float)):
+            out[ks] = v
+        elif isinstance(v, str) and len(v) <= 128 and not any(c in v for c in "/\\\x00"):
             out[ks] = v
     return out
 
@@ -89,13 +105,51 @@ def _sanitize_cfg(cfg):
 # Sandbox capability preflight (subprocess is universal; the rest is platform-gated)
 # --------------------------------------------------------------------------- #
 
-def _bwrap_works(path):
-    """True iff bubblewrap can actually unshare the network here (userns enabled)."""
+def _code_dirs():
+    """Read-only dirs the child needs to import Python + numpy + the user module -- and
+    NOTHING else (crucially NOT the node's data/manifest dir). Binding only these means a
+    sample-and-aggregate child can read code + its OWN block input, never other blocks'
+    records, which is exactly what the 2C/k independence argument requires."""
+    import sysconfig
+    dirs = [sys.prefix, sys.exec_prefix, os.path.dirname(os.path.abspath(sys.executable))]
     try:
-        r = subprocess.run([path, "--unshare-net", "--ro-bind", "/", "/", "true"],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=10)
-        return r.returncode == 0
+        paths = sysconfig.get_paths()
+        dirs += [paths.get(k) for k in ("stdlib", "platstdlib", "purelib", "platlib")]
+    except Exception:
+        pass
+    dirs += list(sys.path)
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen and os.path.isdir(d):
+            out.append(d); seen.add(d)
+    return out
+
+
+def _bwrap_mount(path, td):
+    """A MINIMAL bubblewrap sandbox: fresh tmpfs root, network unshared, ONLY the code dirs
+    bound read-only and ONLY `td` (this block's input/output) writable. No host root, no data
+    dir."""
+    args = [path, "--unshare-all", "--die-with-parent",
+            "--tmpfs", "/", "--proc", "/proc", "--dev", "/dev", "--bind", td, td]
+    for d in _code_dirs():
+        args += ["--ro-bind", d, d]
+    return args
+
+
+def _bwrap_works(path):
+    """True iff bubblewrap can ACTUALLY run our minimal net+fs sandbox here (userns enabled)
+    AND a fresh interpreter can still import numpy inside it. Tests the real sandbox we would
+    enforce -- not a permissive one -- so capabilities never over-report."""
+    try:
+        d = tempfile.mkdtemp(prefix="dsf_bwtest_")
+        try:
+            cmd = _bwrap_mount(path, d) + ["--", sys.executable, "-I", "-c", "import numpy"]
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30,
+                               env={"PATH": "/usr/bin:/bin", "TMPDIR": d})
+            return r.returncode == 0
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
     except Exception:
         return False
 
@@ -103,8 +157,8 @@ def _bwrap_works(path):
 def sandbox_caps():
     """What isolation the platform provides RIGHT NOW. subprocess + parent-side DP (the
     monkeypatch fix) is universal; cross-block net+fs isolation (needed to make
-    sample-and-aggregate sound against malicious code) is offered only where a namespace
-    sandbox (bubblewrap) genuinely works."""
+    sample-and-aggregate sound against malicious code) is reported only where the minimal
+    bubblewrap sandbox is VERIFIED to run."""
     caps = {"subprocess": True, "linux": sys.platform.startswith("linux"),
             "rlimit": False, "bwrap": None, "net_lock": False, "fs_isolation": False}
     try:
@@ -115,37 +169,39 @@ def sandbox_caps():
     tool = shutil.which("bwrap")
     if tool and _bwrap_works(tool):
         caps["bwrap"] = tool
-        caps["net_lock"] = True
-        caps["fs_isolation"] = True
+        caps["net_lock"] = True       # --unshare-all removes the network namespace
+        caps["fs_isolation"] = True   # minimal mount: code + this block only, not other data
     return caps
 
 
 def _full_sandbox_ok(caps):
-    """Sample-and-aggregate's 2C/k bound needs GUARANTEED per-block independence, i.e. no
-    cross-block state via shared network or filesystem."""
-    return bool(caps.get("subprocess") and caps.get("net_lock") and caps.get("fs_isolation"))
+    """Sample-and-aggregate's 2C/k bound needs GUARANTEED per-block independence (no
+    cross-block state via shared network OR filesystem). It is enabled ONLY when the minimal
+    net+fs sandbox is verified AND the custodian has attested (DSF_SAA_SANDBOX_OK=1) that, on
+    THIS host, that sandbox exposes only per-block input + code -- never other records. So SAA
+    stays OFF by default (sound) and can never auto-enable on an unvetted host; the plain 2C
+    floor (which needs only process isolation) is the universal mechanism."""
+    return bool(caps.get("subprocess") and caps.get("net_lock") and caps.get("fs_isolation")
+                and os.environ.get("DSF_SAA_SANDBOX_OK") == "1")
 
 
 def _wrap_sandbox(cmd, caps, td):
-    """Wrap the child in bubblewrap (private net + read-only fs + writable only its temp dir)
-    when available. Otherwise run it plain: the parent still applies ALL DP, and network is
-    best-effort (the child's Python sockets are neutered + the container egress policy is the
-    production boundary)."""
-    if caps.get("bwrap") and caps.get("net_lock"):
-        return [caps["bwrap"], "--unshare-all", "--ro-bind", "/", "/",
-                "--bind", td, td, "--proc", "/proc", "--dev", "/dev",
-                "--die-with-parent", "--", *cmd]
+    """Run the child inside the VERIFIED minimal bubblewrap sandbox when SAA is enabled; else
+    run it plain (the parent still applies ALL DP; network is best-effort via the child socket
+    neuter + the container egress policy as the production boundary)."""
+    if caps.get("bwrap") and _full_sandbox_ok(caps):
+        return _bwrap_mount(caps["bwrap"], td) + ["--", *cmd]
     return cmd
 
 
-def _killpg(p):
+def _killpg(pgid):
+    """SIGKILL a whole process group by its cached pgid (== the child pid under
+    start_new_session). Cached so it works even after wait() has reaped the session leader,
+    so a backgrounded grandchild a malicious update spawned cannot survive."""
     try:
-        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except Exception:
-        try:
-            p.kill()
-        except Exception:
-            pass
+        pass
 
 
 def _run_isolated(module_name, old, X, y, cfg, caps, timeout):
@@ -175,33 +231,33 @@ def _run_isolated(module_name, old, X, y, cfg, caps, timeout):
                                  stderr=subprocess.DEVNULL, env=env, start_new_session=True)
         except Exception:
             return None
+        pgid = p.pid   # == process-group id (start_new_session); cache BEFORE wait reaps it
         try:
             p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            _killpg(p)
             return None
         finally:
-            _killpg(p)  # reap any lingering grandchildren in the process group
+            _killpg(pgid)   # kill the whole group -> reaps any backgrounded grandchild
         if p.returncode != 0:
             return None
-        okf = os.path.join(outd, "_ok")
-        if not os.path.exists(okf):
-            return None
+        # Parse defensively: exact count FIRST, per-file size cap BEFORE loading (a hostile
+        # child cannot exhaust parent memory with a giant/wrong-count/wrong-dtype .npy), and
+        # everything in one try so ANY error -> None -> the caller's zero delta.
         try:
-            nout = int(open(okf).read())
+            okf = os.path.join(outd, "_ok")
+            if not os.path.exists(okf) or int(open(okf).read()) != len(old):
+                return None
+            res = []
+            for i, o in enumerate(old):
+                wf = os.path.join(outd, "w_%d.npy" % i)
+                if not os.path.exists(wf):
+                    return None
+                if os.path.getsize(wf) > int(o.nbytes) + _NPY_HEADER_SLACK:
+                    return None
+                res.append(np.asarray(np.load(wf, allow_pickle=False), np.float64))
+            return res
         except Exception:
             return None
-        res = []
-        for i in range(nout):
-            wf = os.path.join(outd, "w_%d.npy" % i)
-            if not os.path.exists(wf):
-                return None
-            try:
-                a = np.load(wf, allow_pickle=False)
-            except Exception:
-                return None
-            res.append(np.asarray(a, np.float64))
-        return res
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
@@ -239,10 +295,11 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
     platform can guarantee block independence and policy says so, else the plain 2C floor.
     `module_name` (not an imported module) is passed so the parent never imports the upload.
 
-    Back-compat: if a pre-isolation caller still passes an imported module object, fall back
-    to its __name__ so older ClientApps keep working."""
+    The first argument is the module NAME (str) -- never an imported object: the node must
+    not import the upload in its own process."""
     if not isinstance(module_name, str):
-        module_name = getattr(module_name, "__name__", None) or str(module_name)
+        raise TypeError("gated_local_update requires the module NAME (str); the node never "
+                        "imports the untrusted upload in-process")
     old = _as_f64_list(global_arrays)
     n = int(len(X))
     caps = sandbox_caps()

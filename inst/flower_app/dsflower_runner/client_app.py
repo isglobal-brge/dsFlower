@@ -307,8 +307,9 @@ def train(msg: Message, context: Context) -> Message:
         # Compose the DP budget over rounds (DP-FedAvg). Basic (sequential) composition of
         # R Gaussian releases each (eps/R, delta/R)-DP yields (eps, delta)-DP, so BOTH eps
         # and delta are split by num_rounds -- splitting only eps would leave the total at
-        # (eps, R*delta), not (eps, delta).
-        num_rounds = max(1, int(cfg.get("num-server-rounds", 1)))
+        # (eps, R*delta), not (eps, delta). Use the MANIFEST-PINNED rounds (server-written),
+        # not the mutable run config, so the per-round budget cannot be inflated.
+        num_rounds = max(1, int(load_run_pins(context)["num_rounds"]))
         pcfg_round = dict(pcfg)
         pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
         pcfg_round["delta"] = float(pcfg["delta"]) / num_rounds
