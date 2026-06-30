@@ -295,8 +295,11 @@ def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
     np.add.at(G, leaf, g)
     np.add.at(H, leaf, h)
     noise_std = float(sigma) * float(delta2)
-    G_tilde = G + np.random.normal(0.0, noise_std, size=n_leaves)
-    H_tilde = H + np.random.normal(0.0, noise_std, size=n_leaves)
+    # DP leaf noise from a FRESH OS-entropy generator, never the shared global
+    # np.random (predictable noise would void DP); reseeds from os.urandom per call.
+    _noise_rng = np.random.default_rng()
+    G_tilde = G + _noise_rng.normal(0.0, noise_std, size=n_leaves)
+    H_tilde = H + _noise_rng.normal(0.0, noise_std, size=n_leaves)
     return np.concatenate([G_tilde, H_tilde])
 
 

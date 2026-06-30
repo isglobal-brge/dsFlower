@@ -122,6 +122,23 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
 # Tier 2 — output perturbation (clip the whole update + Gaussian noise)
 # --------------------------------------------------------------------------- #
 
+def resolve_dp_track(run_config, manifest_track):
+    """Server-DERIVED, unforgeable DP routing: choose the enforced-DP mechanism from
+    WHAT was actually submitted, never from a client-stated preference. An uploaded
+    user-module (arbitrary foreign code) ALWAYS gets the output-perturbation floor
+    ('egress'), never DP-SGD ('neural') or DP-GBDT ('trees') -- a client cannot route
+    its own code to a tighter mechanism. For node-built artifacts the node-pinned
+    manifest track applies (declarative spec -> neural, gbdt spec -> trees). Anything
+    unrecognized fails closed to the universal floor. This is the single, testable
+    routing decision; client_app.train() calls it (the neural track additionally only
+    ever runs the hash-verified harness, so foreign code cannot impersonate it)."""
+    if run_config.get("user-module"):
+        return "egress"
+    if manifest_track in ("neural", "trees", "egress"):
+        return manifest_track
+    return "egress"
+
+
 def compute_output_sigma(epsilon, delta, clipping_norm):
     """Analytic Gaussian-mechanism noise scale for a single bounded release.
 
@@ -148,22 +165,35 @@ def clip_update(new_weights, old_weights, clipping_norm):
     return [np.asarray(o) + d for o, d in zip(old_weights, delta)]
 
 
-def add_gaussian_noise(weights, old_weights, sigma, clipping_norm):
-    """Add N(0, (sigma*clipping_norm)^2) noise to the (clipped) weight delta."""
+def add_gaussian_noise(weights, old_weights, std):
+    """Add N(0, std^2) noise to the (already clipped) weight delta. `std` is the FULL
+    Gaussian-mechanism standard deviation (sensitivity * sqrt(2 ln(1.25/delta)) / eps),
+    with the sensitivity already folded in by the caller. No implicit re-scaling here:
+    a prior version multiplied by clipping_norm AGAIN, double-counting C whenever the
+    clip != 1 (masked only because C defaults to 1)."""
     out = []
     for w, o in zip(weights, old_weights):
         w = np.asarray(w); o = np.asarray(o)
         delta = w - o
-        noise = np.random.normal(0.0, sigma * float(clipping_norm), size=delta.shape)
+        # Draw DP noise from a FRESH OS-entropy generator, never the shared global
+        # np.random: isolates the noise from any deterministic global seeding elsewhere
+        # (predictable noise would void DP) and reseeds from os.urandom each call.
+        noise = np.random.default_rng().normal(0.0, float(std), size=delta.shape)
         out.append(o + delta + noise.astype(delta.dtype))
     return out
 
 
 def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta):
-    """Tier-2 DP in one call: clip the update to C, then add calibrated noise."""
+    """Tier-2 / universal-floor DP in one call: clip the update to C, then add Gaussian
+    noise calibrated to the L2 SENSITIVITY of a C-clipped release, which is 2*C -- NOT C.
+    Two adjacent datasets each yield an update inside the C-ball, so they can differ by
+    up to the ball's diameter 2C; for ARBITRARY code the update is not a sum of
+    per-record bounded terms, so the per-record bound is the diameter, not C. (DP-SGD's
+    per-sample-gradient SUM is sensitivity C and is accounted separately by Opacus; this
+    floor is the only release where the 2C diameter applies.)"""
     clipped = clip_update(new_weights, old_weights, clipping_norm)
-    sigma = compute_output_sigma(epsilon, delta, clipping_norm)
-    return add_gaussian_noise(clipped, old_weights, sigma, clipping_norm)
+    std = compute_output_sigma(epsilon, delta, 2.0 * clipping_norm)   # full Gaussian std for sensitivity 2C
+    return add_gaussian_noise(clipped, old_weights, std)
 
 
 # --------------------------------------------------------------------------- #
@@ -217,6 +247,38 @@ def assert_releasable(model):
             "trainable on the DP-SGD track." % frozen[:8])
 
 
+# Vetted NODE-OWNED classes the researcher NEVER supplies (specs are DATA, not code):
+# the model_spec graph interpreter. Since the researcher can only name allowlisted ops,
+# the only non-torch.nn class ever instantiated on the DP-SGD path is this trusted,
+# node-built interpreter. Admitted by EXACT name+module (not isinstance -> no subclass
+# smuggling). The Opacus DP layers (DPLSTM/DPGRU/DPMultiheadAttention) will be added
+# here when wired, with their hook/cell_type tolerance handled explicitly.
+_VETTED_NODE_CLASSES = frozenset({"GraphModule", "RecurrentBlock"})
+
+# Exact Opacus DP-layer classes the node may instantiate (DP-friendly RNN replacements).
+# Admitted by exact module + name (the researcher submits only op-enums, never classes,
+# so no subclass smuggling). RecurrentBlock SANITIZES their state_dict hooks + cell_type
+# at build, so they still pass the strict no-hooks / no-instance-override checks below;
+# here we only allow their CLASS ORIGIN.
+_VETTED_OPACUS_CLASSES = frozenset({
+    "DPLSTM", "DPGRU", "DPRNN", "DPLSTMCell", "DPGRUCell", "DPRNNCell",
+    "RNNLinear", "SequenceBias",
+})
+
+
+def _is_node_owned_class(cls):
+    """True iff cls is a stock torch.nn layer, an EXACT vetted node-owned class, or an
+    EXACT vetted Opacus DP-layer class."""
+    mod = cls.__module__
+    if mod.startswith("torch.nn"):
+        return True
+    if mod.rsplit(".", 1)[-1] == "model_spec" and cls.__name__ in _VETTED_NODE_CLASSES:
+        return True
+    if mod.startswith("opacus.layers") and cls.__name__ in _VETTED_OPACUS_CLASSES:
+        return True
+    return False
+
+
 def assert_stock_architecture(model):
     """ROOT defense: the researcher's model object is UNTRUSTED, so allow only a pure
     composition of stock torch.nn layers with NO researcher-injected behaviour at all.
@@ -251,11 +313,12 @@ def assert_stock_architecture(model):
 
     for m in _walk(model):
         cls = type(m)
-        if not cls.__module__.startswith("torch.nn"):
+        if not _is_node_owned_class(cls):
             raise ValueError(
-                "non-stock module %r on the DP-SGD track: only stock torch.nn modules "
-                "are allowed (a custom class is researcher code). Build from torch.nn "
-                "layers, or use the egress track." % cls.__name__)
+                "non-stock module %r on the DP-SGD track: only stock torch.nn layers and "
+                "node-owned vetted classes (%s) are allowed (a custom class is researcher "
+                "code). Build from the allowlist, or use the egress track."
+                % (cls.__name__, ", ".join(sorted(_VETTED_NODE_CLASSES))))
         # No instance-level method override: a stock module stores only params /
         # buffers / submodules / config in its __dict__, never a callable. Any callable
         # there is a method override -- `forward` (stash / sample-coupling) or
@@ -296,23 +359,86 @@ _LOSS_ALLOWLIST = {
     "mse":            ("MSELoss", {}),
     "poisson_nll":    ("PoissonNLLLoss", {"log_input": True}),
     "multilabel_bce": ("BCEWithLogitsLoss", {}),
+    "hinge":          ("MultiMarginLoss", {}),  # linear SVM (multiclass margin), per-sample
+    "ordinal":        ("BCEWithLogitsLoss", {}),  # ordinal regression via K-1 cumulative tasks (CORN)
 }
 
 
-def loss_from_allowlist(name):
+def _negbin_nll_factory(cfg):
+    """Negative-binomial (NB2) negative log-likelihood, log-link, PER-SAMPLE.
+    pred = log-mean [N,1]; target = non-negative counts [N,1]. The dispersion
+    'size' r (variance = mu + mu^2 / r) is a harmless modelling hyperparameter
+    read from the run config: it shapes the loss but NOT the DP guarantee --
+    per-sample gradients are clipped to C and noised regardless of the loss, so a
+    hostile r can only hurt the client's own fit, never privacy. Mean reduction
+    (Opacus calibrates noise assuming it). Decomposes per sample -> DP-SGD-safe."""
+    r = float(cfg.get("nb-dispersion", 1.0))
+    if not math.isfinite(r) or r <= 0.0:
+        raise ValueError("nb-dispersion must be a positive finite float, got %r" % (r,))
+    log_r, lgamma_r = math.log(r), math.lgamma(r)
+
+    def negbin_nll(pred, target):
+        import torch
+        z = pred.reshape(-1)                       # log-mean (log-link)
+        y = target.reshape(-1).to(z.dtype)         # non-negative counts
+        log_r_plus_mu = torch.logaddexp(torch.full_like(z, log_r), z)   # log(r + exp(z)), overflow-safe
+        ll = (torch.lgamma(y + r) - lgamma_r - torch.lgamma(y + 1.0)
+              - r * torch.nn.functional.softplus(z - log_r)   # r*log(r/(r+mu)); stable in both limits
+              + y * (z - log_r_plus_mu))
+        return (-ll).mean()
+    return negbin_nll
+
+
+def _gamma_nll_factory(cfg):
+    """Gamma GLM negative log-likelihood, log-link, PER-SAMPLE. pred = log-mean
+    [N,1]; target = strictly-positive continuous [N,1] (cost, concentration, length
+    of stay). The shape k (variance = mu^2 / k) is a harmless run-config hyperparameter
+    -- it shapes the loss, never the clip/noise, so it is no DP lever. Mean reduction;
+    decomposes per sample -> DP-SGD-safe. At k=1 this is the exponential NLL z + y*exp(-z)."""
+    k = float(cfg.get("gamma-shape", 1.0))
+    if not math.isfinite(k) or k <= 0.0:
+        raise ValueError("gamma-shape must be a positive finite float, got %r" % (k,))
+    lgamma_k, log_k = math.lgamma(k), math.log(k)
+
+    def gamma_nll(pred, target):
+        import torch
+        z = pred.reshape(-1)                       # log-mean (log-link)
+        y = target.reshape(-1).to(z.dtype)         # strictly positive continuous
+        ll = ((k - 1.0) * torch.log(y) - k * y * torch.exp(-z)
+              - k * (z - log_k) - lgamma_k)
+        return (-ll).mean()
+    return gamma_nll
+
+
+# Custom TRUSTED per-sample losses (node code, never client code): name -> factory(cfg).
+# Each MUST decompose per sample with mean reduction so the DP-SGD sensitivity bound
+# holds; enforced by per_sample_independence_probe + the DP safety suite. Hyperparams
+# come from the run config but can only shape the loss, never the clip/noise -> no DP
+# lever. This is how tight DP is GROWN (vetted node losses), not by trusting client code.
+_CUSTOM_LOSS_FACTORY = {
+    "negbin_nll": _negbin_nll_factory,
+    "gamma_nll": _gamma_nll_factory,
+}
+
+
+def loss_from_allowlist(name, cfg=None):
     """Instantiate a per-sample-decomposable loss from the node allowlist, with
     reduction='mean'. The loss is NEVER taken from client code: Opacus computes
     per-sample gradients via backward hooks but never inspects the loss, so a
     sample-coupling loss (contrastive / Cox partial-likelihood / a hand-rolled
     ``loss/batch.mean()``) yields well-formed but WRONG per-sample gradients that
     silently defeat the clip-to-C sensitivity bound. Mean reduction is required
-    because Opacus calibrates the noise assuming it."""
+    because Opacus calibrates the noise assuming it. Stock losses come from the
+    allowlist; vetted custom per-sample losses from _CUSTOM_LOSS_FACTORY (cfg
+    supplies only DP-irrelevant shape hyperparameters)."""
     import torch.nn as nn
-    if name not in _LOSS_ALLOWLIST:
-        raise ValueError("loss '%s' is not on the node allowlist %r"
-                         % (name, sorted(_LOSS_ALLOWLIST)))
-    cls_name, kw = _LOSS_ALLOWLIST[name]
-    return getattr(nn, cls_name)(reduction="mean", **kw)
+    if name in _LOSS_ALLOWLIST:
+        cls_name, kw = _LOSS_ALLOWLIST[name]
+        return getattr(nn, cls_name)(reduction="mean", **kw)
+    if name in _CUSTOM_LOSS_FACTORY:
+        return _CUSTOM_LOSS_FACTORY[name](cfg or {})
+    raise ValueError("loss '%s' is not on the node allowlist %r"
+                     % (name, sorted(list(_LOSS_ALLOWLIST) + list(_CUSTOM_LOSS_FACTORY))))
 
 
 def per_sample_independence_probe(model, criterion, x_sample, y_sample):

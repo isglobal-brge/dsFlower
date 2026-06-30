@@ -222,12 +222,16 @@ flowerTier2PinDS <- function(handle_symbol, app_token) {
     stop("Uploaded app contains no importable Python package to pin.",
          call. = FALSE)
   }
-  runner_hash <- .compute_app_pkg_hash("dsflower_runner")
+  # Tier-2 runs the dsflower_tier2 harness (NOT the unified dsflower_runner), so pin
+  # THAT package -- the default-deny integrity hook checks the imported package name
+  # ('dsflower_tier2'), and pinning dsflower_runner left dsflower_tier2 unlisted ->
+  # the ClientApp aborted ("not in pinned_packages.json").
+  runner_hash <- .compute_app_pkg_hash("dsflower_tier2")
   if (!nzchar(runner_hash)) {
-    stop("The trusted runner (dsflower_runner) is not installed on this node.",
+    stop("The Tier-2 runner (dsflower_tier2) is not installed on this node.",
          call. = FALSE)
   }
-  pinned <- c(list(dsflower_runner = runner_hash), user_hashes)
+  pinned <- c(list(dsflower_tier2 = runner_hash), user_hashes)
   jsonlite::write_json(pinned,
                        file.path(handle$staging_dir, "pinned_packages.json"),
                        auto_unbox = TRUE)

@@ -151,6 +151,59 @@ whole returned update to L2 norm `C` and adds Gaussian noise calibrated to
 by ~√(model-dim)). Use when arbitrary client code is required and the utility
 cost is accepted.
 
+**The built-in Tier-1 suite (tight DP by construction).** The node builds every
+Tier-1 model from a declarative SPEC over a fixed, per-sample-safe op + loss
+allowlist — no researcher code runs, so DP-SGD is sound by construction:
+
+- *GLM / tabular:* logistic, linear, multiclass, multilabel, Poisson, **negative
+  binomial**, **gamma**, **ordinal (CORN)**, **linear SVM (hinge)**.
+- *Penalized:* **ridge (L2)**, **lasso (L1)**, **elastic-net** — applied as
+  post-processing of the already-DP update (no privacy lever).
+- *Deep:* MLP, **2D CNN**, **TCN (dilated conv1d)** via the shape-threaded spec
+  vocabulary (`reshape → conv1d/conv2d/maxpool2d/adaptiveavgpool2d/flatten →
+  linear`); frozen-backbone vision heads (ResNet-18, DenseNet-121); DP-GBDT trees.
+
+Tight DP is GROWN by enriching this vetted allowlist — never by trusting client
+code. Two sound extension points: the **custom-loss factory**
+(`_CUSTOM_LOSS_FACTORY` — vetted node-side per-sample losses; cfg supplies only
+DP-irrelevant shape hyperparameters) and the **op allowlist** (every op
+per-sample, asserted by `per_sample_independence_probe`). Anything that would need
+a cross-sample loss (Cox partial likelihood), a custom forward (RNN take-last), or
+a non-sequential graph (U-Net skips) is **automatically routed to the Tier-2
+output-perturbation floor** — the gateway never grants tight DP it cannot
+guarantee by construction, and never fails open.
+
+**Server-authoritative DP (the trust boundary).** The node is the only trusted
+party; the client (researcher) is untrusted. The client submits only WHAT to
+compute — the node decides and enforces ALL of how-private, and the client cannot
+weaken it (nor even request stronger — the budget is the custodian's resource):
+
+- *Mechanism* is node-pinned and routed by code identity: the DP-SGD path only ever
+  runs the hash-verified harness on a data-only spec; an uploaded user-module is
+  forced to the output-perturbation floor (`client_app.train`). A client cannot
+  route its own code to the tight track.
+- *Parameters* (ε / δ / clip) come from this node's options
+  (`dp_epsilon`/`dp_delta`/`dp_clipping_norm`), OVERRIDING anything the client sends
+  (`.addDpConfigToRunConfig`), bounded by ceilings and an RDP/PRV budget ledger.
+- *Budget* is keyed by DATA identity (table fingerprint + target), never the
+  client-chosen assign symbol — so a sybil client cannot reset the budget by
+  re-assigning the same data to a fresh symbol.
+- *Noise* is drawn from a fresh OS-entropy generator (`np.random.default_rng`),
+  isolated from any global seeding (predictable noise would void DP).
+- The output-perturbation floor calibrates Gaussian noise to the C-ball DIAMETER
+  **2C** (arbitrary code's true L2 sensitivity), not C.
+
+Corroborated by an independent design review (Codex) and a multi-source deep-research
+pass: server-authoritative / client-untrusted enforcement is established prior art
+(DataSHIELD custodian-only parameters; Google Confidential Federated Computations); a
+verifiable budget ledger is essential (re-runs average the noise out); and a
+declarative DSL + Opacus covers conv/RNN/LSTM/GRU/attention — but ONLY with the node's
+OWN per-sample-independence gate, because Opacus' ModuleValidator is non-exhaustive (it
+cannot see `x - x.mean(0)`, batch attention, or Cox risk-set coupling). That gate is
+`per_sample_independence_probe` + `assert_stock_architecture`. Sample-and-aggregate and
+PATE are not worth adding as a universal floor in few-site cross-silo; the Gaussian
+output-perturbation floor remains the universal mechanism.
+
 **DataSHIELD backstop (deterministic).** Independent of DP, every release passes
 minimum-count control: counts ≤ threshold are suppressed/bucketed; `num_examples`
 / sizes are count-bucketed. *Any metric not noised-or-bucketed is an exfiltration

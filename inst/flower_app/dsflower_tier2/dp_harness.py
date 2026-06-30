@@ -104,22 +104,29 @@ def clip_update(new_weights, old_weights, clipping_norm):
     return [np.asarray(o) + d for o, d in zip(old_weights, delta)]
 
 
-def add_gaussian_noise(weights, old_weights, sigma, clipping_norm):
-    """Add N(0, (sigma*clipping_norm)^2) noise to the (clipped) weight delta."""
+def add_gaussian_noise(weights, old_weights, std):
+    """Add N(0, std^2) noise to the (already clipped) weight delta. `std` is the FULL
+    Gaussian-mechanism standard deviation (sensitivity folded in by the caller); drawn
+    from a fresh OS-entropy generator, never the shared global np.random (predictable
+    noise would void DP)."""
     out = []
     for w, o in zip(weights, old_weights):
         w = np.asarray(w); o = np.asarray(o)
         delta = w - o
-        noise = np.random.normal(0.0, sigma * float(clipping_norm), size=delta.shape)
+        noise = np.random.default_rng().normal(0.0, float(std), size=delta.shape)
         out.append(o + delta + noise.astype(delta.dtype))
     return out
 
 
 def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta):
-    """Tier-2 DP in one call: clip the update to C, then add calibrated noise."""
+    """Tier-2 / universal-floor DP in one call: clip the update to C, then add Gaussian
+    noise calibrated to the L2 SENSITIVITY of a C-clipped release = 2*C (the C-ball
+    DIAMETER, since arbitrary code's update is not a sum of per-record bounded terms),
+    NOT C. (A prior version used C and re-multiplied the clip in add_gaussian_noise --
+    a double-C masked only because C defaults to 1.)"""
     clipped = clip_update(new_weights, old_weights, clipping_norm)
-    sigma = compute_output_sigma(epsilon, delta, clipping_norm)
-    return add_gaussian_noise(clipped, old_weights, sigma, clipping_norm)
+    std = compute_output_sigma(epsilon, delta, 2.0 * clipping_norm)   # full std for sensitivity 2C
+    return add_gaussian_noise(clipped, old_weights, std)
 
 
 def bucket_count(n):
