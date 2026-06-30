@@ -61,6 +61,21 @@ def rejects(fn):
         return True
 
 
+# Tier-2 egress now runs uploads OUT-OF-PROCESS, so adversarial "apps" must be real
+# importable modules (by name), never in-process objects. _mkmod writes one to a temp dir
+# on sys.path; the isolated child inherits the parent sys.path and imports it by name.
+import tempfile as _tempfile
+import textwrap as _textwrap
+_T2DIR = _tempfile.mkdtemp(prefix="dpsafe_mods_")
+sys.path.insert(0, _T2DIR)
+
+
+def _mkmod(name, body):
+    with open(os.path.join(_T2DIR, name + ".py"), "w") as f:
+        f.write("import numpy as np\n" + _textwrap.dedent(body))
+    return name
+
+
 # --------------------------------------------------------------------------- #
 print("== output-perturbation floor: analytic Gaussian + sensitivity bound ==")
 C, eps, delta = 1.0, 1.0, 1e-5
@@ -142,30 +157,50 @@ check("buffer stash channel REJECTED", rejects(lambda: dh.assert_releasable(Buf(
 check("frozen-param stash channel REJECTED", rejects(lambda: dh.assert_releasable(Frozen())))
 
 # --------------------------------------------------------------------------- #
-print("== Tier-2 gate (gated_local_update): adversarial apps cannot leak ==")
-pcfg = {"clipping_norm": 1.0, "epsilon": 1.0, "delta": 1e-5}
+print("== Tier-2 gate (ISOLATED gated_local_update): adversarial uploads cannot leak ==")
+pcfg = {"clipping_norm": 1.0, "epsilon": 1.0, "delta": 1e-5, "egress_timeout": 30}
 g = [np.zeros(20, np.float32)]
-Xraw = (np.random.randn(8) * 7).astype(np.float32)
-
-class Exfil:                            # smuggle raw data into the returned weights
-    def initial_arrays(s, cfg, d): return [np.zeros(d, np.float32)]
-    def local_update(s, gg, X, yy, cfg):
-        w = [a.copy() for a in gg]
-        n = min(X.size, w[0].size)
-        w[0].ravel()[:n] = X.ravel()[:n] * 1e6
-        return w
-class WrongShape:
-    def initial_arrays(s, cfg, d): return [np.zeros(d, np.float32)]
-    def local_update(s, gg, X, yy, cfg): return [np.zeros(21, np.float32)]
-
-ex = tier2_lib.gated_local_update(Exfil(), g, Xraw, np.zeros(8), {}, pcfg)
-exrel = np.concatenate([(o - gg).ravel() for o, gg in zip(ex, g)])
+Xraw = (np.random.randn(8) * 7).astype(np.float32); yraw = np.zeros(8)
+_mkmod("t2_exfil", """
+        def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
+        def local_update(g, X, y, cfg):
+            w = [np.asarray(a).copy() for a in g]; X = np.asarray(X)
+            n = min(X.size, w[0].size); w[0].ravel()[:n] = X.ravel()[:n] * 1e6
+            return w
+        """)
+_mkmod("t2_monkey", """
+        def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
+        def local_update(g, X, y, cfg):
+            try:                       # try to disable the DP from inside (in-process attack)
+                import dp_harness
+                dp_harness.add_gaussian_noise = lambda *a, **k: list(a[0])
+                dp_harness.compute_output_sigma = lambda *a, **k: 0.0
+            except Exception: pass
+            return [np.asarray(g[0]) + 1e6]
+        """)
+_mkmod("t2_wrongshape", """
+        def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
+        def local_update(g, X, y, cfg): return [np.zeros(21, np.float32)]
+        """)
+_mkmod("t2_crash", """
+        def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
+        def local_update(g, X, y, cfg): raise RuntimeError("data-dependent boom")
+        """)
+_ex = tier2_lib.gated_local_update("t2_exfil", g, Xraw, yraw, {}, pcfg)
 check("Tier-2 exfil via weights DESTROYED by the gate (1e6 raw -> O(sigma))",
-      np.max(np.abs(exrel)) < 100)
-_ws = tier2_lib.gated_local_update(WrongShape(), g, Xraw, np.zeros(8), {}, pcfg)
-check("Tier-2 shape-mismatch smuggling NEUTRALIZED (validate-or-zero -> global shape, no raw escape)",
+      np.max(np.abs(np.concatenate([(o - gg).ravel() for o, gg in zip(_ex, g)]))) < 100)
+_mk = tier2_lib.gated_local_update("t2_monkey", g, Xraw, yraw, {}, pcfg)
+check("Tier-2 in-process MONKEYPATCH defeated by isolation (parent DP intact, release bounded)",
+      np.max(np.abs(np.concatenate([(o - gg).ravel() for o, gg in zip(_mk, g)]))) < 100)
+check("isolation: the parent NEVER imported the untrusted upload (absent from sys.modules)",
+      "t2_monkey" not in sys.modules and "t2_exfil" not in sys.modules)
+_ws = tier2_lib.gated_local_update("t2_wrongshape", g, Xraw, yraw, {}, pcfg)
+check("Tier-2 shape-mismatch NEUTRALIZED (validate-or-zero -> global shape, no raw escape)",
       len(_ws) == len(g) and all(a.shape == o.shape for a, o in zip(_ws, g))
       and all(np.all(np.isfinite(a)) for a in _ws))
+_cr = tier2_lib.gated_local_update("t2_crash", g, Xraw, yraw, {}, pcfg)
+check("Tier-2 crashing/data-dependent upload -> finite release (validate-or-zero)",
+      all(np.all(np.isfinite(a)) for a in _cr) and all(a.shape == o.shape for a, o in zip(_cr, g)))
 
 # --------------------------------------------------------------------------- #
 print("== custom loss factory: negative-binomial NLL (per-sample, DP-SGD-safe) ==")
@@ -397,36 +432,23 @@ _agDelta = (0.5 * (1 + math.erf((_agA - _agB) / math.sqrt(2)))
 check("analytic Gaussian sigma meets the (eps=10, delta=1e-5) target (classic bound would leak)",
       _agDelta <= 1e-5 * 1.001)
 
-class _SaFakeMod:
-    def __init__(self): self.seen = []
-    def local_update(self, g, X, y, cfg):
-        self.seen.append(np.asarray(X).ravel().copy()); return [g[0] + 0.1, g[1] + 0.1]
-_saPcfg = dict(clipping_norm=_saC, epsilon=2.0, delta=1e-5,
-               sample_aggregate=True, sa_min_block=10, sa_max_blocks=8)  # explicit opt-in (default OFF)
-_saX = np.arange(100).reshape(100, 1).astype(float); _saY = np.arange(100).astype(float)
-_saFm = _SaFakeMod(); tier2_lib.gated_local_update(_saFm, _saOld, _saX, _saY, {}, _saPcfg)
-check("server routes n=100 to k=8 disjoint blocks covering every row exactly once",
-      len(_saFm.seen) == 8 and
-      np.array_equal(np.sort(np.concatenate(_saFm.seen)), np.sort(_saX.ravel())))
-check("block partition is RANDOM (not contiguous) -> data-independent",
-      not all(np.array_equal(np.sort(s), np.arange(int(s.min()), int(s.min()) + len(s)))
-              for s in _saFm.seen))
-_saFm2 = _SaFakeMod(); tier2_lib.gated_local_update(_saFm2, _saOld, _saX[:8], _saY[:8], {}, _saPcfg)
-_saFm3 = _SaFakeMod(); tier2_lib.gated_local_update(_saFm3, _saOld, _saX, _saY, {},
-                                                    dict(_saPcfg, sample_aggregate=False))
-_saFm4 = _SaFakeMod(); tier2_lib.gated_local_update(  # no SAA keys at all -> default OFF
-    _saFm4, _saOld, _saX, _saY, {}, dict(clipping_norm=_saC, epsilon=2.0, delta=1e-5))
-check("small n, policy-off, AND default (no key) all fall back to the plain 2C floor",
-      len(_saFm2.seen) == 1 and len(_saFm3.seen) == 1 and len(_saFm4.seen) == 1)
-
-class _SaBadMod:
-    def local_update(self, g, X, y, cfg):
-        if int(np.asarray(X)[0, 0]) % 2 == 0:
-            raise RuntimeError("data-dependent boom")
-        return [g[0] * np.nan, g[1]]
-check("validate-or-zero: data-dependent crash/NaN blocks -> finite release (no crash/leak)",
-      all(np.all(np.isfinite(a)) for a in
-          tier2_lib.gated_local_update(_SaBadMod(), _saOld, _saX, _saY, {}, _saPcfg)))
+# Mechanism selection is the NODE's automatic, capability-gated decision (NOT a researcher
+# opt-in). _choose_blocks is the pure server-side rule, tested directly.
+_saPol = dict(sa_min_block=10, sa_max_blocks=8)
+check("SAA is GATED OFF without a full sandbox (subprocess-only) -> plain 2C floor",
+      tier2_lib._choose_blocks(1000, _saPol, False) == 1)
+check("with a full sandbox the node auto-selects k from PUBLIC n only (100->8 capped, 30->3)",
+      tier2_lib._choose_blocks(100, _saPol, True) == 8
+      and tier2_lib._choose_blocks(30, _saPol, True) == 3)
+check("small n -> plain floor even with a full sandbox",
+      tier2_lib._choose_blocks(8, _saPol, True) == 1)
+check("custodian governance off-switch honoured even with a full sandbox",
+      tier2_lib._choose_blocks(100, dict(_saPol, sample_aggregate=False), True) == 1)
+check("subprocess isolation (the monkeypatch fix) is universally available",
+      tier2_lib.sandbox_caps()["subprocess"] is True)
+check("SAA full-sandbox gate requires real net+fs isolation (not subprocess alone)",
+      tier2_lib._full_sandbox_ok({"subprocess": True, "net_lock": False, "fs_isolation": False})
+      is False)
 
 # --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")

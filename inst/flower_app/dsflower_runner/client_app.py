@@ -302,7 +302,7 @@ def train(msg: Message, context: Context) -> Message:
     elif track == "egress":
         from . import tier2_lib
         X, y = load_data(context)
-        user_mod = tier2_lib.load_user_module(str(cfg["user-module"]))
+        module_name = str(cfg["user-module"])   # run OUT-OF-PROCESS; the node never imports it
         old = msg.content["arrays"].to_numpy_ndarrays()
         # Compose the DP budget over rounds (DP-FedAvg). Basic (sequential) composition of
         # R Gaussian releases each (eps/R, delta/R)-DP yields (eps, delta)-DP, so BOTH eps
@@ -312,7 +312,7 @@ def train(msg: Message, context: Context) -> Message:
         pcfg_round = dict(pcfg)
         pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
         pcfg_round["delta"] = float(pcfg["delta"]) / num_rounds
-        new_arrays = tier2_lib.gated_local_update(user_mod, old, X, y, cfg, pcfg_round)
+        new_arrays = tier2_lib.gated_local_update(module_name, old, X, y, cfg, pcfg_round)
         n = len(y)
     else:  # neural (tabular or image)
         pins = load_run_pins(context)

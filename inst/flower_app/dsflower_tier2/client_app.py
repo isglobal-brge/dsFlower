@@ -10,7 +10,7 @@ from flwr.clientapp import ClientApp
 from flwr.common import ArrayRecord, Context, Message, MetricRecord, RecordDict
 
 from .task import load_data, load_privacy_config
-from .tier2_lib import load_user_module, gated_local_update
+from .tier2_lib import gated_local_update
 
 try:
     import dp_harness
@@ -30,7 +30,8 @@ def train(msg: Message, context: Context) -> Message:
 
     X, y = load_data(context)
     pcfg = load_privacy_config(context)
-    user_mod = load_user_module(user_module)
+    # The node runs the upload OUT-OF-PROCESS (gated_local_update spawns an isolated
+    # interpreter); it never imports the untrusted module here.
 
     global_arrays = msg.content["arrays"].to_numpy_ndarrays()
     # Compose the DP budget over rounds (DP-FedAvg). Basic (sequential) composition of R
@@ -41,7 +42,7 @@ def train(msg: Message, context: Context) -> Message:
     pcfg_round = dict(pcfg)
     pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
     pcfg_round["delta"] = float(pcfg["delta"]) / num_rounds
-    gated = gated_local_update(user_mod, global_arrays, X, y, dict(cfg), pcfg_round)
+    gated = gated_local_update(user_module, global_arrays, X, y, dict(cfg), pcfg_round)
 
     n_examples = dp_harness.bucket_count(len(X))
     reply = RecordDict({
