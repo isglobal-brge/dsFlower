@@ -185,6 +185,7 @@ def load_privacy_config(context=None):
         "sample_aggregate": bool(float(manifest.get("privacy-sample_aggregate", 0))),
         "sa_min_block": max(1, int(float(manifest.get("privacy-sa_min_block", 64)))),
         "sa_max_blocks": max(1, int(float(manifest.get("privacy-sa_max_blocks", 8)))),
+        "egress_time_pad": max(0.0, float(manifest.get("privacy-egress_time_pad", 0))),
         "allow_per_node_metrics": False,
         "allow_exact_num_examples": False,
         "n_samples": int(manifest.get("n_samples", 0)),

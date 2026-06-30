@@ -182,6 +182,20 @@
     )
   }
 
+  # Idempotent reserve/commit: a run_token already recorded is NEVER charged twice. The
+  # prepare path RESERVES the budget BEFORE the run can release; cleanup then finds the same
+  # token and is a no-op. Charging at prepare (not cleanup) means a run that released but
+  # whose cleanup never fired still spent its budget -- the safe direction (overcharge an
+  # aborted run rather than under-charge a released one).
+  if (!is.null(run_token)) {
+    for (r in entry$runs) {
+      if (!is.null(r$run_token) &&
+          identical(as.character(r$run_token), as.character(run_token))) {
+        return(invisible(NULL))
+      }
+    }
+  }
+
   # Compute RDP cost for this run
   run_rdp <- .compute_rdp_vector(epsilon, delta,
                                   noise_multiplier = noise_multiplier,

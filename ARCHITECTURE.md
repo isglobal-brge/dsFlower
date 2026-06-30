@@ -277,6 +277,47 @@ them); then a patient with `k` images has a per-patient guarantee weaker by up t
 `k` (group privacy). The pooling column is the **same** one admission grouped by
 (pinned in the manifest as `patient_column`), so the two never diverge.
 
+## 5c. Tier-2 egress hardening — process isolation + sample-and-aggregate
+
+Arbitrary uploaded `local_update` (the Tier-2 floor) runs **out-of-process**. The node spawns
+a **fresh interpreter** (`egress_child.py` via `subprocess` fork+exec — never multiprocessing
+fork, which inherits gRPC/curl threads and segfaults here) that imports the upload by name and
+runs it on a block of data; it can only hand back plain `.npy` arrays. The **trusted parent
+never imports or executes the upload** and does ALL DP (clip to the C-ball + analytic-Gaussian
+noise), so an upload cannot monkeypatch the DP harness / NumPy / the RNG. Hardening:
+
+- **Result loaded `allow_pickle=False`**, exact array-count checked first, per-file size capped
+  before load, every file `lstat`-checked as a regular file (no FIFO/symlink/device).
+  **validate-or-zero**: any crash / timeout / wrong-shape / non-finite / oversized → a zero
+  delta (inside the C-ball; sound + leak-safe).
+- **Sealed parent imports**: `dp_harness`/`dp_gbdt` are imported relatively / by explicit
+  co-located path, so an upload on `sys.path` cannot shadow them into the parent.
+- **Process-group kill** by cached pgid (reaps backgrounded grandchildren); rlimits
+  (CPU/FSIZE/CORE); sanitized `cfg` (no DP params, paths, or secrets).
+- **Network**: the child neuters Python sockets *and* installs an unprivileged **seccomp-BPF**
+  (Linux x86_64/aarch64) that EPERMs the socket syscalls. The production boundary remains the
+  **container egress policy** (deny outbound from the data node).
+- **Timing side-channel**: optional **constant-time padding** (`dsflower.dp_egress_time_pad`
+  seconds; set ABOVE the egress timeout, i.e. timeout + a cleanup guard) so a child that
+  sleeps/returns on a data predicate cannot leak it via round duration — the child is killed
+  at an absolute in-envelope deadline, then the call sleeps to the fixed pad. Off by default
+  (adds latency).
+- **Budget reserve-before-release**: the RDP/PRV ledger is charged at **prepare** (idempotent
+  by `run_token`), not at cleanup, so a run that releases but whose cleanup never fires still
+  spent its budget (the safe direction).
+
+**Sample-and-aggregate (2C/k)** is the **node's automatic, server-managed** choice (never a
+researcher opt-in): `_choose_blocks` picks `k = min(sa_max_blocks, n // sa_min_block)` from the
+public row count. It is **sound-or-disabled**: it runs only when `_full_sandbox_ok` holds — a
+**verified minimal bubblewrap sandbox** (`--unshare-all`, fresh tmpfs root, only code dirs +
+the block's own input bound — never other records) AND the custodian attests
+`DSF_SAA_SANDBOX_OK=1`. Otherwise the universal **plain 2C floor** runs (process isolation
+alone). To **enable SAA** an operator must: (1) run the rock container with user namespaces
+enabled (so `bwrap --unshare-all` works — the default containers lack `cap_sys_admin`/userns,
+so SAA stays off), (2) install `bwrap`, (3) audit that `_code_dirs()`/`sys.path` expose only
+code (no data), (4) set `DSF_SAA_SANDBOX_OK=1`, and (5) ideally set `dp_egress_time_pad`. SAA
+then auto-engages where it improves utility.
+
 ## 6. Transport — DSI as a transparent byte tunnel (salvaged)
 
 **The DataSHIELD connection we are handed *is* the channel** — the researcher's R

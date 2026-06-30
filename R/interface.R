@@ -279,6 +279,11 @@ flowerInitDS <- function(data_symbol) {
                                                 .dsf_option("dp_sample_aggregate", FALSE))))
   run_config[["privacy-sa_min_block"]]     <- as.numeric(.dsf_option("dp_sa_min_block", 64))
   run_config[["privacy-sa_max_blocks"]]    <- as.numeric(.dsf_option("dp_sa_max_blocks", 8))
+  # Constant-time padding for the egress sandbox (seconds; 0 = off). Set this ABOVE the
+  # egress timeout (timeout + a few seconds of kill/cleanup guard) to close the timing
+  # side-channel where uploaded code could sleep on a data predicate and leak it via round
+  # duration. Off by default (it adds latency).
+  run_config[["privacy-egress_time_pad"]]  <- as.numeric(.dsf_option("dp_egress_time_pad", 0))
   run_config
 }
 
@@ -337,7 +342,9 @@ flowerInitDS <- function(data_symbol) {
   }
   dataset_key <- .privacy_dataset_key(handle, target_column)
   .check_budget(dataset_key, dp_epsilon, dp_delta)
-  invisible(TRUE)
+  # Return the budget coordinates so the caller can RESERVE the spend (idempotently, by
+  # run_token) once the token exists -- i.e. BEFORE the run can release anything.
+  invisible(list(dataset_key = dataset_key, epsilon = dp_epsilon, delta = dp_delta))
 }
 
 #' Prepare a Training Run
@@ -424,9 +431,9 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
                "check: ", conditionMessage(e), call. = FALSE))
       }
     }
-    .enforceDisclosureAndDp(handle, target_column, template_name,
-                            n_samples, target_data, run_config,
-                            data_type = data_type)
+    dp_resv <- .enforceDisclosureAndDp(handle, target_column, template_name,
+                                       n_samples, target_data, run_config,
+                                       data_type = data_type)
 
     # Inject validated mask paths from dsImaging (segmentation tasks)
     seg_generation_id <- run_config[["segmentation_generation_id"]] %||% NULL
@@ -463,6 +470,11 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
 
     handle$run_token       <- run_token
+    # RESERVE the privacy budget NOW: token set + manifest staged, but BEFORE the run can
+    # release anything. Idempotent by run_token, so flowerCleanupRunDS will not double-charge.
+    # (Charging at prepare, not at cleanup, closes the under-accounting where a run releases
+    # but its cleanup never fires.)
+    .record_spend(dp_resv$dataset_key, dp_resv$epsilon, dp_resv$delta, run_token = run_token)
     handle$staging_dir     <- staging_dir
     handle$target_column   <- target_column
     handle$feature_columns <- feature_columns
@@ -481,9 +493,9 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 
   run_config <- .addDpConfigToRunConfig(run_config)
   template_name <- run_config[["template_name"]] %||% NULL
-  .enforceDisclosureAndDp(handle, target_column, template_name,
-                          nrow(data), data, run_config,
-                          data_type = run_config[["data_type"]] %||% "tabular")
+  dp_resv <- .enforceDisclosureAndDp(handle, target_column, template_name,
+                                     nrow(data), data, run_config,
+                                     data_type = run_config[["data_type"]] %||% "tabular")
 
   # Stage data with manifest
   run_token <- .generate_run_token()
@@ -513,6 +525,9 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   }
 
   handle$run_token       <- run_token
+  # RESERVE the privacy budget NOW (before release); idempotent by run_token so cleanup
+  # never double-charges. See the staged path above for the rationale.
+  .record_spend(dp_resv$dataset_key, dp_resv$epsilon, dp_resv$delta, run_token = run_token)
   handle$staging_dir     <- staging_dir
   handle$target_column   <- target_column
   handle$feature_columns <- feature_columns
