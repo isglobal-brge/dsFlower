@@ -1048,11 +1048,18 @@ flowerFeatureStatsDS <- function(data_symbol, feature_columns = NULL) {
     stop("flowerFeatureStatsDS: none of the requested feature columns are present.",
          call. = FALSE)
   }
+  # Per-feature disclosure gate: a (mostly-)missing column could otherwise leak a
+  # near-individual value through exact (n, sum, sumsq). Only release a feature whose
+  # FINITE count clears the same min-rows threshold; below it, emit zeros (n=0) so the
+  # client treats the feature as absent -> mean 0 / SD 1 (a no-op standardization).
+  min_n <- .disclosure_min_rows()
   n <- s <- ss <- numeric(length(feats))
   for (i in seq_along(feats)) {
     x <- suppressWarnings(as.numeric(obj[[feats[i]]]))   # non-numeric/factor -> NA -> dropped
     ok <- is.finite(x)
-    n[i]  <- sum(ok)
+    ni <- sum(ok)
+    if (ni < min_n) next                                 # leave n/sum/sumsq at 0
+    n[i]  <- ni
     s[i]  <- sum(x[ok])
     ss[i] <- sum(x[ok] * x[ok])
   }

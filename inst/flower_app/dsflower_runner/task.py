@@ -7,6 +7,7 @@ so the manifest is tamper-proof; the researcher cannot weaken DP through it.
 """
 
 import json
+import math
 import os
 
 import numpy as np
@@ -246,17 +247,22 @@ def _decode_feature_norm(cfg, n_features):
     to the [0,1] binning prior). SDs are floored to a positive value."""
     raw = cfg.get("feature-norm-b64")
     if not raw:
-        return None
+        return None                       # absent -> caller uses the [0,1] prior (legit)
+    # Present-but-malformed/mismatched is unexpected (the client sent it): FAIL CLOSED
+    # rather than silently falling back to [0,1], which would resurrect the degenerate
+    # binning bug without anyone noticing.
     import base64
     import json as _json
     try:
         norm = _json.loads(base64.b64decode(str(raw), validate=True).decode("utf-8"))
         mean = np.asarray(norm["means"], dtype=np.float64)
         sd = np.asarray(norm["sds"], dtype=np.float64)
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError("feature-norm-b64 present but undecodable: %s" % e)
     if mean.shape[0] != int(n_features) or sd.shape[0] != int(n_features):
-        return None
+        raise RuntimeError(
+            "feature-norm length (%d/%d) != num features (%d)"
+            % (mean.shape[0], sd.shape[0], int(n_features)))
     sd = np.where(np.isfinite(sd) & (sd > 1e-8), sd, 1.0)
     mean = np.where(np.isfinite(mean), mean, 0.0)
     return mean, sd
@@ -281,6 +287,12 @@ def load_gbdt_spec(context=None):
     n_trees = int(spec.get("n_trees", cfg.get("n-trees", 20)))
     learning_rate = float(spec.get("learning_rate", cfg.get("learning-rate", 0.3)))
     reg_lambda = float(spec.get("reg_lambda", cfg.get("reg-lambda", 1.0)))
+    # Newton-step denominator is max(lambda, H+lambda); lambda<=0 (or non-finite lr/lambda)
+    # can yield inf/NaN leaf weights. Clamp to safe values (fail-closed on the math).
+    if not (math.isfinite(learning_rate) and learning_rate > 0):
+        raise RuntimeError("DP-GBDT learning_rate must be finite and > 0")
+    if not (math.isfinite(reg_lambda) and reg_lambda > 0):
+        reg_lambda = 1e-6
     n_bins = int(spec.get("n_bins", cfg.get("n-bins", 32)))
     run_token = str(manifest.get("run_token", spec.get("run_token", "dsflower")))
     # Admin caps (data-independent): bound compute + keep leaves from being singletons.

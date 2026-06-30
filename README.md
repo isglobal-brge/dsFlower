@@ -71,6 +71,18 @@ squeeze-excitation, U-Net, LSTM/GRU — with **no researcher code on the node**.
 declaratively; it runs the upload in an isolated interpreter while the trusted parent applies
 all DP, so the upload can never disable the noise.
 
+DP-SGD clips per-sample gradients to a fixed norm, so on raw features the large-scale
+columns dominate and the model collapses to the majority baseline even with no noise. The
+node therefore exposes `flowerFeatureStatsDS` — a disclosure-controlled aggregate returning
+per-feature `count/sum/sumsq` (gated on the min-rows threshold, like `ds.mean`/`ds.var`).
+The client pools these into a **global** mean/SD that the neural track standardizes inputs
+with and the trees track uses to place its random-split binning prior (`[mu-4sd, mu+4sd]`).
+These stats are a *separate* sanctioned aggregate release — **not** part of, and not
+weakening, the DP-SGD `(epsilon, delta)` budget (the gradient noise is unchanged); a
+poisoned value is only a utility risk, never a DP bypass. With this in place the DP cost at
+`epsilon = 3` is small (e.g. logistic regression ~0.93, DP-GBDT ~0.88 on a 3-site
+Breast-Cancer-Wisconsin demo, vs a 0.63 majority baseline).
+
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full trust boundary, the integrity gate
 (`assert_stock_architecture`, per-sample-independence probe, releasability), the runner
 hash-pinning, and the Tier-2 isolation/sandbox details.
@@ -84,7 +96,7 @@ hash-pinning, and the Tier-2 isolation/sandbox details.
 | Run preparation (DP set + budget reserved here) | `flowerPrepareRunDS` |
 | SuperNode lifecycle | `flowerEnsureSuperNodeDS`, `flowerCleanupRunDS`, `flowerStatusDS` |
 | Template / code integrity | `flowerListTemplatesDS`, `flowerGetTemplateDS`, `flowerVerifyAppHashDS` |
-| Controlled outputs | `flowerMetricsDS`, `flowerLogDS`, `flowerPrivacyBudgetDS` |
+| Controlled outputs | `flowerMetricsDS`, `flowerLogDS`, `flowerPrivacyBudgetDS`, `flowerFeatureStatsDS` |
 
 Opal/Rock may run cleanup in a different process than the one that launched a SuperNode, so
 the package records process metadata on disk and reaps stale staging dirs and orphan

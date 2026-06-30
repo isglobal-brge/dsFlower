@@ -325,12 +325,19 @@ def grow_tree_from_histograms(summed_hist, n_leaves, reg_lambda, learning_rate):
 def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
                 feature_ranges, n_bins, run_token, epsilon, delta,
                 base_score=0.5, patient_ids=None):
-    """Train a DP-GBDT booster in one process with LOCAL DP. Equivalent to the
-    federated loop with a single shard: each tree is one Gaussian release, σ is
-    calibrated once for T_total = n_trees. Returns the booster dict (our own
-    serializable format). Used by tests and the single-node path; the multi-node
-    path drives ``node_noised_histogram`` / ``grow_tree_from_histograms`` round
-    by round through Flower instead.
+    """Train a DP-GBDT booster in one process with LOCAL DP: each tree is one
+    Gaussian release, σ is calibrated once for T_total = n_trees. Returns the
+    booster dict (our own serializable format).
+
+    DEPLOYED FEDERATION = BAGGING: every node runs this full local fit on its own
+    rows and the server BAGS the M boosters (server_app._bag_boosters: concat trees,
+    scale leaf weights by 1/M). The ``node_noised_histogram`` / ``grow_tree_from_histograms``
+    primitives below implement the alternative HISTOGRAM-SUMMING design (one summed
+    Newton step per tree across all rows). It was evaluated and NOT adopted: at equal
+    per-node privacy its utility is empirically equal-or-worse than bagging (bagging
+    already averages M per-leaf estimates -> the same ~sqrt(M) noise reduction), while
+    it costs T sequential Flower round-trips. The primitives are kept for tests and as
+    a reference implementation, but the live path is bagging.
     """
     if patient_ids is not None:
         X, y = pool_by_patient(X, y, patient_ids)
