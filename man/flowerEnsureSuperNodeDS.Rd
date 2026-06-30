@@ -9,7 +9,8 @@ flowerEnsureSuperNodeDS(
   superlink_address,
   federation_id = NULL,
   ca_cert_pem = NULL,
-  template_name = NULL
+  template_name = NULL,
+  torch_backend = NULL
 )
 }
 \arguments{
