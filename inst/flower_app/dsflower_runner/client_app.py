@@ -190,6 +190,41 @@ def _pool_by_patient(X, y, groups):
     return np.stack(Xp), np.asarray(yp, dtype=y.dtype), True
 
 
+def _apply_feature_norm(X, cfg):
+    """Standardize tabular features with the client-computed GLOBAL mean/SD.
+
+    DP-SGD on RAW features collapses to the majority baseline (per-sample gradient
+    clipping rescales the whole vector to norm C, so large-scale columns dominate
+    and small informative ones vanish -- even with zero DP noise). The client ships
+    cohort-level mean/SD (disclosure-controlled aggregates) so we scale to unit
+    variance; the DP cost then drops to ~0. This is pure post-processing -- the
+    (eps,delta) guarantee is enforced INDEPENDENTLY by DP-SGD on whatever inputs it
+    sees, so a bad/poisoned mu/sigma can only hurt accuracy, never privacy. No-op if
+    the run config carries no stats; FAIL-CLOSED on a length mismatch (a silent skip
+    would desync from prediction, which always normalizes when stats were recorded)."""
+    raw = cfg.get("feature-norm-b64")
+    if not raw:
+        return X
+    import base64
+    try:
+        norm = json.loads(base64.b64decode(str(raw), validate=True).decode("utf-8"))
+        mean = np.asarray(norm["means"], dtype=np.float32)
+        sd = np.asarray(norm["sds"], dtype=np.float32)
+    except Exception as e:
+        raise RuntimeError("could not decode feature-norm-b64: %s" % e)
+    if mean.shape[0] != X.shape[1] or sd.shape[0] != X.shape[1]:
+        raise RuntimeError(
+            "feature-norm length (%d/%d) != num features (%d); refusing to train with a "
+            "mismatched normalization (would desync from prediction)."
+            % (mean.shape[0], sd.shape[0], X.shape[1]))
+    sd = np.where(np.isfinite(sd) & (sd > 1e-8), sd, 1.0).astype(np.float32)
+    mean = np.where(np.isfinite(mean), mean, 0.0).astype(np.float32)
+    Xn = ((X - mean) / sd).astype(np.float32)
+    if not np.all(np.isfinite(Xn)):
+        raise RuntimeError("non-finite values after feature standardization")
+    return Xn
+
+
 def _train_neural(msg, context, cfg, pcfg, pins):
     manifest_image = is_image_run(context)
     cfg_image = str(cfg.get("data-kind", "")).lower() == "image"
@@ -231,6 +266,7 @@ def _train_neural(msg, context, cfg, pcfg, pins):
         model = load_user_model(cfg, feat_dim, pins["loss_name"])
     else:
         X, y = load_data(context)
+        X = _apply_feature_norm(X, cfg)        # GLOBAL standardization (affine; commutes with mean-pool)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
         if pins["loss_name"] in _CLASSIFICATION_LOSSES:
             _assert_label_range(y, n_classes)
