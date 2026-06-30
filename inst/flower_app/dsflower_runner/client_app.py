@@ -32,11 +32,11 @@ from .task import (load_data, load_image_collection, is_image_run,
                    load_gbdt_spec, load_tabular_patient_ids)
 from .params import get_torch_params, set_torch_params, load_user_model
 
-try:
-    import dp_harness
-    import dp_gbdt
-except ImportError:
-    from . import dp_harness, dp_gbdt
+# RELATIVE imports only: resolve within this trusted package, so an uploaded module on
+# sys.path / PYTHONPATH cannot shadow dp_harness / dp_gbdt and execute in the parent at
+# ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
+# .task / .params imports above.)
+from . import dp_harness, dp_gbdt
 
 
 app = ClientApp()
@@ -302,17 +302,18 @@ def train(msg: Message, context: Context) -> Message:
     elif track == "egress":
         from . import tier2_lib
         X, y = load_data(context)
-        user_mod = tier2_lib.load_user_module(str(cfg["user-module"]))
+        module_name = str(cfg["user-module"])   # run OUT-OF-PROCESS; the node never imports it
         old = msg.content["arrays"].to_numpy_ndarrays()
         # Compose the DP budget over rounds (DP-FedAvg). Basic (sequential) composition of
         # R Gaussian releases each (eps/R, delta/R)-DP yields (eps, delta)-DP, so BOTH eps
         # and delta are split by num_rounds -- splitting only eps would leave the total at
-        # (eps, R*delta), not (eps, delta).
-        num_rounds = max(1, int(cfg.get("num-server-rounds", 1)))
+        # (eps, R*delta), not (eps, delta). Use the MANIFEST-PINNED rounds (server-written),
+        # not the mutable run config, so the per-round budget cannot be inflated.
+        num_rounds = max(1, int(load_run_pins(context)["num_rounds"]))
         pcfg_round = dict(pcfg)
         pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
         pcfg_round["delta"] = float(pcfg["delta"]) / num_rounds
-        new_arrays = tier2_lib.gated_local_update(user_mod, old, X, y, cfg, pcfg_round)
+        new_arrays = tier2_lib.gated_local_update(module_name, old, X, y, cfg, pcfg_round)
         n = len(y)
     else:  # neural (tabular or image)
         pins = load_run_pins(context)
