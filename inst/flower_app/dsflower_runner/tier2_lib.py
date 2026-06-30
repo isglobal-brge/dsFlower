@@ -204,6 +204,17 @@ def _killpg(pgid):
         pass
 
 
+def _is_regular(path):
+    """True iff path is an existing REGULAR file (lstat, so NOT a symlink, FIFO, device, or
+    dir). A backgrounded helper that escaped the process group could otherwise drop a FIFO /
+    symlink-to-/dev/zero where a result file is expected and hang or OOM the parent on read."""
+    try:
+        import stat
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except Exception:
+        return False
+
+
 def _run_isolated(module_name, old, X, y, cfg, caps, timeout):
     """Run the untrusted local_update on (X, y) in a FRESH interpreter. Returns f64 arrays,
     or None on ANY failure (crash, timeout, wrong count/shape, non-finite, unreadable). The
@@ -245,14 +256,17 @@ def _run_isolated(module_name, old, X, y, cfg, caps, timeout):
         # everything in one try so ANY error -> None -> the caller's zero delta.
         try:
             okf = os.path.join(outd, "_ok")
-            if not os.path.exists(okf) or int(open(okf).read()) != len(old):
+            if not _is_regular(okf) or os.path.getsize(okf) > 64:   # bounded, regular-file only
                 return None
+            with open(okf) as f:
+                if int(f.read(64)) != len(old):                     # exact count BEFORE any load
+                    return None
             res = []
             for i, o in enumerate(old):
                 wf = os.path.join(outd, "w_%d.npy" % i)
-                if not os.path.exists(wf):
+                if not _is_regular(wf):                             # no FIFO/symlink/device
                     return None
-                if os.path.getsize(wf) > int(o.nbytes) + _NPY_HEADER_SLACK:
+                if os.path.getsize(wf) > int(o.nbytes) + _NPY_HEADER_SLACK:  # size cap before load
                     return None
                 res.append(np.asarray(np.load(wf, allow_pickle=False), np.float64))
             return res

@@ -32,11 +32,11 @@ from .task import (load_data, load_image_collection, is_image_run,
                    load_gbdt_spec, load_tabular_patient_ids)
 from .params import get_torch_params, set_torch_params, load_user_model
 
-try:
-    import dp_harness
-    import dp_gbdt
-except ImportError:
-    from . import dp_harness, dp_gbdt
+# RELATIVE imports only: resolve within this trusted package, so an uploaded module on
+# sys.path / PYTHONPATH cannot shadow dp_harness / dp_gbdt and execute in the parent at
+# ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
+# .task / .params imports above.)
+from . import dp_harness, dp_gbdt
 
 
 app = ClientApp()

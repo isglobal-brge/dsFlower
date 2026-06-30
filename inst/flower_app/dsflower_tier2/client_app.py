@@ -12,10 +12,9 @@ from flwr.common import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from .task import load_data, load_privacy_config
 from .tier2_lib import gated_local_update
 
-try:
-    import dp_harness
-except ImportError:
-    from . import dp_harness
+# RELATIVE import only: an uploaded module on sys.path/PYTHONPATH cannot shadow dp_harness
+# and execute in the parent at ClientApp import time.
+from . import dp_harness
 
 
 app = ClientApp()
