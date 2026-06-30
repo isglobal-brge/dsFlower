@@ -4,7 +4,7 @@
 \alias{flowerPrivacyBudgetDS}
 \title{Query Privacy Budget}
 \usage{
-flowerPrivacyBudgetDS(handle_symbol)
+flowerPrivacyBudgetDS(handle_symbol, target_column = NULL)
 }
 \arguments{
 \item{handle_symbol}{Character; symbol of the handle.}
