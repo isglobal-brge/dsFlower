@@ -272,6 +272,44 @@ def _b_upsample(s, shape, dims):
     return nn.Upsample(scale_factor=sf, mode="nearest"), (c, h * sf, w * sf)
 
 
+class RecurrentBlock(nn.Module):
+    """Node-owned recurrent wrapper: an Opacus DP RNN (DPLSTM/DPGRU) over a per-sample
+    sequence [N, T, F], returning the LAST hidden state [N, H]. The recurrence runs
+    within each sample (over time), never across the batch -> per-sample-safe.
+
+    SANITIZED at build: Opacus' state_dict hook and the ``cell_type`` class attr are
+    stripped from every submodule, so the instance carries NO hooks and NO instance
+    callables. Our release reads ``_parameters`` (not ``state_dict``), so dropping the
+    state_dict hook is harmless. This keeps assert_stock_architecture FULLY STRICT on
+    hooks/overrides while it admits the vetted Opacus classes + this block by identity."""
+
+    def __init__(self, input_size, hidden, kind="lstm"):
+        super().__init__()
+        from opacus.layers import DPLSTM, DPGRU
+        rnn = (DPLSTM if kind == "lstm" else DPGRU)(int(input_size), int(hidden), batch_first=True)
+        for sub in rnn.modules():
+            if hasattr(sub, "_state_dict_hooks"):
+                sub._state_dict_hooks.clear()
+            if hasattr(sub, "_load_state_dict_pre_hooks"):
+                sub._load_state_dict_pre_hooks.clear()
+            sub.__dict__.pop("cell_type", None)
+        self.rnn = rnn
+
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        return out[:, -1, :]
+
+
+def _b_recurrent(kind):
+    def build(s, shape, dims):
+        if len(shape) != 2:
+            raise ValueError("%s needs a (T, F) sequence input -- reshape first, got %r"
+                             % (kind, shape))
+        h = _pos_int(s.get("hidden", 64), "hidden", hi=_MAX_WIDTH)
+        return RecurrentBlock(shape[-1], h, kind=kind), (h,)
+    return build
+
+
 _OPS = {
     "linear": _b_linear,
     "relu": _b_relu, "gelu": _b_gelu, "tanh": _b_tanh, "sigmoid": _b_sigmoid,
@@ -281,6 +319,7 @@ _OPS = {
     "conv1d": _b_conv1d, "conv2d": _b_conv2d,
     "maxpool2d": _b_maxpool2d, "adaptiveavgpool2d": _b_adaptiveavgpool2d,
     "upsample": _b_upsample,
+    "lstm": _b_recurrent("lstm"), "gru": _b_recurrent("gru"),
 }
 
 

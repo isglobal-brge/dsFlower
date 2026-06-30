@@ -253,15 +253,30 @@ def assert_releasable(model):
 # node-built interpreter. Admitted by EXACT name+module (not isinstance -> no subclass
 # smuggling). The Opacus DP layers (DPLSTM/DPGRU/DPMultiheadAttention) will be added
 # here when wired, with their hook/cell_type tolerance handled explicitly.
-_VETTED_NODE_CLASSES = frozenset({"GraphModule"})
+_VETTED_NODE_CLASSES = frozenset({"GraphModule", "RecurrentBlock"})
+
+# Exact Opacus DP-layer classes the node may instantiate (DP-friendly RNN replacements).
+# Admitted by exact module + name (the researcher submits only op-enums, never classes,
+# so no subclass smuggling). RecurrentBlock SANITIZES their state_dict hooks + cell_type
+# at build, so they still pass the strict no-hooks / no-instance-override checks below;
+# here we only allow their CLASS ORIGIN.
+_VETTED_OPACUS_CLASSES = frozenset({
+    "DPLSTM", "DPGRU", "DPRNN", "DPLSTMCell", "DPGRUCell", "DPRNNCell",
+    "RNNLinear", "SequenceBias",
+})
 
 
 def _is_node_owned_class(cls):
-    """True iff cls is a stock torch.nn layer or an EXACT vetted node-owned class."""
-    if cls.__module__.startswith("torch.nn"):
+    """True iff cls is a stock torch.nn layer, an EXACT vetted node-owned class, or an
+    EXACT vetted Opacus DP-layer class."""
+    mod = cls.__module__
+    if mod.startswith("torch.nn"):
         return True
-    return (cls.__module__.rsplit(".", 1)[-1] == "model_spec"
-            and cls.__name__ in _VETTED_NODE_CLASSES)
+    if mod.rsplit(".", 1)[-1] == "model_spec" and cls.__name__ in _VETTED_NODE_CLASSES:
+        return True
+    if mod.startswith("opacus.layers") and cls.__name__ in _VETTED_OPACUS_CLASSES:
+        return True
+    return False
 
 
 def assert_stock_architecture(model):

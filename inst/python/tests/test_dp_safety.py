@@ -329,5 +329,25 @@ check("upsample (U-Net decoder path) builds", tuple(
         torch.randn(4, 16)).shape) == (4, 2))
 
 # --------------------------------------------------------------------------- #
+print("== recurrent (LSTM/GRU) via sanitized Opacus DP-RNN -- gate stays strict ==")
+_lstm = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "x", "op": "reshape", "in": ["@in"], "shape": [8, 8]},
+    {"name": "h", "op": "lstm", "in": ["x"], "hidden": 16},
+    {"name": "out", "op": "linear", "in": ["h"], "out": "@out"}]}
+check("LSTM sequence DAG builds, output width == out_dim",
+      tuple(model_spec.build_from_spec(_lstm, 64, 3)(torch.randn(4, 64)).shape) == (4, 3))
+check("LSTM admitted (RecurrentBlock + sanitized DPLSTM, no buffers)",
+      (not rejects(lambda: dh.assert_stock_architecture(model_spec.build_from_spec(_lstm, 64, 3))))
+      and not rejects(lambda: dh.assert_releasable(model_spec.build_from_spec(_lstm, 64, 3))))
+check("LSTM per-sample-safe (recurrence over TIME, not the batch)",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _cp2.deepcopy(model_spec.build_from_spec(_lstm, 64, 3)), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+_hooked = nn.Sequential(nn.Linear(3, 1))
+_hooked[0].register_forward_hook(lambda m, i, o: o)
+check("gate STILL rejects ANY module carrying a hook (sanitize did NOT weaken it)",
+      rejects(lambda: dh.assert_stock_architecture(_hooked)))
+
+# --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
 sys.exit(1 if fail else 0)
