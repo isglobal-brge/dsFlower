@@ -836,6 +836,11 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     dp_required         = TRUE,
     active_supernodes   = nrow(node_list[node_list$alive, , drop = FALSE]),
     is_docker           = is_docker,
+    # Zombie-process monitor: the subreaper wrapper prevents FL descendants from
+    # leaking to a non-reaping PID 1, so this should stay ~0. A rising count means
+    # leaked defunct processes (e.g. pre-fix, parented to the JVM) that only a
+    # container restart can clear -- poll this for a periodic health check.
+    zombie_processes    = .count_zombies(),
     hostname            = Sys.info()[["nodename"]]
   )
 
