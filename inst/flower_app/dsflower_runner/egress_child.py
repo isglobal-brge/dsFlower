@@ -42,6 +42,7 @@ def _harden():
     except Exception:
         pass
     if os.environ.get("DSF_NO_NET") == "1":
+        # Layer 1 (universal, evadable): neuter Python sockets.
         try:
             import socket
 
@@ -54,6 +55,56 @@ def _harden():
                 socket.create_server = _blocked   # type: ignore[assignment]
         except Exception:
             pass
+        # Layer 2 (Linux, robust, unprivileged): a seccomp-BPF filter that makes the
+        # socket-creating syscalls return EPERM -- so even C-level / non-Python network
+        # attempts fail. Best-effort: any failure is ignored (the parent does all DP
+        # regardless; the container egress policy is the production boundary).
+        _install_seccomp_no_net()
+
+
+def _install_seccomp_no_net():
+    """Block socket/connect/send* syscalls in THIS process via an unprivileged seccomp filter
+    (PR_SET_NO_NEW_PRIVS + SECCOMP_MODE_FILTER). Linux x86_64/aarch64 only; never fatal."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+        import platform
+        import struct
+        machine = platform.machine()
+        if machine in ("x86_64", "amd64"):
+            arch = 0xC000003E
+            sysnos = (41, 42, 44, 46, 49, 50, 43, 288)  # socket,connect,sendto,sendmsg,bind,listen,accept,accept4
+        elif machine in ("aarch64", "arm64"):
+            arch = 0xC00000B7
+            sysnos = (198, 203, 206, 211, 200, 201, 202, 242)
+        else:
+            return
+        BPF_LD, BPF_W, BPF_ABS = 0x00, 0x00, 0x20
+        BPF_JMP, BPF_JEQ, BPF_K, BPF_RET = 0x05, 0x10, 0x00, 0x06
+        ALLOW, ERRNO_EPERM = 0x7FFF0000, 0x00050000 | 1
+        n = len(sysnos)
+        prog = [(BPF_LD | BPF_W | BPF_ABS, 0, 0, 4),        # 0: A = arch (offset 4)
+                (BPF_JMP | BPF_JEQ | BPF_K, 0, n + 1, arch),  # 1: arch!=ours -> ALLOW
+                (BPF_LD | BPF_W | BPF_ABS, 0, 0, 0)]          # 2: A = syscall nr (offset 0)
+        for i, s in enumerate(sysnos):                        # 3+i: nr==s -> ERRNO
+            prog.append((BPF_JMP | BPF_JEQ | BPF_K, n - i, 0, s))
+        prog.append((BPF_RET | BPF_K, 0, 0, ALLOW))           # 3+n
+        prog.append((BPF_RET | BPF_K, 0, 0, ERRNO_EPERM))     # 4+n
+        blob = b"".join(struct.pack("=HBBI", c, jt, jf, k) for (c, jt, jf, k) in prog)
+        buf = ctypes.create_string_buffer(blob, len(blob))
+
+        class _Fprog(ctypes.Structure):
+            _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+        fprog = _Fprog(len(prog), ctypes.cast(buf, ctypes.c_void_p))
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, MODE_FILTER = 38, 22, 2
+        if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            return
+        libc.prctl(PR_SET_SECCOMP, MODE_FILTER, ctypes.byref(fprog), 0, 0)
+    except Exception:
+        return
 
 
 def main():

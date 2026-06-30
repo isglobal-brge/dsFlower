@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -56,6 +57,7 @@ _CHILD = os.path.join(_HERE, "egress_child.py")
 _FSIZE_LIMIT = 1024 * 1024 * 1024     # 1 GiB cap on child file writes
 _DEFAULT_TIMEOUT = 900                 # wall-clock seconds per child run
 _NPY_HEADER_SLACK = 4096               # bytes of .npy header allowed above the array payload
+_PAD_GUARD = 5.0                       # seconds reserved for kill+cleanup inside a padded envelope
 
 
 def load_user_module(module_name):
@@ -215,11 +217,19 @@ def _is_regular(path):
         return False
 
 
-def _run_isolated(module_name, old, X, y, cfg, caps, timeout):
+def _run_isolated(module_name, old, X, y, cfg, caps, timeout, pad_to=0.0):
     """Run the untrusted local_update on (X, y) in a FRESH interpreter. Returns f64 arrays,
     or None on ANY failure (crash, timeout, wrong count/shape, non-finite, unreadable). The
     parent never imports or executes the upload; the result is loaded allow_pickle=False so
-    it can never execute code here."""
+    it can never execute code here.
+
+    pad_to>0 pads the call to a CONSTANT wall-clock of pad_to seconds so a child that sleeps
+    (or returns fast) on a data predicate cannot leak it via round duration -- a timing
+    side-channel outside the DP release. For EXACT constant time the child is killed at an
+    absolute deadline (t0 + pad_to - guard), leaving the guard for kill+cleanup, then the call
+    sleeps to exactly t0 + pad_to; so set pad_to > timeout + guard (the custodian sets
+    egress_time_pad above egress_timeout). Default 0 = off."""
+    t0 = time.monotonic()
     td = tempfile.mkdtemp(prefix="dsf_egress_")
     try:
         inp = os.path.join(td, "in.npz")
@@ -243,8 +253,14 @@ def _run_isolated(module_name, old, X, y, cfg, caps, timeout):
         except Exception:
             return None
         pgid = p.pid   # == process-group id (start_new_session); cache BEFORE wait reaps it
+        # With padding on, kill the child at an ABSOLUTE deadline that leaves a cleanup guard
+        # inside the pad envelope, so even a deliberately-timing-out child finishes (killed +
+        # reaped) before t0+pad_to -> exact constant time after the final pad-sleep.
+        eff_timeout = timeout
+        if pad_to > 0:
+            eff_timeout = max(1.0, min(timeout, (t0 + pad_to - _PAD_GUARD) - time.monotonic()))
         try:
-            p.wait(timeout=timeout)
+            p.wait(timeout=eff_timeout)
         except subprocess.TimeoutExpired:
             return None
         finally:
@@ -274,6 +290,10 @@ def _run_isolated(module_name, old, X, y, cfg, caps, timeout):
             return None
     finally:
         shutil.rmtree(td, ignore_errors=True)
+        if pad_to > 0:                                   # constant-time padding (anti timing leak)
+            rem = float(pad_to) - (time.monotonic() - t0)
+            if rem > 0:
+                time.sleep(rem)
 
 
 def _validate(res, old):
@@ -319,6 +339,7 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
     caps = sandbox_caps()
     k = _choose_blocks(n, pcfg, _full_sandbox_ok(caps))
     timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
+    pad_to = float(pcfg.get("egress_time_pad", 0))   # 0=off; >=timeout for constant-time runs
 
     if k >= 2:
         # Data-INDEPENDENT random partition into k disjoint blocks (fresh-entropy permutation
@@ -328,7 +349,7 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
         block_updates = []
         for idx in np.array_split(perm, k):
             r = _validate(_run_isolated(module_name, old, _take_rows(X, idx),
-                                        _take_rows(y, idx), cfg, caps, timeout), old)
+                                        _take_rows(y, idx), cfg, caps, timeout, pad_to), old)
             block_updates.append(r if r is not None else [o.copy() for o in old])
         gated = dp_harness.sample_and_aggregate(
             block_updates, old,
@@ -337,7 +358,7 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
             delta=pcfg["delta"],
         )
     else:
-        r = _validate(_run_isolated(module_name, old, X, y, cfg, caps, timeout), old)
+        r = _validate(_run_isolated(module_name, old, X, y, cfg, caps, timeout, pad_to), old)
         new = r if r is not None else [o.copy() for o in old]   # validate-or-zero
         gated = dp_harness.output_perturbation(
             new, old,

@@ -217,6 +217,13 @@ check("Tier-2 wrong array-count rejected (count checked before any load) -> vali
       len(_wc) == len(g) and all(np.all(np.isfinite(a)) for a in _wc))
 check("gated_local_update refuses a non-str module (the node never imports an object)",
       rejects(lambda: tier2_lib.gated_local_update(object(), g, Xraw, yraw, {}, pcfg)))
+import time as _time
+_t0 = _time.monotonic()
+tier2_lib.gated_local_update("t2_crash", g, Xraw, yraw, {}, dict(pcfg, egress_time_pad=2.0))
+check("constant-time padding holds the egress run to >= the pad (timing side-channel closed)",
+      _time.monotonic() - _t0 >= 1.9)
+check("seccomp network-lock helper is present + callable (no-op off-Linux)",
+      callable(getattr(__import__("egress_child"), "_install_seccomp_no_net", None)))
 
 # --------------------------------------------------------------------------- #
 print("== custom loss factory: negative-binomial NLL (per-sample, DP-SGD-safe) ==")
