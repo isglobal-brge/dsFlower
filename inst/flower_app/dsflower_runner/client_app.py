@@ -291,14 +291,11 @@ def _train_trees(context, pcfg):
 def train(msg: Message, context: Context) -> Message:
     cfg = dict(context.run_config)
     pcfg = load_privacy_config(context)
-    track = load_dp_track(context)                 # node-pinned, NOT trusted from pyproject
-    # Server-DERIVED routing (defense in depth over the code-identity hash gate):
-    # uploaded foreign code (a user-module) ALWAYS gets the output-perturbation floor,
-    # never DP-SGD -- a client cannot route its own code to the tight track. The
-    # neural/DP-SGD track only ever runs the node's hash-verified harness on a
-    # data-only spec, so foreign code cannot impersonate it either way.
-    if cfg.get("user-module"):
-        track = "egress"
+    # Server-DERIVED routing (single source of truth: dp_harness.resolve_dp_track):
+    # an uploaded user-module is forced to the output-perturbation floor; node-built
+    # artifacts use the node-pinned track. The client cannot route its own code to a
+    # tighter track, and the neural track only ever runs the hash-verified harness.
+    track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
 
     if track == "trees":
         new_arrays, n = _train_trees(context, pcfg)

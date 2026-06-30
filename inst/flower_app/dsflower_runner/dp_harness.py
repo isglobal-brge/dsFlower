@@ -122,6 +122,23 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
 # Tier 2 — output perturbation (clip the whole update + Gaussian noise)
 # --------------------------------------------------------------------------- #
 
+def resolve_dp_track(run_config, manifest_track):
+    """Server-DERIVED, unforgeable DP routing: choose the enforced-DP mechanism from
+    WHAT was actually submitted, never from a client-stated preference. An uploaded
+    user-module (arbitrary foreign code) ALWAYS gets the output-perturbation floor
+    ('egress'), never DP-SGD ('neural') or DP-GBDT ('trees') -- a client cannot route
+    its own code to a tighter mechanism. For node-built artifacts the node-pinned
+    manifest track applies (declarative spec -> neural, gbdt spec -> trees). Anything
+    unrecognized fails closed to the universal floor. This is the single, testable
+    routing decision; client_app.train() calls it (the neural track additionally only
+    ever runs the hash-verified harness, so foreign code cannot impersonate it)."""
+    if run_config.get("user-module"):
+        return "egress"
+    if manifest_track in ("neural", "trees", "egress"):
+        return manifest_track
+    return "egress"
+
+
 def compute_output_sigma(epsilon, delta, clipping_norm):
     """Analytic Gaussian-mechanism noise scale for a single bounded release.
 

@@ -238,5 +238,17 @@ check("conv out_channels over cap REJECTED", rejects(
         {"op": "flatten"}, {"op": "linear", "out": "@out"}]}, 64, 2)))
 
 # --------------------------------------------------------------------------- #
+print("== adaptive routing: the SERVER picks the DP mechanism, unforgeably ==")
+check("declarative spec -> neural (DP-SGD, tight)", dh.resolve_dp_track({}, "neural") == "neural")
+check("gbdt spec -> trees (DP-GBDT)", dh.resolve_dp_track({}, "trees") == "trees")
+check("explicit egress -> egress (output-perturbation floor)", dh.resolve_dp_track({}, "egress") == "egress")
+check("uploaded code requesting NEURAL -> FORCED to the floor (cannot be fooled)",
+      dh.resolve_dp_track({"user-module": "evil"}, "neural") == "egress")
+check("uploaded code requesting TREES -> FORCED to the floor",
+      dh.resolve_dp_track({"user-module": "evil"}, "trees") == "egress")
+check("unrecognized track -> fail-closed to the floor",
+      dh.resolve_dp_track({}, "weird") == "egress")
+
+# --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
 sys.exit(1 if fail else 0)
