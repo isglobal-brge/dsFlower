@@ -71,6 +71,9 @@ def _analytic_delta(s, ep, sens):
             - math.exp(ep) * 0.5 * (1 + math.erf((-a - b) / math.sqrt(2))))
 check("compute_output_sigma returns the analytic-Gaussian sigma meeting the target delta",
       _analytic_delta(sigma, eps, C) <= delta * 1.001)
+check("analytic Gaussian meets target delta across the whole policy range (eps<=10, delta>=1e-8)",
+      all(_analytic_delta(dh.compute_output_sigma(e, d, 2.0), e, 2.0) <= d * 1.001
+          for e in (0.5, 1.0, 3.0, 5.0, 8.0, 10.0) for d in (1e-3, 1e-5, 1e-8)))
 check("compute_output_sigma rejects eps<=0", rejects(lambda: dh.compute_output_sigma(0, delta, C)))
 
 old = [np.zeros((4, 3), np.float32), np.zeros(3, np.float32)]

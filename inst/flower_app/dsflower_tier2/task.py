@@ -74,13 +74,28 @@ def load_privacy_config(context=None):
         return _privacy_config
 
     manifest = _load_manifest(context)
+    epsilon = float(manifest.get("privacy-epsilon", 3.0))
+    delta = float(manifest.get("privacy-delta", 1e-5))
+    clipping_norm = float(manifest.get("privacy-clipping_norm", 1.0))
+    # Legal ranges (a corrupted value must not silently produce zero/infinite noise that
+    # voids the guarantee) + HARDCODED node ceilings (NOT manifest-derived -- a client-
+    # influenced manifest cannot raise its own ceiling). Mirrors the unified runner.
+    if not (epsilon > 0 and 0.0 < delta < 1.0 and clipping_norm > 0):
+        raise ValueError(
+            "invalid DP parameters in manifest (need epsilon>0, 0<delta<1, clipping_norm>0)")
+    if epsilon > 10.0:
+        raise ValueError("privacy epsilon %.4g exceeds the node ceiling (10)" % epsilon)
+    if delta > 1e-3:
+        raise ValueError("privacy delta %.4g exceeds the node ceiling (1e-3)" % delta)
+    if clipping_norm > 100.0:
+        raise ValueError("privacy clipping_norm %.4g exceeds the node ceiling (100)" % clipping_norm)
     _privacy_config = {
-        "epsilon": float(manifest.get("privacy-epsilon", 3.0)),
-        "delta": float(manifest.get("privacy-delta", 1e-5)),
-        "clipping_norm": float(manifest.get("privacy-clipping_norm", 1.0)),
+        "epsilon": epsilon,
+        "delta": delta,
+        "clipping_norm": clipping_norm,
         "sample_aggregate": bool(float(manifest.get("privacy-sample_aggregate", 0))),
-        "sa_min_block": int(float(manifest.get("privacy-sa_min_block", 64))),
-        "sa_max_blocks": int(float(manifest.get("privacy-sa_max_blocks", 8))),
+        "sa_min_block": max(1, int(float(manifest.get("privacy-sa_min_block", 64)))),
+        "sa_max_blocks": max(1, int(float(manifest.get("privacy-sa_max_blocks", 8)))),
         "allow_per_node_metrics": False,
         "allow_exact_num_examples": False,
         "n_samples": int(manifest.get("n_samples", 0)),

@@ -172,6 +172,10 @@ def compute_output_sigma(epsilon, delta, clipping_norm):
         hi *= 2.0
         if hi > 1e15:
             break
+    if _delta_of_sigma(hi) > delta:   # FAIL CLOSED: refuse rather than release under-noised
+        raise ValueError(
+            "cannot achieve (epsilon=%g, delta=%g) at sensitivity %g: no sigma brackets "
+            "the target delta" % (epsilon, delta, clipping_norm))
     for _ in range(200):
         mid = 0.5 * (lo + hi)
         if _delta_of_sigma(mid) > delta:
