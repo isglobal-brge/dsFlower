@@ -304,7 +304,15 @@ def train(msg: Message, context: Context) -> Message:
         X, y = load_data(context)
         user_mod = tier2_lib.load_user_module(str(cfg["user-module"]))
         old = msg.content["arrays"].to_numpy_ndarrays()
-        new_arrays = tier2_lib.gated_local_update(user_mod, old, X, y, cfg, pcfg)
+        # Compose the DP budget over rounds (DP-FedAvg). Basic (sequential) composition of
+        # R Gaussian releases each (eps/R, delta/R)-DP yields (eps, delta)-DP, so BOTH eps
+        # and delta are split by num_rounds -- splitting only eps would leave the total at
+        # (eps, R*delta), not (eps, delta).
+        num_rounds = max(1, int(cfg.get("num-server-rounds", 1)))
+        pcfg_round = dict(pcfg)
+        pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
+        pcfg_round["delta"] = float(pcfg["delta"]) / num_rounds
+        new_arrays = tier2_lib.gated_local_update(user_mod, old, X, y, cfg, pcfg_round)
         n = len(y)
     else:  # neural (tabular or image)
         pins = load_run_pins(context)

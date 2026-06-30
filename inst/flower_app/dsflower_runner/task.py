@@ -179,6 +179,12 @@ def load_privacy_config(context=None):
         "epsilon": epsilon,
         "delta": delta,
         "clipping_norm": clipping_norm,
+        # Improved Tier-2 floor (sample-and-aggregate) policy. Parsed defensively; the
+        # harness clamps k = min(sa_max_blocks, n // sa_min_block) and falls back to the
+        # plain 2C floor below 2 blocks, so out-of-range values cannot weaken DP.
+        "sample_aggregate": bool(float(manifest.get("privacy-sample_aggregate", 0))),
+        "sa_min_block": max(1, int(float(manifest.get("privacy-sa_min_block", 64)))),
+        "sa_max_blocks": max(1, int(float(manifest.get("privacy-sa_max_blocks", 8)))),
         "allow_per_node_metrics": False,
         "allow_exact_num_examples": False,
         "n_samples": int(manifest.get("n_samples", 0)),
