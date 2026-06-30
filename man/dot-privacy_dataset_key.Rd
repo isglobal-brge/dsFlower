@@ -16,9 +16,10 @@ Character privacy-budget key.
 }
 \description{
 The key is deliberately server-side. For descriptor-backed resources we use
-the descriptor dataset id. For in-session DataSHIELD tables we include the
-assigned symbol and a local digest of the materialised table, so independent
-validation tables do not consume each other's budget merely because they use
-the same target column name.
+the descriptor dataset id. For in-session DataSHIELD tables we key on a local
+digest (fingerprint) of the materialised table + the target -- NOT the
+client-chosen assign symbol, so the same data always maps to the same budget
+(a sybil client cannot reset the budget by re-assigning to a fresh symbol),
+while genuinely different tables stay separated by their fingerprint.
 }
 \keyword{internal}

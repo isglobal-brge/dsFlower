@@ -2,11 +2,11 @@
 % Please edit documentation in R/python_env.R
 \name{.python_deps_for_framework}
 \alias{.python_deps_for_framework}
-\title{Get all pip dependencies for a framework}
+\title{Get all pip dependencies for a framework (GPU/CPU-adaptive)}
 \usage{
 .python_deps_for_framework(framework)
 }
 \description{
-Get all pip dependencies for a framework
+Get all pip dependencies for a framework (GPU/CPU-adaptive)
 }
 \keyword{internal}
