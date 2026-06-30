@@ -152,7 +152,6 @@ def _require_spatial(shape, op, ndim):
 
 
 def _b_linear(s, shape, dims):
-    _require_flat(shape, "linear")
     out_raw = s.get("out", "@out")
     out = _resolve_dim(out_raw, dims)
     if not isinstance(out_raw, str) and out > _MAX_WIDTH:
@@ -160,7 +159,9 @@ def _b_linear(s, shape, dims):
     bias = s.get("bias", True)
     if not isinstance(bias, bool):
         raise ValueError("linear 'bias' must be a bool, got %r" % (bias,))
-    return nn.Linear(shape[0], out, bias=bias), (out,)
+    # Applies to the LAST (feature) dim: [.., in] -> [.., out]. Works flat (MLP) AND
+    # token-wise ([T, d] -> [T, out]) for transformers. Per-sample (no batch mixing).
+    return nn.Linear(shape[-1], out, bias=bias), tuple(shape[:-1]) + (out,)
 
 
 def _b_relu(s, shape, dims):     return nn.ReLU(), shape
@@ -181,10 +182,20 @@ def _b_dropout(s, shape, dims):
 
 
 def _b_layernorm(s, shape, dims):
-    # Normalizes over the feature dim (per-sample): DP-safe, affine params, and --
-    # unlike BatchNorm -- no running-stat buffers (so assert_releasable still holds).
-    _require_flat(shape, "layernorm")
-    return nn.LayerNorm(shape[0]), shape
+    # Normalizes over the LAST (feature) dim, per-sample: DP-safe, affine params, and --
+    # unlike BatchNorm -- no running-stat buffers (assert_releasable holds). Works flat
+    # and token-wise ([T, d] -> normalize each token's d features), for transformers.
+    return nn.LayerNorm(shape[-1]), shape
+
+
+def _b_softmax(s, shape, dims):
+    # Softmax over a PER-SAMPLE axis (default last) -- e.g. attention weights over the
+    # token axis. Never the batch dim (axis is per-sample; the module uses axis+1).
+    axis = s.get("axis", len(shape) - 1)
+    if isinstance(axis, bool) or not isinstance(axis, int) or axis < 0 or axis >= len(shape):
+        raise ValueError("softmax 'axis' must be a per-sample axis in [0, %d), got %r"
+                         % (len(shape), axis))
+    return nn.Softmax(dim=axis + 1), shape
 
 
 def _b_reshape(s, shape, dims):
@@ -252,14 +263,24 @@ def _b_adaptiveavgpool2d(s, shape, dims):
     return nn.AdaptiveAvgPool2d((h, w)), (shape[0], h, w)
 
 
+def _b_upsample(s, shape, dims):
+    # Nearest-neighbour spatial upsampling (parameterless) -- enables the U-Net decoder
+    # path (upsample -> conv) without transpose-conv. Per-sample (per image).
+    _require_spatial(shape, "upsample", 2)
+    c, h, w = shape
+    sf = _pos_int(s.get("scale_factor", 2), "scale_factor", hi=64)
+    return nn.Upsample(scale_factor=sf, mode="nearest"), (c, h * sf, w * sf)
+
+
 _OPS = {
     "linear": _b_linear,
     "relu": _b_relu, "gelu": _b_gelu, "tanh": _b_tanh, "sigmoid": _b_sigmoid,
     "elu": _b_elu, "silu": _b_silu, "leaky_relu": _b_leaky_relu,
-    "dropout": _b_dropout, "layernorm": _b_layernorm,
+    "dropout": _b_dropout, "layernorm": _b_layernorm, "softmax": _b_softmax,
     "reshape": _b_reshape, "flatten": _b_flatten,
     "conv1d": _b_conv1d, "conv2d": _b_conv2d,
     "maxpool2d": _b_maxpool2d, "adaptiveavgpool2d": _b_adaptiveavgpool2d,
+    "upsample": _b_upsample,
 }
 
 
@@ -354,20 +375,66 @@ class GraphModule(nn.Module):
                 env[nd["name"]] = t
             elif op == "concat":
                 env[nd["name"]] = torch.cat(ins, dim=nd["axis"] + 1)   # +1: never the batch dim
+            elif op == "sub":
+                env[nd["name"]] = ins[0] - ins[1]
+            elif op == "div":
+                env[nd["name"]] = ins[0] / ins[1]
+            elif op == "affine":
+                env[nd["name"]] = nd["scale"] * ins[0] + nd["shift"]
+            elif op == "matmul":
+                env[nd["name"]] = torch.matmul(ins[0], ins[1])
+            elif op == "transpose":
+                d = nd["dims"]
+                env[nd["name"]] = ins[0].transpose(d[0] + 1, d[1] + 1)  # +1: skip the batch dim
             else:
                 raise ValueError("graph forward: unsupported functional op %r" % (op,))
         return env[self._dsflower_output]
 
 
+def _broadcast(shapes):
+    # Equal-rank, numpy-style per-axis broadcast (dims equal or one is 1). Equal rank is
+    # required so per-sample broadcasting NEVER crosses the batch boundary (enables
+    # squeeze-excitation channel scaling [C,1,1] x [C,H,W], gating, etc.).
+    rank = len(shapes[0])
+    if any(len(s) != rank for s in shapes):
+        raise ValueError("broadcast needs equal-rank per-sample shapes, got %r" % (shapes,))
+    out = []
+    for ax in zip(*shapes):
+        nz = set(d for d in ax if d != 1)
+        if len(nz) > 1:
+            raise ValueError("shapes not broadcastable on a per-sample axis: %r" % (shapes,))
+        out.append(max(ax))
+    return tuple(out)
+
+
 def _g_add(nd, in_shapes):
-    if len(in_shapes) < 2 or any(s != in_shapes[0] for s in in_shapes):
-        raise ValueError("add needs >=2 inputs of identical per-sample shape, got %r" % (in_shapes,))
-    return in_shapes[0]
+    if len(in_shapes) < 2:
+        raise ValueError("add needs >=2 inputs")
+    return _broadcast(in_shapes)
 
 
 def _g_mul(nd, in_shapes):
-    if len(in_shapes) < 2 or any(s != in_shapes[0] for s in in_shapes):
-        raise ValueError("mul needs >=2 inputs of identical per-sample shape, got %r" % (in_shapes,))
+    if len(in_shapes) < 2:
+        raise ValueError("mul needs >=2 inputs")
+    return _broadcast(in_shapes)
+
+
+def _g_sub(nd, in_shapes):
+    if len(in_shapes) != 2:
+        raise ValueError("sub takes exactly 2 inputs")
+    return _broadcast(in_shapes)
+
+
+def _g_div(nd, in_shapes):
+    if len(in_shapes) != 2:
+        raise ValueError("div takes exactly 2 inputs")
+    return _broadcast(in_shapes)
+
+
+def _g_affine(nd, in_shapes):
+    # scale * x + shift with PUBLIC constants (enables 1-x gates, scaling, shifts).
+    if len(in_shapes) != 1:
+        raise ValueError("affine takes 1 input")
     return in_shapes[0]
 
 
@@ -388,9 +455,40 @@ def _g_concat(nd, in_shapes):
     return tuple(out)
 
 
+def _g_matmul(nd, in_shapes):
+    # Batched matmul over the LAST TWO per-sample dims: [.., m, k] @ [.., k, n] -> [.., m, n].
+    # The batch dim (tensor dim 0, NOT in the per-sample shape) is carried, never
+    # contracted -- so attention scores Q@K^T are over the TOKEN axis, never the batch.
+    if len(in_shapes) != 2:
+        raise ValueError("matmul takes exactly 2 inputs, got %d" % len(in_shapes))
+    a, b = in_shapes
+    if len(a) < 2 or len(b) < 2:
+        raise ValueError("matmul needs >=2D per-sample shapes (matrix dims), got %r" % (in_shapes,))
+    if a[-1] != b[-2]:
+        raise ValueError("matmul inner dims mismatch: %r @ %r" % (a, b))
+    if tuple(a[:-2]) != tuple(b[:-2]):
+        raise ValueError("matmul leading per-sample dims must match: %r @ %r" % (a, b))
+    return tuple(a[:-2]) + (a[-2], b[-1])
+
+
+def _g_transpose(nd, in_shapes):
+    # Swap two PER-SAMPLE axes (e.g. K -> K^T for attention). Never the batch dim.
+    if len(in_shapes) != 1:
+        raise ValueError("transpose takes 1 input")
+    shape, d = in_shapes[0], nd.get("dims", [])
+    if not (isinstance(d, list) and len(d) == 2) or any(
+            isinstance(v, bool) or not isinstance(v, int) or v < 0 or v >= len(shape) for v in d):
+        raise ValueError("transpose 'dims' must be [a,b] per-sample axes in [0, %d), got %r"
+                         % (len(shape), d))
+    out = list(shape); out[d[0]], out[d[1]] = out[d[1]], out[d[0]]
+    return tuple(out)
+
+
 # Multi-input / functional graph ops: (node, [in_shapes]) -> out_shape. All per-sample
 # (operate on per-sample axes; the batch dim is never touched).
-_GRAPH_OPS = {"add": _g_add, "mul": _g_mul, "concat": _g_concat}
+_GRAPH_OPS = {"add": _g_add, "mul": _g_mul, "sub": _g_sub, "div": _g_div,
+              "affine": _g_affine, "concat": _g_concat,
+              "matmul": _g_matmul, "transpose": _g_transpose}
 
 
 def build_from_graph(spec, in_dim, out_dim, *, num_labels=None):
@@ -431,7 +529,11 @@ def build_from_graph(spec, in_dim, out_dim, *, num_labels=None):
             graph.append({"name": name, "op": op, "inputs": ins, "module": name})
         elif op in _GRAPH_OPS:
             out_shape = _GRAPH_OPS[op](nd, [shapes[t] for t in ins])
-            graph.append({"name": name, "op": op, "inputs": ins, "axis": int(nd.get("axis", 0))})
+            graph.append({"name": name, "op": op, "inputs": ins,
+                          "axis": int(nd.get("axis", 0)),
+                          "dims": [int(v) for v in nd.get("dims", [])],
+                          "scale": float(nd.get("scale", 1.0)),
+                          "shift": float(nd.get("shift", 0.0))})
         else:
             raise ValueError("graph node %r has unknown op %r (allowed: %s)"
                              % (name, op, ", ".join(sorted(list(_OPS) + list(_GRAPH_OPS)))))

@@ -291,5 +291,43 @@ check("DAG forward-referenced input (non-topological) REJECTED", rejects(
         {"name": "out", "op": "linear", "in": ["a"], "out": "@out"}]}, 8, 2)))
 
 # --------------------------------------------------------------------------- #
+print("== advanced graph ops: attention / broadcast / upsample (per-sample) ==")
+_tx = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "x", "op": "reshape", "in": ["@in"], "shape": [8, 8]},
+    {"name": "q", "op": "linear", "in": ["x"], "out": 8},
+    {"name": "k", "op": "linear", "in": ["x"], "out": 8},
+    {"name": "v", "op": "linear", "in": ["x"], "out": 8},
+    {"name": "kt", "op": "transpose", "in": ["k"], "dims": [0, 1]},
+    {"name": "sc", "op": "matmul", "in": ["q", "kt"]},
+    {"name": "a", "op": "softmax", "in": ["sc"], "axis": 1},
+    {"name": "ctx", "op": "matmul", "in": ["a", "v"]},
+    {"name": "res", "op": "add", "in": ["x", "ctx"]},
+    {"name": "n", "op": "layernorm", "in": ["res"]},
+    {"name": "flat", "op": "flatten", "in": ["n"]},
+    {"name": "out", "op": "linear", "in": ["flat"], "out": "@out"}]}
+check("transformer attention block (matmul/softmax/transpose) builds, admitted, width ok",
+      (not rejects(lambda: dh.assert_stock_architecture(model_spec.build_from_spec(_tx, 64, 3))))
+      and tuple(model_spec.build_from_spec(_tx, 64, 3)(torch.randn(4, 64)).shape) == (4, 3))
+check("attention block per-sample-safe (attention over TOKENS, not the batch)",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _cp2.deepcopy(model_spec.build_from_spec(_tx, 64, 3)), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+check("broadcast mul [4,1,1] x [4,4,4] (squeeze-excitation) builds", tuple(
+    model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "i", "op": "reshape", "in": ["@in"], "shape": [4, 4, 4]},
+        {"name": "sq", "op": "adaptiveavgpool2d", "in": ["i"], "output_size": [1, 1]},
+        {"name": "sc", "op": "mul", "in": ["i", "sq"]},
+        {"name": "f", "op": "flatten", "in": ["sc"]},
+        {"name": "out", "op": "linear", "in": ["f"], "out": "@out"}]}, 64, 2)(
+        torch.randn(4, 64)).shape) == (4, 2))
+check("upsample (U-Net decoder path) builds", tuple(
+    model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "i", "op": "reshape", "in": ["@in"], "shape": [1, 4, 4]},
+        {"name": "u", "op": "upsample", "in": ["i"], "scale_factor": 2},
+        {"name": "f", "op": "flatten", "in": ["u"]},
+        {"name": "out", "op": "linear", "in": ["f"], "out": "@out"}]}, 16, 2)(
+        torch.randn(4, 16)).shape) == (4, 2))
+
+# --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
 sys.exit(1 if fail else 0)
