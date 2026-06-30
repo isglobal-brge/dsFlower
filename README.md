@@ -1,175 +1,113 @@
 # dsFlower
 
-`dsFlower` is the server-side DataSHIELD package that lets approved
-[Flower](https://flower.ai/) federated learning templates run inside
-Opal/Rock nodes. It is installed by the data-owning institution. Researchers
-use the companion client package,
-[`dsFlowerClient`](https://github.com/isglobal-brge/dsFlowerClient), from their
-local R session.
+`dsFlower` is the **node-side** DataSHIELD package that lets [Flower](https://flower.ai/)
+federated learning run inside Opal/Rock servers under **differential privacy that the data
+node alone decides and enforces**. The data-owning institution installs it; researchers use
+the companion client,
+[`dsFlowerClient`](https://github.com/isglobal-brge/dsFlowerClient), from their own R session.
 
-The package does not turn DataSHIELD into an unrestricted remote Python
-executor. It exposes a controlled federated learning surface:
+The package is not an unrestricted remote Python executor. The trust model is simple: **the
+data node is the only trusted party; the researcher (and everything they submit) is
+untrusted.** Every release is differentially private, and the node — never the client —
+chooses the privacy level and the mechanism.
 
-- authorised Flower templates installed on the server;
-- server-side staging of selected columns, feature tables or image manifests;
-- privacy profiles controlled by DataSHIELD server options;
-- Secure Aggregation and Differential Privacy compatibility checks;
-- code hash verification before training starts;
-- disclosure-controlled metrics, logs and privacy-budget reporting;
-- cleanup and orphan-process handling for Flower SuperNodes.
-
-Model weights and updates travel through Flower's gRPC/TLS plane. DataSHIELD
-continues to carry handles, preparation requests, status, approved metrics and
-cleanup calls. Patient-level rows, raw images, masks and staging files remain
-inside the institutional server.
+- The client submits models as **declarative specs (data, not code)**; the node builds them
+  from a vetted allow-list with stock layers.
+- Differential privacy is **always on**: epsilon/delta/clipping come from the node's own
+  DataSHIELD options (with hard ceilings), and an RDP/PRV budget ledger is debited
+  **before any result is released**.
+- The DP **mechanism is chosen server-side by submission type** (unforgeable routing).
+- Arbitrary uploaded code runs **out-of-process**, with the node applying all DP itself.
+- Raw rows, images, masks and staging files never leave the server. Model weights/updates
+  travel Flower's gRPC/TLS plane; DataSHIELD carries handles, prep, status and approved
+  metrics.
 
 ## Package roles
 
-| Package | Installed where | Main responsibility |
+| Package | Installed where | Responsibility |
 |---|---|---|
-| `dsFlower` | Each Opal/Rock DataSHIELD server | Validate requests, stage data locally, enforce server policy, start Flower SuperNodes and expose controlled status/metrics. |
-| `dsFlowerClient` | Researcher workstation | Build recipes, start the researcher-side Flower SuperLink, call authorised DataSHIELD methods, launch runs and render validation evidence. |
-
-This architecture follows the DataSHIELD governance model: the researcher
-selects from approved server-side capabilities rather than submitting arbitrary
-training code to the data-owning institutions.
+| `dsFlower` | Each Opal/Rock node | Validate requests, stage data locally, build models from specs, **decide + enforce DP**, run Flower SuperNodes, expose controlled status/metrics. |
+| `dsFlowerClient` | Researcher workstation | Build the request, start the SuperLink, call authorised DataSHIELD methods, launch runs. |
 
 ## Installation
 
-Install the server package on each Opal/Rock node:
-
 ```r
-remotes::install_github("isglobal-brge/dsFlower")
+remotes::install_github("isglobal-brge/dsFlower")        # each Opal/Rock node
 ```
 
-The package `configure` script prepares the server-side Python runtime root and
-uses [uv](https://docs.astral.sh/uv/) to provision template-specific Python
-environments on demand. Templates use Python libraries such as Flower,
-scikit-learn, PyTorch, XGBoost and Opacus according to the selected model
-family.
+The `configure` script prepares the node Python runtime and uses
+[uv](https://docs.astral.sh/uv/) to provision per-template environments on demand (Flower,
+PyTorch, XGBoost, Opacus).
 
-Install the client package on the researcher workstation:
+## Server-authoritative differential privacy
 
-```r
-remotes::install_github("isglobal-brge/dsFlowerClient")
-```
+There are **no privacy profiles and no client privacy knob**. The node sets the policy from
+its own options and re-asserts hard ceilings as a fail-closed backstop:
 
-## Authorised templates
-
-The current catalogue covers 18 server-side templates, exposed by
-20 client-facing model constructors. `sklearn_svm` and
-`sklearn_elastic_net` are convenience constructors that resolve to the
-`sklearn_sgd` template with hinge-loss and elastic-net configurations.
-
-| Family | Templates |
-|---|---|
-| scikit-learn linear models | `sklearn_logreg`, `sklearn_ridge`, `sklearn_sgd` |
-| PyTorch tabular models | `pytorch_logreg`, `pytorch_mlp`, `pytorch_linear_regression`, `pytorch_multiclass`, `pytorch_multilabel`, `pytorch_poisson` |
-| PyTorch survival models | `pytorch_coxph`, `pytorch_lognormal_aft`, `pytorch_cause_specific_cox` |
-| PyTorch sequence models | `pytorch_lstm`, `pytorch_tcn` |
-| PyTorch vision models | `pytorch_resnet18`, `pytorch_densenet121`, `pytorch_unet2d` |
-| Gradient boosting | `xgboost` with a histogram aggregation protocol |
-
-Each template declares its framework, accepted hyperparameters, data shape,
-minimum row policy and privacy-profile compatibility. Requests outside those
-server-side bounds fail before local data are staged.
-
-## Privacy profiles
-
-The client may request a privacy profile, but the server determines and enforces
-the effective policy.
-
-| Profile | Intended setting | Main controls |
+| Option | Default | Ceiling |
 |---|---|---|
-| `sandbox_open` | Local development and catalogue checks | Minimal restrictions; requires explicit administrator opt-in. |
-| `trusted_internal` | Controlled internal experiments | Staging and metric controls; per-node metrics may be visible. |
-| `consortium_internal` | Multi-site consortium runs | Requires SecAgg+, fixed participation and suppressed per-node metrics. |
-| `clinical_default` | Default clinical profile | Requires SecAgg+, stricter row/event guards and controlled output policy. |
-| `clinical_hardened` | More restrictive clinical studies | Higher row/event thresholds and stricter participation requirements. |
-| `clinical_update_noise` | Update or histogram noise hardening | Requires SecAgg+ and adds bounded Gaussian noise where the template supports it. |
-| `high_sensitivity_dp` | Patient-level DP-SGD runs | Requires SecAgg+ and only allows templates validated for Opacus per-example gradients. |
+| `dsflower.dp_epsilon` | 3.0 | `dsflower.dp_epsilon_ceiling` (10) |
+| `dsflower.dp_delta` | 1e-5 | `dsflower.dp_delta_ceiling` (1e-3) |
+| `dsflower.dp_clipping_norm` | 1.0 | `dsflower.dp_clip_ceiling` (100) |
 
-`clinical_update_noise` and `high_sensitivity_dp` are deliberately distinct.
-The first hardens released updates or histograms; it is not a patient-level
-DP-SGD claim. The second is restricted to templates whose losses decompose by
-sample and whose model layers are compatible with Opacus accounting.
+Noise uses the **analytic Gaussian mechanism** (exact for all epsilon). Multi-round runs
+compose `(epsilon/R, delta/R)` per round, and the budget ledger (keyed by data
+fingerprint + target) is **reserved at prepare**, so a run that releases but never cleans up
+still spent its budget. The client can only *query* the remaining budget
+(`flowerPrivacyBudgetDS`).
 
-## Server-side lifecycle
+## DP mechanism routing (chosen by the node, by construction)
 
-The exported DataSHIELD methods are organised by lifecycle stage:
-
-| Stage | DataSHIELD methods |
+| Submission | Mechanism |
 |---|---|
-| Connectivity and capabilities | `flowerPingDS()`, `flowerCheckConnectivityDS()`, `flowerGetCapabilitiesDS()` |
-| Handle lifecycle | `flowerInitDS()`, `flowerDestroyDS()` |
-| Run preparation | `flowerPrepareRunDS()` |
-| SuperNode lifecycle | `flowerEnsureSuperNodeDS()`, `flowerCleanupRunDS()`, `flowerStatusDS()` |
-| Template and code integrity | `flowerListTemplatesDS()`, `flowerGetTemplateDS()`, `flowerVerifyAppHashDS()` |
-| Controlled outputs | `flowerMetricsDS()`, `flowerLogDS()`, `flowerPrivacyBudgetDS()` |
+| Declarative **neural** spec | Opacus **DP-SGD** (per-sample clip + noise) |
+| **XGBoost** spec | **DP-GBDT** |
+| Arbitrary uploaded **code** (Tier-2) | Out-of-process **output-perturbation floor** (sensitivity 2C), optionally sample-and-aggregate (2C/k) where a verified sandbox allows |
 
-This separation is important in Opal/Rock deployments, where Rserve processes
-may not be the same process that originally launched a SuperNode. `dsFlower`
-therefore records process metadata on disk and includes cleanup logic for stale
-staging directories and orphan SuperNode processes.
+The declarative typed-graph model language covers the full per-sample DP-SGD space — MLP,
+CNN (1/2/3D), TCN, ResNet, DenseNet, Inception, Transformer (attention from primitives),
+squeeze-excitation, U-Net, LSTM/GRU — with **no researcher code on the node**. Plus XGBoost
+(DP-GBDT). The Tier-2 egress path is for arbitrary code that cannot be expressed
+declaratively; it runs the upload in an isolated interpreter while the trusted parent applies
+all DP, so the upload can never disable the noise.
 
-## Validation evidence
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full trust boundary, the integrity gate
+(`assert_stock_architecture`, per-sample-independence probe, releasability), the runner
+hash-pinning, and the Tier-2 isolation/sandbox details.
 
-The current presentation evidence is maintained in the `dsFlowerClient`
-repository, because validation runs are launched from the client and rendered
-in its pkgdown articles.
+## Server-side lifecycle (exported DataSHIELD methods)
 
-| Evidence layer | Current role |
+| Stage | Methods |
 |---|---|
-| Public clinical benchmarks | Breast Cancer Wisconsin, UCI Heart Disease, Pima Indians Diabetes and CDC Diabetes Health Indicators compare centralised and federated held-out metrics. |
-| Clinical privacy profiles | `clinical_default`, `clinical_update_noise` and `high_sensitivity_dp` exercise SecAgg+, bounded histogram noise and Opacus DP-SGD where applicable. |
-| SUPPORT2 method-family runs | Continuous regression, count regression, multiclass, multilabel and Cox survival tasks validate non-binary clinical families under `clinical_default`; the four DP-SGD-compatible families are repeated under `high_sensitivity_dp`. |
-| Imaging handoff | LUNG1 radiomics features and LUNG1 direct-image assets are resolved through `dsImaging`; PathMNIST validates a larger direct-image ResNet path with 1,500 images. |
-| Catalogue coverage | The 17 non-vision and 3 vision templates are also exercised on deterministic synthetic fixtures. It complements the biomedical validation reports by checking the full authorised template surface. |
+| Connectivity / capabilities | `flowerPingDS`, `flowerCheckConnectivityDS`, `flowerGetCapabilitiesDS` |
+| Handle lifecycle | `flowerInitDS`, `flowerDestroyDS` |
+| Run preparation (DP set + budget reserved here) | `flowerPrepareRunDS` |
+| SuperNode lifecycle | `flowerEnsureSuperNodeDS`, `flowerCleanupRunDS`, `flowerStatusDS` |
+| Template / code integrity | `flowerListTemplatesDS`, `flowerGetTemplateDS`, `flowerVerifyAppHashDS` |
+| Controlled outputs | `flowerMetricsDS`, `flowerLogDS`, `flowerPrivacyBudgetDS` |
 
-Use the client pkgdown site for the rendered reports:
-<https://isglobal-brge.github.io/dsFlowerClient/>.
+Opal/Rock may run cleanup in a different process than the one that launched a SuperNode, so
+the package records process metadata on disk and reaps stale staging dirs and orphan
+SuperNodes (fork-free, to stay safe under the FL runtime's threads).
 
 ## Minimal client-side example
 
-The researcher normally uses `dsFlowerClient`, not this server package directly:
+Researchers use `dsFlowerClient`, not this package directly:
 
 ```r
-library(dsFlowerClient)
-library(DSI)
-library(DSOpal)
+library(dsFlowerClient); library(DSI); library(DSOpal)
 
 builder <- DSI::newDSLoginBuilder()
-builder$append(
-  server = "site1",
-  url = "https://opal1.example.org",
-  user = "researcher",
-  password = "...",
-  table = "PROJECT.training_data",
-  driver = "OpalDriver"
-)
-builder$append(
-  server = "site2",
-  url = "https://opal2.example.org",
-  user = "researcher",
-  password = "...",
-  table = "PROJECT.training_data",
-  driver = "OpalDriver"
-)
-
+builder$append(server = "site1", url = "https://opal1.example.org",
+               user = "researcher", password = "...",
+               table = "PROJECT.training_data", driver = "OpalDriver")
 conns <- DSI::datashield.login(builder$build(), assign = TRUE, symbol = "D")
 
-fit <- ds.flower.fit(
-  conns,
-  symbol = "D",
-  target = "diagnosis",
-  features = c("age", "sex", "biomarker"),
-  model = "sklearn_logreg",
-  strategy = "fedavg",
-  privacy = "clinical_default",
-  rounds = 5L
-)
+# DP is always applied by the node; the analyst does not set it.
+fit <- ds.flower.fit(conns, symbol = "D", target = "diagnosis", model = "pytorch_logreg")
 
 ds.flower.metrics(fit)
+ds.flower.privacy.budget(conns, symbol = "D")   # query the node's real remaining budget
 DSI::datashield.logout(conns)
 ```
 
