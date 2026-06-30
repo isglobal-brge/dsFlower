@@ -41,10 +41,11 @@
 #' Build a stable privacy-budget key for the current training data
 #'
 #' The key is deliberately server-side. For descriptor-backed resources we use
-#' the descriptor dataset id. For in-session DataSHIELD tables we include the
-#' assigned symbol and a local digest of the materialised table, so independent
-#' validation tables do not consume each other's budget merely because they use
-#' the same target column name.
+#' the descriptor dataset id. For in-session DataSHIELD tables we key on a local
+#' digest (fingerprint) of the materialised table + the target -- NOT the
+#' client-chosen assign symbol, so the same data always maps to the same budget
+#' (a sybil client cannot reset the budget by re-assigning to a fresh symbol),
+#' while genuinely different tables stay separated by their fingerprint.
 #'
 #' @param handle Flower handle.
 #' @param target_column Character target column.
@@ -59,14 +60,17 @@
   }
 
   if (identical(handle$source, "table")) {
-    symbol <- handle$data_symbol %||% "table"
+    # Key by DATA identity (fingerprint), NOT the client-chosen assign symbol: a
+    # symbol in the key let a sybil client reset the budget by re-assigning the same
+    # table to a fresh symbol. The fingerprint already separates genuinely different
+    # tables; the SAME data must SHARE a budget (that is what DP composition means).
     fingerprint <- handle$table_fingerprint
     if ((is.null(fingerprint) || !nzchar(as.character(fingerprint))) &&
         !is.null(handle$table_data)) {
       fingerprint <- digest::digest(handle$table_data, algo = "xxhash64")
     }
     if (!is.null(fingerprint) && nzchar(as.character(fingerprint))) {
-      return(paste("table", symbol, fingerprint, target, sep = ":"))
+      return(paste("table", fingerprint, target, sep = ":"))
     }
   }
 

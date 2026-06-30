@@ -46,16 +46,24 @@ app = ClientApp()
 # Neural track (Opacus DP-SGD)
 # --------------------------------------------------------------------------- #
 
-def _prep_target(y, loss_name):
-    """Target tensor shaped for the harness-owned loss."""
-    if loss_name == "cross_entropy":
-        return torch.from_numpy(y).long()              # [N], multi-logit output
+def _prep_target(y, loss_name, n_classes):
+    """Target tensor shaped for the harness-owned loss. n_classes is node-pinned and
+    only used by encodings that need the class/level count (ordinal)."""
+    if loss_name in ("cross_entropy", "hinge"):
+        return torch.from_numpy(y).long()              # [N], multi-logit output (CE / hinge-SVM)
     if loss_name == "multilabel_bce":
         return torch.from_numpy(y).float()             # [N, L]
-    return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson)
+    if loss_name == "ordinal":
+        # CORN cumulative encoding: K-1 binary tasks, column j = 1{level > j}. The
+        # head emits K-1 logits; the node builds the target so the client sends only
+        # the ordinal level (0..K-1) and cannot mis-shape it.
+        levels = torch.from_numpy(y).long().reshape(-1)              # [N] in 0..K-1
+        thresholds = torch.arange(max(2, int(n_classes)) - 1)       # [K-1]
+        return (levels.unsqueeze(1) > thresholds.unsqueeze(0)).float()   # [N, K-1]
+    return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson/count/gamma)
 
 
-def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
+def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
@@ -67,9 +75,21 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
     local_epochs = int(pins["local_epochs"])
     num_rounds = int(pins["num_rounds"])
 
+    lr = float(pins["learning_rate"])
+    # Penalized regression (ridge / lasso / elastic-net): L2 (weight_decay) is applied
+    # INSIDE the optimizer to the NOISED grad + PUBLIC weights; L1 as a proximal
+    # soft-threshold on the PUBLIC weights after the step. Both are post-processing of
+    # already-DP quantities -> no privacy lever (DP is immune to post-processing).
+    # Validated non-negative; both 0 -> identical to the plain path.
+    weight_decay = float(cfg.get("weight-decay", 0.0))
+    l1_penalty = float(cfg.get("l1-penalty", 0.0))
+    if not (np.isfinite(weight_decay) and weight_decay >= 0.0
+            and np.isfinite(l1_penalty) and l1_penalty >= 0.0):
+        raise RuntimeError("weight-decay and l1-penalty must be finite and >= 0")
     model = model.to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=float(pins["learning_rate"]))
-    dataset = TensorDataset(torch.from_numpy(X).float(), _prep_target(y, loss_name))
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+    dataset = TensorDataset(torch.from_numpy(X).float(),
+                            _prep_target(y, loss_name, int(pins["n_classes"])))
     # Anti-shrink: the manifest n_samples is the server-recorded count of the STAGED
     # (pre-pool) frame; assert it matches so the client can't shrink the accountant
     # denominator. The accountant below uses len(dataset) (POST-pool = per-patient DP
@@ -87,7 +107,7 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
 
     set_torch_params(model, msg.content["arrays"].to_numpy_ndarrays())
 
-    criterion = dp_harness.loss_from_allowlist(loss_name)   # node allowlist, mean reduction
+    criterion = dp_harness.loss_from_allowlist(loss_name, cfg)   # node allowlist, mean reduction
     model.train()
     for _ in range(local_epochs):
         for xb, yb in trainloader:
@@ -105,6 +125,11 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
                 for p, c in zip(model.parameters(), clean):
                     p.copy_(c)
             optimizer.step()
+            if l1_penalty > 0.0:        # lasso / elastic-net: proximal on PUBLIC weights
+                thr = l1_penalty * lr
+                with torch.no_grad():
+                    for p in model.parameters():
+                        p.copy_(torch.sign(p) * torch.clamp(p.abs() - thr, min=0.0))
     # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
     # a buffer / frozen param / new parameter registered lazily inside the
     # researcher's forward appears only AFTER load, and Opacus noises ONLY the
@@ -126,7 +151,7 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged):
 # Only classification losses constrain labels to [0, n_classes); regression (mse) and
 # count (poisson_nll) targets are continuous, and multilabel targets are 2D -- none of
 # them carry a class-range invariant, so the label-range check must not run for them.
-_CLASSIFICATION_LOSSES = ("bce_logits", "cross_entropy")
+_CLASSIFICATION_LOSSES = ("bce_logits", "cross_entropy", "hinge", "ordinal")
 
 
 def _assert_label_range(y, n_classes):
@@ -225,14 +250,14 @@ def _train_neural(msg, context, cfg, pcfg, pins):
     import copy
     k = min(8, len(X))
     xb = torch.from_numpy(X[:k]).float()
-    yb = _prep_target(y[:k], pins["loss_name"])
+    yb = _prep_target(y[:k], pins["loss_name"], int(pins["n_classes"]))
     # Probe a DEEPCOPY: the probe wraps the model with Opacus to read per-sample
     # gradients, which leaves grad-sample hooks behind; the real model must reach
     # make_private clean (else Opacus raises "Trying to add hooks twice").
     dp_harness.per_sample_independence_probe(
-        copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"]), xb, yb)
+        copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"], cfg), xb, yb)
 
-    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged)
+    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -266,7 +291,11 @@ def _train_trees(context, pcfg):
 def train(msg: Message, context: Context) -> Message:
     cfg = dict(context.run_config)
     pcfg = load_privacy_config(context)
-    track = load_dp_track(context)                 # node-pinned, NOT trusted from pyproject
+    # Server-DERIVED routing (single source of truth: dp_harness.resolve_dp_track):
+    # an uploaded user-module is forced to the output-perturbation floor; node-built
+    # artifacts use the node-pinned track. The client cannot route its own code to a
+    # tighter track, and the neural track only ever runs the hash-verified harness.
+    track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
 
     if track == "trees":
         new_arrays, n = _train_trees(context, pcfg)

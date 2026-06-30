@@ -37,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import dp_harness as dh
+import model_spec
 import tier2_lib
 
 torch.manual_seed(0)
@@ -78,6 +79,16 @@ out = dh.output_perturbation(huge, old, clipping_norm=C, epsilon=eps, delta=delt
 rel = np.concatenate([(o2 - o1).ravel() for o2, o1 in zip(out, old)])
 check("output-perturbation DESTROYS raw-data exfil (1e6 -> O(sigma))",
       np.max(np.abs(rel)) < 50)
+
+# The floor's L2 sensitivity is the C-ball DIAMETER = 2C (arbitrary code), so the noise
+# std must be 2*sigma(C), NOT sigma(C). Test at C=1 AND C=4: C=4 also catches the
+# double-C regression (a prior version multiplied the clip in twice -> std ~ C^2).
+for Cx in (1.0, 4.0):
+    s1 = dh.compute_output_sigma(eps, delta, Cx)                  # k*Cx/eps (sensitivity Cx)
+    z = [np.zeros(300000, np.float32)]
+    emp = float(np.std(dh.output_perturbation(z, z, clipping_norm=Cx, epsilon=eps, delta=delta)[0]))
+    check("floor noise std == 2*sigma(C) for C=%g (2C sensitivity, no double-C)" % Cx,
+          abs(emp - 2.0 * s1) < 0.05 * (2.0 * s1))
 
 # --------------------------------------------------------------------------- #
 print("== loss allowlist: only stock per-sample-decomposable losses ==")
@@ -146,6 +157,196 @@ check("Tier-2 exfil via weights DESTROYED by the gate (1e6 raw -> O(sigma))",
       np.max(np.abs(exrel)) < 100)
 check("Tier-2 shape-mismatch smuggling REJECTED",
       rejects(lambda: tier2_lib.gated_local_update(WrongShape(), g, Xraw, np.zeros(8), {}, pcfg)))
+
+# --------------------------------------------------------------------------- #
+print("== custom loss factory: negative-binomial NLL (per-sample, DP-SGD-safe) ==")
+nb = dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": 2.0})
+check("loss_from_allowlist('negbin_nll', cfg) returns a callable", callable(nb))
+# Numerics, INDEPENDENT cross-check: NB2 -> exact Poisson NLL as dispersion -> inf.
+# float64 so the check probes the FORMULA's limit, not float32 cancellation at huge r.
+zc = torch.tensor([0.2, 0.8, 1.5]).reshape(-1, 1).double()
+yc = torch.tensor([0.0, 2.0, 4.0]).reshape(-1, 1).double()
+pois_exact = float((zc.exp() - yc * zc + torch.lgamma(yc + 1.0)).mean())
+nb_big = dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": 1e7})
+check("negbin_nll -> exact Poisson NLL as dispersion -> inf",
+      abs(float(nb_big(zc, yc)) - pois_exact) < 1e-2)
+check("negbin_nll rejects dispersion <= 0 (fail closed)",
+      rejects(lambda: dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": 0.0})))
+check("negbin_nll rejects non-finite dispersion (fail closed)",
+      rejects(lambda: dh.loss_from_allowlist("negbin_nll", {"nb-dispersion": float("inf")})))
+class CountHead(nn.Module):
+    def __init__(s): super().__init__(); s.lin = nn.Linear(3, 1)
+    def forward(s, x): return s.lin(x)
+xct = torch.randn(8, 3); yct = torch.randint(0, 6, (8, 1)).float()
+check("negbin_nll model passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(CountHead(), nb, xct, yct)))
+
+# --------------------------------------------------------------------------- #
+print("== custom loss factory: gamma NLL (per-sample, DP-SGD-safe) ==")
+gm = dh.loss_from_allowlist("gamma_nll", {"gamma-shape": 1.0})
+check("loss_from_allowlist('gamma_nll', cfg) returns a callable", callable(gm))
+# Numerics, INDEPENDENT: gamma(shape=1) == exponential NLL z + y*exp(-z).
+zg = torch.tensor([0.3, 1.1]).reshape(-1, 1).double()
+yg = torch.tensor([0.5, 2.0]).reshape(-1, 1).double()
+expo = float((zg + yg * torch.exp(-zg)).mean())
+check("gamma_nll(shape=1) == exponential NLL", abs(float(gm(zg, yg)) - expo) < 1e-9)
+check("gamma_nll rejects shape <= 0 (fail closed)",
+      rejects(lambda: dh.loss_from_allowlist("gamma_nll", {"gamma-shape": -1.0})))
+class PosHead(nn.Module):
+    def __init__(s): super().__init__(); s.lin = nn.Linear(3, 1)
+    def forward(s, x): return s.lin(x)
+check("gamma_nll model passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          PosHead(), gm, torch.randn(8, 3), torch.rand(8, 1) + 0.1)))
+
+# --------------------------------------------------------------------------- #
+print("== ordinal (CORN): node-decided K-1 width + stock per-sample BCE ==")
+check("ordinal output_width = K-1", model_spec.output_width("ordinal", {"num-classes": 4}) == 3)
+check("ordinal degenerate (K=2) width = 1", model_spec.output_width("ordinal", {"num-classes": 2}) == 1)
+check("ordinal loss is stock BCEWithLogitsLoss",
+      type(dh.loss_from_allowlist("ordinal")).__name__ == "BCEWithLogitsLoss")
+
+# --------------------------------------------------------------------------- #
+print("== conv ops: node-shaped CNN, per-sample, stock + Opacus grad_sample ==")
+import copy as _copy
+_cnn_spec = {"kind": "sequential", "layers": [
+    {"op": "reshape", "shape": [1, 8, 8]},
+    {"op": "conv2d", "out_channels": 8, "kernel_size": 3, "padding": 1}, {"op": "relu"},
+    {"op": "maxpool2d", "kernel_size": 2},
+    {"op": "adaptiveavgpool2d", "output_size": [1, 1]}, {"op": "flatten"},
+    {"op": "linear", "out": "@out"}]}
+_cnn = model_spec.build_from_spec(_cnn_spec, 64, 3)
+check("CNN spec builds to a stock module with output width == out_dim",
+      tuple(_cnn(torch.randn(4, 64)).shape) == (4, 3))
+check("CNN has no buffers (assert_releasable holds)",
+      not rejects(lambda: dh.assert_releasable(_cnn)))
+check("CNN passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _copy.deepcopy(_cnn), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+check("conv2d on a flat (un-reshaped) input REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+        {"op": "conv2d", "out_channels": 8}, {"op": "flatten"},
+        {"op": "linear", "out": "@out"}]}, 64, 2)))
+check("reshape that changes element count REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+        {"op": "reshape", "shape": [1, 8, 8]}, {"op": "flatten"},
+        {"op": "linear", "out": "@out"}]}, 30, 1)))
+check("conv out_channels over cap REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+        {"op": "reshape", "shape": [1, 8, 8]}, {"op": "conv2d", "out_channels": 99999},
+        {"op": "flatten"}, {"op": "linear", "out": "@out"}]}, 64, 2)))
+
+# --------------------------------------------------------------------------- #
+print("== adaptive routing: the SERVER picks the DP mechanism, unforgeably ==")
+check("declarative spec -> neural (DP-SGD, tight)", dh.resolve_dp_track({}, "neural") == "neural")
+check("gbdt spec -> trees (DP-GBDT)", dh.resolve_dp_track({}, "trees") == "trees")
+check("explicit egress -> egress (output-perturbation floor)", dh.resolve_dp_track({}, "egress") == "egress")
+check("uploaded code requesting NEURAL -> FORCED to the floor (cannot be fooled)",
+      dh.resolve_dp_track({"user-module": "evil"}, "neural") == "egress")
+check("uploaded code requesting TREES -> FORCED to the floor",
+      dh.resolve_dp_track({"user-module": "evil"}, "trees") == "egress")
+check("unrecognized track -> fail-closed to the floor",
+      dh.resolve_dp_track({}, "weird") == "egress")
+
+# --------------------------------------------------------------------------- #
+print("== typed graph (DAG): residual/skip/concat, per-sample, gate-admitted ==")
+import copy as _cp2
+_resnet = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "img", "op": "reshape", "in": ["@in"], "shape": [1, 8, 8]},
+    {"name": "c1", "op": "conv2d", "in": ["img"], "out_channels": 4, "kernel_size": 3, "padding": 1},
+    {"name": "r1", "op": "relu", "in": ["c1"]},
+    {"name": "c2", "op": "conv2d", "in": ["r1"], "out_channels": 4, "kernel_size": 3, "padding": 1},
+    {"name": "res", "op": "add", "in": ["c1", "c2"]},          # residual skip
+    {"name": "pool", "op": "adaptiveavgpool2d", "in": ["res"], "output_size": [1, 1]},
+    {"name": "flat", "op": "flatten", "in": ["pool"]},
+    {"name": "out", "op": "linear", "in": ["flat"], "out": "@out"}]}
+check("DAG ResNet block (residual conv) builds, output width == out_dim",
+      tuple(model_spec.build_from_spec(_resnet, 64, 3)(torch.randn(4, 64)).shape) == (4, 3))
+check("DAG GraphModule admitted by assert_stock_architecture",
+      not rejects(lambda: dh.assert_stock_architecture(model_spec.build_from_spec(_resnet, 64, 3))))
+check("DAG ResNet block has no buffers (releasable)",
+      not rejects(lambda: dh.assert_releasable(model_spec.build_from_spec(_resnet, 64, 3))))
+check("DAG ResNet block passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _cp2.deepcopy(model_spec.build_from_spec(_resnet, 64, 3)), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+check("DAG concat (2 branches) builds with summed feature width",
+      tuple(model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+          {"name": "b1", "op": "linear", "in": ["@in"], "out": 8},
+          {"name": "b2", "op": "linear", "in": ["@in"], "out": 8},
+          {"name": "cat", "op": "concat", "in": ["b1", "b2"], "axis": 0},
+          {"name": "out", "op": "linear", "in": ["cat"], "out": "@out"}]}, 16, 2)(
+          torch.randn(4, 16)).shape) == (4, 2))
+check("DAG add with mismatched per-sample shapes REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "h1", "op": "linear", "in": ["@in"], "out": 8},
+        {"name": "h2", "op": "linear", "in": ["@in"], "out": 16},
+        {"name": "bad", "op": "add", "in": ["h1", "h2"]},
+        {"name": "out", "op": "linear", "in": ["bad"], "out": "@out"}]}, 16, 2)))
+check("DAG forward-referenced input (non-topological) REJECTED", rejects(
+    lambda: model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "a", "op": "relu", "in": ["b"]},
+        {"name": "b", "op": "linear", "in": ["@in"], "out": 4},
+        {"name": "out", "op": "linear", "in": ["a"], "out": "@out"}]}, 8, 2)))
+
+# --------------------------------------------------------------------------- #
+print("== advanced graph ops: attention / broadcast / upsample (per-sample) ==")
+_tx = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "x", "op": "reshape", "in": ["@in"], "shape": [8, 8]},
+    {"name": "q", "op": "linear", "in": ["x"], "out": 8},
+    {"name": "k", "op": "linear", "in": ["x"], "out": 8},
+    {"name": "v", "op": "linear", "in": ["x"], "out": 8},
+    {"name": "kt", "op": "transpose", "in": ["k"], "dims": [0, 1]},
+    {"name": "sc", "op": "matmul", "in": ["q", "kt"]},
+    {"name": "a", "op": "softmax", "in": ["sc"], "axis": 1},
+    {"name": "ctx", "op": "matmul", "in": ["a", "v"]},
+    {"name": "res", "op": "add", "in": ["x", "ctx"]},
+    {"name": "n", "op": "layernorm", "in": ["res"]},
+    {"name": "flat", "op": "flatten", "in": ["n"]},
+    {"name": "out", "op": "linear", "in": ["flat"], "out": "@out"}]}
+check("transformer attention block (matmul/softmax/transpose) builds, admitted, width ok",
+      (not rejects(lambda: dh.assert_stock_architecture(model_spec.build_from_spec(_tx, 64, 3))))
+      and tuple(model_spec.build_from_spec(_tx, 64, 3)(torch.randn(4, 64)).shape) == (4, 3))
+check("attention block per-sample-safe (attention over TOKENS, not the batch)",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _cp2.deepcopy(model_spec.build_from_spec(_tx, 64, 3)), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+check("broadcast mul [4,1,1] x [4,4,4] (squeeze-excitation) builds", tuple(
+    model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "i", "op": "reshape", "in": ["@in"], "shape": [4, 4, 4]},
+        {"name": "sq", "op": "adaptiveavgpool2d", "in": ["i"], "output_size": [1, 1]},
+        {"name": "sc", "op": "mul", "in": ["i", "sq"]},
+        {"name": "f", "op": "flatten", "in": ["sc"]},
+        {"name": "out", "op": "linear", "in": ["f"], "out": "@out"}]}, 64, 2)(
+        torch.randn(4, 64)).shape) == (4, 2))
+check("upsample (U-Net decoder path) builds", tuple(
+    model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+        {"name": "i", "op": "reshape", "in": ["@in"], "shape": [1, 4, 4]},
+        {"name": "u", "op": "upsample", "in": ["i"], "scale_factor": 2},
+        {"name": "f", "op": "flatten", "in": ["u"]},
+        {"name": "out", "op": "linear", "in": ["f"], "out": "@out"}]}, 16, 2)(
+        torch.randn(4, 16)).shape) == (4, 2))
+
+# --------------------------------------------------------------------------- #
+print("== recurrent (LSTM/GRU) via sanitized Opacus DP-RNN -- gate stays strict ==")
+_lstm = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "x", "op": "reshape", "in": ["@in"], "shape": [8, 8]},
+    {"name": "h", "op": "lstm", "in": ["x"], "hidden": 16},
+    {"name": "out", "op": "linear", "in": ["h"], "out": "@out"}]}
+check("LSTM sequence DAG builds, output width == out_dim",
+      tuple(model_spec.build_from_spec(_lstm, 64, 3)(torch.randn(4, 64)).shape) == (4, 3))
+check("LSTM admitted (RecurrentBlock + sanitized DPLSTM, no buffers)",
+      (not rejects(lambda: dh.assert_stock_architecture(model_spec.build_from_spec(_lstm, 64, 3))))
+      and not rejects(lambda: dh.assert_releasable(model_spec.build_from_spec(_lstm, 64, 3))))
+check("LSTM per-sample-safe (recurrence over TIME, not the batch)",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _cp2.deepcopy(model_spec.build_from_spec(_lstm, 64, 3)), nn.CrossEntropyLoss(),
+          torch.randn(8, 64), torch.randint(0, 3, (8,)))))
+_hooked = nn.Sequential(nn.Linear(3, 1))
+_hooked[0].register_forward_hook(lambda m, i, o: o)
+check("gate STILL rejects ANY module carrying a hook (sanitize did NOT weaken it)",
+      rejects(lambda: dh.assert_stock_architecture(_hooked)))
 
 # --------------------------------------------------------------------------- #
 print(f"\n== DP safety suite: {ok} passed, {fail} failed ==")
