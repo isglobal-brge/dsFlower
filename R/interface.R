@@ -1011,6 +1011,61 @@ flowerPrivacyBudgetDS <- function(handle_symbol, target_column = NULL) {
   .get_budget(dataset_key)
 }
 
+#' Per-feature standardization statistics (disclosure-controlled)
+#'
+#' DataSHIELD AGGREGATE method. Returns per-feature count / sum / sum-of-squares
+#' for the requested numeric columns of an assigned data.frame so the client can
+#' compute GLOBAL feature means/SDs across nodes and standardize DP-SGD inputs.
+#'
+#' These are cohort-level aggregates (exactly what \code{ds.mean} / \code{ds.var}
+#' release): they reveal nothing about an individual row, and the call is gated on
+#' the same minimum-rows disclosure threshold as training admission. No DP noise
+#' is added -- an aggregate over >= min rows is a sanctioned DataSHIELD release,
+#' and the stats are pure post-processing for the model: a poisoned value can only
+#' hurt accuracy, never the DP guarantee (the node enforces (eps,delta) on its own
+#' via DP-SGD, independently of any client-supplied normalization).
+#'
+#' @param data_symbol Character; symbol of the assigned data.frame.
+#' @param feature_columns Character or JSON-encoded character vector; feature
+#'   column names (order is preserved in the returned vectors). NULL = all columns.
+#' @return Named list with \code{features}, \code{n}, \code{sum}, \code{sumsq}
+#'   (numeric vectors aligned to \code{features}).
+#' @export
+flowerFeatureStatsDS <- function(data_symbol, feature_columns = NULL) {
+  obj <- get(data_symbol, envir = parent.frame(), inherits = FALSE)
+  if (is.matrix(obj)) obj <- as.data.frame(obj)
+  if (!is.data.frame(obj)) {
+    stop("flowerFeatureStatsDS: '", data_symbol, "' is not a data.frame.",
+         call. = FALSE)
+  }
+  # Disclosure: never release stats below the training-admission minimum.
+  .assertMinSamples(nrow(obj), min_n = .disclosure_min_rows())
+  feats <- .ds_arg(feature_columns)
+  if (is.null(feats) || length(feats) == 0L) feats <- names(obj)
+  feats <- as.character(unlist(feats))
+  feats <- feats[feats %in% names(obj)]
+  if (length(feats) == 0L) {
+    stop("flowerFeatureStatsDS: none of the requested feature columns are present.",
+         call. = FALSE)
+  }
+  # Per-feature disclosure gate: a (mostly-)missing column could otherwise leak a
+  # near-individual value through exact (n, sum, sumsq). Only release a feature whose
+  # FINITE count clears the same min-rows threshold; below it, emit zeros (n=0) so the
+  # client treats the feature as absent -> mean 0 / SD 1 (a no-op standardization).
+  min_n <- .disclosure_min_rows()
+  n <- s <- ss <- numeric(length(feats))
+  for (i in seq_along(feats)) {
+    x <- suppressWarnings(as.numeric(obj[[feats[i]]]))   # non-numeric/factor -> NA -> dropped
+    ok <- is.finite(x)
+    ni <- sum(ok)
+    if (ni < min_n) next                                 # leave n/sum/sumsq at 0
+    n[i]  <- ni
+    s[i]  <- sum(x[ok])
+    ss[i] <- sum(x[ok] * x[ok])
+  }
+  list(features = feats, n = n, sum = s, sumsq = ss)
+}
+
 # --- Internal metric parsing ---
 
 #' Parse training metrics from Flower log output

@@ -1,7 +1,7 @@
 Package: dsFlower
 Type: Package
 Title: DataSHIELD Server-Side Integration for Flower Federated Learning
-Version: 0.2.0
+Version: 0.2.2
 Authors@R: c(
     person("David", "Sarrat González", role = c("aut", "cre"), email = "david.sarrat@isglobal.org"),
     person("Juan R", "González", role = "aut", email = "juanr.gonzalez@isglobal.org"))
@@ -37,6 +37,7 @@ AggregateMethods:
     flowerLogDS,
     flowerCheckConnectivityDS,
     flowerPrivacyBudgetDS,
+    flowerFeatureStatsDS,
     flowerTunnelResetDS,
     flowerTunnelPollDS,
     flowerTunnelPushDS,
