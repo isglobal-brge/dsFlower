@@ -269,6 +269,16 @@ flowerInitDS <- function(data_symbol) {
   run_config[["privacy-epsilon"]]       <- as.numeric(.dsf_option("dp_epsilon", 3.0))
   run_config[["privacy-delta"]]         <- as.numeric(.dsf_option("dp_delta", 1e-5))
   run_config[["privacy-clipping_norm"]] <- as.numeric(.dsf_option("dp_clipping_norm", 1.0))
+  # Improved Tier-2 floor policy (sample-and-aggregate): the node may split its private
+  # data into k disjoint blocks, run the uploaded black-box update per block, and release
+  # the clipped MEAN -- sensitivity 2C/k instead of 2C, so k-times-less noise at the same
+  # epsilon. k = min(sa_max_blocks, n / sa_min_block) is chosen by THIS policy + the row
+  # count alone (never the data values); below 2 blocks it falls back to the plain 2C
+  # floor. Encoded numerically (1/0 for the on/off flag) for stable manifest transport.
+  run_config[["privacy-sample_aggregate"]] <- as.numeric(isTRUE(as.logical(
+                                                .dsf_option("dp_sample_aggregate", FALSE))))
+  run_config[["privacy-sa_min_block"]]     <- as.numeric(.dsf_option("dp_sa_min_block", 64))
+  run_config[["privacy-sa_max_blocks"]]    <- as.numeric(.dsf_option("dp_sa_max_blocks", 8))
   run_config
 }
 
