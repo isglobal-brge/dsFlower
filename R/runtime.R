@@ -306,6 +306,19 @@
   log_name <- gsub("[^a-zA-Z0-9._-]", "_", superlink_address)
   log_path <- file.path(log_dir, paste0(log_name, ".log"))
 
+  # Launch the SuperNode UNDER a subreaper wrapper. The container's PID 1 is the
+  # Opal JVM, which never waitpid()s reparented orphans, so flwr's per-run
+  # superexec/clientapp grandchildren -- once the supernode dies -- would orphan to
+  # PID 1 and zombify FOREVER (a zombie is only cleared by its parent's wait()).
+  # The wrapper sets PR_SET_CHILD_SUBREAPER + runs the supernode in its own session
+  # and reaps the whole subtree, so nothing can reach PID 1. Graceful fallback to a
+  # direct launch if the wrapper script or venv python is missing (older install).
+  reaper_py <- system.file("python", "supernode_reaper.py", package = "dsFlower")
+  venv_python <- (if (!is.null(runtime_desc)) runtime_desc$python else NULL) %||%
+                 file.path(venv_path, "bin", "python")
+  use_reaper <- nzchar(reaper_py) && file.exists(reaper_py) &&
+                !is.null(venv_python) && nzchar(venv_python) && file.exists(venv_python)
+
   # Spawn with retry on port collision (up to 3 attempts)
   proc <- NULL
   clientappio_port <- NULL
@@ -351,8 +364,8 @@
     )
 
     proc <- processx::process$new(
-      command = supernode_cmd,
-      args = args,
+      command = if (use_reaper) venv_python else supernode_cmd,
+      args = if (use_reaper) c(reaper_py, supernode_cmd, args) else args,
       stdout = log_path,
       stderr = "2>&1",
       cleanup = TRUE,
@@ -410,11 +423,7 @@
 #' @keywords internal
 .supernode_stop <- function(manifest_dir) {
   stop_pid <- function(pid) {
-    tryCatch({
-      tools::pskill(pid, signal = 15L)
-      Sys.sleep(1)
-      if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
-    }, error = function(e) NULL)
+    .terminate_supernode_pid(pid)   # SIGTERM + drain (wrapper reaps subtree) + SIGKILL last resort
     .remove_supernode_pid(pid)
   }
 
@@ -438,8 +447,8 @@
   pid <- entry$pid
   tryCatch({
     if (proc$is_alive()) {
-      proc$signal(15L)  # SIGTERM
-      proc$wait(timeout = 5000)
+      proc$signal(15L)  # SIGTERM -> wrapper drains its supernode group + reaps the subtree
+      proc$wait(timeout = 15000)   # generous: let the wrapper finish reaping before SIGKILL
       if (proc$is_alive()) {
         proc$kill()
       }
@@ -642,6 +651,54 @@
   }, error = function(e) FALSE)
 }
 
+#' Terminate a tracked SuperNode (wrapper) PID and let it reap its subtree
+#'
+#' SIGTERM the (subreaper-wrapped) SuperNode and POLL for it to exit -- the wrapper
+#' needs a moment to SIGTERM its supernode group, drain the flwr clientapp/superexec
+#' grandchildren and waitpid()-reap them, then exit. Only after a generous grace do we
+#' SIGKILL as a last resort (a SIGKILL'd wrapper can't reap, re-leaking to PID 1 -- so
+#' we avoid it unless the wrapper is truly stuck). Replaces the old 1-second
+#' SIGTERM->SIGKILL, which was far too fast for a clean drain.
+#' @keywords internal
+.terminate_supernode_pid <- function(pid) {
+  grace <- suppressWarnings(as.numeric(.dsf_option("supernode_term_grace", 15)))
+  if (is.na(grace) || grace < 1) grace <- 15
+  tryCatch({
+    if (!.pid_is_alive(pid)) return(invisible(TRUE))
+    tools::pskill(pid, signal = 15L)
+    waited <- 0
+    while (waited < grace && .pid_is_alive(pid)) {
+      Sys.sleep(0.5); waited <- waited + 0.5
+    }
+    if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)   # last resort
+  }, error = function(e) NULL)
+  invisible(TRUE)
+}
+
+#' Count defunct (zombie) processes on Linux, for leak monitoring
+#'
+#' Scans /proc/<pid>/stat for state 'Z'. Pure file reads (no subprocess). Returns 0
+#' off-Linux. The subreaper wrapper PREVENTS new accumulation; this only reports, so
+#' an operator can see if any have leaked (e.g. pre-fix zombies parented to the
+#' non-reaping PID 1, which only a container restart can clear).
+#' @keywords internal
+.count_zombies <- function() {
+  if (!dir.exists("/proc")) return(0L)
+  pids <- suppressWarnings(as.integer(list.dirs("/proc", recursive = FALSE,
+                                                full.names = FALSE)))
+  pids <- pids[!is.na(pids)]
+  z <- 0L
+  for (pid in pids) {
+    st <- tryCatch(readLines(file.path("/proc", pid, "stat"), n = 1, warn = FALSE),
+                   error = function(e) NULL, warning = function(w) NULL)
+    if (is.null(st) || !length(st)) next
+    # field 3 (after "pid (comm)") is the state char; comm may contain spaces/parens
+    after <- sub("^.*\\)\\s+", "", st)
+    if (substr(after, 1, 1) == "Z") z <- z + 1L
+  }
+  z
+}
+
 #' List live flower-supernode processes on Linux without spawning subprocesses
 #' @keywords internal
 .list_supernode_processes <- function() {
@@ -733,12 +790,9 @@
     if (age_hours < 2) next
 
     if (.pid_is_alive(pid)) {
-      # Process alive but PID file is old -- likely orphaned
-      tryCatch({
-        tools::pskill(pid, signal = 15L)
-        Sys.sleep(1)
-        if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
-      }, error = function(e) NULL)
+      # Process alive but PID file is old -- likely orphaned. Terminate the wrapper so
+      # it reaps its whole subtree (no orphan escapes to the non-reaping PID 1).
+      .terminate_supernode_pid(pid)
       cleaned <- cleaned + 1L
     }
     unlink(pf)
@@ -759,13 +813,15 @@
       }
       if (!is.na(age_mins) && age_mins < grace_mins) next
 
-      tryCatch({
-        tools::pskill(pid, signal = 15L)
-        Sys.sleep(1)
-        if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)
-      }, error = function(e) NULL)
+      .terminate_supernode_pid(pid)   # wrapper-aware: drains + reaps the subtree
       cleaned <- cleaned + 1L
     }
+  }
+  if (cleaned > 0L) {
+    z <- .count_zombies()
+    if (z > 0L) message("dsFlower: reaped ", cleaned, " orphaned SuperNode(s); ",
+                        z, " defunct process(es) remain (pre-fix leaks parented to a ",
+                        "non-reaping PID 1 need a container restart to clear).")
   }
   cleaned
 }

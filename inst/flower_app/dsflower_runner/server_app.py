@@ -118,7 +118,16 @@ def _run_trees(grid, cfg):
                 for nid in node_ids]
     replies = grid.send_and_receive(
         messages, timeout=float(cfg.get("round-timeout", 3600)))
+    return _collect_trees(replies, len(node_ids), min_nodes)
 
+
+def _collect_trees(replies, n_connected, min_nodes):
+    """Bag the successful DP-GBDT boosters and report the TRUE failure count.
+
+    FAIL CLOSED when fewer than ``min_nodes`` boosters come back: the connection gate
+    only guarantees enough nodes DIALLED IN, but a node can still error during training,
+    and silently bagging the survivors would (a) weaken the model and (b) misreport the
+    federation size as fully successful. Returns (bagged_booster, n_failures)."""
     boosters = []
     for r in replies:
         try:
@@ -129,13 +138,16 @@ def _run_trees(grid, cfg):
                 boosters.append(_array_to_booster(arrays[0]))
         except Exception:
             continue
-    if not boosters:
+    n_failures = int(n_connected) - len(boosters)
+    if len(boosters) < min_nodes:
         raise RuntimeError(
-            "no DP-GBDT boosters returned (all ClientApps failed); check node logs.")
-    return _bag_boosters(boosters)
+            "only %d of %d node(s) returned a DP-GBDT booster, need >= %d; refusing to "
+            "bag a degraded federation (check node logs)."
+            % (len(boosters), int(n_connected), min_nodes))
+    return _bag_boosters(boosters), n_failures
 
 
-def _save_trees(cfg, booster):
+def _save_trees(cfg, booster, n_failures=0):
     results_dir = cfg.get("results-dir")
     if not results_dir:
         return
@@ -143,7 +155,7 @@ def _save_trees(cfg, booster):
     with open(os.path.join(results_dir, "booster.json"), "w") as f:
         json.dump(booster, f)
     with open(os.path.join(results_dir, "history.json"), "w") as f:
-        json.dump([{"round": 1, "n_failures": 0,
+        json.dump([{"round": 1, "n_failures": int(n_failures),
                     "n_trees": len(booster.get("trees", [])),
                     "n_boosters": booster.get("n_boosters", 1)}], f)
 
@@ -214,6 +226,7 @@ def main(grid: Grid, context: Context) -> None:
     cfg = context.run_config
     track = str(cfg.get("dp-track", "neural")).lower()
     if track == "trees":
-        _save_trees(cfg, _run_trees(grid, cfg))
+        booster, n_failures = _run_trees(grid, cfg)
+        _save_trees(cfg, booster, n_failures)
     else:  # neural or egress
         _run_fedavg(grid, cfg, track)
