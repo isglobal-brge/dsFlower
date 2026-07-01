@@ -326,6 +326,16 @@
       stop("flower-supernode not found in venv.", call. = FALSE)
     }
 
+    # Reclaim disk: the uv download cache (~1.5 GB of wheels) is only needed to
+    # (re)install -- the built venv is self-contained -- so drop it once provisioning
+    # succeeds. This keeps EVERY node lean (not just the Docker image), enforced by the
+    # package itself. Best-effort; opt out with options(dsflower.clean_uv_cache=FALSE) to
+    # keep the cache warm for frequent re-provisioning.
+    if (isTRUE(as.logical(.dsf_option("clean_uv_cache", TRUE)))) {
+      tryCatch(processx::run(uv, c("cache", "clean"), error_on_status = FALSE,
+                             timeout = 120), error = function(e) NULL)
+    }
+
     dep_hash <- .deps_hash(deps)
     writeLines(dep_hash, file.path(venv_path, ".dsflower_ready"))
     message("  Python environment for '", framework, "' ready.")
