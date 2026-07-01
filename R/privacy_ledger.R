@@ -9,21 +9,65 @@
 # Default RDP orders for accounting
 .RDP_ORDERS <- c(1.25, 1.5, 2, 4, 8, 16, 32, 64, 128, 256)
 
+#' Is a directory creatable AND writable? (probe-tested)
+#'
+#' The privacy ledger MUST land on a path the DataSHIELD session user can actually
+#' write. Rock sessions often run with HOME=/root (the container root env) while
+#' executing as an unprivileged `rock` user, so any HOME-derived path
+#' (rappdirs::user_data_dir -> $HOME/.local/share) silently fails at write time and
+#' corrupts every run on that profile. We therefore probe-test each candidate.
+#' @keywords internal
+.dir_is_writable <- function(d) {
+  if (is.null(d) || !nzchar(d)) return(FALSE)
+  ok <- tryCatch({
+    dir.create(d, recursive = TRUE, showWarnings = FALSE)
+    dir.exists(d)
+  }, error = function(e) FALSE)
+  if (!ok) return(FALSE)
+  probe <- file.path(d, paste0(".dsfl_w_", Sys.getpid()))
+  tryCatch({ con <- file(probe, "w"); close(con); unlink(probe); TRUE },
+           error = function(e) FALSE, warning = function(w) FALSE)
+}
+
+#' First PERSISTENT, writable directory for the privacy ledger.
+#'
+#' Ordered so the budget survives across sessions (never silently reset): explicit
+#' option -> the rock's own writable volume (ROCK_HOME, persistent) -> the standard
+#' user-data dir (only if writable) -> /var/lib/dsflower -> and, as a last resort,
+#' tempdir() with a LOUD warning (budget would not persist there).
+#' @keywords internal
+.ledger_dir <- function() {
+  explicit_dir <- .dsf_option("privacy_ledger_dir", NULL)
+  rock_home <- Sys.getenv("ROCK_HOME", "")
+  candidates <- c(
+    if (!is.null(explicit_dir) && nzchar(as.character(explicit_dir))) as.character(explicit_dir),
+    if (nzchar(rock_home)) file.path(rock_home, "dsflower", "privacy"),
+    file.path(rappdirs::user_data_dir("dsFlower"), "privacy"),
+    "/var/lib/dsflower/privacy"
+  )
+  for (d in candidates) if (.dir_is_writable(d)) return(d)
+  fallback <- file.path(tempdir(), "dsflower", "privacy")
+  dir.create(fallback, recursive = TRUE, showWarnings = FALSE)
+  warning("dsFlower: no PERSISTENT writable privacy-ledger directory found; using ",
+          "an ephemeral tempdir (the DP budget will NOT persist across sessions). ",
+          "Set options(dsflower.privacy_ledger_dir=) to a writable path.",
+          call. = FALSE)
+  fallback
+}
+
 #' Get the path to the privacy ledger file
 #' @return Character; path to the ledger JSON file.
 #' @keywords internal
 .ledger_path <- function() {
   explicit_path <- .dsf_option("privacy_ledger_path", NULL)
   if (!is.null(explicit_path) && nzchar(as.character(explicit_path))) {
-    dir.create(dirname(explicit_path), recursive = TRUE, showWarnings = FALSE)
-    return(as.character(explicit_path))
+    p <- as.character(explicit_path)
+    if (.dir_is_writable(dirname(p))) return(p)
+    warning("dsFlower: configured privacy_ledger_path '", p, "' is not writable; ",
+            "falling back to a writable ledger directory.", call. = FALSE)
   }
 
-  ledger_dir <- .dsf_option(
-    "privacy_ledger_dir",
-    file.path(rappdirs::user_data_dir("dsFlower"), "privacy")
-  )
-  dir.create(ledger_dir, recursive = TRUE, showWarnings = FALSE)
+  ledger_dir <- .ledger_dir()
   namespace <- .dsf_option("privacy_ledger_namespace", "default")
   namespace <- as.character(namespace %||% "default")
   namespace <- gsub("[^A-Za-z0-9_.-]+", "_", namespace)
