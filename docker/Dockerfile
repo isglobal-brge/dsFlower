@@ -23,22 +23,18 @@ LABEL org.opencontainers.image.title="dsflower-rock" \
 
 COPY dsFlower.tar.gz /tmp/dsFlower.tar.gz
 
-# 1) dsFlower + any missing R deps into the rock's R library.
+# Install dsFlower (+ any missing R deps), bake the Flower runtime venv, hand everything to
+# the rock service user (uid 10041), and DROP the uv wheel cache -- all in ONE layer. Doing
+# it in one RUN matters: a separate `chown -R` layer would re-store the whole ~1.7 GB venv
+# (doubling it), and the uv cache (~1.6 GB of wheels) is useless at runtime once the venv
+# exists. So the first federated run is still instant, but the image stays ~3 GB smaller.
+# Torch backend is AUTO-DETECTED (CPU on a CPU build host -> the small portable default),
+# never pinned, so a GPU host resolves to GPU and provisions the CUDA venv there.
 RUN R -e 'p<-c("arrow","digest","jsonlite","processx","rappdirs"); m<-p[!vapply(p,requireNamespace,logical(1),quietly=TRUE)]; if(length(m)) install.packages(m, repos="https://cloud.r-project.org")' \
  && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsFlower.tar.gz \
- && rm -f /tmp/dsFlower.tar.gz
-
-# 2) Bake the Flower runtime venv exactly as the node provisions it at run time, so the
-#    first federated run is instant instead of a multi-GB download. The torch backend is
-#    AUTO-DETECTED, not forced: on a CPU build host this bakes the CPU build (the right,
-#    small default for GPU-less nodes); it is NOT pinned, so if the image is deployed on
-#    a GPU host the runtime resolves to GPU and (re)provisions the CUDA venv there. Build
-#    on a GPU-visible host to bake CUDA directly.
-RUN R -e '.libPaths(c("/var/lib/rock/R/library", .libPaths())); dsFlower:::.ensure_python_env("pytorch")'
-
-# 3) Hand the R library + runtime to the rock service user (uid 10041) so the R
-#    server (which runs as `rock`) can read/execute them and manage its runtime state.
-RUN chown -R rock:rock /var/lib/rock/R/library/dsFlower /var/lib/dsflower
+ && R -e '.libPaths(c("/var/lib/rock/R/library", .libPaths())); dsFlower:::.ensure_python_env("pytorch")' \
+ && chown -R rock:rock /var/lib/rock/R/library/dsFlower /var/lib/dsflower \
+ && rm -rf /tmp/dsFlower.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv
 
 # ENTRYPOINT / CMD / exposed port are inherited from datashield/rock-base — do NOT
 # override them, or the rock server will not start correctly.
