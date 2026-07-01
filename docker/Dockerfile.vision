@@ -15,22 +15,28 @@
 #   docker build -f docker/Dockerfile.vision -t davidsarrat/dsflower-vision:0.2.5 \
 #                -t davidsarrat/dsflower-vision:latest docker/
 # ---------------------------------------------------------------------------
-FROM davidsarrat/dsflower-rock:0.2.5
+FROM davidsarrat/dsflower-rock:0.2.6
 
 LABEL org.opencontainers.image.title="dsflower-vision" \
       org.opencontainers.image.description="dsFlower vision FL node: dsflower-rock + dsImaging (+dsHPC) for federated medical-image models" \
       org.opencontainers.image.source="https://github.com/isglobal-brge/dsFlower" \
-      org.opencontainers.image.version="0.2.5" \
+      org.opencontainers.image.version="0.2.7" \
       org.opencontainers.image.licenses="MIT"
 
 COPY dsHPC.tar.gz dsImaging.tar.gz /tmp/
 
 # R deps (skip any already in the base) + dsHPC + dsImaging, hand them to the rock user,
-# and drop caches -- all in ONE layer (dsImaging's configure is best-effort and, finding no
-# `uv` on the standard PATH, skips its heavy analysis venvs, so this stays light).
+# and drop caches -- all in ONE layer. dsImaging's configure eagerly provisions its own
+# ANALYSIS venvs (radiomics / TotalSegmentator / lungmask / monai-seg, ~6 GB with a
+# duplicate torch); those power dsImaging's *own* segmentation/radiomics runners, NOT the
+# dsFlower FL vision path (which reads images with the dsFlower venv and only needs
+# dsImaging to RESOLVE the image resources). So we drop them here to keep this image lean
+# and avoid a duplicate torch -- they re-provision on demand if a node later runs
+# dsImaging's analysis functions.
 RUN R -e 'p<-c("DBI","RSQLite","arrow","uuid","yaml","aws.s3","resourcer","R6","digest","jsonlite","processx"); m<-p[!vapply(p,requireNamespace,logical(1),quietly=TRUE)]; if(length(m)) install.packages(m, repos="https://cloud.r-project.org")' \
  && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsHPC.tar.gz \
  && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsImaging.tar.gz \
+ && rm -rf /var/lib/dsimaging/venvs \
  && (chown -R rock:rock /var/lib/rock/R/library/dsImaging /var/lib/rock/R/library/dsHPC /var/lib/dsimaging 2>/dev/null || true) \
  && rm -rf /tmp/dsHPC.tar.gz /tmp/dsImaging.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv
 
