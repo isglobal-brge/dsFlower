@@ -1,0 +1,37 @@
+# dsFlower VISION demo rock image
+# ---------------------------------------------------------------------------
+# = the dsflower-rock image (dsFlower + the full PyTorch vision venv already baked:
+#   torch/torchvision/monai/SimpleITK/nibabel/pynrrd) PLUS dsImaging (+ dsHPC), so the
+#   dsImaging image-resource path (imaging+dataset://...) resolves and federated VISION
+#   models (pytorch_resnet18 / densenet121) train on medical images out of the box.
+#
+# Image reading for the FL path is done by the dsFlower venv; dsImaging is needed on the
+# node only to RESOLVE the image resources. dsImaging's heavy analysis venvs (radiomics /
+# TotalSegmentator) are intentionally NOT provisioned here (its configure is best-effort
+# and finds no `uv` on the standard PATH), keeping this image light -- provision them
+# separately on nodes that need dsImaging's own analysis runners.
+#
+# Build (after davidsarrat/dsflower-rock:0.2.5 exists locally; stage the tarballs here):
+#   docker build -f docker/Dockerfile.vision -t davidsarrat/dsflower-vision:0.2.5 \
+#                -t davidsarrat/dsflower-vision:latest docker/
+# ---------------------------------------------------------------------------
+FROM davidsarrat/dsflower-rock:0.2.5
+
+LABEL org.opencontainers.image.title="dsflower-vision" \
+      org.opencontainers.image.description="dsFlower vision FL node: dsflower-rock + dsImaging (+dsHPC) for federated medical-image models" \
+      org.opencontainers.image.source="https://github.com/isglobal-brge/dsFlower" \
+      org.opencontainers.image.version="0.2.5" \
+      org.opencontainers.image.licenses="MIT"
+
+COPY dsHPC.tar.gz dsImaging.tar.gz /tmp/
+
+# R deps (skip any already in the base) + dsHPC + dsImaging, hand them to the rock user,
+# and drop caches -- all in ONE layer (dsImaging's configure is best-effort and, finding no
+# `uv` on the standard PATH, skips its heavy analysis venvs, so this stays light).
+RUN R -e 'p<-c("DBI","RSQLite","arrow","uuid","yaml","aws.s3","resourcer","R6","digest","jsonlite","processx"); m<-p[!vapply(p,requireNamespace,logical(1),quietly=TRUE)]; if(length(m)) install.packages(m, repos="https://cloud.r-project.org")' \
+ && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsHPC.tar.gz \
+ && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsImaging.tar.gz \
+ && (chown -R rock:rock /var/lib/rock/R/library/dsImaging /var/lib/rock/R/library/dsHPC /var/lib/dsimaging 2>/dev/null || true) \
+ && rm -rf /tmp/dsHPC.tar.gz /tmp/dsImaging.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv
+
+# ENTRYPOINT / CMD / port inherited from dsflower-rock (-> datashield/rock-base).
