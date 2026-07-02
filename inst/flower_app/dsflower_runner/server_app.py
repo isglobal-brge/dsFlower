@@ -23,7 +23,8 @@ import numpy as np
 import torch
 
 from flwr.serverapp import Grid, ServerApp
-from flwr.serverapp.strategy import FedAvg
+from flwr.serverapp.strategy import (
+    FedAvg, FedAdam, FedAdagrad, FedYogi, FedAvgM)
 from flwr.common import ArrayRecord, Context, Message, RecordDict
 
 from .params import get_torch_params, set_torch_params
@@ -176,14 +177,31 @@ def _initial_arrays(cfg, track):
     return model, ArrayRecord(numpy_ndarrays=get_torch_params(model))
 
 
+# Selectable server-side aggregation. Every strategy here runs ONLY on the
+# already-DP client updates, on the researcher's SuperLink -- so by the DP
+# post-processing theorem the per-node (epsilon, delta) guarantee is unchanged.
+# The strategy is pure aggregation, never a privacy knob. FedProx is excluded
+# (it needs a node-side proximal term); the trees track never reaches here.
+_STRATEGIES = {
+    "fedavg": FedAvg, "fedadam": FedAdam, "fedadagrad": FedAdagrad,
+    "fedyogi": FedYogi, "fedavgm": FedAvgM,
+}
+
+
+def _build_strategy(cfg, min_nodes):
+    name = str(cfg.get("strategy", "fedavg")).lower()
+    cls = _STRATEGIES.get(name, FedAvg)
+    return cls(
+        fraction_train=1.0, fraction_evaluate=0.0,
+        min_train_nodes=min_nodes, min_evaluate_nodes=0,
+        min_available_nodes=min_nodes)
+
+
 def _run_fedavg(grid, cfg, track):
     num_rounds = int(cfg.get("num-server-rounds", 1))
     min_nodes = int(cfg.get("min-train-nodes", 2))
     model, initial = _initial_arrays(cfg, track)
-    strategy = FedAvg(
-        fraction_train=1.0, fraction_evaluate=0.0,
-        min_train_nodes=min_nodes, min_evaluate_nodes=0,
-        min_available_nodes=min_nodes)
+    strategy = _build_strategy(cfg, min_nodes)
     result = strategy.start(grid=grid, initial_arrays=initial, num_rounds=num_rounds)
     _save_results(cfg, model, result)
 
