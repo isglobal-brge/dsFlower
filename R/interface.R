@@ -315,7 +315,7 @@ flowerInitDS <- function(data_symbol) {
       task_type = run_config[["task-type"]] %||% run_config[["task_type"]]
     )
   }
-  # DP budget check -- DP is always on.
+  # Per-run DP parameter bounds (DP is always on).
   dp_epsilon <- as.numeric(run_config[["privacy-epsilon"]] %||% 3.0)
   dp_delta   <- as.numeric(run_config[["privacy-delta"]] %||% 1e-5)
   eps_ceiling <- suppressWarnings(as.numeric(.dsf_option("dp_epsilon_ceiling", 10)))
@@ -340,11 +340,7 @@ flowerInitDS <- function(data_symbol) {
     stop("Requested DP clipping_norm (", dp_clip, ") exceeds this server's ceiling (",
          clip_ceiling, ").", call. = FALSE)
   }
-  dataset_key <- .privacy_dataset_key(handle, target_column)
-  .check_budget(dataset_key, dp_epsilon, dp_delta)
-  # Return the budget coordinates so the caller can RESERVE the spend (idempotently, by
-  # run_token) once the token exists -- i.e. BEFORE the run can release anything.
-  invisible(list(dataset_key = dataset_key, epsilon = dp_epsilon, delta = dp_delta))
+  invisible(NULL)
 }
 
 #' Prepare a Training Run
@@ -433,9 +429,9 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
                "check: ", conditionMessage(e), call. = FALSE))
       }
     }
-    dp_resv <- .enforceDisclosureAndDp(handle, target_column, template_name,
-                                       n_samples, target_data, run_config,
-                                       data_type = data_type)
+    .enforceDisclosureAndDp(handle, target_column, template_name,
+                            n_samples, target_data, run_config,
+                            data_type = data_type)
 
     # Inject validated mask paths from dsImaging (segmentation tasks)
     seg_generation_id <- run_config[["segmentation_generation_id"]] %||% NULL
@@ -472,11 +468,6 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
 
     handle$run_token       <- run_token
-    # RESERVE the privacy budget NOW: token set + manifest staged, but BEFORE the run can
-    # release anything. Idempotent by run_token, so flowerCleanupRunDS will not double-charge.
-    # (Charging at prepare, not at cleanup, closes the under-accounting where a run releases
-    # but its cleanup never fires.)
-    .record_spend(dp_resv$dataset_key, dp_resv$epsilon, dp_resv$delta, run_token = run_token)
     handle$staging_dir     <- staging_dir
     handle$target_column   <- target_column
     handle$feature_columns <- feature_columns
@@ -495,9 +486,9 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 
   run_config <- .addDpConfigToRunConfig(run_config)
   template_name <- run_config[["template_name"]] %||% NULL
-  dp_resv <- .enforceDisclosureAndDp(handle, target_column, template_name,
-                                     nrow(data), data, run_config,
-                                     data_type = run_config[["data_type"]] %||% "tabular")
+  .enforceDisclosureAndDp(handle, target_column, template_name,
+                          nrow(data), data, run_config,
+                          data_type = run_config[["data_type"]] %||% "tabular")
 
   # Stage data with manifest
   run_token <- .generate_run_token()
@@ -527,9 +518,6 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   }
 
   handle$run_token       <- run_token
-  # RESERVE the privacy budget NOW (before release); idempotent by run_token so cleanup
-  # never double-charges. See the staged path above for the rationale.
-  .record_spend(dp_resv$dataset_key, dp_resv$epsilon, dp_resv$delta, run_token = run_token)
   handle$staging_dir     <- staging_dir
   handle$target_column   <- target_column
   handle$feature_columns <- feature_columns
@@ -712,30 +700,6 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 #' @export
 flowerCleanupRunDS <- function(handle_symbol) {
   handle <- .getHandle(handle_symbol)
-
-  # Record privacy spend if this was a DP run
-  if (!is.null(handle$staging_dir) && dir.exists(handle$staging_dir)) {
-    manifest_path <- file.path(handle$staging_dir, "manifest.json")
-    if (file.exists(manifest_path)) {
-      manifest <- tryCatch(
-        jsonlite::fromJSON(manifest_path, simplifyVector = TRUE),
-        error = function(e) NULL
-      )
-      # DP is always enforced, so every run spends from the privacy budget.
-      if (!is.null(manifest)) {
-        dataset_key <- .privacy_dataset_key(
-          handle,
-          manifest$target_column %||% handle$target_column %||% "unknown"
-        )
-        .record_spend(
-          dataset_key  = dataset_key,
-          epsilon      = as.numeric(manifest[["privacy-epsilon"]] %||% 1.0),
-          delta        = as.numeric(manifest[["privacy-delta"]] %||% 1e-5),
-          run_token    = handle$run_token
-        )
-      }
-    }
-  }
 
   # Stop SuperNode if associated. This must happen before staging deletion
   # because orphan cleanup uses the manifest_dir embedded in the process args.
@@ -994,26 +958,6 @@ flowerLogDS <- function(handle_symbol, last_n = 50L) {
   }
 
   .supernode_read_log(handle$staging_dir, last_n)
-}
-
-#' Query Privacy Budget
-#'
-#' DataSHIELD AGGREGATE method. Returns the remaining privacy budget
-#' for the dataset associated with the handle.
-#'
-#' @param handle_symbol Character; symbol of the handle.
-#' @return Named list with spent/remaining epsilon and delta.
-#' @export
-flowerPrivacyBudgetDS <- function(handle_symbol, target_column = NULL) {
-  handle <- .getHandle(handle_symbol)
-  # The budget is keyed by (data fingerprint + target). A standalone query uses a transient
-  # handle that was never prepared, so its target is unset -- accept the target explicitly so
-  # the right per-target key is read. Falls back to the handle's target (mid-lifecycle calls).
-  # This only READS the ledger; it never debits.
-  target <- if (!is.null(target_column) && nzchar(as.character(target_column)))
-    as.character(target_column) else (handle$target_column %||% "unknown")
-  dataset_key <- .privacy_dataset_key(handle, target)
-  .get_budget(dataset_key)
 }
 
 #' Per-feature standardization statistics (disclosure-controlled)
