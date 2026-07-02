@@ -10,6 +10,32 @@
 # SuperNode singleton registry -- keyed by SuperLink address
 .supernode_registry <- new.env(parent = emptyenv())
 
+#' Ensure a per-node secret for deterministic-yet-secret DP noise
+#'
+#' Created once and persisted, never released. It lets a repeated IDENTICAL run
+#' (same data + same config) return the SAME model, so an analyst cannot average
+#' many runs to cancel the DP noise -- while the secret keeps that noise
+#' unpredictable to the analyst. Best-effort: if the directory is not writable the
+#' Python harness simply falls back to fresh OS-entropy noise (still DP-safe, just
+#' non-deterministic). Stored as a 64-char hex string; the harness reads this file.
+#' @keywords internal
+.ensure_node_secret <- function() {
+  path <- Sys.getenv(
+    "DSFLOWER_NODE_SECRET_FILE",
+    unset = getOption("dsflower.node_secret_path", "/var/lib/dsflower/node_secret")
+  )
+  if (file.exists(path)) return(invisible(path))
+  tryCatch({
+    dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+    raw <- tryCatch(readBin("/dev/urandom", "raw", 32L), error = function(e) NULL)
+    if (is.null(raw) || length(raw) < 32L)
+      raw <- as.raw((sample.int(256L, 32L, replace = TRUE) - 1L))
+    writeLines(paste(sprintf("%02x", as.integer(raw)), collapse = ""), path)
+    Sys.chmod(path, "0600")
+  }, error = function(e) NULL)
+  invisible(path)
+}
+
 #' Package load hook -- verify Python venv root exists
 #'
 #' Fallback for when the configure script did not run (e.g. binary install,
@@ -61,6 +87,9 @@
       }
     }
   }
+
+  # Per-node secret for deterministic-yet-secret DP noise (see .ensure_node_secret).
+  tryCatch(.ensure_node_secret(), error = function(e) NULL)
 
   # Check Python availability
   python <- Sys.which("python3")

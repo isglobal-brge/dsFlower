@@ -74,7 +74,8 @@ def calibrate_noise_multiplier(epsilon, delta, sample_rate, total_epochs):
 
 def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
                        epsilon, delta, local_epochs, num_rounds=1,
-                       noise_multiplier=None, n_samples=None, batch_size=None):
+                       noise_multiplier=None, n_samples=None, batch_size=None,
+                       noise_generator=None):
     """Wrap model/optimizer/dataloader with Opacus for per-example DP-SGD.
 
     Returns (model, optimizer, trainloader, privacy_engine). The sensitivity
@@ -108,12 +109,16 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
         )
 
     privacy_engine = PrivacyEngine()
+    # noise_generator: when seeded (from the node secret + data + config) the DP noise is
+    # deterministic across identical repeats yet unpredictable to the analyst (defeats the
+    # averaging attack); when None, Opacus draws fresh randomness (non-reproducible, safe).
     model, optimizer, trainloader = privacy_engine.make_private(
         module=model,
         optimizer=optimizer,
         data_loader=trainloader,
         noise_multiplier=noise_multiplier,
         max_grad_norm=float(clipping_norm),
+        noise_generator=noise_generator,
     )
     return model, optimizer, trainloader, privacy_engine
 
@@ -197,25 +202,28 @@ def clip_update(new_weights, old_weights, clipping_norm):
     return [np.asarray(o) + d for o, d in zip(old_weights, delta)]
 
 
-def add_gaussian_noise(weights, old_weights, std):
+def add_gaussian_noise(weights, old_weights, std, rng=None):
     """Add N(0, std^2) noise to the (already clipped) weight delta. `std` is the FULL
     Gaussian-mechanism standard deviation (sensitivity * sqrt(2 ln(1.25/delta)) / eps),
-    with the sensitivity already folded in by the caller. No implicit re-scaling here:
-    a prior version multiplied by clipping_norm AGAIN, double-counting C whenever the
-    clip != 1 (masked only because C defaults to 1)."""
+    with the sensitivity already folded in by the caller.
+
+    `rng` is a numpy Generator. When None, a fresh OS-entropy generator is used (noise is
+    unpredictable but non-reproducible). When a SEEDED generator is passed -- derived from
+    the node secret + data + config -- the noise is deterministic across identical repeats
+    yet still unpredictable to the analyst, defeating the averaging attack without a
+    budget. A predictable (secret-less) seed would VOID DP, so the seed must fold in the
+    node secret; the caller guarantees this."""
+    _rng = rng if rng is not None else np.random.default_rng()
     out = []
     for w, o in zip(weights, old_weights):
         w = np.asarray(w); o = np.asarray(o)
         delta = w - o
-        # Draw DP noise from a FRESH OS-entropy generator, never the shared global
-        # np.random: isolates the noise from any deterministic global seeding elsewhere
-        # (predictable noise would void DP) and reseeds from os.urandom each call.
-        noise = np.random.default_rng().normal(0.0, float(std), size=delta.shape)
+        noise = _rng.normal(0.0, float(std), size=delta.shape)
         out.append(o + delta + noise.astype(delta.dtype))
     return out
 
 
-def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta):
+def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta, rng=None):
     """Tier-2 / universal-floor DP in one call: clip the update to C, then add Gaussian
     noise calibrated to the L2 SENSITIVITY of a C-clipped release, which is 2*C -- NOT C.
     Two adjacent datasets each yield an update inside the C-ball, so they can differ by
@@ -225,10 +233,10 @@ def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta)
     floor is the only release where the 2C diameter applies.)"""
     clipped = clip_update(new_weights, old_weights, clipping_norm)
     std = compute_output_sigma(epsilon, delta, 2.0 * clipping_norm)   # full Gaussian std for sensitivity 2C
-    return add_gaussian_noise(clipped, old_weights, std)
+    return add_gaussian_noise(clipped, old_weights, std, rng=rng)
 
 
-def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, delta):
+def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, delta, rng=None):
     """Improved universal floor (Nissim-Raskhodnikova-Smith sample-and-aggregate): given
     the user's black-box update computed INDEPENDENTLY on each of k DISJOINT, data-
     independent blocks of the private data, release the clip-and-average aggregate under
@@ -259,7 +267,7 @@ def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, del
     mean_delta = [md / float(k) for md in mean_delta]
     mean_new = [o + md for o, md in zip(old, mean_delta)]
     std = compute_output_sigma(epsilon, delta, 2.0 * float(clipping_norm) / float(k))  # sensitivity 2C/k
-    return add_gaussian_noise(mean_new, old, std)
+    return add_gaussian_noise(mean_new, old, std, rng=rng)
 
 
 # --------------------------------------------------------------------------- #

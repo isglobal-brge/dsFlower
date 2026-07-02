@@ -275,7 +275,7 @@ def predict_proba(booster, X):
 # --------------------------------------------------------------------------- #
 
 def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
-                          sigma, delta2, g_star, h_star, n_leaves):
+                          sigma, delta2, g_star, h_star, n_leaves, rng=None):
     """ONE round, node-side: compute this node's per-leaf (G, H) histogram for the
     given (already public) tree structure, then add the FULL Gaussian noise
     LOCALLY before returning — the local-DP release. ``current_margin`` is F(x_i)
@@ -295,9 +295,11 @@ def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
     np.add.at(G, leaf, g)
     np.add.at(H, leaf, h)
     noise_std = float(sigma) * float(delta2)
-    # DP leaf noise from a FRESH OS-entropy generator, never the shared global
-    # np.random (predictable noise would void DP); reseeds from os.urandom per call.
-    _noise_rng = np.random.default_rng()
+    # DP leaf noise. A SEEDED `rng` (from node secret + data + config) makes the noise
+    # deterministic across identical repeats yet unpredictable to the analyst (defeats
+    # averaging); None -> fresh OS entropy (non-reproducible, always safe). A predictable
+    # secret-less seed would void DP, so the seed must fold in the node secret.
+    _noise_rng = rng if rng is not None else np.random.default_rng()
     G_tilde = G + _noise_rng.normal(0.0, noise_std, size=n_leaves)
     H_tilde = H + _noise_rng.normal(0.0, noise_std, size=n_leaves)
     return np.concatenate([G_tilde, H_tilde])
@@ -324,7 +326,7 @@ def grow_tree_from_histograms(summed_hist, n_leaves, reg_lambda, learning_rate):
 
 def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
                 feature_ranges, n_bins, run_token, epsilon, delta,
-                base_score=0.5, patient_ids=None):
+                base_score=0.5, patient_ids=None, noise_seed=None):
     """Train a DP-GBDT booster in one process with LOCAL DP: each tree is one
     Gaussian release, σ is calibrated once for T_total = n_trees. Returns the
     booster dict (our own serializable format).
@@ -361,12 +363,15 @@ def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
                "sigma": float(sigma), "delta2": float(delta2),
                "epsilon": float(epsilon), "delta": float(delta), "trees": []}
     F = np.full(n, base_margin, dtype=np.float64)
+    # ONE seeded generator drives every tree's leaf noise: deterministic across identical
+    # repeats when noise_seed is set (from node secret + data + config), OS entropy when None.
+    noise_rng = np.random.default_rng(noise_seed)
     debits = 0
     for t in range(t_total):
         feat, thr = random_tree(run_token, t, depth, feature_ranges, n_bins)
         s_tilde = node_noised_histogram(
             X, y, F, feat, thr, depth, sigma=sigma, delta2=delta2,
-            g_star=g_star, h_star=h_star, n_leaves=n_leaves)
+            g_star=g_star, h_star=h_star, n_leaves=n_leaves, rng=noise_rng)
         debits += 1
         w = grow_tree_from_histograms(s_tilde, n_leaves, reg_lambda, learning_rate)
         booster["trees"].append({"feat": feat.tolist(), "thr": thr.tolist(),
