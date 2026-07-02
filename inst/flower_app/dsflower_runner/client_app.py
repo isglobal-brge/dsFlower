@@ -36,7 +36,7 @@ from .params import get_torch_params, set_torch_params, load_user_model
 # sys.path / PYTHONPATH cannot shadow dp_harness / dp_gbdt and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import dp_harness, dp_gbdt
+from . import dp_harness, dp_gbdt, seeding
 
 
 app = ClientApp()
@@ -63,7 +63,7 @@ def _prep_target(y, loss_name, n_classes):
     return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson/count/gamma)
 
 
-def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
+def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=None):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
@@ -97,17 +97,28 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg):
     # per-patient pooling (which reduces len(dataset)) does not trip this check.
     if pcfg.get("n_samples") and int(pcfg["n_samples"]) != int(n_staged):
         raise RuntimeError("staged sample count != manifest n_samples (fail closed)")
-    trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Seeded shuffle generator: deterministic batch order across identical repeats
+    # (from node secret + data + config); random when no secret is present.
+    trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                             generator=seeding.torch_generator(
+                                 seeding.sub_seed(master, "shuffle"), "cpu"))
 
+    # Seed the global RNG (Opacus's Poisson sampler + internal draws) and pass a seeded
+    # noise_generator so the DP noise is reproducible-yet-secret. Both fall back to fresh
+    # randomness when the node has no secret.
+    seeding.seed_torch(seeding.sub_seed(master, "sample"))
     model, optimizer, trainloader, _engine = dp_harness.make_private_dpsgd(
         model, optimizer, trainloader,
         clipping_norm=pcfg["clipping_norm"], epsilon=pcfg["epsilon"],
         delta=pcfg["delta"], local_epochs=local_epochs, num_rounds=num_rounds,
-        n_samples=len(dataset), batch_size=batch_size)
+        n_samples=len(dataset), batch_size=batch_size,
+        noise_generator=seeding.torch_generator(seeding.sub_seed(master, "noise"), device))
 
     set_torch_params(model, msg.content["arrays"].to_numpy_ndarrays())
 
     criterion = dp_harness.loss_from_allowlist(loss_name, cfg)   # node allowlist, mean reduction
+    # Deterministic dropout masks + in-loop sampling across identical repeats.
+    seeding.seed_torch(seeding.sub_seed(master, "train"))
     model.train()
     for _ in range(local_epochs):
         for xb, yb in trainloader:
@@ -261,6 +272,9 @@ def _train_neural(msg, context, cfg, pcfg, pins):
             Xp, yp, pooled = _pool_by_patient(X, y, groups)
             if pooled:
                 X, y = Xp, yp
+        # Deterministic weight init from (node secret + data + config).
+        master = seeding.master_seed(cfg, X, y)
+        seeding.seed_torch(seeding.sub_seed(master, "init"))
         # The trainable head is node-built from the researcher's spec, with the
         # frozen-backbone feature dim as @in (default spec = nn.Linear(feat_dim, @out)).
         model = load_user_model(cfg, feat_dim, pins["loss_name"])
@@ -275,6 +289,8 @@ def _train_neural(msg, context, cfg, pcfg, pins):
             Xp, yp, pooled = _pool_by_patient(X, y, groups)
             if pooled:
                 X, y = Xp, yp
+        master = seeding.master_seed(cfg, X, y)
+        seeding.seed_torch(seeding.sub_seed(master, "init"))
         model = load_user_model(cfg, X.shape[1], pins["loss_name"])
 
     # Defense in depth: probe per-sample independence before training. The model is
@@ -293,7 +309,7 @@ def _train_neural(msg, context, cfg, pcfg, pins):
     dp_harness.per_sample_independence_probe(
         copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"], cfg), xb, yb)
 
-    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg)
+    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=master)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,16 +321,19 @@ def _booster_to_array(booster):
     return np.frombuffer(json.dumps(booster).encode("utf-8"), dtype=np.uint8)
 
 
-def _train_trees(context, pcfg):
+def _train_trees(context, pcfg, cfg):
     spec = load_gbdt_spec(context)                 # validated, manifest-authoritative
     X, y = load_data(context)
     pids = load_tabular_patient_ids(context)       # per-patient DP unit when present
+    # Deterministic leaf noise from (node secret + data + config); OS entropy if no secret.
+    noise_seed = seeding.sub_seed(seeding.master_seed(cfg, X, y), "gbdt")
     booster = dp_gbdt.fit_dp_gbdt(
         X, y, objective=spec["objective"], depth=spec["max_depth"],
         n_trees=spec["n_trees"], learning_rate=spec["learning_rate"],
         reg_lambda=spec["reg_lambda"], feature_ranges=spec["feature_ranges"],
         n_bins=spec["n_bins"], run_token=spec["run_token"],
-        epsilon=pcfg["epsilon"], delta=pcfg["delta"], patient_ids=pids)
+        epsilon=pcfg["epsilon"], delta=pcfg["delta"], patient_ids=pids,
+        noise_seed=noise_seed)
     n = len(y) if pids is None else int(np.unique(pids).size)
     return [_booster_to_array(booster)], n
 
@@ -334,7 +353,7 @@ def train(msg: Message, context: Context) -> Message:
     track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
 
     if track == "trees":
-        new_arrays, n = _train_trees(context, pcfg)
+        new_arrays, n = _train_trees(context, pcfg, cfg)
     elif track == "egress":
         from . import tier2_lib
         X, y = load_data(context)
@@ -349,7 +368,10 @@ def train(msg: Message, context: Context) -> Message:
         pcfg_round = dict(pcfg)
         pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
         pcfg_round["delta"] = float(pcfg["delta"]) / num_rounds
-        new_arrays = tier2_lib.gated_local_update(module_name, old, X, y, cfg, pcfg_round)
+        # Deterministic egress noise from (node secret + data + config); OS entropy otherwise.
+        egress_seed = seeding.sub_seed(seeding.master_seed(cfg, X, y), "egress")
+        new_arrays = tier2_lib.gated_local_update(module_name, old, X, y, cfg, pcfg_round,
+                                                  seed=egress_seed)
         n = len(y)
     else:  # neural (tabular or image)
         pins = load_run_pins(context)

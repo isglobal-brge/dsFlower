@@ -50,6 +50,7 @@ def _trusted_import(name):
 
 
 dp_harness = _trusted_import("dp_harness")
+seeding = _trusted_import("seeding")
 
 
 _REQUIRED_HOOKS = ("initial_arrays", "local_update")
@@ -323,7 +324,7 @@ def _choose_blocks(n, pcfg, full_sandbox):
     return max(1, min(max_blocks, int(n) // min_block))
 
 
-def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
+def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None):
     """Run the upload out-of-process from the global model, then apply the DP gate in the
     trusted parent. The NODE picks the mechanism: sample-and-aggregate (2C/k) when the
     platform can guarantee block independence and policy says so, else the plain 2C floor.
@@ -345,7 +346,7 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
         # Data-INDEPENDENT random partition into k disjoint blocks (fresh-entropy permutation
         # of row INDICES, never by feature/label). One record lands in exactly one block, and
         # each block runs in its OWN isolated interpreter -> genuine independence.
-        perm = np.random.default_rng().permutation(n)
+        perm = seeding.np_rng(seeding.sub_seed(seed, "partition")).permutation(n)
         block_updates = []
         for idx in np.array_split(perm, k):
             r = _validate(_run_isolated(module_name, old, _take_rows(X, idx),
@@ -356,6 +357,7 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
             clipping_norm=pcfg["clipping_norm"],
             epsilon=pcfg["epsilon"],
             delta=pcfg["delta"],
+            rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
         )
     else:
         r = _validate(_run_isolated(module_name, old, X, y, cfg, caps, timeout, pad_to), old)
@@ -365,5 +367,6 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg):
             clipping_norm=pcfg["clipping_norm"],
             epsilon=pcfg["epsilon"],
             delta=pcfg["delta"],
+            rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
         )
     return [g.astype(np.float32) for g in gated]
