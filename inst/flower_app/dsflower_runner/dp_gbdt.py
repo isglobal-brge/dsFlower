@@ -1,5 +1,5 @@
 """dsFlower DP-GBDT engine (node-side, trusted) — enforced differential privacy
-for gradient-boosted decision trees, via the S-GBDT-style local-DP mechanism
+for gradient-boosted decision trees, via an S-GBDT-style curator-side mechanism
 (Nuradha et al., "Frugal Differentially Private GBDT", arXiv:2309.12041).
 
 This is the TREES track's privacy core. Like ``dp_harness.py`` it is installed
@@ -8,17 +8,17 @@ only a *spec* (objective, depth, learning rate, ...), never this module, so the
 DP guarantee cannot be disabled or weakened by uploaded app code.
 
 Design invariants (identical posture to ``dp_harness.py``):
-  * LOCAL DP only — there is NO Secure Aggregation. Each node adds the FULL
+  * NODE-SIDE CENTRAL DP — each node curates its local dataset and there is NO
+    Secure Aggregation. Each node adds the FULL
     Gaussian noise to its own per-leaf gradient/hessian histogram node-side,
-    BEFORE any booster bytes leave the SuperNode. The federation aggregate (sum
-    of already-noised histograms over disjoint rows) is post-processing, so the
-    guarantee composes and the untrusted researcher-side ServerApp performs no
+    BEFORE any booster bytes leave the SuperNode. The federation server bags the
+    already-private local boosters; this is post-processing, so it performs no
     DP work and sees no raw sums.
   * TOTALLY-RANDOM splits — each internal node's (feature, threshold) is drawn
     from a PUBLIC PRNG seeded by (run_token, tree_index, node_index). No data
-    flows into split selection, so split selection costs ZERO privacy budget and
-    every node grows the identical structure for a given tree (same seed ⇒ leaf
-    ℓ means the same routing predicate federation-wide).
+    flows into split selection, so split selection costs ZERO privacy budget.
+    Run tokens are node-local; the deployed server bags complete local boosters,
+    so tree structures do not need to align across nodes.
   * The ONLY data-touching release per tree is the leaf histogram
     S_t = (G_leaf, H_leaf) in R^{2L}. One individual (a patient under per-patient
     pooling, else a row) routes to exactly ONE leaf, so the replace-one L2
@@ -31,9 +31,7 @@ Design invariants (identical posture to ``dp_harness.py``):
     (α, α/(2σ²))-RDP. There are exactly K = T_total releases per contributing
     record (depth does NOT multiply K — one release per tree, not per level),
     composed SEQUENTIALLY by RDP addition. σ is calibrated ONCE up front for
-    T_total. The accountant mirrors privacy_ledger.R::.rdp_gaussian /
-    .rdp_to_dp byte-for-byte (the trees venv has no opacus) and FAILS CLOSED if
-    it cannot solve — never an analytic per-release fallback.
+    T_total with the closed continuous-order Gaussian RDP bound.
 
 All privacy parameters MUST come from the server-written, tamper-proof manifest.
 """
@@ -43,13 +41,23 @@ import math
 
 import numpy as np
 
+try:
+    from .seeding import SecureNumpyRng
+except ImportError:  # Direct execution by the standalone regression script.
+    from seeding import SecureNumpyRng
+
 # --------------------------------------------------------------------------- #
-# Accountant — pure-numpy RDP, mirroring privacy_ledger.R exactly.
+# Accountant — pure-numpy RDP composed across all tree releases.
 # --------------------------------------------------------------------------- #
 
-# Mirror privacy_ledger.R::.RDP_ORDERS exactly so the node-side calibration and
-# the R-side ledger agree on what "(epsilon, delta)" means.
-_RDP_ORDERS = (1.25, 1.5, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0)
+# Absolute engine caps. The manifest applies tighter admin caps, but these checks
+# live beside the allocations they protect so direct/library calls cannot bypass
+# them and evaluate ``1 << depth`` or build an unbounded booster first.
+_MAX_DEPTH = 10
+_MAX_TREES = 200
+_MAX_BINS = 64
+_MAX_FEATURES = 65_536
+_MAX_RUN_TOKEN_CHARS = 1024
 
 # Objective allowlist: each maps to FINITE per-instance gradient/hessian clip
 # bounds (g*, h*). Only objectives whose gradient AND hessian are provably
@@ -61,6 +69,88 @@ _RDP_ORDERS = (1.25, 1.5, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0)
 _OBJECTIVE_CLIP = {
     "binary:logistic": (1.0, 0.25),
 }
+
+
+def _require_secure_noise_rng(rng):
+    if not isinstance(rng, SecureNumpyRng):
+        raise RuntimeError(
+            "DP-GBDT requires an explicit release-scoped SecureNumpyRng"
+        )
+    if not callable(getattr(rng, "normal", None)):
+        raise RuntimeError("DP-GBDT secure RNG must provide normal()")
+    return rng
+
+
+def _bounded_int(value, name, lo, hi):
+    if (isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))):
+        raise ValueError("%s must be an int in [%d, %d], got %r"
+                         % (name, lo, hi, value))
+    value = int(value)
+    if value < lo or value > hi:
+        raise ValueError("%s must be an int in [%d, %d], got %r"
+                         % (name, lo, hi, value))
+    return value
+
+
+def _finite_float(value, name, *, positive=False):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("%s must be a finite number, got %r" % (name, value))
+    if not math.isfinite(value) or (positive and value <= 0.0):
+        suffix = " and > 0" if positive else ""
+        raise ValueError("%s must be finite%s, got %r" % (name, suffix, value))
+    return value
+
+
+def _finite_xy(X, y):
+    """Normalize and reject non-finite private data before any DP mechanism."""
+    try:
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).ravel()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("X and y must be numeric arrays") from exc
+    if X.ndim != 2 or X.shape[0] < 1 or X.shape[1] < 1:
+        raise ValueError("X must be a non-empty 2D array")
+    if X.shape[1] > _MAX_FEATURES:
+        raise ValueError("X has %d features (cap %d)" % (X.shape[1], _MAX_FEATURES))
+    if y.shape != (X.shape[0],):
+        raise ValueError("y length %d != X rows %d" % (y.size, X.shape[0]))
+    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
+        raise ValueError("X and y must contain only finite values")
+    return X, y
+
+
+def _validated_feature_ranges(feature_ranges, n_features=None):
+    if not isinstance(feature_ranges, (list, tuple)) or not feature_ranges:
+        raise ValueError("feature_ranges must be a non-empty list")
+    if len(feature_ranges) > _MAX_FEATURES:
+        raise ValueError("feature_ranges has %d entries (cap %d)"
+                         % (len(feature_ranges), _MAX_FEATURES))
+    if n_features is not None and len(feature_ranges) != int(n_features):
+        raise ValueError("feature_ranges length %d != n_features %d"
+                         % (len(feature_ranges), n_features))
+    result = []
+    for j, bounds in enumerate(feature_ranges):
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+            raise ValueError("feature_ranges[%d] must be [lower, upper]" % j)
+        lo = _finite_float(bounds[0], "feature_ranges[%d].lower" % j)
+        hi = _finite_float(bounds[1], "feature_ranges[%d].upper" % j)
+        span = hi - lo
+        if not (hi > lo and math.isfinite(span)):
+            raise ValueError("feature_ranges[%d] must be finite with lower < upper "
+                             "and a finite span" % j)
+        result.append((lo, hi))
+    return result
+
+
+def _validated_run_token(run_token):
+    if (not isinstance(run_token, str) or not run_token
+            or len(run_token) > _MAX_RUN_TOKEN_CHARS):
+        raise ValueError("run_token must be a non-empty string of at most %d characters"
+                         % _MAX_RUN_TOKEN_CHARS)
+    return run_token
 
 
 def clip_bounds(objective):
@@ -88,73 +178,47 @@ def replace_one_sensitivity(g_star, h_star):
     return math.sqrt((2.0 * float(g_star)) ** 2 + float(h_star) ** 2)
 
 
-def _rdp_gaussian(alpha, sigma):
-    """RDP of the Gaussian mechanism at order alpha, noise multiplier sigma
-    (= noise_std / sensitivity). Mirrors privacy_ledger.R::.rdp_gaussian."""
-    if sigma <= 0:
-        return math.inf
-    return alpha / (2.0 * sigma * sigma)
-
-
-def _rdp_to_dp(rdp_vec, orders, delta):
-    """RDP → (epsilon, delta) conversion. Mirrors privacy_ledger.R::.rdp_to_dp:
-    epsilon(delta) = min over alpha of [rdp(alpha) + log(1/delta)/(alpha-1)]."""
-    if delta <= 0 or delta >= 1:
-        return math.inf
-    return min(r + math.log(1.0 / delta) / (a - 1.0)
-               for r, a in zip(rdp_vec, orders))
-
-
-def gbdt_epsilon(sigma, delta, t_total, orders=_RDP_ORDERS):
+def gbdt_epsilon(sigma, delta, t_total):
     """(epsilon, delta) achieved by ``t_total`` sequential Gaussian releases at
-    noise multiplier ``sigma`` (RDP composes by addition)."""
-    rdp_vec = [t_total * _rdp_gaussian(a, sigma) for a in orders]
-    return _rdp_to_dp(rdp_vec, orders, delta)
+    noise multiplier ``sigma``, minimized over every real Renyi order > 1.
 
-
-def calibrate_gbdt_sigma(epsilon, delta, t_total, orders=_RDP_ORDERS):
-    """Smallest Gaussian noise multiplier σ s.t. ``t_total`` composed releases
-    achieve (epsilon, delta)-DP. RDP-primary, pure-numpy, FAILS CLOSED.
-
-    Returns σ (= noise_std / sensitivity). The caller draws N(0, (σ·Δ₂)²) on each
-    of the 2L histogram coordinates. ε is monotonically decreasing in σ, so we
-    bracket then bisect. Raises RuntimeError rather than returning an
-    under-noising fallback.
+    For one Gaussian, RDP(alpha)=alpha/(2*sigma^2). Composing T releases and
+    minimizing ``T*alpha/(2*sigma^2) + log(1/delta)/(alpha-1)`` gives the closed
+    bound below. Unlike a finite order grid, it remains valid and useful for
+    arbitrarily small positive epsilon in the supported policy range.
     """
-    if not (epsilon > 0) or not (0 < delta < 1):
+    try:
+        sigma = float(sigma)
+        delta = float(delta)
+        releases = float(t_total)
+    except (TypeError, ValueError, OverflowError):
+        return math.inf
+    if (not math.isfinite(sigma) or sigma <= 0.0
+            or not math.isfinite(delta) or not 0.0 < delta < 1.0
+            or not math.isfinite(releases) or releases < 1.0
+            or releases != math.floor(releases)):
+        return math.inf
+    inv_sigma = 1.0 / sigma
+    return (releases * inv_sigma * inv_sigma / 2.0
+            + inv_sigma * math.sqrt(
+                2.0 * releases * math.log(1.0 / delta)))
+
+
+def calibrate_gbdt_sigma(epsilon, delta, t_total):
+    """Conservative closed-form multiplier for the composed Gaussian transcript."""
+    epsilon = _finite_float(epsilon, "epsilon", positive=True)
+    delta = _finite_float(delta, "delta")
+    if not (0 < delta < 1):
         raise ValueError("require epsilon > 0 and 0 < delta < 1")
-    t_total = max(1, int(t_total))
+    t_total = _bounded_int(t_total, "t_total", 1, _MAX_TREES)
 
-    def eps_at(sigma):
-        return gbdt_epsilon(sigma, delta, t_total, orders)
-
-    lo, hi = 1.0e-3, 1.0
-    # Grow hi until enough noise meets the budget.
-    bracketed = False
-    for _ in range(64):
-        if eps_at(hi) <= epsilon:
-            bracketed = True
-            break
-        hi *= 2.0
-    if not bracketed:
-        raise RuntimeError(
-            "DP-GBDT noise calibration could not bracket a multiplier for "
-            "(epsilon=%g, delta=%g, T_total=%d); refusing to train rather than "
-            "under-noise." % (epsilon, delta, t_total))
-    if eps_at(lo) <= epsilon:
-        # Even negligible noise already satisfies a (very loose) budget.
-        sigma = lo
-    else:
-        for _ in range(100):
-            mid = 0.5 * (lo + hi)
-            if eps_at(mid) <= epsilon:
-                hi = mid
-            else:
-                lo = mid
-        sigma = hi  # hi-side always satisfies the budget
+    root_log = math.sqrt(2.0 * -math.log(delta))
+    positive_root = math.hypot(root_log, math.sqrt(2.0 * epsilon))
+    y = (2.0 * epsilon) / (positive_root + root_log)
+    sigma = math.sqrt(float(t_total)) / y
     if not math.isfinite(sigma) or sigma <= 0:
         raise RuntimeError("DP-GBDT noise calibration failed; refusing to train.")
-    return float(sigma)
+    return math.nextafter(float(sigma) * (1.0 + 1.0e-12), math.inf)
 
 
 # --------------------------------------------------------------------------- #
@@ -176,7 +240,7 @@ def _logit(p):
 
 def _seed(run_token, *parts):
     """Deterministic 63-bit seed from the run token + integer parts. Identical on
-    every node (run_token is manifest-pinned), so trees match federation-wide."""
+    a retry of this node's manifest-pinned run."""
     key = (str(run_token) + ":" + ":".join(str(int(p)) for p in parts)).encode()
     return int(hashlib.sha256(key).hexdigest()[:16], 16) & 0x7FFFFFFFFFFFFFFF
 
@@ -184,27 +248,33 @@ def _seed(run_token, *parts):
 def random_tree(run_token, tree_index, depth, feature_ranges, n_bins):
     """Complete binary tree of ``depth``; each internal node's (feature,
     threshold) is drawn from a PUBLIC PRNG seeded by (run_token, tree_index,
-    node_index). Data-independent ⇒ zero split budget, identical on every node.
+    node_index). Data-independent ⇒ zero split budget and exact retryability
+    within one node run.
 
     Returns (feat[n_internal], thr[n_internal]) where n_internal = 2^depth - 1
     and node k's children are 2k+1 (left, x<thr) and 2k+2 (right, x>=thr).
+    The live federated path bags local boosters, so independent node run tokens
+    may intentionally produce different public structures.
     Thresholds lie on bin boundaries inside the manifest-pinned [lo, hi] range.
     """
-    depth = int(depth)
+    run_token = _validated_run_token(run_token)
+    tree_index = _bounded_int(tree_index, "tree_index", 0, _MAX_TREES - 1)
+    depth = _bounded_int(depth, "depth", 1, _MAX_DEPTH)
+    n_bins = _bounded_int(n_bins, "n_bins", 2, _MAX_BINS)
+    feature_ranges = _validated_feature_ranges(feature_ranges)
     n_internal = (1 << depth) - 1
     n_features = len(feature_ranges)
-    n_bins = max(2, int(n_bins))
     feat = np.empty(n_internal, dtype=np.int64)
     thr = np.empty(n_internal, dtype=np.float64)
     for node in range(n_internal):
         rng = np.random.default_rng(_seed(run_token, tree_index, node))
         j = int(rng.integers(0, n_features))
-        lo, hi = float(feature_ranges[j][0]), float(feature_ranges[j][1])
-        if not (hi > lo):
-            hi = lo + 1.0
+        lo, hi = feature_ranges[j]
         b = int(rng.integers(1, n_bins))           # bin boundary 1..n_bins-1
         feat[node] = j
         thr[node] = lo + (hi - lo) * (b / float(n_bins))
+        if not math.isfinite(thr[node]):
+            raise RuntimeError("random-tree threshold is non-finite; refusing to train")
     return feat, thr
 
 
@@ -233,10 +303,18 @@ def pool_by_patient(X, y, patient_ids):
     label) so the DP unit is the patient: one patient then routes to one leaf and
     contributes one clamped (g, h), bounding its replace-one sensitivity to Δ₂.
     Returns (X_pooled, y_pooled)."""
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64).ravel()
+    X, y = _finite_xy(X, y)
     pid = np.asarray(patient_ids).ravel()
-    uniq = np.unique(pid)
+    if pid.shape != (X.shape[0],):
+        raise ValueError("patient_ids length %d != X rows %d" % (pid.size, X.shape[0]))
+    for value in pid:
+        if value is None or (isinstance(value, (float, np.floating))
+                             and not math.isfinite(float(value))):
+            raise ValueError("patient_ids must not contain missing values")
+    try:
+        uniq = np.unique(pid)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("patient_ids must have a consistently comparable type") from exc
     Xp = np.empty((len(uniq), X.shape[1]), dtype=np.float64)
     yp = np.empty(len(uniq), dtype=np.float64)
     for k, u in enumerate(uniq):
@@ -275,18 +353,53 @@ def predict_proba(booster, X):
 # --------------------------------------------------------------------------- #
 
 def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
-                          sigma, delta2, g_star, h_star, n_leaves, rng=None):
+                          sigma, delta2, g_star, h_star, n_leaves, rng):
     """ONE round, node-side: compute this node's per-leaf (G, H) histogram for the
     given (already public) tree structure, then add the FULL Gaussian noise
-    LOCALLY before returning — the local-DP release. ``current_margin`` is F(x_i)
+    on-node before returning — the curator-side DP release. ``current_margin`` is F(x_i)
     from the global booster grown so far (post-processing; DP-safe).
 
     Returns the noised 2L vector S̃ = concat(G̃, H̃). The caller (ClientApp) ships
     this; it never ships raw sums.
     """
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64).ravel()
-    p = _sigmoid(np.asarray(current_margin, dtype=np.float64))
+    rng = _require_secure_noise_rng(rng)
+    X, y = _finite_xy(X, y)
+    depth = _bounded_int(depth, "depth", 1, _MAX_DEPTH)
+    n_leaves = _bounded_int(n_leaves, "n_leaves", 2, 1 << _MAX_DEPTH)
+    if n_leaves != 1 << depth:
+        raise ValueError("n_leaves must equal 2^depth")
+    n_internal = n_leaves - 1
+    try:
+        if len(feat) != n_internal or len(thr) != n_internal:
+            raise ValueError("feat/thr must have length %d" % n_internal)
+        raw_feat = np.asarray(feat)
+        feat = np.asarray(feat, dtype=np.int64)
+        thr = np.asarray(thr, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("feat/thr must be numeric vectors of length %d" % n_internal) from exc
+    if (raw_feat.shape != (n_internal,) or feat.shape != (n_internal,)
+            or not np.issubdtype(raw_feat.dtype, np.integer)):
+        raise ValueError("feat must be an integer vector of length %d" % n_internal)
+    if thr.shape != (n_internal,) or not np.all(np.isfinite(thr)):
+        raise ValueError("thr must be a finite vector of length %d" % n_internal)
+    if np.any(feat < 0) or np.any(feat >= X.shape[1]):
+        raise ValueError("tree feature index is outside X's columns")
+    try:
+        current_margin = np.asarray(current_margin, dtype=np.float64).ravel()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("current_margin must be numeric") from exc
+    if (current_margin.shape != (X.shape[0],)
+            or not np.all(np.isfinite(current_margin))):
+        raise ValueError("current_margin must be finite with one value per X row")
+    sigma = _finite_float(sigma, "sigma", positive=True)
+    delta2 = _finite_float(delta2, "delta2", positive=True)
+    g_star = _finite_float(g_star, "g_star", positive=True)
+    h_star = _finite_float(h_star, "h_star", positive=True)
+    noise_std = sigma * delta2
+    if not math.isfinite(noise_std):
+        raise ValueError("sigma * delta2 must be finite")
+
+    p = _sigmoid(current_margin)
     g = np.clip(p - y, -g_star, g_star)
     h = np.clip(p * (1.0 - p), 0.0, h_star)
     leaf = route_to_leaf(X, feat, thr, depth)
@@ -294,15 +407,21 @@ def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
     H = np.zeros(n_leaves, dtype=np.float64)
     np.add.at(G, leaf, g)
     np.add.at(H, leaf, h)
-    noise_std = float(sigma) * float(delta2)
-    # DP leaf noise. A SEEDED `rng` (from node secret + data + config) makes the noise
-    # deterministic across identical repeats yet unpredictable to the analyst (defeats
-    # averaging); None -> fresh OS entropy (non-reproducible, always safe). A predictable
-    # secret-less seed would void DP, so the seed must fold in the node secret.
-    _noise_rng = rng if rng is not None else np.random.default_rng()
-    G_tilde = G + _noise_rng.normal(0.0, noise_std, size=n_leaves)
-    H_tilde = H + _noise_rng.normal(0.0, noise_std, size=n_leaves)
-    return np.concatenate([G_tilde, H_tilde])
+    if not np.all(np.isfinite(G)) or not np.all(np.isfinite(H)):
+        raise RuntimeError("DP-GBDT raw histogram overflowed; refusing to run the mechanism")
+    G_noise = np.asarray(rng.normal(0.0, noise_std, size=n_leaves),
+                         dtype=np.float64)
+    H_noise = np.asarray(rng.normal(0.0, noise_std, size=n_leaves),
+                         dtype=np.float64)
+    if (G_noise.shape != (n_leaves,) or H_noise.shape != (n_leaves,)
+            or not np.all(np.isfinite(G_noise)) or not np.all(np.isfinite(H_noise))):
+        raise RuntimeError("DP-GBDT noise generator returned a non-finite/invalid draw")
+    G_tilde = G + G_noise
+    H_tilde = H + H_noise
+    released = np.concatenate([G_tilde, H_tilde])
+    if not np.all(np.isfinite(released)):
+        raise RuntimeError("DP-GBDT noised histogram is non-finite; refusing release")
+    return released
 
 
 def grow_tree_from_histograms(summed_hist, n_leaves, reg_lambda, learning_rate):
@@ -313,11 +432,31 @@ def grow_tree_from_histograms(summed_hist, n_leaves, reg_lambda, learning_rate):
 
         w_ℓ = -η · G̃_ℓ / max(λ, H̃_ℓ + λ)        (denominator guard)
     """
-    s = np.asarray(summed_hist, dtype=np.float64)
+    n_leaves = _bounded_int(n_leaves, "n_leaves", 2, 1 << _MAX_DEPTH)
+    try:
+        if len(summed_hist) != 2 * n_leaves:
+            raise ValueError("wrong histogram length")
+        s = np.asarray(summed_hist, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("summed_hist must be numeric") from exc
+    if s.shape != (2 * n_leaves,) or not np.all(np.isfinite(s)):
+        raise ValueError("summed_hist must be a finite vector of length %d"
+                         % (2 * n_leaves))
     G = s[:n_leaves]
     H = s[n_leaves:2 * n_leaves]
-    lam = float(reg_lambda)
-    return (-float(learning_rate) * G / np.maximum(lam, H + lam)).astype(np.float64)
+    lam = _finite_float(reg_lambda, "reg_lambda", positive=True)
+    eta = _finite_float(learning_rate, "learning_rate", positive=True)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        numerator = -eta * G
+        shifted_h = H + lam
+        denominator = np.maximum(lam, shifted_h)
+        w = (numerator / denominator).astype(np.float64)
+    if (not np.all(np.isfinite(numerator))
+            or not np.all(np.isfinite(shifted_h))):
+        raise RuntimeError("DP-GBDT leaf-weight arithmetic overflowed; refusing release")
+    if not np.all(np.isfinite(w)):
+        raise RuntimeError("DP-GBDT leaf weights are non-finite; refusing release")
+    return w
 
 
 # --------------------------------------------------------------------------- #
@@ -326,8 +465,8 @@ def grow_tree_from_histograms(summed_hist, n_leaves, reg_lambda, learning_rate):
 
 def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
                 feature_ranges, n_bins, run_token, epsilon, delta,
-                base_score=0.5, patient_ids=None, noise_seed=None):
-    """Train a DP-GBDT booster in one process with LOCAL DP: each tree is one
+                noise_rng, base_score=0.5, patient_ids=None):
+    """Train a DP-GBDT booster with trusted-curator DP at one node: each tree is one
     Gaussian release, σ is calibrated once for T_total = n_trees. Returns the
     booster dict (our own serializable format).
 
@@ -340,43 +479,69 @@ def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
     already averages M per-leaf estimates -> the same ~sqrt(M) noise reduction), while
     it costs T sequential Flower round-trips. The primitives are kept for tests and as
     a reference implementation, but the live path is bagging.
+
+    ``noise_rng`` is deliberately mandatory and type-checked. Production and
+    direct callers share the same CSPRNG contract; tests that need failure
+    doubles subclass ``SecureNumpyRng`` explicitly instead of activating an
+    insecure fallback.
     """
+    objective = str(objective)
+    g_star, h_star = clip_bounds(objective)
+    depth = _bounded_int(depth, "depth", 1, _MAX_DEPTH)
+    t_total = _bounded_int(n_trees, "n_trees", 1, _MAX_TREES)
+    n_bins = _bounded_int(n_bins, "n_bins", 2, _MAX_BINS)
+    learning_rate = _finite_float(learning_rate, "learning_rate", positive=True)
+    reg_lambda = _finite_float(reg_lambda, "reg_lambda", positive=True)
+    epsilon = _finite_float(epsilon, "epsilon", positive=True)
+    delta = _finite_float(delta, "delta")
+    if not (0.0 < delta < 1.0):
+        raise ValueError("require 0 < delta < 1")
+    base_score = _finite_float(base_score, "base_score")
+    if not (0.0 <= base_score <= 1.0):
+        raise ValueError("base_score must be in [0, 1]")
+    run_token = _validated_run_token(run_token)
+    noise_rng = _require_secure_noise_rng(noise_rng)
+
+    # This gate intentionally precedes patient pooling and every noise draw. Legacy
+    # staged data may retain missing values (drop_missing=FALSE); NaN/Inf must fail
+    # closed instead of becoming data-dependent routing or a non-finite release.
+    X, y = _finite_xy(X, y)
     if patient_ids is not None:
         X, y = pool_by_patient(X, y, patient_ids)
-    X = np.asarray(X, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64).ravel()
     n, n_features = X.shape
-    if len(feature_ranges) != n_features:
-        raise ValueError("feature_ranges length %d != n_features %d"
-                         % (len(feature_ranges), n_features))
-    g_star, h_star = clip_bounds(objective)
+    feature_ranges = _validated_feature_ranges(feature_ranges, n_features)
     delta2 = replace_one_sensitivity(g_star, h_star)
-    depth = int(depth)
     n_leaves = 1 << depth
-    t_total = max(1, int(n_trees))
     sigma = calibrate_gbdt_sigma(epsilon, delta, t_total)   # ONE σ up front
 
-    base_margin = _logit(float(base_score))
-    booster = {"objective": objective, "depth": depth, "n_bins": int(n_bins),
-               "base_margin": base_margin, "learning_rate": float(learning_rate),
-               "feature_ranges": [[float(a), float(b)] for a, b in feature_ranges],
-               "sigma": float(sigma), "delta2": float(delta2),
-               "epsilon": float(epsilon), "delta": float(delta), "trees": []}
+    base_margin = _logit(base_score)
+    if not math.isfinite(base_margin):
+        raise RuntimeError("DP-GBDT base margin is non-finite; refusing to train")
+    booster = {"objective": objective, "depth": depth, "n_bins": n_bins,
+               "base_margin": base_margin, "learning_rate": learning_rate,
+               "feature_ranges": [[a, b] for a, b in feature_ranges],
+               "sigma": sigma, "delta2": delta2,
+               "epsilon": epsilon, "delta": delta, "trees": []}
     F = np.full(n, base_margin, dtype=np.float64)
-    # ONE seeded generator drives every tree's leaf noise: deterministic across identical
-    # repeats when noise_seed is set (from node secret + data + config), OS entropy when None.
-    noise_rng = np.random.default_rng(noise_seed)
+    # ONE release-scoped CSPRNG drives every tree's leaf noise.
     debits = 0
     for t in range(t_total):
         feat, thr = random_tree(run_token, t, depth, feature_ranges, n_bins)
         s_tilde = node_noised_histogram(
             X, y, F, feat, thr, depth, sigma=sigma, delta2=delta2,
             g_star=g_star, h_star=h_star, n_leaves=n_leaves, rng=noise_rng)
+        if not np.all(np.isfinite(s_tilde)):
+            raise RuntimeError("DP-GBDT histogram is non-finite; refusing release")
         debits += 1
         w = grow_tree_from_histograms(s_tilde, n_leaves, reg_lambda, learning_rate)
+        if not np.all(np.isfinite(w)):
+            raise RuntimeError("DP-GBDT leaf weights are non-finite; refusing release")
+        leaf = route_to_leaf(X, feat, thr, depth)
+        next_F = F + w[leaf]
+        if not np.all(np.isfinite(next_F)):
+            raise RuntimeError("DP-GBDT margin is non-finite; refusing release")
         booster["trees"].append({"feat": feat.tolist(), "thr": thr.tolist(),
                                   "w": w.tolist()})
-        leaf = route_to_leaf(X, feat, thr, depth)
-        F = F + w[leaf]
+        F = next_F
     assert debits == t_total, "DP-GBDT release count != T_total; refusing release"
     return booster

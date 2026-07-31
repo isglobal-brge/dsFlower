@@ -2,7 +2,7 @@
 % Please edit documentation in R/interface.R
 \name{flowerFeatureStatsDS}
 \alias{flowerFeatureStatsDS}
-\title{Per-feature standardization statistics (disclosure-controlled)}
+\title{Legacy per-feature statistics endpoint (DP-safe compatibility response)}
 \usage{
 flowerFeatureStatsDS(data_symbol, feature_columns = NULL)
 }
@@ -13,20 +13,13 @@ flowerFeatureStatsDS(data_symbol, feature_columns = NULL)
 column names (order is preserved in the returned vectors). NULL = all columns.}
 }
 \value{
-Named list with \code{features}, \code{n}, \code{sum}, \code{sumsq}
-  (numeric vectors aligned to \code{features}).
+Named list with the requested \code{features}, zero-valued
+  \code{n}/\code{sum}/\code{sumsq} vectors, \code{disabled = TRUE}, and a
+  reason. No statistic computed from feature values is returned.
 }
 \description{
-DataSHIELD AGGREGATE method. Returns per-feature count / sum / sum-of-squares
-for the requested numeric columns of an assigned data.frame so the client can
-compute GLOBAL feature means/SDs across nodes and standardize DP-SGD inputs.
-}
-\details{
-These are cohort-level aggregates (exactly what \code{ds.mean} / \code{ds.var}
-release): they reveal nothing about an individual row, and the call is gated on
-the same minimum-rows disclosure threshold as training admission. No DP noise
-is added -- an aggregate over >= min rows is a sanctioned DataSHIELD release,
-and the stats are pure post-processing for the model: a poisoned value can only
-hurt accuracy, never the DP guarantee (the node enforces (eps,delta) on its own
-via DP-SGD, independently of any client-supplied normalization).
+Exact sums and sums-of-squares are incompatible with dsFlower's DP-only egress
+contract.  The symbol remains callable by older clients, but returns a
+data-independent identity transform (n/sum/sumsq all zero).  New clients use
+public, analyst-supplied feature bounds instead.
 }

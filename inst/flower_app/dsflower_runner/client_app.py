@@ -12,39 +12,251 @@ Tracks, dispatched on the manifest's pinned ``dp-track``:
     that trains only a head on FROZEN-backbone features). Per-sample clip + noise;
     the loss is harness-owned; the released state_dict is stash-gated.
   * trees  — enforced DP-GBDT (S-GBDT mechanism): random-split trees with the full
-    Gaussian noise added node-side to each leaf histogram (local DP), then a
+    Gaussian noise added by the node-side curator to each leaf histogram, then a
     booster the untrusted ServerApp bags by post-processing.
   * egress — the labelled-weaker fallback: the client's own local_update, wrapped
     in output-perturbation DP (whole-update clip + Gaussian noise). Admission-gated.
 """
 
 import json
+import io
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from flwr.clientapp import ClientApp
-from flwr.common import ArrayRecord, Context, Message, MetricRecord, RecordDict
+from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
+                         MetricRecord, RecordDict)
 
 from .task import (load_data, load_image_collection, is_image_run,
                    load_privacy_config, load_dp_track, load_run_pins,
-                   load_gbdt_spec, load_tabular_patient_ids)
+                   load_gbdt_spec, load_tabular_patient_ids,
+                   load_pinned_run_config)
 from .params import get_torch_params, set_torch_params, load_user_model
 
 # RELATIVE imports only: resolve within this trusted package, so an uploaded module on
 # sys.path / PYTHONPATH cannot shadow dp_harness / dp_gbdt and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import dp_harness, dp_gbdt, seeding
+from . import dp_harness, dp_gbdt, release_guard, seeding, task as task_module
 
 
 app = ClientApp()
+
+_MAX_EGRESS_ARRAYS = 256
+_MAX_EGRESS_NDIM = 8
+_MAX_EGRESS_ELEMENTS = 8_000_000
+_MAX_EGRESS_BYTES = 64 * 1024 * 1024
+_MAX_PUBLIC_ARRAY_ABS = dp_harness.MAX_RELEASE_ABS
+
+
+def _reply(msg, arrays):
+    """Return arrays with one constant, data-independent aggregation weight."""
+    return Message(content=RecordDict({
+        "arrays": ArrayRecord(numpy_ndarrays=[np.asarray(a) for a in arrays]),
+        "metrics": MetricRecord({"num-examples": 1}),
+    }), reply_to=msg)
+
+
+def _cache_reply(context, claim, arrays):
+    context.state["dsflower-last-release"] = ArrayRecord(
+        numpy_ndarrays=[np.asarray(a) for a in arrays])
+    context.state["dsflower-last-release-meta"] = ConfigRecord({
+        "message-id": claim["message_id"],
+        "release-index": int(claim["release_index"]),
+    })
+
+
+def _replay_reply(context, claim, msg):
+    meta = context.state.get("dsflower-last-release-meta")
+    arrays = context.state.get("dsflower-last-release")
+    if (meta is not None and arrays is not None
+            and meta.get("message-id") == claim["message_id"]):
+        return _reply(msg, arrays.to_numpy_ndarrays())
+    # An old replay whose bytes are no longer cached gets no new private release.
+    return _safe_noop_reply(msg, context, claim=claim)
+
+
+def _validate_public_egress_arrays(arrays, label="HookApp"):
+    """Bound an analyst-supplied public model before any private-data read."""
+    if hasattr(arrays, "to_numpy_ndarrays") and hasattr(arrays, "values"):
+        encoded = list(arrays.values())
+        if not (1 <= len(encoded) <= _MAX_EGRESS_ARRAYS):
+            raise RuntimeError("%s initial arrays exceed the public array-count cap" % label)
+        serialized_bytes = 0
+        metadata_elements = 0
+        metadata_bytes = 0
+        for item in encoded:
+            data = getattr(item, "data", None)
+            if getattr(item, "stype", None) != "numpy.ndarray" or not isinstance(data, bytes):
+                raise RuntimeError("%s initial arrays need NumPy tensor encoding" % label)
+            serialized_bytes += len(data)
+            if serialized_bytes > _MAX_EGRESS_BYTES + _MAX_EGRESS_ARRAYS * 4096:
+                raise RuntimeError("%s initial arrays exceed the public model-size cap" % label)
+            try:
+                stream = io.BytesIO(data)
+                version = np.lib.format.read_magic(stream)
+                if version == (1, 0):
+                    shape, _, dtype = np.lib.format.read_array_header_1_0(
+                        stream, max_header_size=4096)
+                elif version == (2, 0):
+                    shape, _, dtype = np.lib.format.read_array_header_2_0(
+                        stream, max_header_size=4096)
+                else:
+                    raise ValueError("unsupported NPY version")
+                if (tuple(shape) != tuple(item.shape)
+                        or np.dtype(dtype) != np.dtype(item.dtype)
+                        or np.dtype(dtype).kind not in "biuf"
+                        or len(shape) > _MAX_EGRESS_NDIM
+                        or any(isinstance(dim, bool) or int(dim) < 1 for dim in shape)):
+                    raise ValueError("invalid array metadata")
+                elements = int(np.prod(shape, dtype=object))
+                expected_payload = elements * int(np.dtype(dtype).itemsize)
+                if expected_payload != len(data) - stream.tell():
+                    raise ValueError("array payload length mismatch")
+                metadata_elements += elements
+                metadata_bytes += expected_payload
+                if (metadata_elements > _MAX_EGRESS_ELEMENTS
+                        or metadata_bytes > _MAX_EGRESS_BYTES):
+                    raise ValueError("array cap exceeded")
+            except Exception as exc:
+                raise RuntimeError(
+                    "%s initial array encoding is invalid or oversized" % label) from exc
+        arrays = arrays.to_numpy_ndarrays()
+    if not isinstance(arrays, (list, tuple)) or not (1 <= len(arrays) <= _MAX_EGRESS_ARRAYS):
+        raise RuntimeError("%s initial arrays exceed the public array-count cap" % label)
+    total_elements = 0
+    total_bytes = 0
+    validated = []
+    for value in arrays:
+        array = np.asarray(value)
+        if array.dtype.kind not in "biuf" or array.ndim > _MAX_EGRESS_NDIM:
+            raise RuntimeError(
+                "%s initial arrays need bounded real numeric tensors" % label)
+        if array.size < 1 or not bool(np.all(np.isfinite(array))):
+            raise RuntimeError(
+                "%s initial arrays must be non-empty and finite" % label)
+        if bool(np.any(array > _MAX_PUBLIC_ARRAY_ABS)) or bool(
+                np.any(array < -_MAX_PUBLIC_ARRAY_ABS)):
+            raise RuntimeError(
+                "%s initial arrays exceed the public magnitude cap" % label)
+        total_elements += int(array.size)
+        total_bytes += int(array.nbytes)
+        if (total_elements > _MAX_EGRESS_ELEMENTS
+                or total_bytes > _MAX_EGRESS_BYTES):
+            raise RuntimeError("%s initial arrays exceed the public model-size cap" % label)
+        validated.append(array)
+    return validated
 
 
 # --------------------------------------------------------------------------- #
 # Neural track (Opacus DP-SGD)
 # --------------------------------------------------------------------------- #
+
+def _neural_input_dim(context, cfg, manifest_image):
+    """Resolve @in from public server-pinned metadata, without opening data."""
+    if manifest_image:
+        from . import vision
+        backbone = vision.normalize_backbone(
+            cfg.get("backbone", cfg.get("model", "resnet18")))
+        return int(vision.feature_dim_for(backbone))
+
+    manifest = task_module._load_manifest(context)
+    feature_columns = manifest.get("feature_columns")
+    if not isinstance(feature_columns, list) or not feature_columns:
+        raise RuntimeError(
+            "tabular neural manifest must pin non-empty feature_columns")
+    if any(not isinstance(column, str) or not column for column in feature_columns):
+        raise RuntimeError("manifest feature_columns must be non-empty strings")
+    patient_column = manifest.get("patient_column")
+    feature_columns = [column for column in feature_columns
+                       if column != patient_column]
+    if not feature_columns or len(set(feature_columns)) != len(feature_columns):
+        raise RuntimeError("manifest feature_columns are empty or duplicated")
+    return len(feature_columns)
+
+
+def _validate_public_neural_arrays(arrays, model):
+    """Validate and load the public global model before any private-data read."""
+    released = getattr(model, "_module", model)
+    expected_count = sum(
+        1 for _ in torch.nn.Module.named_parameters(released))
+    if hasattr(arrays, "values"):
+        received_count = len(list(arrays.values()))
+    elif isinstance(arrays, (list, tuple)):
+        received_count = len(arrays)
+    else:
+        received_count = -1
+    if received_count != expected_count:
+        raise ValueError(
+            "neural parameter count mismatch: expected %d, received %d"
+            % (expected_count, received_count))
+    arrays = _validate_public_egress_arrays(
+        arrays, label="neural global model")
+    set_torch_params(model, arrays)
+    return arrays
+
+
+def _prepare_neural_model(msg, context, cfg, pins, private_release_id):
+    """Build and initialize the node-owned model using public inputs only."""
+    manifest_image = is_image_run(context)
+    cfg_image = str(cfg.get("data-kind", "")).lower() == "image"
+    if manifest_image != cfg_image:
+        raise RuntimeError(
+            "data-kind mismatch: run config says "
+            + ("image" if cfg_image else "tabular")
+            + " but this node's data is "
+            + ("an image collection" if manifest_image else "tabular")
+            + ". Use a vision model for imaging collections, a tabular model otherwise.")
+    input_dim = _neural_input_dim(context, cfg, manifest_image)
+    master = seeding.master_seed(cfg, None, None, private_release_id)
+    seeding.seed_torch(seeding.sub_seed(master, "init"))
+    model = load_user_model(cfg, input_dim, pins["loss_name"])
+    _validate_public_neural_arrays(msg.content["arrays"], model)
+    return model, master, input_dim, manifest_image
+
+
+def _assert_finite_private_inputs(X, y):
+    """Fail closed before non-finite values can invalidate gradient clipping."""
+    if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
+        raise RuntimeError("DP-SGD inputs must contain only finite values")
+
+
+def _totalize_private_features(X):
+    """Map every feature to the fixed finite domain before patient pooling."""
+    try:
+        values = np.asarray(X, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("model features must be numeric") from exc
+    values = np.nan_to_num(
+        values, nan=0.0, posinf=dp_harness.MAX_PARAMETER_ABS,
+        neginf=-dp_harness.MAX_PARAMETER_ABS)
+    return np.clip(
+        values, -dp_harness.MAX_PARAMETER_ABS,
+        dp_harness.MAX_PARAMETER_ABS).astype(np.float32)
+
+
+def _assert_finite_release(model):
+    """Never release a parameter for which the finite-sensitivity path failed."""
+    released = getattr(model, "_module", model)
+    if any(not bool(torch.isfinite(p).all())
+           for _, p in torch.nn.Module.named_parameters(released)):
+        raise RuntimeError("DP-SGD produced a non-finite parameter; refusing release")
+
+
+def _totalize_grad_samples(model, clipping_norm):
+    """Make every per-sample gradient finite before Opacus computes its L2 clip.
+
+    Deep but valid declarative graphs can overflow during backpropagation even
+    when every forward activation is saturated.  Opacus cannot safely clip an
+    ``inf``/``nan`` norm (``inf * 0`` becomes ``nan``), so first apply a fixed,
+    record-local coordinate saturation.  Opacus then enforces the authoritative
+    global per-sample L2 bound as usual; this preprocessing cannot enlarge that
+    bound or alter the accountant.
+    """
+    dp_harness.totalize_grad_samples(model.parameters(), clipping_norm)
+
 
 def _prep_target(y, loss_name, n_classes):
     """Target tensor shaped for the harness-owned loss. n_classes is node-pinned and
@@ -63,12 +275,15 @@ def _prep_target(y, loss_name, n_classes):
     return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson/count/gamma)
 
 
-def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=None):
+def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
     client run config -- so the client cannot stretch the composition horizon while
     the ledger debits a fixed budget."""
+    _assert_finite_private_inputs(X, y)
+    X = np.clip(X, -dp_harness.MAX_PARAMETER_ABS,
+                dp_harness.MAX_PARAMETER_ABS).astype(np.float32)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loss_name = pins["loss_name"]
     batch_size = int(pins["batch_size"])
@@ -83,9 +298,10 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=None):
     # Validated non-negative; both 0 -> identical to the plain path.
     weight_decay = float(cfg.get("weight-decay", 0.0))
     l1_penalty = float(cfg.get("l1-penalty", 0.0))
-    if not (np.isfinite(weight_decay) and weight_decay >= 0.0
-            and np.isfinite(l1_penalty) and l1_penalty >= 0.0):
-        raise RuntimeError("weight-decay and l1-penalty must be finite and >= 0")
+    if not (np.isfinite(weight_decay) and 0.0 <= weight_decay <= 1.0e3
+            and np.isfinite(l1_penalty) and 0.0 <= l1_penalty <= 1.0e3):
+        raise RuntimeError(
+            "weight-decay and l1-penalty must be finite and in [0, 1000]")
     model = model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     dataset = TensorDataset(torch.from_numpy(X).float(),
@@ -97,27 +313,19 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=None):
     # per-patient pooling (which reduces len(dataset)) does not trip this check.
     if pcfg.get("n_samples") and int(pcfg["n_samples"]) != int(n_staged):
         raise RuntimeError("staged sample count != manifest n_samples (fail closed)")
-    # Seeded shuffle generator: deterministic batch order across identical repeats
-    # (from node secret + data + config); random when no secret is present.
-    trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                             generator=seeding.torch_generator(
-                                 seeding.sub_seed(master, "shuffle"), "cpu"))
-
-    # Seed the global RNG (Opacus's Poisson sampler + internal draws) and pass a seeded
-    # noise_generator so the DP noise is reproducible-yet-secret. Both fall back to fresh
-    # randomness when the node has no secret.
-    seeding.seed_torch(seeding.sub_seed(master, "sample"))
+    # This loader pins the horizon only. The harness replaces it with independent
+    # Poisson draws driven directly by the domain-separated ChaCha20 stream.
+    trainloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     model, optimizer, trainloader, _engine = dp_harness.make_private_dpsgd(
         model, optimizer, trainloader,
         clipping_norm=pcfg["clipping_norm"], epsilon=pcfg["epsilon"],
         delta=pcfg["delta"], local_epochs=local_epochs, num_rounds=num_rounds,
         n_samples=len(dataset), batch_size=batch_size,
-        noise_generator=seeding.torch_generator(seeding.sub_seed(master, "noise"), device))
-
-    set_torch_params(model, msg.content["arrays"].to_numpy_ndarrays())
+        secure_noise_rng=seeding.np_rng(seeding.sub_seed(master, "noise")),
+        secure_sampling_rng=seeding.np_rng(seeding.sub_seed(master, "sample")))
 
     criterion = dp_harness.loss_from_allowlist(loss_name, cfg)   # node allowlist, mean reduction
-    # Deterministic dropout masks + in-loop sampling across identical repeats.
+    # Deterministic dropout masks; sampling remains on its separate ChaCha stream.
     seeding.seed_torch(seeding.sub_seed(master, "train"))
     model.train()
     for _ in range(local_epochs):
@@ -127,6 +335,7 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=None):
             optimizer.zero_grad()
             loss = criterion(model(xb), yb)
             loss.backward()
+            _totalize_grad_samples(model, pcfg["clipping_norm"])
             # Defense-in-depth for the param-stash (A1): undo ANY in-place write the
             # forward made to the leaf params BEFORE the optimizer steps, so weights
             # evolve ONLY via the (noised) DP-SGD update, never a forward side effect.
@@ -136,9 +345,18 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=None):
                 for p, c in zip(model.parameters(), clean):
                     p.copy_(c)
             optimizer.step()
-            if l1_penalty > 0.0:        # lasso / elastic-net: proximal on PUBLIC weights
-                thr = l1_penalty * lr
-                with torch.no_grad():
+            with torch.no_grad():
+                for p in model.parameters():
+                    # Saturating parameters is post-processing of the noised
+                    # optimizer step and keeps every subsequent forward inside
+                    # the declared finite numeric domain.
+                    p.nan_to_num_(nan=0.0,
+                                  posinf=dp_harness.MAX_PARAMETER_ABS,
+                                  neginf=-dp_harness.MAX_PARAMETER_ABS)
+                    p.clamp_(-dp_harness.MAX_PARAMETER_ABS,
+                             dp_harness.MAX_PARAMETER_ABS)
+                if l1_penalty > 0.0:    # proximal on already-DP public weights
+                    thr = l1_penalty * lr
                     for p in model.parameters():
                         p.copy_(torch.sign(p) * torch.clamp(p.abs() - thr, min=0.0))
     # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
@@ -149,6 +367,7 @@ def _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=None):
     # releasability on the ACTUAL post-training module AND require its released
     # key-set to be EXACTLY the set validated at load. Fail closed on any drift.
     released = getattr(model, "_module", model)
+    _assert_finite_release(model)
     dp_harness.assert_releasable(released)
     expected = getattr(released, "_dsflower_release_keys", None)
     current = tuple(n for n, _ in torch.nn.Module.named_parameters(released))
@@ -183,44 +402,77 @@ def _assert_label_range(y, n_classes):
             "model's n_classes to at least your class count.")
 
 
-def _pool_by_patient(X, y, groups):
-    """Per-PATIENT DP: mean-pool features per patient (one DP example per patient).
-    Returns (X_pooled, y_pooled, True) when labels are patient-level; (None,None,False)
-    when any patient mixes labels (pooling would corrupt them, so keep per-row)."""
+def _pool_by_patient(X, y, groups, loss_name):
+    """Collapse every patient to exactly one DP unit.
+
+    A detected patient identifier must never silently fall back to row-level
+    privacy. Features and continuous outcomes are averaged; categorical
+    outcomes use a deterministic mode, and multilabel outcomes use majority per
+    label. These are local preprocessing operations on one privacy unit.
+    """
     g = [("" if gv is None else str(gv)) for gv in groups]
     g = np.asarray([gv if (gv and gv.lower() != "nan") else f"__row_{i}"
                     for i, gv in enumerate(g)], dtype=object)
     Xp, yp = [], []
+    categorical = loss_name in _CLASSIFICATION_LOSSES
     for key in dict.fromkeys(g.tolist()):
         m = g == key
-        labs = np.unique(y[m])
-        if labs.size > 1:
-            return None, None, False
-        Xp.append(X[m].mean(axis=0))
-        yp.append(labs[0])
-    return np.stack(Xp), np.asarray(yp, dtype=y.dtype), True
+        Xp.append(np.asarray(X[m], dtype=np.float64).mean(axis=0))
+        values = np.asarray(y[m])
+        if values.ndim > 1:
+            pooled = np.asarray(values, dtype=np.float64).mean(axis=0)
+            if categorical:
+                pooled = (pooled >= 0.5).astype(values.dtype)
+        elif categorical:
+            labels, counts = np.unique(values, return_counts=True)
+            pooled = labels[np.argmax(counts)]
+        else:
+            pooled = np.asarray(values, dtype=np.float64).mean()
+        yp.append(pooled)
+    return np.stack(Xp), np.asarray(yp, dtype=y.dtype)
 
 
 def _apply_feature_norm(X, cfg):
-    """Standardize tabular features with the client-computed GLOBAL mean/SD.
+    """Apply public clipped affine bounds, with legacy affine support.
 
-    DP-SGD on RAW features collapses to the majority baseline (per-sample gradient
-    clipping rescales the whole vector to norm C, so large-scale columns dominate
-    and small informative ones vanish -- even with zero DP noise). The client ships
-    cohort-level mean/SD (disclosure-controlled aggregates) so we scale to unit
-    variance; the DP cost then drops to ~0. This is pure post-processing -- the
-    (eps,delta) guarantee is enforced INDEPENDENTLY by DP-SGD on whatever inputs it
-    sees, so a bad/poisoned mu/sigma can only hurt accuracy, never privacy. No-op if
-    the run config carries no stats; FAIL-CLOSED on a length mismatch (a silent skip
-    would desync from prediction, which always normalizes when stats were recorded)."""
+    Bounds are public constants. ``feature-norm-b64`` is retained only for legacy
+    saved runs; its arithmetic is totalised before any patient aggregation so even
+    extreme public mean/SD values cannot create a private success/failure oracle.
+    A length mismatch remains a public configuration error."""
+    bounds = cfg.get("feature-bounds")
+    raw_bounds = cfg.get("feature-bounds-b64")
+    if bounds is None and raw_bounds:
+        import base64
+        try:
+            bounds = json.loads(base64.b64decode(
+                str(raw_bounds), validate=True).decode("utf-8"))
+        except Exception as e:
+            raise RuntimeError("could not decode feature-bounds-b64: %s" % e)
+    if bounds is not None:
+        lower = np.asarray(bounds.get("lower", []), dtype=np.float64)
+        upper = np.asarray(bounds.get("upper", []), dtype=np.float64)
+        if lower.shape != (X.shape[1],) or upper.shape != (X.shape[1],):
+            raise RuntimeError("public feature bounds do not match num features")
+        if (not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper))
+                or not np.all(lower < upper)
+                or np.any(np.abs(lower) > task_module._MAX_NUMERIC_ABS)
+                or np.any(np.abs(upper) > task_module._MAX_NUMERIC_ABS)):
+            raise RuntimeError("public feature bounds must be finite with lower < upper")
+        center = (lower + upper) / 2.0
+        scale = (upper - lower) / 2.0
+        safe = _totalize_private_features(X).astype(np.float64)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            transformed = (np.clip(safe, lower, upper) - center) / scale
+        return _totalize_private_features(transformed)
+
     raw = cfg.get("feature-norm-b64")
     if not raw:
-        return X
+        return _totalize_private_features(X)
     import base64
     try:
         norm = json.loads(base64.b64decode(str(raw), validate=True).decode("utf-8"))
-        mean = np.asarray(norm["means"], dtype=np.float32)
-        sd = np.asarray(norm["sds"], dtype=np.float32)
+        mean = np.asarray(norm["means"], dtype=np.float64)
+        sd = np.asarray(norm["sds"], dtype=np.float64)
     except Exception as e:
         raise RuntimeError("could not decode feature-norm-b64: %s" % e)
     if mean.shape[0] != X.shape[1] or sd.shape[0] != X.shape[1]:
@@ -228,24 +480,15 @@ def _apply_feature_norm(X, cfg):
             "feature-norm length (%d/%d) != num features (%d); refusing to train with a "
             "mismatched normalization (would desync from prediction)."
             % (mean.shape[0], sd.shape[0], X.shape[1]))
-    sd = np.where(np.isfinite(sd) & (sd > 1e-8), sd, 1.0).astype(np.float32)
-    mean = np.where(np.isfinite(mean), mean, 0.0).astype(np.float32)
-    Xn = ((X - mean) / sd).astype(np.float32)
-    if not np.all(np.isfinite(Xn)):
-        raise RuntimeError("non-finite values after feature standardization")
-    return Xn
+    sd = np.where(np.isfinite(sd) & (sd > 1e-8), sd, 1.0)
+    mean = np.where(np.isfinite(mean), mean, 0.0)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        Xn = (np.asarray(X, dtype=np.float64) - mean) / sd
+    return _totalize_private_features(Xn)
 
 
-def _train_neural(msg, context, cfg, pcfg, pins):
-    manifest_image = is_image_run(context)
-    cfg_image = str(cfg.get("data-kind", "")).lower() == "image"
-    if manifest_image != cfg_image:
-        raise RuntimeError(
-            "data-kind mismatch: run config says "
-            + ("image" if cfg_image else "tabular")
-            + " but this node's data is "
-            + ("an image collection" if manifest_image else "tabular")
-            + ". Use a vision model for imaging collections, a tabular model otherwise.")
+def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
+                  manifest_image):
     n_classes = int(pins["n_classes"])
 
     if manifest_image:
@@ -257,6 +500,8 @@ def _train_neural(msg, context, cfg, pcfg, pins):
         if pins["loss_name"] in _CLASSIFICATION_LOSSES:
             _assert_label_range(y, n_classes)
         encoder, feat_dim = vision.build_backbone(backbone)
+        if int(feat_dim) != int(input_dim):
+            raise RuntimeError("backbone feature width changed after model validation")
         read = vision.read_image_3d if vision.is_3d_backbone(backbone) else vision.read_image_2d
         try:
             images = [read(p, image_size) for p in paths]      # the ONLY pass over pixels
@@ -266,76 +511,112 @@ def _train_neural(msg, context, cfg, pcfg, pins):
             raise RuntimeError("no images could be read from the collection")
         X = vision.extract_features(encoder, images)           # frozen, no grad
         del images
-        if not np.all(np.isfinite(X)):
-            raise RuntimeError("non-finite features (corrupt backbone weights or inputs?)")
-        if groups is not None:
-            Xp, yp, pooled = _pool_by_patient(X, y, groups)
-            if pooled:
-                X, y = Xp, yp
-        # Deterministic weight init from (node secret + data + config).
-        master = seeding.master_seed(cfg, X, y)
-        seeding.seed_torch(seeding.sub_seed(master, "init"))
-        # The trainable head is node-built from the researcher's spec, with the
-        # frozen-backbone feature dim as @in (default spec = nn.Linear(feat_dim, @out)).
-        model = load_user_model(cfg, feat_dim, pins["loss_name"])
     else:
         X, y = load_data(context)
+        if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
+            raise RuntimeError("staged feature width changed after model validation")
         X = _apply_feature_norm(X, cfg)        # GLOBAL standardization (affine; commutes with mean-pool)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
         if pins["loss_name"] in _CLASSIFICATION_LOSSES:
             _assert_label_range(y, n_classes)
         groups = load_tabular_patient_ids(context)
-        if groups is not None:
-            Xp, yp, pooled = _pool_by_patient(X, y, groups)
-            if pooled:
-                X, y = Xp, yp
-        master = seeding.master_seed(cfg, X, y)
-        seeding.seed_torch(seeding.sub_seed(master, "init"))
-        model = load_user_model(cfg, X.shape[1], pins["loss_name"])
 
-    # Defense in depth: probe per-sample independence before training. The model is
-    # node-built from the allowlisted spec vocabulary (all per-sample-safe), so this
-    # passes by construction -- but it stays as a fail-closed backstop against a
-    # build_from_spec bug ever admitting a layer that couples samples (x - x.mean(0),
-    # batch attention, cdist(x, x)) and silently breaking the per-sample DP-SGD
-    # sensitivity bound. Cheap; a Linear/ReLU head passes it trivially.
-    import copy
-    k = min(8, len(X))
-    xb = torch.from_numpy(X[:k]).float()
-    yb = _prep_target(y[:k], pins["loss_name"], int(pins["n_classes"]))
-    # Probe a DEEPCOPY: the probe wraps the model with Opacus to read per-sample
-    # gradients, which leaves grad-sample hooks behind; the real model must reach
-    # make_private clean (else Opacus raises "Trying to add hooks twice").
-    dp_harness.per_sample_independence_probe(
-        copy.deepcopy(model), dp_harness.loss_from_allowlist(pins["loss_name"], cfg), xb, yb)
+    X = _totalize_private_features(X)
+    if groups is not None:
+        X, y = _pool_by_patient(X, y, groups, pins["loss_name"])
+        X = _totalize_private_features(X)
 
-    return _dp_fit(model, X, y, pcfg, pins, msg, n_staged, cfg, master=master)
+    return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master)
 
 
 # --------------------------------------------------------------------------- #
-# Trees track (enforced DP-GBDT, local DP node-side)
+# Trees track (enforced DP-GBDT, node-side central DP)
 # --------------------------------------------------------------------------- #
 
 def _booster_to_array(booster):
     """Serialize the booster (our own format) to a uint8 array for transport."""
-    return np.frombuffer(json.dumps(booster).encode("utf-8"), dtype=np.uint8)
+    public_booster = dict(booster)
+    for key in ("sigma", "delta2", "epsilon", "delta", "privacy_noop"):
+        public_booster.pop(key, None)
+    return np.frombuffer(json.dumps(public_booster).encode("utf-8"), dtype=np.uint8)
 
 
-def _train_trees(context, pcfg, cfg):
+def _train_trees(context, pcfg, cfg, private_release_id):
     spec = load_gbdt_spec(context)                 # validated, manifest-authoritative
     X, y = load_data(context)
     pids = load_tabular_patient_ids(context)       # per-patient DP unit when present
-    # Deterministic leaf noise from (node secret + data + config); OS entropy if no secret.
-    noise_seed = seeding.sub_seed(seeding.master_seed(cfg, X, y), "gbdt")
+    master = seeding.master_seed(cfg, X, y, private_release_id)
     booster = dp_gbdt.fit_dp_gbdt(
         X, y, objective=spec["objective"], depth=spec["max_depth"],
         n_trees=spec["n_trees"], learning_rate=spec["learning_rate"],
         reg_lambda=spec["reg_lambda"], feature_ranges=spec["feature_ranges"],
         n_bins=spec["n_bins"], run_token=spec["run_token"],
         epsilon=pcfg["epsilon"], delta=pcfg["delta"], patient_ids=pids,
-        noise_seed=noise_seed)
+        noise_rng=seeding.np_rng(seeding.sub_seed(master, "gbdt-noise")))
     n = len(y) if pids is None else int(np.unique(pids).size)
     return [_booster_to_array(booster)], n
+
+
+def _public_noop_arrays(msg, context, track):
+    """Valid response independent of private rows when no release is available."""
+    if track != "trees":
+        return _validate_public_egress_arrays(
+            msg.content["arrays"], label="public fallback model")
+    spec = load_gbdt_spec(context)  # manifest/public config only; no data needed
+    depth = int(spec["max_depth"])
+    trees = []
+    for tree_index in range(int(spec["n_trees"])):
+        feat, thr = dp_gbdt.random_tree(
+            spec["run_token"], tree_index, depth,
+            spec["feature_ranges"], spec["n_bins"])
+        trees.append({
+            "feat": feat.tolist(),
+            "thr": thr.tolist(),
+            "w": np.zeros(1 << depth, dtype=np.float64).tolist(),
+        })
+    booster = {
+        "objective": spec["objective"],
+        "depth": depth,
+        "n_bins": spec["n_bins"],
+        "base_margin": 0.0,
+        "learning_rate": spec["learning_rate"],
+        "feature_ranges": spec["feature_ranges"],
+        "trees": trees,
+    }
+    return [_booster_to_array(booster)]
+
+
+def _safe_public_noop_arrays(msg, context, track):
+    """Construct a bounded fallback using public inputs/configuration only."""
+    try:
+        return _public_noop_arrays(msg, context, track)
+    except Exception:
+        try:
+            return _validate_public_egress_arrays(
+                msg.content["arrays"], label="public fallback model")
+        except Exception:
+            return [np.zeros(1, dtype=np.float32)]
+
+
+def _safe_noop_reply(msg, context, claim=None, track=None):
+    """Never expose a ClientApp exception through Flower's Error response."""
+    arrays = _safe_public_noop_arrays(msg, context, track)
+    if (claim is not None and claim.get("status") == "new"
+            and claim.get("release_index") is not None):
+        try:
+            _cache_reply(context, claim, arrays)
+        except Exception:
+            pass
+    try:
+        return _reply(msg, arrays)
+    except Exception:
+        # Arrays above are public, but keep a constant minimal last resort in case
+        # their Flower encoding itself is rejected.
+        return Message(content=RecordDict({
+            "arrays": ArrayRecord(
+                numpy_ndarrays=[np.zeros(1, dtype=np.float32)]),
+            "metrics": MetricRecord({"num-examples": 1}),
+        }), reply_to=msg)
 
 
 # --------------------------------------------------------------------------- #
@@ -344,42 +625,72 @@ def _train_trees(context, pcfg, cfg):
 
 @app.train()
 def train(msg: Message, context: Context) -> Message:
-    cfg = dict(context.run_config)
-    pcfg = load_privacy_config(context)
-    # Server-DERIVED routing (single source of truth: dp_harness.resolve_dp_track):
-    # an uploaded user-module is forced to the output-perturbation floor; node-built
-    # artifacts use the node-pinned track. The client cannot route its own code to a
-    # tighter track, and the neural track only ever runs the hash-verified harness.
-    track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
+    claim = None
+    track = None
+    try:
+        claim = release_guard.claim_release(context, msg)  # before any private read
+        if claim["status"] == "replay":
+            return _replay_reply(context, claim, msg)
 
-    if track == "trees":
-        new_arrays, n = _train_trees(context, pcfg, cfg)
-    elif track == "egress":
-        from . import tier2_lib
-        X, y = load_data(context)
-        module_name = str(cfg["user-module"])   # run OUT-OF-PROCESS; the node never imports it
-        old = msg.content["arrays"].to_numpy_ndarrays()
-        # Compose the DP budget over rounds (DP-FedAvg). Basic (sequential) composition of
-        # R Gaussian releases each (eps/R, delta/R)-DP yields (eps, delta)-DP, so BOTH eps
-        # and delta are split by num_rounds -- splitting only eps would leave the total at
-        # (eps, R*delta), not (eps, delta). Use the MANIFEST-PINNED rounds (server-written),
-        # not the mutable run config, so the per-round budget cannot be inflated.
-        num_rounds = max(1, int(load_run_pins(context)["num_rounds"]))
-        pcfg_round = dict(pcfg)
-        pcfg_round["epsilon"] = float(pcfg["epsilon"]) / num_rounds
-        pcfg_round["delta"] = float(pcfg["delta"]) / num_rounds
-        # Deterministic egress noise from (node secret + data + config); OS entropy otherwise.
-        egress_seed = seeding.sub_seed(seeding.master_seed(cfg, X, y), "egress")
-        new_arrays = tier2_lib.gated_local_update(module_name, old, X, y, cfg, pcfg_round,
-                                                  seed=egress_seed)
-        n = len(y)
-    else:  # neural (tabular or image)
-        pins = load_run_pins(context)
-        new_arrays, n = _train_neural(msg, context, cfg, pcfg, pins)
+        cfg = load_pinned_run_config(context)
+        # Server-DERIVED routing (single source of truth: dp_harness.resolve_dp_track):
+        # an uploaded user-module is forced to the output-perturbation floor; node-built
+        # artifacts use the node-pinned track. The client cannot route its own code to a
+        # tighter track, and the neural track only ever runs the hash-verified harness.
+        track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
+        if claim["status"] == "noop":
+            return _safe_noop_reply(msg, context, claim=claim, track=track)
 
-    # Disclosure backstop: bucket the released sample count; no per-node metrics.
-    reply = RecordDict({
-        "arrays": ArrayRecord(numpy_ndarrays=new_arrays),
-        "metrics": MetricRecord({"num-examples": dp_harness.bucket_count(n)}),
-    })
-    return Message(content=reply, reply_to=msg)
+        pcfg = load_privacy_config(context)
+        # SQLite is authoritative. The manifest copy is validated for structure,
+        # then replaced with the exact values returned by the atomic ledger claim.
+        pcfg["epsilon"] = float(claim["epsilon"])
+        pcfg["delta"] = float(claim["delta"])
+        private_release_id = release_guard.release_id(claim)
+
+        if track == "trees":
+            new_arrays, _n = _train_trees(context, pcfg, cfg, private_release_id)
+        elif track == "egress":
+            from . import tier2_lib
+            old = _validate_public_egress_arrays(msg.content["arrays"])
+            # Compose all Gaussian Hook releases jointly through the closed RDP
+            # bound. Per-release sigma scales with sqrt(R), which is much tighter
+            # than splitting epsilon and delta linearly while preserving the same
+            # run-level (epsilon, delta) guarantee.
+            num_rounds = int(claim["max_releases"])
+            pcfg_round = dict(pcfg)
+            pcfg_round["composition_releases"] = num_rounds
+            hook_caps = tier2_lib.hook_execution_caps(pcfg_round)
+            if hook_caps is None:
+                # Policy/sandbox no-op: no private file is opened and no private
+                # randomness is needed.  The incoming arrays are already public.
+                new_arrays = [np.asarray(a, dtype=np.float32) for a in old]
+                _cache_reply(context, claim, new_arrays)
+                return _reply(msg, new_arrays)
+
+            module_name = str(cfg["user-module"])
+            X, y = load_data(context)
+            unit_ids = load_tabular_patient_ids(context)
+            master = seeding.master_seed(cfg, X, y, private_release_id)
+            new_arrays = tier2_lib.gated_local_update(
+                module_name, old, X, y, cfg, pcfg_round,
+                seed=seeding.sub_seed(master, "egress"),
+                hook_caps=hook_caps, unit_ids=unit_ids)
+        else:  # neural (tabular or image)
+            pins = load_run_pins(context)
+            if int(pins["num_rounds"]) != int(claim["max_releases"]):
+                raise RuntimeError(
+                    "neural calibration horizon does not match release guard")
+            model, master, input_dim, manifest_image = _prepare_neural_model(
+                msg, context, cfg, pins, private_release_id)
+            new_arrays, _n = _train_neural(
+                context, cfg, pcfg, pins, model, master, input_dim,
+                manifest_image)
+
+        _cache_reply(context, claim, new_arrays)
+        return _reply(msg, new_arrays)
+    except Exception:
+        # Flower serializes uncaught exception strings into Error.reason. Those
+        # strings can contain private values (for example pandas conversion errors),
+        # so the trusted boundary must return content and never propagate/log them.
+        return _safe_noop_reply(msg, context, claim=claim, track=track)

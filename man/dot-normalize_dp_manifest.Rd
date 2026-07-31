@@ -2,22 +2,20 @@
 % Please edit documentation in R/staging.R
 \name{.normalize_dp_manifest}
 \alias{.normalize_dp_manifest}
-\title{Stage data for a training run}
+\title{Force the always-on DP contract into a staging manifest}
 \usage{
 .normalize_dp_manifest(manifest)
 }
 \arguments{
-\item{data}{Data.frame of training data.}
-
-\item{run_token}{Character; the unique run token.
-Force the DP-always contract into a staging manifest.
-
-Differential privacy is always enforced (local DP, no Secure Aggregation) and
-disclosure is non-disclosive by default, so every manifest carries dp_enabled
-+ suppressed metrics/counts + fixed sampling.}
+\item{manifest}{Named list containing the server-authored run manifest.}
+}
+\value{
+The manifest with mandatory privacy flags applied.
 }
 \description{
-Creates a run-specific directory under \code{{tempdir()}/dsflower/{run_token}/},
-writes the training data as CSV and a JSON manifest describing the data.
+Differential privacy is always enforced by the node-side trusted curator
+(central DP before egress, no Secure Aggregation), and
+disclosure is non-disclosive by default, so every manifest carries dp_enabled
++ suppressed metrics/counts + fixed sampling.
 }
 \keyword{internal}

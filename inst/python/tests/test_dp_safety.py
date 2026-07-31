@@ -28,6 +28,7 @@ tests assert that every leak vector is closed, fail-closed.
 import math
 import os
 import sys
+from unittest import mock as _mock
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "..", "..", "flower_app", "dsflower_runner")
@@ -38,6 +39,7 @@ import torch
 import torch.nn as nn
 import dp_harness as dh
 import model_spec
+import seeding
 import tier2_lib
 
 torch.manual_seed(0)
@@ -61,9 +63,23 @@ def rejects(fn):
         return True
 
 
+def raises_value_error(fn):
+    """True only for an explicit precondition rejection, not a later OOM/sentinel."""
+    try:
+        fn(); return False
+    except ValueError:
+        return True
+    except Exception:
+        return False
+
+
+def _secure_rng(value):
+    return seeding.np_rng(int(value).to_bytes(32, "big", signed=False))
+
+
 # Tier-2 egress now runs uploads OUT-OF-PROCESS, so adversarial "apps" must be real
-# importable modules (by name), never in-process objects. _mkmod writes one to a temp dir
-# on sys.path; the isolated child inherits the parent sys.path and imports it by name.
+# importable packages (by name), never in-process objects. _mkmod writes one exact package
+# initializer; the isolated child loads that path directly rather than resolving sys.path.
 import tempfile as _tempfile
 import textwrap as _textwrap
 _T2DIR = _tempfile.mkdtemp(prefix="dpsafe_mods_")
@@ -71,25 +87,36 @@ sys.path.insert(0, _T2DIR)
 
 
 def _mkmod(name, body):
-    with open(os.path.join(_T2DIR, name + ".py"), "w") as f:
+    package = os.path.join(_T2DIR, name)
+    os.mkdir(package)
+    with open(os.path.join(package, "__init__.py"), "w") as f:
         f.write("import numpy as np\n" + _textwrap.dedent(body))
     return name
 
 
 # --------------------------------------------------------------------------- #
-print("== output-perturbation floor: analytic Gaussian + sensitivity bound ==")
+print("== output-perturbation floor: composed Gaussian RDP + sensitivity bound ==")
 C, eps, delta = 1.0, 1.0, 1e-5
 sigma = dh.compute_output_sigma(eps, delta, C)
-def _analytic_delta(s, ep, sens):
-    a, b = sens / (2 * s), ep * s / sens
-    return (0.5 * (1 + math.erf((a - b) / math.sqrt(2)))
-            - math.exp(ep) * 0.5 * (1 + math.erf((-a - b) / math.sqrt(2))))
-check("compute_output_sigma returns the analytic-Gaussian sigma meeting the target delta",
-      _analytic_delta(sigma, eps, C) <= delta * 1.001)
-check("analytic Gaussian meets target delta across the whole policy range (eps<=10, delta>=1e-8)",
-      all(_analytic_delta(dh.compute_output_sigma(e, d, 2.0), e, 2.0) <= d * 1.001
-          for e in (0.5, 1.0, 3.0, 5.0, 8.0, 10.0) for d in (1e-3, 1e-5, 1e-8)))
+def _rdp_epsilon_bound(s, de, sens, releases=1):
+    z = sens / s
+    return releases * z * z / 2 + z * math.sqrt(
+        2 * releases * math.log(1 / de))
+check("compute_output_sigma meets the closed Gaussian RDP bound",
+      _rdp_epsilon_bound(sigma, delta, C) <= eps)
+check("Gaussian RDP calibration is safe across the full numeric policy range",
+      all(_rdp_epsilon_bound(
+              dh.compute_output_sigma(e, d, 2.0, num_releases=r), d, 2.0, r) <= e
+          for e in (1e-6, 0.5, 1.0, 3.0, 10.0)
+          for d in (1e-3, 1e-5, 1e-12) for r in (1, 3, 500)))
+check("composed per-release sigma scales exactly as sqrt(R)",
+      math.isclose(
+          dh.compute_output_sigma(eps, delta, C, num_releases=9),
+          3 * dh.compute_output_sigma(eps, delta, C),
+          rel_tol=2e-15, abs_tol=0.0))
 check("compute_output_sigma rejects eps<=0", rejects(lambda: dh.compute_output_sigma(0, delta, C)))
+check("compute_output_sigma rejects a non-integer release horizon",
+      rejects(lambda: dh.compute_output_sigma(eps, delta, C, num_releases=1.5)))
 
 old = [np.zeros((4, 3), np.float32), np.zeros(3, np.float32)]
 huge = [np.full((4, 3), 1e6, np.float32), np.full(3, 1e6, np.float32)]   # "raw data" delta
@@ -97,7 +124,9 @@ clipped = dh.clip_update(huge, old, C)
 cd = np.concatenate([(c - o).ravel() for c, o in zip(clipped, old)])
 check("clip_update bounds ||delta|| <= C", np.linalg.norm(cd) <= C + 1e-5)
 
-out = dh.output_perturbation(huge, old, clipping_norm=C, epsilon=eps, delta=delta)
+out = dh.output_perturbation(
+    huge, old, clipping_norm=C, epsilon=eps, delta=delta,
+    rng=_secure_rng(100))
 rel = np.concatenate([(o2 - o1).ravel() for o2, o1 in zip(out, old)])
 check("output-perturbation DESTROYS raw-data exfil (1e6 -> O(sigma))",
       np.max(np.abs(rel)) < 50)
@@ -108,7 +137,9 @@ check("output-perturbation DESTROYS raw-data exfil (1e6 -> O(sigma))",
 for Cx in (1.0, 4.0):
     s1 = dh.compute_output_sigma(eps, delta, Cx)                  # k*Cx/eps (sensitivity Cx)
     z = [np.zeros(300000, np.float32)]
-    emp = float(np.std(dh.output_perturbation(z, z, clipping_norm=Cx, epsilon=eps, delta=delta)[0]))
+    emp = float(np.std(dh.output_perturbation(
+        z, z, clipping_norm=Cx, epsilon=eps, delta=delta,
+        rng=_secure_rng(int(1000 * Cx)))[0]))
     check("floor noise std == 2*sigma(C) for C=%g (2C sensitivity, no double-C)" % Cx,
           abs(emp - 2.0 * s1) < 0.05 * (2.0 * s1))
 
@@ -158,7 +189,10 @@ check("frozen-param stash channel REJECTED", rejects(lambda: dh.assert_releasabl
 
 # --------------------------------------------------------------------------- #
 print("== Tier-2 gate (ISOLATED gated_local_update): adversarial uploads cannot leak ==")
-pcfg = {"clipping_norm": 1.0, "epsilon": 1.0, "delta": 1e-5, "egress_timeout": 30}
+pcfg = {
+    "clipping_norm": 1.0, "epsilon": 1.0, "delta": 1e-5,
+    "egress_timeout": 30, "hook_enabled": True, "sample_aggregate": False,
+}
 g = [np.zeros(20, np.float32)]
 Xraw = (np.random.randn(8) * 7).astype(np.float32); yraw = np.zeros(8)
 _mkmod("t2_exfil", """
@@ -186,21 +220,6 @@ _mkmod("t2_crash", """
         def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
         def local_update(g, X, y, cfg): raise RuntimeError("data-dependent boom")
         """)
-_ex = tier2_lib.gated_local_update("t2_exfil", g, Xraw, yraw, {}, pcfg)
-check("Tier-2 exfil via weights DESTROYED by the gate (1e6 raw -> O(sigma))",
-      np.max(np.abs(np.concatenate([(o - gg).ravel() for o, gg in zip(_ex, g)]))) < 100)
-_mk = tier2_lib.gated_local_update("t2_monkey", g, Xraw, yraw, {}, pcfg)
-check("Tier-2 in-process MONKEYPATCH defeated by isolation (parent DP intact, release bounded)",
-      np.max(np.abs(np.concatenate([(o - gg).ravel() for o, gg in zip(_mk, g)]))) < 100)
-check("isolation: the parent NEVER imported the untrusted upload (absent from sys.modules)",
-      "t2_monkey" not in sys.modules and "t2_exfil" not in sys.modules)
-_ws = tier2_lib.gated_local_update("t2_wrongshape", g, Xraw, yraw, {}, pcfg)
-check("Tier-2 shape-mismatch NEUTRALIZED (validate-or-zero -> global shape, no raw escape)",
-      len(_ws) == len(g) and all(a.shape == o.shape for a, o in zip(_ws, g))
-      and all(np.all(np.isfinite(a)) for a in _ws))
-_cr = tier2_lib.gated_local_update("t2_crash", g, Xraw, yraw, {}, pcfg)
-check("Tier-2 crashing/data-dependent upload -> finite release (validate-or-zero)",
-      all(np.all(np.isfinite(a)) for a in _cr) and all(a.shape == o.shape for a, o in zip(_cr, g)))
 _mkmod("t2_huge", """
         def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
         def local_update(g, X, y, cfg): return [np.zeros(5_000_000, np.float64)]
@@ -209,19 +228,57 @@ _mkmod("t2_count", """
         def initial_arrays(cfg, d): return [np.zeros(d, np.float32)]
         def local_update(g, X, y, cfg): return [np.asarray(g[0]), np.zeros(3)]
         """)
-_hr = tier2_lib.gated_local_update("t2_huge", g, Xraw, yraw, {}, pcfg)
-check("Tier-2 oversized result rejected by the size cap -> validate-or-zero (no parent OOM)",
-      len(_hr) == len(g) and all(a.shape == o.shape for a, o in zip(_hr, g)))
-_wc = tier2_lib.gated_local_update("t2_count", g, Xraw, yraw, {}, pcfg)
-check("Tier-2 wrong array-count rejected (count checked before any load) -> validate-or-zero",
-      len(_wc) == len(g) and all(np.all(np.isfinite(a)) for a in _wc))
-check("gated_local_update refuses a non-str module (the node never imports an object)",
-      rejects(lambda: tier2_lib.gated_local_update(object(), g, Xraw, yraw, {}, pcfg)))
+_test_caps = {"subprocess": True, "net_lock": True, "fs_isolation": True,
+              "bwrap": None}
+_pinned_file = lambda name: os.path.join(_T2DIR, name, "__init__.py")
+with _mock.patch.object(tier2_lib, "hook_execution_caps", return_value=_test_caps), \
+        _mock.patch.object(tier2_lib, "_pinned_user_package", side_effect=_pinned_file):
+    _seed = b"t" * 32
+    _ex = tier2_lib.gated_local_update(
+        "t2_exfil", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+    check("Tier-2 exfil via weights DESTROYED by the gate (1e6 raw -> O(sigma))",
+          np.max(np.abs(np.concatenate([(o - gg).ravel()
+                                        for o, gg in zip(_ex, g)]))) < 100)
+    _mk = tier2_lib.gated_local_update(
+        "t2_monkey", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+    check("Tier-2 in-process MONKEYPATCH defeated by isolation (parent DP intact, release bounded)",
+          np.max(np.abs(np.concatenate([(o - gg).ravel()
+                                        for o, gg in zip(_mk, g)]))) < 100)
+    check("isolation: the parent NEVER imported the untrusted upload (absent from sys.modules)",
+          "t2_monkey" not in sys.modules and "t2_exfil" not in sys.modules)
+    check("trusted Hook loader shares the exact SecureNumpyRng class with its DP gate",
+          isinstance(tier2_lib.seeding.np_rng(b"k" * 32),
+                     tier2_lib.dp_harness.SecureNumpyRng))
+    _ws = tier2_lib.gated_local_update(
+        "t2_wrongshape", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+    check("Tier-2 shape-mismatch NEUTRALIZED (validate-or-zero -> noisy global shape)",
+          len(_ws) == len(g) and all(a.shape == o.shape for a, o in zip(_ws, g))
+          and all(np.all(np.isfinite(a)) for a in _ws))
+    _cr = tier2_lib.gated_local_update(
+        "t2_crash", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+    check("Tier-2 crashing/data-dependent upload -> finite NOISY release",
+          all(np.all(np.isfinite(a)) for a in _cr)
+          and all(a.shape == o.shape for a, o in zip(_cr, g))
+          and any(not np.array_equal(a, o) for a, o in zip(_cr, g)))
+    _hr = tier2_lib.gated_local_update(
+        "t2_huge", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+    check("Tier-2 oversized result rejected by the size cap -> noisy zero update (no parent OOM)",
+          len(_hr) == len(g) and all(a.shape == o.shape for a, o in zip(_hr, g)))
+    _wc = tier2_lib.gated_local_update(
+        "t2_count", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+    check("Tier-2 wrong array-count rejected before load -> noisy zero update",
+          len(_wc) == len(g) and all(np.all(np.isfinite(a)) for a in _wc))
+    check("gated_local_update refuses a non-str module (the node never imports an object)",
+          rejects(lambda: tier2_lib.gated_local_update(
+              object(), g, Xraw, yraw, {}, pcfg, seed=_seed,
+              hook_caps=_test_caps)))
 import time as _time
 _t0 = _time.monotonic()
-tier2_lib.gated_local_update("t2_crash", g, Xraw, yraw, {}, dict(pcfg, egress_time_pad=2.0))
-check("constant-time padding holds the egress run to >= the pad (timing side-channel closed)",
-      _time.monotonic() - _t0 >= 1.9)
+_disabled = tier2_lib.gated_local_update(
+    "t2_crash", g, Xraw, yraw, {}, dict(pcfg, egress_time_pad=2.0))
+check("HookApp stays disabled when the timing envelope is shorter than timeout+guard",
+      _time.monotonic() - _t0 < 1.9
+      and all(np.array_equal(a, b) for a, b in zip(_disabled, g)))
 check("seccomp network-lock helper is present + callable (no-op off-Linux)",
       callable(getattr(__import__("egress_child"), "_install_seccomp_no_net", None)))
 
@@ -305,6 +362,114 @@ check("conv out_channels over cap REJECTED", rejects(
         {"op": "flatten"}, {"op": "linear", "out": "@out"}]}, 64, 2)))
 
 # --------------------------------------------------------------------------- #
+print("== hostile model specs: reject before large constructors/forwards ==")
+import base64 as _base64
+_real_b64decode = _base64.b64decode
+_decode_calls = []
+def _forbidden_decode(*args, **kwargs):
+    _decode_calls.append(args)
+    raise AssertionError("decoder reached")
+_base64.b64decode = _forbidden_decode
+try:
+    _oversized_b64_rejected = raises_value_error(lambda: model_spec.read_spec(
+        {"model-spec-b64": "A" * (model_spec._MAX_SPEC_B64_BYTES + 4)}))
+finally:
+    _base64.b64decode = _real_b64decode
+check("oversized encoded spec rejected before base64 decode",
+      _oversized_b64_rejected and not _decode_calls)
+import json as _json
+_real_json_loads = _json.loads
+_json_calls = []
+def _forbidden_json_loads(*args, **kwargs):
+    _json_calls.append(args)
+    raise AssertionError("JSON parser reached")
+_json.loads = _forbidden_json_loads
+try:
+    _large_decoded = _base64.b64encode(
+        b" " * (model_spec._MAX_SPEC_JSON_BYTES + 1)).decode("ascii")
+    _oversized_json_rejected = raises_value_error(lambda: model_spec.read_spec(
+        {"model-spec-b64": _large_decoded}))
+finally:
+    _json.loads = _real_json_loads
+check("oversized decoded spec rejected before JSON parse",
+      _oversized_json_rejected and not _json_calls)
+
+_real_linear = model_spec.nn.Linear
+_linear_calls = []
+def _forbidden_linear(*args, **kwargs):
+    _linear_calls.append(args)
+    raise AssertionError("Linear constructor reached")
+model_spec.nn.Linear = _forbidden_linear
+try:
+    _huge_linear_rejected = raises_value_error(lambda: model_spec.build_from_spec(
+        {"kind": "sequential", "layers": [
+            {"op": "linear", "out": model_spec._MAX_WIDTH},
+            {"op": "linear", "out": "@out"}]},
+        model_spec._MAX_WIDTH, 2))
+finally:
+    model_spec.nn.Linear = _real_linear
+check("huge linear parameter product rejected before constructor",
+      _huge_linear_rejected and not _linear_calls)
+
+_real_conv1d = model_spec.nn.Conv1d
+_conv_calls = []
+def _forbidden_conv1d(*args, **kwargs):
+    _conv_calls.append(args)
+    raise AssertionError("Conv1d constructor reached")
+model_spec.nn.Conv1d = _forbidden_conv1d
+try:
+    _huge_conv_rejected = raises_value_error(lambda: model_spec.build_from_spec(
+        {"kind": "sequential", "layers": [
+            {"op": "reshape", "shape": [4096, 1]},
+            {"op": "conv1d", "out_channels": 4096, "kernel_size": 1},
+            {"op": "flatten"}, {"op": "linear", "out": "@out"}]}, 4096, 2))
+finally:
+    model_spec.nn.Conv1d = _real_conv1d
+check("huge convolution parameter product rejected before constructor",
+      _huge_conv_rejected and not _conv_calls)
+
+_linear_calls = []
+def _cheap_linear(*args, **kwargs):
+    _linear_calls.append(args)
+    return nn.Identity()
+model_spec.nn.Linear = _cheap_linear
+try:
+    _cumulative_rejected = raises_value_error(lambda: model_spec.build_from_spec(
+        {"kind": "sequential", "layers": [
+            {"op": "linear", "out": 2000}, {"op": "linear", "out": 2000},
+            {"op": "linear", "out": "@out"}]}, 2000, 2))
+finally:
+    model_spec.nn.Linear = _real_linear
+check("cumulative parameter budget rejects before the overflowing constructor",
+      _cumulative_rejected and len(_linear_calls) == 1)
+check("oversized activation shape rejected before a model forward", raises_value_error(
+      lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+          {"op": "reshape", "shape": [1, 64, 64]},
+          {"op": "upsample", "scale_factor": 64}, {"op": "flatten"},
+          {"op": "linear", "out": "@out"}]}, 4096, 2)))
+check("oversized node-owned input dim rejected before constructor", raises_value_error(
+      lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
+          {"op": "linear", "out": "@out"}]}, model_spec._MAX_DIM + 1, 2)))
+check("non-finite graph affine constants rejected", raises_value_error(
+      lambda: model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+          {"name": "bad", "op": "affine", "in": ["@in"], "scale": math.nan},
+          {"name": "out", "op": "linear", "in": ["bad"], "out": "@out"}]}, 4, 2)))
+check("oversized graph affine constants rejected", raises_value_error(
+      lambda: model_spec.build_from_spec({"kind": "graph", "output": "out", "nodes": [
+          {"name": "bad", "op": "affine", "in": ["@in"],
+           "scale": model_spec._MAX_PUBLIC_SCALAR_ABS + 1.0},
+          {"name": "out", "op": "linear", "in": ["bad"], "out": "@out"}]}, 4, 2)))
+_wide_regression = model_spec.build_from_spec(
+    {"kind": "sequential", "layers": [{"op": "linear", "out": "@out"}]},
+    1, 1, output_limit=model_spec.output_limit_for_loss("mse"))
+with torch.no_grad():
+    _wide_regression[0].weight.fill_(model_spec._MAX_PUBLIC_SCALAR_ABS)
+    _wide_regression[0].bias.zero_()
+_wide_value = _wide_regression(torch.ones(1, 1)).item()
+check("direct MSE regression keeps a wide finite output domain",
+      model_spec._MAX_OUTPUT_ABS < _wide_value <= model_spec._MAX_ACTIVATION_ABS)
+
+# --------------------------------------------------------------------------- #
 print("== adaptive routing: the SERVER picks the DP mechanism, unforgeably ==")
 check("declarative spec -> neural (DP-SGD, tight)", dh.resolve_dp_track({}, "neural") == "neural")
 check("gbdt spec -> trees (DP-GBDT)", dh.resolve_dp_track({}, "trees") == "trees")
@@ -356,6 +521,31 @@ check("DAG forward-referenced input (non-topological) REJECTED", rejects(
         {"name": "a", "op": "relu", "in": ["b"]},
         {"name": "b", "op": "linear", "in": ["@in"], "out": 4},
         {"name": "out", "op": "linear", "in": ["a"], "out": "@out"}]}, 8, 2)))
+
+_total_div = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "ratio", "op": "div", "in": ["@in", "@in"]},
+    {"name": "out", "op": "linear", "in": ["ratio"], "out": "@out"}]}
+_total_div_model = model_spec.build_from_spec(_total_div, 3, 1)
+_total_div_x = torch.tensor([[0.0, 1.0, -1.0], [1.0, 2.0, 3.0]])
+check("DAG division is total at zero and emits only finite bounded logits",
+      bool(torch.isfinite(_total_div_model(_total_div_x)).all())
+      and bool((_total_div_model(_total_div_x).abs() <= model_spec._MAX_OUTPUT_ABS).all()))
+check("totalized DAG division remains per-sample independent",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          _cp2.deepcopy(_total_div_model), nn.MSELoss(),
+          _total_div_x.repeat(4, 1), torch.zeros(8, 1))))
+
+_total_arithmetic = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "product", "op": "mul", "in": ["@in", "@in"]},
+    {"name": "scaled", "op": "affine", "in": ["product"],
+     "scale": model_spec._MAX_PUBLIC_SCALAR_ABS,
+     "shift": model_spec._MAX_PUBLIC_SCALAR_ABS},
+    {"name": "out", "op": "linear", "in": ["scaled"], "out": "@out"}]}
+_total_arithmetic_out = model_spec.build_from_spec(
+    _total_arithmetic, 3, 1)(torch.full((4, 3), model_spec._MAX_ACTIVATION_ABS))
+check("DAG extreme finite arithmetic saturates instead of failing",
+      bool(torch.isfinite(_total_arithmetic_out).all())
+      and bool((_total_arithmetic_out.abs() <= model_spec._MAX_OUTPUT_ABS).all()))
 
 # --------------------------------------------------------------------------- #
 print("== advanced graph ops: attention / broadcast / upsample (per-sample) ==")
@@ -416,7 +606,7 @@ check("gate STILL rejects ANY module carrying a hook (sanitize did NOT weaken it
       rejects(lambda: dh.assert_stock_architecture(_hooked)))
 
 # --------------------------------------------------------------------------- #
-print("== improved floor: sample-and-aggregate (NRS) -- sensitivity 2C/k, server-routed ==")
+print("== improved floor: sample-and-aggregate -- conservative multi-block sensitivity ==")
 _saC, _saK = 4.0, 5
 _saOld = [np.zeros(10), np.zeros(3)]
 _saRng = np.random.default_rng(0)
@@ -440,33 +630,33 @@ check("sample-and-aggregate L2 sensitivity <= 2C/k for ANY one-block neighbor",
       _saWorst <= 2 * _saC / _saK + 1e-9)
 _saEps, _saDelta = 1.0, 1e-5
 _saZero = [[o.copy() for o in _saOld] for _ in range(_saK)]
+_saNoise = _secure_rng(991)
 _saRel = np.array([np.concatenate([a.ravel() for a in
-                   dh.sample_and_aggregate(_saZero, _saOld, _saC, _saEps, _saDelta)])
+                   dh.sample_and_aggregate(
+                       _saZero, _saOld, _saC, _saEps, _saDelta, rng=_saNoise)])
                    for _ in range(3000)])
-_saTheo = dh.compute_output_sigma(_saEps, _saDelta, 2 * _saC / _saK)  # analytic Gaussian, sens 2C/k
-check("sample-and-aggregate noise std matches the analytic-Gaussian sigma for sensitivity 2C/k",
+_saSens = min(2 * _saC, 4 * _saC / _saK)
+_saTheo = dh.compute_output_sigma(_saEps, _saDelta, _saSens)
+check("sample-and-aggregate noise matches min(2C,4C/k) conservative sensitivity",
       abs(_saRel.std() - _saTheo) / _saTheo < 0.12)
-# analytic Gaussian must actually MEET the target delta at high epsilon (the classic
-# sqrt(2 ln(1.25/delta)) S/eps bound leaks ~2.3x here -- the bug this fixes).
-_agS = dh.compute_output_sigma(10.0, 1e-5, 2.0)
-_agA, _agB = 2.0 / (2 * _agS), 10.0 * _agS / 2.0
-_agDelta = (0.5 * (1 + math.erf((_agA - _agB) / math.sqrt(2)))
-            - math.exp(10.0) * 0.5 * (1 + math.erf((-_agA - _agB) / math.sqrt(2))))
-check("analytic Gaussian sigma meets the (eps=10, delta=1e-5) target (classic bound would leak)",
-      _agDelta <= 1e-5 * 1.001)
+# The strict safety margin keeps the independently recomputed RDP inequality on
+# the safe side even at the smallest supported epsilon/delta and 500 releases.
+_edge_eps, _edge_delta, _edge_r = 1e-6, 1e-12, 500
+_edge_sigma = dh.compute_output_sigma(
+    _edge_eps, _edge_delta, 2.0, num_releases=_edge_r)
+check("Gaussian RDP sigma is strictly safe at the numerical policy edge",
+      _rdp_epsilon_bound(
+          _edge_sigma, _edge_delta, 2.0, _edge_r) <= _edge_eps)
 
 # Mechanism selection is the NODE's automatic, capability-gated decision (NOT a researcher
 # opt-in). _choose_blocks is the pure server-side rule, tested directly.
-_saPol = dict(sa_min_block=10, sa_max_blocks=8)
+_saPol = dict(sa_blocks=8)
 check("SAA is GATED OFF without a full sandbox (subprocess-only) -> plain 2C floor",
-      tier2_lib._choose_blocks(1000, _saPol, False) == 1)
-check("with a full sandbox the node auto-selects k from PUBLIC n only (100->8 capped, 30->3)",
-      tier2_lib._choose_blocks(100, _saPol, True) == 8
-      and tier2_lib._choose_blocks(30, _saPol, True) == 3)
-check("small n -> plain floor even with a full sandbox",
-      tier2_lib._choose_blocks(8, _saPol, True) == 1)
+      tier2_lib._choose_blocks(_saPol, False) == 1)
+check("with a full sandbox the node uses the fixed public block count",
+      tier2_lib._choose_blocks(_saPol, True) == 8)
 check("custodian governance off-switch honoured even with a full sandbox",
-      tier2_lib._choose_blocks(100, dict(_saPol, sample_aggregate=False), True) == 1)
+      tier2_lib._choose_blocks(dict(_saPol, sample_aggregate=False), True) == 1)
 check("subprocess isolation (the monkeypatch fix) is universally available",
       tier2_lib.sandbox_caps()["subprocess"] is True)
 check("SAA full-sandbox gate requires real net+fs isolation (not subprocess alone)",

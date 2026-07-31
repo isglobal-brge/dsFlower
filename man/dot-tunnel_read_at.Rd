@@ -4,7 +4,7 @@
 \alias{.tunnel_read_at}
 \title{Read a byte range [from, EOF) from a spool file (relay-owned offset).}
 \usage{
-.tunnel_read_at(spool, binname, from)
+.tunnel_read_at(spool, binname, from, max_bytes = Inf)
 }
 \description{
 Read a byte range [from, EOF) from a spool file (relay-owned offset).

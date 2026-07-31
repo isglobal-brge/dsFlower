@@ -12,7 +12,7 @@ flowerTunnelExchangeDS(conn_id, req = "")
 \item{req}{Character; \code{.ds_encode}'d named request map, or "".}
 }
 \value{
-list(sz, ud, ue) for this node.
+list(sz, ud, ue, g) for this node.
 }
 \description{
 The RELAY owns the byte offsets, so this method is loss-free and idempotent: a
@@ -21,6 +21,7 @@ or loss. \code{req} is a \code{.ds_encode}'d named list keyed by node name;
 this node's entry is list(pa = down append-offset the relay believes,
 pd = "B64:" SuperLink->SuperNode bytes, pf = up read-offset). Returns this
 node's list(sz = new down.bin size, ud = "B64:" SuperNode->SuperLink bytes
-from pf, ue = new up.bin EOF).
+from pf, ue = new up.bin EOF, g = connection generation). Payloads are
+bounded to the node-owned chunk size and exchanges are serialized per tunnel.
 }
 \keyword{internal}

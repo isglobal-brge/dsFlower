@@ -2,18 +2,11 @@
 % Please edit documentation in R/interface.R
 \name{.removeHandle}
 \alias{.removeHandle}
-\title{Remove a Flower handle}
+\title{Remove authoritative state for an opaque Flower handle}
 \usage{
-.removeHandle(symbol)
-}
-\arguments{
-\item{symbol}{Character; the handle symbol name.}
-}
-\value{
-Invisible NULL.
+.removeHandle(symbol, cleanup = TRUE)
 }
 \description{
-Cleans up staging data and removes the handle from storage.
-Does NOT stop SuperNodes (they are singleton by SuperLink address).
+Remove authoritative state for an opaque Flower handle
 }
 \keyword{internal}

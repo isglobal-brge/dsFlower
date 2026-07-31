@@ -34,6 +34,13 @@ import time
 # its offsets) for up to this long. Only a SUSTAINED loss tears down. Matched to
 # the SuperNode --max-wait-time so both tolerate the same window.
 RELAY_TTL = float(os.environ.get("DSFLOWER_RELAY_TTL", "180"))  # seconds
+SPOOL_MAX_BYTES = int(
+    os.environ.get("DSFLOWER_TUNNEL_SPOOL_MAX_BYTES", str(1024**3))
+)
+IO_CHUNK_BYTES = 65536
+
+if SPOOL_MAX_BYTES < IO_CHUNK_BYTES:
+    raise RuntimeError("DSFLOWER_TUNNEL_SPOOL_MAX_BYTES is too small")
 
 
 def relay_alive(hb_path):
@@ -60,20 +67,30 @@ def serve_connection(conn, up_path, down_path, gen_path, hb_path, gen):
         if now - last_hb_check > 1.0:
             last_hb_check = now
             if not relay_alive(hb_path):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
                 return False   # relay gone -> stop serving + exit
-        # socket -> up.bin
+        # socket -> up.bin. Once the bounded spool is full, stop receiving so
+        # TCP applies backpressure instead of allowing unbounded disk growth.
         try:
-            data = conn.recv(65536)
-            if data:
-                with open(up_path, "ab") as f:
-                    f.write(data)
-                moved = True
-            else:
-                break  # peer closed
-        except BlockingIOError:
-            pass
-        except (ConnectionResetError, OSError):
-            break
+            up_size = os.path.getsize(up_path)
+        except OSError:
+            up_size = 0
+        if up_size < SPOOL_MAX_BYTES:
+            try:
+                data = conn.recv(min(IO_CHUNK_BYTES, SPOOL_MAX_BYTES - up_size))
+                if data:
+                    with open(up_path, "ab") as f:
+                        f.write(data)
+                    moved = True
+                else:
+                    break  # peer closed
+            except BlockingIOError:
+                pass
+            except (ConnectionResetError, OSError):
+                break
         # down.bin -> socket
         try:
             sz = os.path.getsize(down_path)
@@ -82,12 +99,15 @@ def serve_connection(conn, up_path, down_path, gen_path, hb_path, gen):
         if sz > down_off:
             with open(down_path, "rb") as f:
                 f.seek(down_off)
-                chunk = f.read(sz - down_off)
+                chunk = f.read(min(IO_CHUNK_BYTES, sz - down_off))
             try:
-                conn.sendall(chunk)
-                down_off = sz
-                moved = True
-            except (BrokenPipeError, OSError):
+                sent = conn.send(chunk)
+                if sent > 0:
+                    down_off += sent
+                    moved = True
+            except BlockingIOError:
+                pass
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 break
         if moved:
             idle = 0
@@ -115,10 +135,13 @@ def main():
     open(up_path, "ab").close()
     open(down_path, "ab").close()
 
-    host, port = a.listen.rsplit(":", 1)
+    host, port_text = a.listen.rsplit(":", 1)
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise ValueError("listen port must be between 1 and 65535")
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((host, int(port)))
+    srv.bind((host, port))
     srv.listen(8)
     srv.settimeout(5.0)   # so we can poll relay liveness while waiting to accept
     open(os.path.join(a.spool, "ready"), "w").close()

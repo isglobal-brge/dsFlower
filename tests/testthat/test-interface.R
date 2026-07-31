@@ -1,5 +1,20 @@
 # Tests for R/interface.R — DataSHIELD Methods
 
+local_interface_privacy_state <- function(.local_envir = parent.frame()) {
+  state_dir <- tempfile("dsflower-interface-state-")
+  dir.create(state_dir, recursive = TRUE)
+  withr::defer(unlink(state_dir, recursive = TRUE), envir = .local_envir)
+  withr::local_options(list(
+    dsflower.privacy_ledger_path = file.path(state_dir, "ledger.sqlite")
+  ), .local_envir = .local_envir)
+  withr::local_envvar(c(
+    DSFLOWER_NODE_SECRET_FILE = file.path(state_dir, "node-secret"),
+    DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1",
+    DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
+  ), .local_envir = .local_envir)
+  invisible(state_dir)
+}
+
 test_that("flowerPingDS returns correct structure", {
   result <- flowerPingDS()
   expect_type(result, "list")
@@ -17,11 +32,12 @@ test_that(".getHandle errors for missing symbol", {
 })
 
 test_that("Handle CRUD operations work", {
-  env <- dsFlower:::.dsflower_env
-
   # Create and set
   handle <- mock_handle(data_path = "/tmp/test.csv")
-  dsFlower:::.setHandle("test_crud", handle)
+  reference <- dsFlower:::.setHandle("test_crud", handle)
+  expect_named(reference, "capability")
+  expect_match(reference$capability, "^hdl_[0-9a-f]{32}$")
+  expect_false("data_path" %in% names(reference))
 
   # Get
   retrieved <- dsFlower:::.getHandle("test_crud")
@@ -30,6 +46,93 @@ test_that("Handle CRUD operations work", {
   # Remove
   dsFlower:::.removeHandle("test_crud")
   expect_error(dsFlower:::.getHandle("test_crud"), "No Flower handle")
+})
+
+test_that("forged handle fields never become authoritative", {
+  victim <- withr::local_tempdir()
+  marker <- file.path(victim, "keep.txt")
+  writeLines("keep", marker)
+  forged_handle <- list(
+    data_path = marker,
+    run_token = "../../victim",
+    staging_dir = victim,
+    prepared = TRUE
+  )
+  expect_error(dsFlower:::.getHandle("forged_handle"), "forged")
+  expect_error(flowerCleanupRunDS("forged_handle"), "forged")
+  expect_true(file.exists(marker))
+
+  unknown_handle <- structure(
+    list(capability = paste0("hdl_", strrep("a", 32))),
+    class = "dsflower_handle_ref")
+  expect_error(dsFlower:::.getHandle("unknown_handle"), "stale")
+
+  forged_fields_handle <- dsFlower:::.setHandle(
+    "forged_fields_handle", mock_handle(data_path = "authoritative.csv"))
+  forged_fields_handle$data_path <- marker
+  forged_fields_handle$run_token <- "../../victim"
+  expect_equal(
+    dsFlower:::.getHandle("forged_fields_handle")$data_path,
+    "authoritative.csv"
+  )
+  dsFlower:::.removeHandle("forged_fields_handle")
+  expect_true(file.exists(marker))
+})
+
+test_that("handle capabilities are stale after destroy and bound to one session", {
+  stale_handle <- dsFlower:::.setHandle("stale_handle", mock_handle())
+  saved <- stale_handle
+  dsFlower:::.removeHandle("stale_handle")
+  stale_handle <- saved
+  expect_error(dsFlower:::.getHandle("stale_handle"), "stale")
+
+  owner_a <- new.env(parent = globalenv())
+  owner_b <- new.env(parent = globalenv())
+  reference <- dsFlower:::.registerHandle(mock_handle(), owner_env = owner_a)
+  assign("owned_handle", reference, envir = owner_a)
+  assign("owned_handle", reference, envir = owner_b)
+  expect_equal(evalq(dsFlower:::.getHandle("owned_handle"), owner_a)$prepared,
+               FALSE)
+  expect_error(
+    evalq(dsFlower:::.getHandle("owned_handle"), owner_b),
+    "cross-session"
+  )
+  evalq(dsFlower:::.removeHandle("owned_handle"), owner_a)
+})
+
+test_that("opaque handles preserve the legitimate DSLite assign flow", {
+  local_interface_privacy_state()
+  skip_if_not_installed("DSLite")
+  server <- DSLite::newDSLiteServer(tables = list(
+    T = data.frame(f1 = seq_len(20), target = rep(0:1, 10))),
+    config = list())
+  server$assignMethod("flowerInitDS", "dsFlower::flowerInitDS")
+  server$assignMethod("flowerPrepareRunDS", "dsFlower::flowerPrepareRunDS")
+  server$assignMethod("flowerDestroyDS", "dsFlower::flowerDestroyDS")
+  server$aggregateMethod("flowerStatusDS", "dsFlower::flowerStatusDS")
+  server_name <- paste0("dsflower_handle_server_", Sys.getpid())
+  assign(server_name, server, envir = .GlobalEnv)
+  withr::defer(rm(list = server_name, envir = .GlobalEnv))
+  connection <- DSLite::dsConnect(
+    DSLite::DSLite(), name = "site", url = server_name)
+  withr::defer(DSLite::dsDisconnect(connection))
+
+  invisible(DSLite::dsAssignTable(connection, "D", "T"))
+  invisible(DSLite::dsAssignExpr(
+    connection, "flower", 'flowerInitDS("D")'))
+  reference <- server$getSessionData(connection@sid, "flower")
+  expect_named(reference, "capability")
+  expect_false("data_path" %in% names(reference))
+
+  invisible(DSLite::dsAssignExpr(
+    connection, "flower",
+    'flowerPrepareRunDS("flower", "target", "f1")'))
+  status <- DSLite::dsFetch(DSLite::dsAggregate(
+    connection, 'flowerStatusDS("flower")'))
+  expect_true(status$prepared)
+  invisible(DSLite::dsAssignExpr(
+    connection, "flower", 'flowerDestroyDS("flower")'))
+  expect_null(server$getSessionData(connection@sid, "flower"))
 })
 
 test_that(".ds_arg handles JSON strings", {
@@ -72,7 +175,72 @@ test_that(".dsf_option follows option chain", {
   })
 })
 
+test_that("run horizon and data routing are pinned before staging", {
+  expect_error(
+    dsFlower:::.normalizeRunHorizon(list("num-server-rounds" = 1.5)),
+    "positive integer"
+  )
+  expect_error(
+    dsFlower:::.normalizeRunHorizon(list(
+      "num-server-rounds" = 2L, num_rounds = 3L
+    )),
+    "disagree"
+  )
+  routed <- dsFlower:::.takeRunDataType(
+    list(data_type = "IMAGE", "batch-size" = 8L), expected = "image")
+  expect_equal(routed$data_type, "image")
+  expect_null(routed$run_config$data_type)
+  expect_error(
+    dsFlower:::.takeRunDataType(list(data_type = "tabular"), expected = "image"),
+    "disagrees"
+  )
+})
+
+test_that("HookApp resource policy is finite, bounded, and unambiguous", {
+  base <- list("num-server-rounds" = 1L)
+  withr::local_options(list(
+    dsflower.dp_sa_blocks = 8L,
+    dsflower.dp_egress_timeout = 60L,
+    dsflower.dp_egress_time_pad = 65,
+    dsflower.dp_egress_memory_mb = 4096L,
+    dsflower.dp_egress_file_mb = 512L,
+    dsflower.dp_egress_processes = 32L
+  ))
+  cfg <- dsFlower:::.addDpConfigToRunConfig(base)
+  expect_identical(cfg[["privacy-sa_blocks"]], 8L)
+  expect_identical(cfg[["privacy-egress_timeout"]], 60L)
+  expect_equal(cfg[["privacy-egress_time_pad"]], 65)
+  expect_identical(cfg[["privacy-egress_memory_mb"]], 4096L)
+  expect_identical(cfg[["privacy-egress_file_mb"]], 512L)
+  expect_identical(cfg[["privacy-egress_processes"]], 32L)
+
+  bad <- list(
+    list(dsflower.dp_sa_blocks = 1.5),
+    list(dsflower.dp_sa_blocks = Inf),
+    list(dsflower.dp_sa_blocks = 65L),
+    list(dsflower.dp_sa_blocks = c(2L, 3L)),
+    list(dsflower.dp_egress_timeout = 3601L),
+    list(dsflower.dp_egress_timeout = NaN),
+    list(dsflower.dp_egress_time_pad = 3661),
+    list(dsflower.dp_egress_time_pad = c(0, 1)),
+    list(dsflower.dp_egress_memory_mb = 511L),
+    list(dsflower.dp_egress_file_mb = 16385L),
+    list(dsflower.dp_egress_processes = 0L)
+  )
+  for (opts in bad) {
+    expect_error(withr::with_options(
+      c(list(dsflower.dp_egress_timeout = 60L,
+             dsflower.dp_egress_time_pad = 0), opts),
+      dsFlower:::.addDpConfigToRunConfig(base)), "must be")
+  }
+  expect_error(withr::with_options(
+    list(dsflower.dp_egress_timeout = 60L,
+         dsflower.dp_egress_time_pad = 64),
+    dsFlower:::.addDpConfigToRunConfig(base)), "timeout \\+ 5")
+})
+
 test_that("flowerPrepareRunDS stages data correctly", {
+  local_interface_privacy_state()
   csv_path <- create_test_csv(n = 200)
   on.exit(unlink(csv_path))
 
@@ -83,27 +251,28 @@ test_that("flowerPrepareRunDS stages data correctly", {
 
   # Prepare the run
   result <- flowerPrepareRunDS("test_prepare", "target", c("f1", "f2", "f3"))
+  expect_named(result, "capability")
+  state <- dsFlower:::.getHandle("test_prepare")
 
-  expect_true(result$prepared)
-  expect_equal(result$target_column, "target")
-  expect_equal(result$feature_columns, c("f1", "f2", "f3"))
-  expect_true(!is.null(result$run_token))
-  expect_true(!is.null(result$staging_dir))
-  expect_true(dir.exists(result$staging_dir))
+  expect_true(state$prepared)
+  expect_equal(state$target_column, "target")
+  expect_equal(state$feature_columns, c("f1", "f2", "f3"))
+  expect_match(state$run_token, "^run_[0-9a-f]{32}$")
+  expect_true(dir.exists(state$staging_dir))
 
   # Verify manifest exists
-  manifest_path <- file.path(result$staging_dir, "manifest.json")
+  manifest_path <- file.path(state$staging_dir, "manifest.json")
   expect_true(file.exists(manifest_path))
 
   manifest <- jsonlite::fromJSON(manifest_path)
   expect_equal(manifest$n_samples, 200)
   expect_equal(manifest$target_column, "target")
-
-  # Clean up staging
-  dsFlower:::.cleanupStaging(result$run_token)
+  expect_true(manifest[["privacy-reserved"]])
+  expect_equal(manifest[["privacy-allocation-index"]], 1L)
 })
 
-test_that("flowerPrepareRunDS blocks on insufficient samples", {
+test_that("flowerPrepareRunDS does not expose a minimum-size admission bit", {
+  local_interface_privacy_state()
   # Create tiny dataset
   tiny_dir <- tempdir()
   tiny_path <- file.path(tiny_dir, "tiny_test.csv")
@@ -114,15 +283,82 @@ test_that("flowerPrepareRunDS blocks on insufficient samples", {
   dsFlower:::.setHandle("test_tiny", handle)
   on.exit(dsFlower:::.removeHandle("test_tiny"), add = TRUE)
 
+  expect_no_error(flowerPrepareRunDS("test_tiny", "target"))
+  state <- dsFlower:::.getHandle("test_tiny")
+  manifest <- jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
+  expect_equal(manifest$n_samples, 2L)
+  expect_equal(manifest$n_units, 2L)
+  expect_true(manifest[["privacy-reserved"]])
+})
+
+test_that("prepare reserves before schema access and never refunds failures", {
+  local_interface_privacy_state()
+  dsFlower:::.setHandle(
+    "test_failed_prepare_reservation",
+    mock_handle(table_data = data.frame(f1 = 1:5)))
+  withr::defer(dsFlower:::.removeHandle("test_failed_prepare_reservation"))
   expect_error(
-    flowerPrepareRunDS("test_tiny", "target"),
-    "Disclosive"
+    flowerPrepareRunDS("test_failed_prepare_reservation", "target", "f1"),
+    "target columns were not found"
+  )
+
+  dsFlower:::.setHandle(
+    "test_next_prepare_reservation",
+    mock_handle(table_data = data.frame(f1 = 1:5, target = rep(0:1, length.out = 5))))
+  withr::defer(dsFlower:::.removeHandle("test_next_prepare_reservation"))
+  expect_no_error(
+    flowerPrepareRunDS("test_next_prepare_reservation", "target", "f1"))
+  state <- dsFlower:::.getHandle("test_next_prepare_reservation")
+  manifest <- jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
+  expect_equal(manifest[["privacy-allocation-index"]], 2L)
+})
+
+test_that("run admission is independent of a rare target class", {
+  local_interface_privacy_state()
+  # A class-count gate would turn prepare success/error into a label-dependent
+  # transcript oracle. Only the fixed privacy-unit count may affect admission.
+  withr::local_options(list(nfilter.subset = 3, nfilter.tab = 5))
+  rare_path <- tempfile(fileext = ".csv")
+  utils::write.csv(
+    data.frame(f1 = seq_len(20), target = c(rep(0L, 19), 1L)),
+    rare_path, row.names = FALSE)
+  withr::defer(unlink(rare_path))
+
+  handle <- mock_handle(data_path = rare_path, data_format = "csv")
+  dsFlower:::.setHandle("test_rare_class_admission", handle)
+  withr::defer(dsFlower:::.removeHandle("test_rare_class_admission"))
+
+  expect_no_error(
+    flowerPrepareRunDS("test_rare_class_admission", "target", "f1"))
+  state <- dsFlower:::.getHandle("test_rare_class_admission")
+  manifest <- jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
+  expect_equal(manifest$n_samples, 20L)
+  expect_equal(manifest$n_units, 20L)
+})
+
+test_that("run admission fails closed without one exact privacy-unit count", {
+  base_args <- list(
+    handle = NULL, target_column = "target", template_name = NULL,
+    n_samples = 20L, target_data = NULL,
+    run_config = list("privacy-clipping_norm" = 1),
+    data_type = "tabular"
+  )
+  expect_error(
+    do.call(dsFlower:::.enforceDisclosureAndDp,
+            c(base_args, list(n_units = NULL))),
+    "Invalid staged privacy-unit count"
+  )
+  expect_error(
+    do.call(dsFlower:::.enforceDisclosureAndDp,
+            c(base_args, list(n_units = c(10L, 20L)))),
+    "Invalid staged privacy-unit count"
   )
 })
 
 # --- TLS ca.pem handling ---
 
 test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
+  local_interface_privacy_state()
   csv_path <- create_test_csv(n = 200)
   on.exit(unlink(csv_path))
 
@@ -131,10 +367,8 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
   on.exit(dsFlower:::.removeHandle("test_tls"), add = TRUE)
 
   # Prepare the handle first
-  result <- flowerPrepareRunDS("test_tls", "target", c("f1", "f2", "f3"))
-  dsFlower:::.setHandle("test_tls", result)
-
-  staging_dir <- result$staging_dir
+  flowerPrepareRunDS("test_tls", "target", c("f1", "f2", "f3"))
+  staging_dir <- dsFlower:::.getHandle("test_tls")$staging_dir
 
   # B64-encode a mock CA cert PEM (same as client would send)
   ca_pem <- "-----BEGIN CERTIFICATE-----\nMOCKCERT\n-----END CERTIFICATE-----"
@@ -147,6 +381,7 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
 
   # Mock .supernode_ensure to avoid spawning real process
   local_mocked_bindings(
+    .active_tunnel_port = function() 18080L,
     .supernode_ensure = function(superlink_address, manifest_dir,
                                  python_path, ca_cert_path = NULL,
                                  template_name = NULL, insecure = FALSE) {
@@ -155,14 +390,9 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
     }
   )
 
-  # v2 transport is the DSI tunnel, which skips the connectivity preflight.
-  .env <- getFromNamespace(".dsflower_env", "dsFlower")
-  old_fp <- .env$tunnel_forwarder_port
-  .env$tunnel_forwarder_port <- 18080L
-  on.exit(.env$tunnel_forwarder_port <- old_fp, add = TRUE)
-
-  updated <- flowerEnsureSuperNodeDS("test_tls", "127.0.0.1:9092",
-                                      "fl-test", encoded)
+  flowerEnsureSuperNodeDS("test_tls", "127.0.0.1:9092",
+                          "fl-test", encoded)
+  updated <- dsFlower:::.getHandle("test_tls")
 
   # Verify ca.pem was written
   ca_pem_path <- file.path(staging_dir, "ca.pem")
@@ -170,12 +400,14 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
   written_pem <- paste(readLines(ca_pem_path, warn = FALSE), collapse = "\n")
   expect_true(grepl("MOCKCERT", written_pem))
   expect_equal(updated$ca_cert_path, ca_pem_path)
-
-  # Clean up staging
-  dsFlower:::.cleanupStaging(result$run_token)
+  manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  expect_true(manifest[["privacy-reserved"]])
+  expect_equal(manifest[["privacy-allocation-index"]], 1L)
+  expect_gt(manifest[["privacy-epsilon"]], 0)
 })
 
 test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)", {
+  local_interface_privacy_state()
   csv_path <- create_test_csv(n = 200)
   on.exit(unlink(csv_path))
 
@@ -183,10 +415,10 @@ test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)"
   dsFlower:::.setHandle("test_no_tls", handle)
   on.exit(dsFlower:::.removeHandle("test_no_tls"), add = TRUE)
 
-  result <- flowerPrepareRunDS("test_no_tls", "target", c("f1", "f2", "f3"))
-  dsFlower:::.setHandle("test_no_tls", result)
+  flowerPrepareRunDS("test_no_tls", "target", c("f1", "f2", "f3"))
 
   local_mocked_bindings(
+    .active_tunnel_port = function() 18080L,
     .supernode_ensure = function(superlink_address, manifest_dir,
                                  python_path, ca_cert_path = NULL,
                                  template_name = NULL, insecure = FALSE) {
@@ -195,26 +427,50 @@ test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)"
     }
   )
 
-  .env <- getFromNamespace(".dsflower_env", "dsFlower")
-  old_fp <- .env$tunnel_forwarder_port
-  .env$tunnel_forwarder_port <- 18080L
-  on.exit(.env$tunnel_forwarder_port <- old_fp, add = TRUE)
-
-  updated <- flowerEnsureSuperNodeDS("test_no_tls", "127.0.0.1:9092", "fl-test")
+  flowerEnsureSuperNodeDS("test_no_tls", "127.0.0.1:9092", "fl-test")
+  updated <- dsFlower:::.getHandle("test_no_tls")
   expect_null(updated$ca_cert_path)
   expect_true(updated$node_ensured)
+})
 
-  dsFlower:::.cleanupStaging(result$run_token)
+test_that("a client-supplied hostname is not mistaken for a trusted coordinator", {
+  handle_name <- "test_untrusted_hostname"
+  run_token <- dsFlower:::.generate_run_token()
+  staging_dir <- dsFlower:::.ensureStagingDir(run_token)
+  dsFlower:::.setHandle(handle_name, mock_handle(
+    run_token = run_token, staging_dir = staging_dir, prepared = TRUE))
+  withr::defer(dsFlower:::.removeHandle(handle_name))
+  withr::local_options(list(
+    dsflower.coordinator_address = "",
+    dsflower.allow_untrusted_coordinator = FALSE
+  ))
+  env <- getFromNamespace(".dsflower_env", "dsFlower")
+  old_port <- env$tunnel_forwarder_port
+  env$tunnel_forwarder_port <- NULL
+  withr::defer(env$tunnel_forwarder_port <- old_port)
+
+  expect_error(
+    flowerEnsureSuperNodeDS(handle_name, "evil.example:9092"),
+    "Refusing SuperNode"
+  )
+  # Loopback is not an operator authorization either when supplied directly by
+  # the analyst; only the server-created tunnel or an exact admin pin is trusted.
+  expect_error(
+    flowerEnsureSuperNodeDS(handle_name, "127.0.0.1:9092"),
+    "Refusing SuperNode"
+  )
 })
 
 test_that("flowerCleanupRunDS resets handle state", {
   csv_path <- create_test_csv(n = 10)
   on.exit(unlink(csv_path))
 
+  run_token <- dsFlower:::.generate_run_token()
+  staging_dir <- dsFlower:::.ensureStagingDir(run_token)
   handle <- mock_handle(
     data_path = csv_path,
-    run_token = "run_cleanup_test",
-    staging_dir = file.path(tempdir(), "dsflower", "run_cleanup_test"),
+    run_token = run_token,
+    staging_dir = staging_dir,
     target_column = "target",
     feature_columns = c("f1"),
     prepared = TRUE
@@ -222,19 +478,22 @@ test_that("flowerCleanupRunDS resets handle state", {
   dsFlower:::.setHandle("test_cleanup", handle)
   on.exit(dsFlower:::.removeHandle("test_cleanup"), add = TRUE)
 
-  result <- flowerCleanupRunDS("test_cleanup")
-  expect_false(result$prepared)
-  expect_false(result$node_ensured)
-  expect_null(result$run_token)
-  expect_null(result$staging_dir)
-  expect_null(result$target_column)
+  flowerCleanupRunDS("test_cleanup")
+  state <- dsFlower:::.getHandle("test_cleanup")
+  expect_false(state$prepared)
+  expect_false(state$node_ensured)
+  expect_null(state$run_token)
+  expect_null(state$staging_dir)
+  expect_null(state$target_column)
 })
 
 test_that("flowerCleanupRunDS stops associated SuperNode before reset", {
   stopped <- character()
+  run_token <- dsFlower:::.generate_run_token()
+  staging_dir <- dsFlower:::.ensureStagingDir(run_token)
   handle <- mock_handle(
-    run_token = "run_cleanup_stop_test",
-    staging_dir = file.path(tempdir(), "dsflower", "run_cleanup_stop_test"),
+    run_token = run_token,
+    staging_dir = staging_dir,
     prepared = TRUE,
     node_ensured = TRUE
   )
@@ -259,6 +518,9 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("dsflower_version" %in% names(caps))
   expect_true("python_version" %in% names(caps))
   expect_true("flower_version" %in% names(caps))
+  expect_true("torch_version" %in% names(caps))
+  expect_true("opacus_version" %in% names(caps))
+  expect_true("runtime_versions_sha256" %in% names(caps))
   expect_true("templates" %in% names(caps))
   expect_true("max_rounds" %in% names(caps))
   expect_true("min_samples" %in% names(caps))
@@ -272,6 +534,20 @@ test_that("flowerGetCapabilitiesDS includes is_docker and hostname", {
   expect_type(caps$is_docker, "logical")
   expect_type(caps$hostname, "character")
   expect_true(nchar(caps$hostname) > 0)
+})
+
+test_that("handle capabilities expose schema but never a private row count", {
+  name <- "test_capabilities_no_rows"
+  dsFlower:::.setHandle(name, list(
+    data_path = tempfile(), source = "table",
+    table_data = data.frame(x = 1:8, y = 9:16),
+    prepared = FALSE, node_ensured = FALSE))
+  withr::defer(dsFlower:::.removeHandle(name))
+
+  caps <- flowerGetCapabilitiesDS(name)
+  expect_false("data_n_rows" %in% names(caps))
+  expect_equal(caps$data_n_cols, 2L)
+  expect_equal(caps$data_columns, c("x", "y"))
 })
 
 test_that(".detect_container_env returns logical", {
@@ -290,6 +566,27 @@ test_that("flowerCheckConnectivityDS rejects bad format", {
   result <- flowerCheckConnectivityDS("not-a-valid-address")
   expect_false(result$reachable)
   expect_true(grepl("Invalid", result$error))
+})
+
+test_that("connectivity checks reject every non-global IPv4 class", {
+  unsafe <- c(
+    "0.1.2.3", "10.0.0.1", "100.64.0.1", "100.100.100.200",
+    "127.0.0.1", "169.254.169.254", "172.31.255.255",
+    "192.0.0.1", "192.0.2.1", "192.88.99.1", "192.168.1.1",
+    "198.18.0.1", "198.51.100.1", "203.0.113.1", "224.0.0.1",
+    "255.255.255.255"
+  )
+  expect_true(all(vapply(
+    unsafe, dsFlower:::.is_private_or_local_host, logical(1))))
+  expect_false(dsFlower:::.is_private_or_local_host("8.8.8.8"))
+
+  # The RFC6598 range includes cloud metadata endpoints such as
+  # 100.100.100.200, so rejection must happen before opening a socket.
+  withr::local_options(list(dsflower.restrict_connectivity = TRUE,
+                            dsflower.coordinator_address = ""))
+  result <- flowerCheckConnectivityDS("100.100.100.200:80")
+  expect_false(result$reachable)
+  expect_match(result$error, "not allowed")
 })
 
 test_that("flowerStatusDS returns status info", {

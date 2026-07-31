@@ -8,12 +8,19 @@ so the manifest is tamper-proof; the researcher cannot weaken DP through it.
 
 import json
 import math
+import ntpath
 import os
 
 import numpy as np
 import pandas as pd
 
-_privacy_config = None
+
+_MAX_BATCH_SIZE = 65_536
+_MAX_LOCAL_EPOCHS = 1_000
+_MAX_SERVER_ROUNDS = 500
+_MAX_LEARNING_RATE = 10.0
+_MAX_GBDT_REG_LAMBDA = 1.0e6
+_MAX_NUMERIC_ABS = 1.0e6
 
 
 def _get_manifest_dir(context=None):
@@ -36,6 +43,64 @@ def _load_manifest(context=None):
         return json.load(f)
 
 
+def _load_target(y_series, manifest):
+    """Load a target under its public, manifest-pinned semantics.
+
+    New manifests stage the target as numeric codes (classification) or a
+    publicly clipped scalar (regression/count).  The checks here are defense in
+    depth and deliberately never infer a vocabulary from private cohort values.
+    """
+    task_type = str(manifest.get("task-type", "classification")).lower()
+    numeric_task = task_type in ("regression", "count", "continuous")
+    try:
+        numeric = pd.to_numeric(y_series, errors="raise").to_numpy(dtype=np.float64)
+    except Exception as exc:
+        if numeric_task:
+            raise ValueError("regression/count target must be numeric") from exc
+        raise ValueError(
+            "non-numeric classification target requires public target-levels") from exc
+    if not bool(np.all(np.isfinite(numeric))):
+        raise ValueError("target contains non-finite values")
+
+    if numeric_task:
+        bounds = manifest.get("target-bounds")
+        if not isinstance(bounds, dict):
+            raise ValueError("manifest is missing public target-bounds")
+        try:
+            lower = float(bounds["lower"])
+            upper = float(bounds["upper"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("manifest has invalid public target-bounds") from exc
+        if not (math.isfinite(lower) and math.isfinite(upper) and lower < upper
+                and abs(lower) <= _MAX_NUMERIC_ABS
+                and abs(upper) <= _MAX_NUMERIC_ABS):
+            raise ValueError("manifest has invalid public target-bounds")
+        loss_name = str(manifest.get("loss-name", "")).lower()
+        if task_type == "count" and lower < 0.0:
+            raise ValueError("count target-bounds require lower >= 0")
+        if loss_name == "gamma_nll" and lower <= 0.0:
+            raise ValueError("gamma_nll target-bounds require lower > 0")
+        return np.clip(numeric, lower, upper).astype(np.float32)
+
+    levels = manifest.get("target-levels")
+    if levels is not None:
+        if (not isinstance(levels, dict)
+                or levels.get("type") not in ("character", "logical", "numeric")
+                or not isinstance(levels.get("values"), list)):
+            raise ValueError("manifest has invalid public target-levels")
+        n_classes = len(levels["values"])
+    else:
+        n_classes = int(manifest.get(
+            "num-classes", 2 if manifest.get("dp-track") == "trees" else 2))
+    if n_classes < 2 or n_classes > 1024:
+        raise ValueError("manifest has invalid public class count")
+    if not bool(np.all(numeric == np.floor(numeric))):
+        raise ValueError("classification target must contain integer class codes")
+    if not bool(np.all((numeric >= 0) & (numeric < n_classes))):
+        raise ValueError("classification target is outside the public class domain")
+    return numeric.astype(np.float32)
+
+
 def load_data(context=None):
     """Load (X, y) for standard supervised training from the staged manifest."""
     manifest = _load_manifest(context)
@@ -49,19 +114,20 @@ def load_data(context=None):
         df = pd.read_csv(data_file)
 
     target_col = manifest["target_column"]
+    if not isinstance(target_col, str) or target_col not in df.columns:
+        raise ValueError("manifest must pin one available target column")
     feat_cols = manifest.get("feature_columns")
-    feat = df[feat_cols] if feat_cols else df.drop(columns=[target_col])
-    X = feat.to_numpy(dtype=np.float32)
-
-    # Coerce the target to numeric {0,1,...}. Uses is_numeric_dtype (so pandas
-    # arrow-backed string columns are handled too, not just object) and stable
-    # categorical encoding for factor/string/bool labels; numeric passes through.
-    y_series = df[target_col]
-    if pd.api.types.is_numeric_dtype(y_series):
-        y = y_series.to_numpy()
+    patient_col = manifest.get("patient_column")
+    if feat_cols:
+        feat_cols = [str(col) for col in feat_cols if str(col) != patient_col]
+        if not feat_cols:
+            raise ValueError("manifest has no non-identifier feature columns")
+        feat = df[feat_cols]
     else:
-        y = y_series.astype("category").cat.codes.to_numpy()
-    return X, np.asarray(y, dtype=np.float32)
+        excluded = [target_col] + ([patient_col] if patient_col else [])
+        feat = df.drop(columns=excluded)
+    X = feat.to_numpy(dtype=np.float32)
+    return X, _load_target(df[target_col], manifest)
 
 
 def is_image_run(context=None):
@@ -69,23 +135,51 @@ def is_image_run(context=None):
     return _load_manifest(context).get("data_type") == "image"
 
 
-# Patient / subject identifier candidates — MUST mirror R .detectPatientColumn
-# (policy.R) so the admission grouping and the per-patient DP unit pick the same
-# column. The server-written manifest may pin one via "patient_column".
-_PATIENT_CANDIDATES = ("patient_id", "patientid", "patient", "subject_id",
-                       "subjectid", "subject", "participant_id", "case_id",
-                       "person_id", "pid", "mrn")
-
-
-def _detect_patient_column(df, manifest):
+def _load_patient_ids(df, manifest):
+    """Return the explicit server-pinned DP unit; never auto-detect/fallback."""
+    unit = manifest.get("dp-unit")
+    if unit not in ("row", "patient"):
+        raise ValueError("manifest is missing a valid pinned DP unit")
     explicit = manifest.get("patient_column")
-    if explicit and explicit in df.columns:
-        return explicit
-    lc = {str(c).lower(): c for c in df.columns}
-    for cand in _PATIENT_CANDIDATES:
-        if cand in lc:
-            return lc[cand]
-    return None
+    if unit == "row":
+        if explicit not in (None, ""):
+            raise ValueError("row-level manifest must not pin a patient column")
+        return None
+    if (not isinstance(explicit, str) or not explicit
+            or explicit not in df.columns):
+        raise ValueError("manifest-pinned patient column is missing")
+    if manifest.get("patient-id-canonicalization") != "trim-utf8-v1":
+        raise ValueError("manifest has an unsupported patient ID canonicalization")
+    values = df[explicit]
+    text = values.astype(str).str.strip()
+    invalid = values.isna() | text.eq("") | text.str.lower().isin(
+        ("na", "nan", "null"))
+    if bool(invalid.any()):
+        raise ValueError(
+            "manifest-pinned patient identifiers contain missing values")
+    return text.to_numpy(dtype=str)
+
+
+def _resolve_image_path(images_root, value):
+    """Resolve one portable relative path without allowing root escape."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("image samples contain an unsafe relative path")
+    if ("\\" in value or os.path.isabs(value) or ntpath.isabs(value)
+            or ntpath.splitdrive(value)[0]):
+        raise ValueError("image samples contain an unsafe relative path")
+    parts = value.split("/")
+    if any(not part or part in (".", "..") for part in parts):
+        raise ValueError("image samples contain an unsafe relative path")
+
+    root = os.path.realpath(images_root)
+    candidate = os.path.realpath(os.path.join(root, *parts))
+    try:
+        contained = os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        contained = False
+    if not contained or not os.path.isfile(candidate):
+        raise ValueError("one or more staged images are unavailable")
+    return candidate
 
 
 def load_image_collection(context=None):
@@ -105,7 +199,7 @@ def load_image_collection(context=None):
     manifest_dir = _get_manifest_dir(context)
     samples_file = os.path.join(manifest_dir, manifest["samples_file"])
     if not os.path.isfile(samples_file):
-        raise ValueError(f"image samples file not found: {samples_file}")
+        raise ValueError("image samples file is unavailable")
     if samples_file.lower().endswith(".parquet"):
         import pyarrow.parquet as pq
         df = pq.read_table(samples_file).to_pandas()
@@ -116,31 +210,21 @@ def load_image_collection(context=None):
     images = assets.get("images", {}) or {}
     images_root = images.get("root") or manifest["data_root"]
     if not os.path.isdir(images_root):
-        raise ValueError(f"image data root not found: {images_root}")
+        raise ValueError("image data root is unavailable")
     path_col = images.get("path_col", "relative_path")
     if path_col not in df.columns:
         raise ValueError(
             f"image samples table is missing the path column '{path_col}'")
 
     target_col = manifest["target_column"]
-    # Drop rows with a missing label: a NaN label becomes categorical code -1 ->
-    # an off-range gradient that silently mislearns AND leaks the row's presence.
-    if df[target_col].isna().any():
-        df = df[df[target_col].notna()].reset_index(drop=True)
-    if not len(df):
-        raise ValueError(
-            "image collection has no labelled samples after dropping missing labels")
+    if not isinstance(target_col, str) or target_col not in df.columns:
+        raise ValueError("manifest must pin one available target column")
+    if df[target_col].isna().any() or not len(df):
+        raise ValueError("staged image collection has an invalid target column")
 
-    paths = [os.path.join(images_root, str(p)) for p in df[path_col]]
-    y_series = df[target_col]
-    if pd.api.types.is_numeric_dtype(y_series):
-        y = y_series.to_numpy()
-    else:
-        y = y_series.astype("category").cat.codes.to_numpy()
-
-    pcol = _detect_patient_column(df, manifest)
-    groups = df[pcol].astype(str).to_numpy() if pcol else None
-    return paths, np.asarray(y, dtype=np.float32), groups
+    paths = [_resolve_image_path(images_root, p) for p in df[path_col]]
+    groups = _load_patient_ids(df, manifest)
+    return paths, _load_target(df[target_col], manifest), groups
 
 
 def load_privacy_config(context=None):
@@ -149,22 +233,33 @@ def load_privacy_config(context=None):
     DP is ALWAYS enforced — there is no 'off' path and no profiles. Counts and
     per-node metrics are suppressed/bucketed by default (disclosure backstop).
     """
-    global _privacy_config
-    if _privacy_config is not None:
-        return _privacy_config
-
     manifest = _load_manifest(context)
-    epsilon = float(manifest.get("privacy-epsilon", 3.0))
-    delta = float(manifest.get("privacy-delta", 1e-5))
+    if manifest.get("privacy-reserved") is not True:
+        raise ValueError("manifest has no committed privacy reservation")
+    release_enabled = bool(manifest.get("privacy-release-enabled", False))
+    epsilon = float(manifest.get("privacy-epsilon", 0.0))
+    delta = float(manifest.get("privacy-delta", 0.0))
     clipping_norm = float(manifest.get("privacy-clipping_norm", 1.0))
     # The manifest is server-written, but during the staging transition it may
     # still carry client-PROPOSED DP params (the run_config is merged in at stage
     # time), so the node treats them as untrusted. First: legal ranges (a corrupted
     # value must not silently produce zero/infinite noise that voids the guarantee).
-    if not (epsilon > 0 and 0.0 < delta < 1.0 and clipping_norm > 0):
+    if not (clipping_norm > 0 and math.isfinite(clipping_norm)):
         raise ValueError(
-            "invalid DP parameters in manifest (need epsilon>0, 0<delta<1, "
-            "clipping_norm>0)")
+            "invalid DP clipping norm in manifest")
+    if release_enabled and not (
+        epsilon > 0 and 0.0 < delta < 1.0
+        and math.isfinite(epsilon) and math.isfinite(delta)
+    ):
+        raise ValueError("enabled DP release has invalid epsilon/delta")
+    if not release_enabled and not (
+        epsilon >= 0.0 and delta >= 0.0
+        and math.isfinite(epsilon) and math.isfinite(delta)
+    ):
+        # The accountant preserves the exact (possibly tiny) scheduled values
+        # in the ledger/manifest even when numerical policy turns the operation
+        # into a data-independent no-op.
+        raise ValueError("disabled DP allocation has invalid epsilon/delta")
     # Then: HARDCODED node ceilings (NOT manifest-derived -- a client-influenced
     # manifest cannot raise its own ceiling). Reject anything weaker than policy; an
     # inflated epsilon or a near-1 delta would void the (epsilon, delta) guarantee
@@ -176,22 +271,71 @@ def load_privacy_config(context=None):
     if clipping_norm > 100.0:
         raise ValueError(
             "privacy clipping_norm %.4g exceeds the node ceiling (100)" % clipping_norm)
-    _privacy_config = {
+    try:
+        sample_aggregate_raw = float(
+            manifest.get("privacy-sample_aggregate", 0))
+        sa_blocks_raw = float(manifest.get("privacy-sa_blocks", 8))
+        egress_time_pad = float(manifest.get("privacy-egress_time_pad", 0))
+        egress_timeout_raw = float(
+            manifest.get("privacy-egress_timeout", 900))
+        egress_memory_mb_raw = float(
+            manifest.get("privacy-egress_memory_mb", 8192))
+        egress_file_mb_raw = float(
+            manifest.get("privacy-egress_file_mb", 1024))
+        egress_processes_raw = float(
+            manifest.get("privacy-egress_processes", 128))
+        hook_enabled_raw = float(manifest.get("privacy-hook_enabled", 0))
+        n_samples_raw = float(manifest.get("n_samples", 0))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("manifest contains an invalid server privacy option") from exc
+    if sample_aggregate_raw not in (0.0, 1.0) or hook_enabled_raw not in (0.0, 1.0):
+        raise ValueError("manifest privacy switches must be exactly zero or one")
+    if manifest.get("privacy-adjacency") != "replace_one":
+        raise ValueError("manifest must pin replace-one privacy adjacency")
+    if (not math.isfinite(sa_blocks_raw) or sa_blocks_raw != math.floor(sa_blocks_raw)
+            or not 2 <= sa_blocks_raw <= 64):
+        raise ValueError("manifest S&A block count must be an integer in [2, 64]")
+    if not math.isfinite(egress_time_pad) or egress_time_pad < 0:
+        raise ValueError("manifest Hook time pad must be finite and non-negative")
+    if (not math.isfinite(egress_timeout_raw)
+            or egress_timeout_raw != math.floor(egress_timeout_raw)
+            or not 1 <= egress_timeout_raw <= 3600):
+        raise ValueError("manifest Hook timeout must be an integer in [1, 3600]")
+    resource_limits = (
+        ("memory", egress_memory_mb_raw, 512, 131072),
+        ("file", egress_file_mb_raw, 16, 16384),
+        ("process", egress_processes_raw, 1, 1024),
+    )
+    for label, value, lower, upper in resource_limits:
+        if (not math.isfinite(value) or value != math.floor(value)
+                or not lower <= value <= upper):
+            raise ValueError(
+                "manifest Hook %s limit must be an integer in [%d, %d]"
+                % (label, lower, upper))
+    if (not math.isfinite(n_samples_raw) or n_samples_raw != math.floor(n_samples_raw)
+            or n_samples_raw < 0):
+        raise ValueError("manifest sample count must be a non-negative integer")
+    return {
         "epsilon": epsilon,
         "delta": delta,
         "clipping_norm": clipping_norm,
-        # Improved Tier-2 floor (sample-and-aggregate) policy. Parsed defensively; the
-        # harness clamps k = min(sa_max_blocks, n // sa_min_block) and falls back to the
-        # plain 2C floor below 2 blocks, so out-of-range values cannot weaken DP.
-        "sample_aggregate": bool(float(manifest.get("privacy-sample_aggregate", 0))),
-        "sa_min_block": max(1, int(float(manifest.get("privacy-sa_min_block", 64)))),
-        "sa_max_blocks": max(1, int(float(manifest.get("privacy-sa_max_blocks", 8)))),
-        "egress_time_pad": max(0.0, float(manifest.get("privacy-egress_time_pad", 0))),
+        "release_enabled": release_enabled,
+        "adjacency": "replace_one",
+        # Improved Tier-2 floor (sample-and-aggregate) policy. k is a fixed,
+        # administrator-pinned value: deriving it from private n would expose n
+        # through a data-dependent Gaussian variance.
+        "sample_aggregate": bool(sample_aggregate_raw),
+        "sa_blocks": int(sa_blocks_raw),
+        "egress_time_pad": egress_time_pad,
+        "egress_timeout": int(egress_timeout_raw),
+        "egress_memory_mb": int(egress_memory_mb_raw),
+        "egress_file_mb": int(egress_file_mb_raw),
+        "egress_processes": int(egress_processes_raw),
+        "hook_enabled": bool(hook_enabled_raw),
         "allow_per_node_metrics": False,
         "allow_exact_num_examples": False,
-        "n_samples": int(manifest.get("n_samples", 0)),
+        "n_samples": int(n_samples_raw),
     }
-    return _privacy_config
 
 
 def _run_config(context):
@@ -206,8 +350,9 @@ def load_dp_track(context=None):
     node-side, so a client-chosen track cannot dodge DP -- at most pick trees vs
     neural. The manifest pin, once added, makes it fully node-authoritative.)"""
     manifest = _load_manifest(context)
-    cfg = _run_config(context)
-    track = str(manifest.get("dp-track", cfg.get("dp-track", "neural"))).lower()
+    if "dp-track" not in manifest:
+        raise ValueError("manifest is missing the pinned dp-track")
+    track = str(manifest["dp-track"]).lower()
     if track not in ("neural", "trees", "egress"):
         raise ValueError("invalid dp-track '%s'" % track)
     return track
@@ -227,17 +372,60 @@ def load_run_pins(context=None):
     manifest = _load_manifest(context)
     cfg = _run_config(context)
 
-    def pin(key, default, cast):
-        return cast(manifest[key]) if key in manifest else cast(cfg.get(key, default))
+    def required(key, cast):
+        if key not in manifest:
+            raise ValueError("manifest is missing DP-critical pin '%s'" % key)
+        return cast(manifest[key])
+
+    def bounded_int(key, upper):
+        if key not in manifest or isinstance(manifest[key], bool):
+            raise ValueError("manifest is missing valid DP-critical pin '%s'" % key)
+        try:
+            number = float(manifest[key])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("manifest pin '%s' must be an integer" % key) from exc
+        if (not math.isfinite(number) or number != math.floor(number)
+                or number < 1 or number > int(upper)):
+            raise ValueError(
+                "manifest pin '%s' must be in [1, %d]" % (key, int(upper)))
+        return int(number)
+
+    try:
+        learning_rate = float(
+            cfg.get("learning-rate", manifest.get("learning-rate", 0.01)))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("learning-rate must be in (0, 10]") from exc
+    if (not math.isfinite(learning_rate) or learning_rate <= 0.0
+            or learning_rate > _MAX_LEARNING_RATE):
+        raise ValueError("learning-rate must be in (0, 10]")
 
     return {
-        "loss_name": str(manifest.get("loss-name", cfg.get("loss-name", "bce_logits"))),
-        "batch_size": pin("batch-size", 32, int),
-        "local_epochs": pin("local-epochs", 1, int),
-        "num_rounds": pin("num-server-rounds", 1, int),
-        "n_classes": pin("num-classes", 2, int),
-        "learning_rate": float(cfg.get("learning-rate", manifest.get("learning-rate", 0.01))),
+        "loss_name": required("loss-name", str),
+        "batch_size": bounded_int("batch-size", _MAX_BATCH_SIZE),
+        "local_epochs": bounded_int("local-epochs", _MAX_LOCAL_EPOCHS),
+        "num_rounds": bounded_int("num-server-rounds", _MAX_SERVER_ROUNDS),
+        "n_classes": required("num-classes", int),
+        "learning_rate": learning_rate,
     }
+
+
+def load_pinned_run_config(context=None):
+    """Overlay every node-pinned declarative field onto Flower run_config."""
+    manifest = _load_manifest(context)
+    cfg = _run_config(context)
+    # The analyst-facing Flower config may name a module for the researcher-side
+    # ServerApp, but node execution accepts only the package name derived and
+    # written by flowerTier2PinDS after installation/hash verification.
+    cfg.pop("user-module", None)
+    keys = (
+        "model-spec-b64", "loss-name", "num-classes", "num-labels",
+        "local-epochs", "batch-size", "num-server-rounds", "num-features",
+        "gbdt-spec", "feature-bounds", "user-module",
+    )
+    for key in keys:
+        if key in manifest:
+            cfg[key] = manifest[key]
+    return cfg
 
 
 def _decode_feature_norm(cfg, n_features):
@@ -268,6 +456,30 @@ def _decode_feature_norm(cfg, n_features):
     return mean, sd
 
 
+def _decode_feature_bounds(cfg, n_features):
+    """Decode public bounds pinned in the manifest or legacy b64 run config."""
+    bounds = cfg.get("feature-bounds")
+    if bounds is None and cfg.get("feature-bounds-b64"):
+        import base64
+        try:
+            bounds = json.loads(base64.b64decode(
+                str(cfg["feature-bounds-b64"]), validate=True).decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError("feature-bounds-b64 is invalid: %s" % exc)
+    if bounds is None:
+        return None
+    lower = np.asarray(bounds.get("lower", []), dtype=np.float64)
+    upper = np.asarray(bounds.get("upper", []), dtype=np.float64)
+    if lower.shape != (int(n_features),) or upper.shape != (int(n_features),):
+        raise RuntimeError("public feature bounds do not match num features")
+    if (not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper))
+            or not np.all(lower < upper)
+            or np.any(np.abs(lower) > _MAX_NUMERIC_ABS)
+            or np.any(np.abs(upper) > _MAX_NUMERIC_ABS)):
+        raise RuntimeError("public feature bounds must be finite with lower < upper")
+    return lower, upper
+
+
 def load_gbdt_spec(context=None):
     """Validated, manifest-authoritative XGBoost spec for the trees track.
 
@@ -279,8 +491,10 @@ def load_gbdt_spec(context=None):
     data quantiles). Returns the dict consumed by dp_gbdt.fit_dp_gbdt.
     """
     manifest = _load_manifest(context)
+    if "gbdt-spec" not in manifest:
+        raise ValueError("manifest is missing the pinned gbdt-spec")
     spec = dict(manifest.get("gbdt-spec", {}) or {})
-    cfg = _run_config(context)
+    cfg = load_pinned_run_config(context)
 
     objective = str(spec.get("objective", cfg.get("objective", "binary:logistic")))
     max_depth = int(spec.get("max_depth", cfg.get("max-depth", 3)))
@@ -289,10 +503,12 @@ def load_gbdt_spec(context=None):
     reg_lambda = float(spec.get("reg_lambda", cfg.get("reg-lambda", 1.0)))
     # Newton-step denominator is max(lambda, H+lambda); lambda<=0 (or non-finite lr/lambda)
     # can yield inf/NaN leaf weights. Clamp to safe values (fail-closed on the math).
-    if not (math.isfinite(learning_rate) and learning_rate > 0):
-        raise RuntimeError("DP-GBDT learning_rate must be finite and > 0")
+    if not (math.isfinite(learning_rate)
+            and 0 < learning_rate <= _MAX_LEARNING_RATE):
+        raise RuntimeError("DP-GBDT learning_rate must be in (0, 10]")
     if not (math.isfinite(reg_lambda) and reg_lambda > 0):
         reg_lambda = 1e-6
+    reg_lambda = min(reg_lambda, _MAX_GBDT_REG_LAMBDA)
     n_bins = int(spec.get("n_bins", cfg.get("n-bins", 32)))
     run_token = str(manifest.get("run_token", spec.get("run_token", "dsflower")))
     # Admin caps (data-independent): bound compute + keep leaves from being singletons.
@@ -304,23 +520,14 @@ def load_gbdt_spec(context=None):
     if not feature_ranges:
         n_features = int(manifest.get("num-features", 0))
         if n_features <= 0:
-            X, _ = load_data(context)            # shape only (schema), not content
-            n_features = int(X.shape[1])
-        # Binning prior for the random-split thresholds. The DP-GBDT draws each
-        # threshold from a DATA-INDEPENDENT range; a fixed [0,1] collapses every
-        # feature whose values exceed 1 (area, perimeter, ...) to a single leaf, so
-        # the booster learns nothing (-> majority baseline). The client ships the
-        # GLOBAL feature mean/SD (a sanctioned low-sensitivity aggregate, not data
-        # quantiles), and we centre the prior at [mu-4sd, mu+4sd] -- ~all of a
-        # roughly-normal feature, so the random thresholds land in the real range.
-        # This depends on data ONLY through the already-released mu/sd (pure
-        # post-processing -> no extra privacy cost). Absent stats -> [0,1] fallback.
-        norm = _decode_feature_norm(cfg, n_features)
-        if norm is not None:
-            mean, sd = norm
-            R = 4.0
-            feature_ranges = [[float(mean[j] - R * sd[j]),
-                               float(mean[j] + R * sd[j])] for j in range(n_features)]
+            raise RuntimeError(
+                "manifest must pin num-features before DP-GBDT execution")
+        # Threshold ranges are public constants, never exact node statistics.
+        bounds = _decode_feature_bounds(cfg, n_features)
+        if bounds is not None:
+            lower, upper = bounds
+            feature_ranges = [[float(lower[j]), float(upper[j])]
+                              for j in range(n_features)]
         else:
             feature_ranges = [[0.0, 1.0]] * n_features
     return {"objective": objective, "max_depth": max_depth, "n_trees": n_trees,
@@ -342,5 +549,4 @@ def load_tabular_patient_ids(context=None):
         df = pq.read_table(data_file).to_pandas()
     else:
         df = pd.read_csv(data_file)
-    pcol = _detect_patient_column(df, manifest)
-    return df[pcol].astype(str).to_numpy() if pcol else None
+    return _load_patient_ids(df, manifest)

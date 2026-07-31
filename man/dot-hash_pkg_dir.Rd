@@ -2,15 +2,13 @@
 % Please edit documentation in R/app_store.R
 \name{.hash_pkg_dir}
 \alias{.hash_pkg_dir}
-\title{Hash a Python package dir, byte-identically to sitecustomize.py _hash_package
-(and .compute_harness_hash): radix-sorted relpaths, relpath+"\n"+content+"\x00",
-excluding compiled artifacts. This is the hash the integrity hook pins against.}
+\title{Hash a Python package directory for integrity pinning}
 \usage{
 .hash_pkg_dir(pkg_dir)
 }
 \description{
-Hash a Python package dir, byte-identically to sitecustomize.py _hash_package
-(and .compute_harness_hash): radix-sorted relpaths, relpath+"\n"+content+"\x00",
-excluding compiled artifacts. This is the hash the integrity hook pins against.
+Matches \code{sitecustomize.py} and \code{.compute_harness_hash}: radix-sorted
+relative paths followed by a newline byte, file content and a NUL byte, with
+compiled artifacts excluded.
 }
 \keyword{internal}

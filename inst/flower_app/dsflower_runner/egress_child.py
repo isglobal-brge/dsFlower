@@ -2,10 +2,10 @@
 interpreter, fully separate from the trusted parent.
 
 Why this file exists: the parent (the ClientApp on the data node) applies ALL differential
-privacy -- clip to the C-ball, aggregate, add analytic-Gaussian noise. The untrusted upload
+privacy -- clip to the C-ball, aggregate, add RDP-calibrated Gaussian noise. The untrusted upload
 must therefore never share the parent's process: in-process it could monkeypatch the DP
 harness / NumPy / the RNG before the gate runs, or carry state across sample-and-aggregate
-blocks and break the 2C/k independence. Here the child only ever produces a plain numeric
+blocks and break the bounded-block argument. Here the child only ever produces a plain numeric
 weight array, written as .npy; the parent reads it back with allow_pickle=False (so the
 result can never execute code) and validates it. Anything the child does to its OWN
 interpreter is irrelevant.
@@ -29,16 +29,29 @@ def _harden():
     parent's launcher."""
     try:
         import resource
+
+        def _set_limit(name, soft, hard=None):
+            limit = getattr(resource, name, None)
+            if limit is None or soft < 0:
+                return
+            try:
+                resource.setrlimit(limit, (soft, soft if hard is None else hard))
+            except Exception:
+                # Limits are independent: one unsupported RLIMIT must not prevent
+                # the remaining limits from being installed.
+                pass
+
         cpu = int(os.environ.get("DSF_RLIMIT_CPU", "0"))
         if cpu > 0:
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 2))
-        asb = int(os.environ.get("DSF_RLIMIT_AS", "0"))
-        if asb > 0:
-            resource.setrlimit(resource.RLIMIT_AS, (asb, asb))
-        fsz = int(os.environ.get("DSF_RLIMIT_FSIZE", "0"))
-        if fsz > 0:
-            resource.setrlimit(resource.RLIMIT_FSIZE, (fsz, fsz))
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            _set_limit("RLIMIT_CPU", cpu, cpu + 2)
+        for name, env_name in (
+                ("RLIMIT_AS", "DSF_RLIMIT_AS"),
+                ("RLIMIT_FSIZE", "DSF_RLIMIT_FSIZE"),
+                ("RLIMIT_NPROC", "DSF_RLIMIT_NPROC")):
+            value = int(os.environ.get(env_name, "0"))
+            if value > 0:
+                _set_limit(name, value)
+        _set_limit("RLIMIT_CORE", 0)
     except Exception:
         pass
     if os.environ.get("DSF_NO_NET") == "1":
@@ -107,22 +120,40 @@ def _install_seccomp_no_net():
         return
 
 
+def _load_pinned_package(module_name, module_file):
+    """Load one package from its exact, parent-verified initializer path."""
+    import importlib.util
+    import stat
+
+    module_file = os.path.realpath(module_file)
+    module_dir = os.path.dirname(module_file)
+    if (module_file != os.path.join(module_dir, "__init__.py")
+            or not stat.S_ISREG(os.lstat(module_file).st_mode)):
+        raise RuntimeError("pinned module file is not a regular package __init__.py")
+    spec = importlib.util.spec_from_file_location(
+        module_name, module_file, submodule_search_locations=[module_dir])
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load the pinned hook package")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="inp", required=True)
     ap.add_argument("--out", dest="out", required=True)
     ap.add_argument("--cfg", dest="cfg", required=True)
     ap.add_argument("--module", dest="module", required=True)
-    ap.add_argument("--syspath", dest="syspath", default="")
+    ap.add_argument("--module-file", dest="module_file", required=True)
     args = ap.parse_args()
 
     _harden()
 
     import numpy as np
 
-    for p in args.syspath.split(os.pathsep):
-        if p and p not in sys.path:
-            sys.path.insert(0, p)
+    module_file = os.path.realpath(args.module_file)
 
     data = np.load(args.inp, allow_pickle=False)
     gkeys = sorted(k for k in data.files if k.startswith("g_"))
@@ -132,8 +163,10 @@ def main():
     with open(args.cfg) as f:
         cfg = json.load(f)
 
-    import importlib
-    mod = importlib.import_module(args.module)            # re-verified by sitecustomize
+    # Load the exact re-hashed package initializer.  Do not ask PathFinder to
+    # resolve the name from a root containing a same-name ``foo.py`` or namespace
+    # package; that would execute bytes outside the package digest.
+    mod = _load_pinned_package(args.module, module_file)
     res = mod.local_update([np.asarray(o).copy() for o in old], X, y, cfg)
     res = [np.asarray(w, dtype=np.float64) for w in res]  # arrays only -> .npy
 

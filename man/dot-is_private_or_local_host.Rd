@@ -2,7 +2,7 @@
 % Please edit documentation in R/utils.R
 \name{.is_private_or_local_host}
 \alias{.is_private_or_local_host}
-\title{Whether a host is loopback / private (RFC1918) / link-local / non-routable}
+\title{Whether a host is non-global, local, or otherwise unsafe to probe}
 \usage{
 .is_private_or_local_host(host)
 }

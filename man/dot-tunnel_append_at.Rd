@@ -6,7 +6,7 @@
 only the bytes of 'raw' not already present, so a retried push never
 duplicates or loses bytes. Returns the new file size.}
 \usage{
-.tunnel_append_at(spool, binname, at, raw)
+.tunnel_append_at(spool, binname, at, raw, max_bytes = Inf)
 }
 \description{
 Idempotent append: 'at' is the size the relay believes the file has; append
