@@ -19,7 +19,7 @@
   if (is.character(x) && length(x) == 1) {
     if (startsWith(x, "B64:")) {
       # URL-safe base64 -> standard base64
-      b64 <- substring(x, 5)
+      b64 <- substring(x, first = 5L, last = nchar(x, type = "chars"))
       b64 <- gsub("-", "+", b64)
       b64 <- gsub("_", "/", b64)
       # Restore padding

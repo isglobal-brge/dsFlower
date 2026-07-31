@@ -58,13 +58,17 @@ side channels. A HookApp executes only when all of the following are true:
 
 - the custodian enables it;
 - a Bubblewrap filesystem/network boundary is available and explicitly attested;
-- the configured constant-time envelope is valid;
+- the configured minimum-duration timing envelope is valid;
 - the uploaded package passes archive validation, scanning and hash pinning.
 
 If any gate is absent, the HookApp is not executed and the operation returns the
 incoming public model unchanged. This data-independent no-op is intentional and
 fail-closed. `ds.flower.tier2.run()` remains only as a deprecated name for the
 HookApp API.
+
+The Hook timing envelope is defense in depth, not a formal constant-time
+guarantee: cleanup, process availability and storage behavior remain outside the
+numeric DP proof and require deployment-level quotas/isolation when in scope.
 
 ## Lifetime accounting without a query-count block
 
@@ -100,6 +104,14 @@ small data changes cannot reset it. Multiple domains are disabled by default and
 are sound only when a custodian has established that their protected populations
 are disjoint. SQLite is a single-host accountant; replicas protecting the same
 population require one shared transactional backend and anti-rollback controls.
+The ledger file must be owned by the Rock process with mode `0600`; its parent
+directory must have the same owner and no group/world write permission. The
+release runner also compares the directory and database device/inode before and
+after `sqlite3.connect()`. Given a trusted enclosing mount path, these checks
+protect the database and SQLite sidecar entries from ordinary cross-user
+replacement, but they are not anti-rollback storage and cannot exclude a
+malicious process running as the same UID swapping a path out and back between
+checks.
 
 The guarantee is accounted independently at each node. If one person can occur
 at `m` observed nodes, their federation-wide guarantee composes across those
@@ -127,17 +139,30 @@ subkey      = HMAC-SHA256(release_key, mechanism_axis)
 ```
 
 The node secret is 32 bytes from the operating-system CSPRNG, created at runtime,
-stored outside staging with mode `0600` and never exposed to submitted code. It
-is deliberately independent of R's mutable RNG and `datashield.seed`. DP
+stored outside staging with mode `0600` and never exposed to submitted code. Its
+file must be owned by the Rock service UID; its real parent directory may be
+owned by that UID or root, but must not be writable by group or other users.
+The parent is checked before and after the key is opened. It is deliberately
+independent of R's mutable RNG and `datashield.seed`. DP
 Gaussian noise, Poisson sampling and HookApp partitioning use separate
 ChaCha20-backed streams. Data-independent Torch initialization/dropout uses a
 separate HMAC-derived seed in the framework PRNG; it is not used as the DP noise
 source. Configuration and private data are deliberately absent from key derivation.
 
-An administrator can inspect a platform-provided DataSHIELD seed inside the R
-service with `getOption("datashield.seed", NULL)`. dsFlower intentionally does
-not consume or expose it: common Opal/Armadillo deployments represent it as a
-short numeric reproducibility option, not a confidential 256-bit mechanism key.
+The current Gaussian sampler is a hardened Box--Muller construction over
+IEEE-754 values. ChaCha20 makes its finite random choices unpredictable, but it
+does not turn floating-point output into an exact continuous Gaussian. The
+implemented guarantee is therefore the documented computational/practical DP
+contract, not a claim of a formally verified finite-precision mechanism. Moving
+to a verified discrete-Gaussian sampler would require a new mechanism/accountant
+ABI and a privacy-policy migration, rather than a drop-in RNG change.
+
+DataSHIELD does not define a portable, connector-level confidential seed for
+Opal or Armadillo. `dsBase::setSeedDS()` sets R's mutable `.Random.seed` from an
+analyst-supplied integer, so it is a reproducibility facility rather than a
+secret mechanism key. A deployment-specific R option may exist, but dsFlower
+intentionally neither depends on nor exposes it; the dedicated node secret is
+the fail-closed source of keyed release randomness.
 
 ## Data and output minimization
 
@@ -157,6 +182,13 @@ numeric and non-finite/unparseable values use the public bounds midpoint (or zer
 when bounds are absent); public numeric values/bounds are capped at `1e6` to
 stay below unsafe float32 center/span arithmetic. These are fixed per-record maps: no node derives a
 vocabulary, imputation value or range from its cohort, and no row is dropped.
+
+Vision inputs are decoded under fixed node-side limits (256 MiB source and
+decoded payload, 32M elements) and embedded from paths in batches capped at
+128 MiB; the full resized-image cohort is never retained. Raster, NIfTI,
+inline NRRD, MHA and DICOM inputs are supported. Detached NRRD payloads and
+`.mhd` sidecars are conservatively mapped to the same zero-image record as a
+corrupt input, before any sidecar is opened.
 
 The declarative neural runner also totalises its arithmetic: safe division,
 finite saturation after every graph operation, parameters/intermediates bounded
@@ -222,15 +254,24 @@ Options use the `dsflower.*` prefix, with the standard
 | `tunnel_loss_tolerance` | `180` | Seconds without a relay heartbeat before the node forwarder exits; constrained to 5--86400. |
 | `hook_enabled` | `FALSE` | Allow HookApp execution, subject to every other gate. |
 | `hook_sandbox_attested` | `FALSE` | Custodian attestation of the Bubblewrap boundary. |
+| `hook_resource_isolation_attested` | `FALSE` | Custodian attestation of externally enforced Hook resource isolation. |
 | `dp_sample_aggregate` | `FALSE` | Enable fixed-block HookApp sample-and-aggregate when every sandbox gate is present. |
 | `dp_sa_blocks` | `8` | Public, fixed HookApp block count, constrained to `[2, 64]`; never derived from private cohort size. |
 | `dp_egress_timeout` | `900` | Hook child timeout in seconds. |
-| `dp_egress_time_pad` | `0` | Constant-time envelope; zero disables HookApp execution, otherwise at least `dp_egress_timeout + 5`. |
+| `dp_egress_time_pad` | `0` | One minimum-duration envelope for the complete Hook release (all S&A blocks); zero disables execution, otherwise at least `dp_egress_timeout + 5`. It is timing defense in depth, not a formal constant-time proof. |
 | `dp_egress_memory_mb` | `8192` | Hook child address-space limit in MiB (`512` to `131072`). |
 | `dp_egress_file_mb` | `1024` | Maximum size of any Hook child output file in MiB (`16` to `16384`). |
 | `dp_egress_processes` | `128` | Hook child process/thread limit (`1` to `1024`, where supported). |
 | `expose_privacy_status` | `FALSE` | Expose allocation count/status to clients. |
 | `allow_untrusted_coordinator` | `FALSE` | Permit a coordinator to observe already-private per-node updates. |
+
+`hook_resource_isolation_attested=TRUE` is an operator assertion, not an
+in-process control. Set it only when the SuperNode and every inherited Hook
+child are confined by cgroup v2 memory, PID and CPU limits (`memory.max`,
+`pids.max`, `cpu.max`) and their writable temporary filesystem is a size-limited
+tmpfs or quota-enforced volume. Bubblewrap/RLIMIT alone do not satisfy this
+second gate. Without both attestations, the time envelope and `hook_enabled`, a
+HookApp remains a data-independent no-op.
 
 Upload admission and writes are serialized by a node-global lock, so the byte
 and token-directory caps are atomic across R sessions. Before each admitted
@@ -240,14 +281,32 @@ run token in the app spool: GC revalidates it against the permitted staging root
 and retains the app until that staging directory is cleaned, even for runs longer
 than the TTL. Explicit `flowerAppDeleteDS()` remains an intentional deletion.
 
-The DSI transport is capability-bound and all-or-nothing. A loopback tunnel is
-operator-authorized only while its exact registered forwarder is alive and its
-post-bind `ready` marker exists. Failed startup kills the child and removes its
-registry/spool state; the client tears down every attempted site if any site
+The DSI transport is capability-bound and all-or-nothing. It does not add
+encryption to DataSHIELD itself: production Opal/Armadillo frontends must enforce
+TLS and certificate validation. The official `dsFlowerClient` can inspect the
+URL and retained verification options of DSOpal connections. A recognized
+Armadillo connection with a valid `https://` URL is accepted automatically for
+connector parity; its frontend or reverse proxy remains authoritative for
+certificate and hostname validation. Unknown or unidentifiable connectors
+require an explicit per-site operator attestation. Plaintext HTTP is rejected by
+default and can be enabled only for exact named sites through the client-side
+`dsflower.dsi_allow_insecure_http` exception; that requires an independently
+trusted network layer. A loopback tunnel
+is operator-authorized only while its exact registered forwarder is alive and
+its post-bind `ready` marker exists. Failed startup kills the child and removes
+its registry/spool state; the client tears down every attempted site if any site
 fails. Exchanges use a per-session lock, bounded negotiated chunks and bounded
-client buffers. Spools are reset on a new SuperNode connection and capped rather
-than compacted concurrently with the Python forwarder, avoiding offset races;
-administrators should size the cap for the largest permitted model transfer.
+client buffers. Spools are reset on a new SuperNode connection; acknowledged
+prefixes are compacted atomically under the same exchange lock while external
+offsets remain absolute. This keeps long sessions bounded without racing the R
+exchange, and TCP backpressure applies whenever a configured cap is reached.
+
+DSI 1.8 can represent a per-node failure as a named `NULL`. Every mutating
+dsFlower path therefore requires an explicit, correctly named `ok = TRUE` ACK;
+`NULL` is never delivery. Upload and tunnel ACKs also bind the generation,
+offset, length and content identity. After an ambiguous response, only the
+byte-identical in-flight chunk may be replayed against an idempotent store: its
+geometry is never reduced or extended until that ACK is resolved.
 
 Example:
 
@@ -267,6 +326,11 @@ options(
 Policy values are bound when a domain is first initialized; incompatible changes
 then fail closed. Deleting, rolling back or cloning the ledger/secret state can
 invalidate the declared lifetime guarantee and must be prevented operationally.
+The one-way `trim-utf8-v1` to `trim-utf8-v2` identifier migration preserves row
+accounting. In patient mode it proceeds only when the ledger has no legacy
+claims, and atomically exhausts every outstanding legacy reservation before
+binding v2; any claimed legacy release fails closed and requires an offline
+roster audit.
 Pre-unit legacy ledgers are intentionally not migrated automatically. Their
 historical adjacency cannot be inferred safely from stored state; rotate them
 only through a separately audited, administrator-attested migration.

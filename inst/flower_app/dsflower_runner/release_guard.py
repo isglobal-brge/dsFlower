@@ -4,9 +4,55 @@ import json
 import os
 import re
 import sqlite3
+import stat
+from pathlib import Path
 
 
 _TOKEN_RE = re.compile(r"^run_[0-9a-f]{32}$")
+_LEDGER_MODE = 0o600
+_UNSAFE_DIRECTORY_WRITE = stat.S_IWGRP | stat.S_IWOTH
+
+
+def _ledger_path_state(path):
+    """Validate the server-owned ledger path and return stable identities.
+
+    A private parent directory prevents a different UID from replacing SQLite's
+    database or sidecar files.  The before/after identities catch ordinary path
+    replacement while SQLite opens the database.  They cannot exclude a process
+    running as the same UID swapping a path out and back between both checks.
+    """
+    parent = os.path.dirname(path)
+    try:
+        parent_info = os.lstat(parent)
+        path_info = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError("trusted privacy-ledger path is missing or unsafe") from exc
+
+    if not stat.S_ISDIR(parent_info.st_mode):
+        raise RuntimeError("privacy ledger parent must be a real directory")
+    if parent_info.st_uid != os.geteuid():
+        raise RuntimeError("privacy ledger parent must be owned by the node EUID")
+    if stat.S_IMODE(parent_info.st_mode) & _UNSAFE_DIRECTORY_WRITE:
+        raise RuntimeError(
+            "privacy ledger parent must not be writable by group or other users"
+        )
+
+    if not stat.S_ISREG(path_info.st_mode):
+        raise RuntimeError("privacy ledger must be a regular file")
+    if path_info.st_uid != os.geteuid():
+        raise RuntimeError("privacy ledger must be owned by the node EUID")
+    if stat.S_IMODE(path_info.st_mode) != _LEDGER_MODE:
+        raise RuntimeError("privacy ledger must have mode 0600")
+
+    return (
+        (parent_info.st_dev, parent_info.st_ino),
+        (path_info.st_dev, path_info.st_ino),
+    )
+
+
+def _assert_ledger_path_unchanged(path, expected):
+    if _ledger_path_state(path) != expected:
+        raise RuntimeError("privacy ledger path changed while opening")
 
 
 def _manifest(context):
@@ -54,14 +100,22 @@ def claim_release(context, msg):
         raise RuntimeError("invalid privacy release horizon in manifest")
 
     db_path = os.environ.get("DSFLOWER_PRIVACY_LEDGER_PATH", "")
-    if not db_path or not os.path.isabs(db_path) or os.path.islink(db_path):
+    if not db_path or not os.path.isabs(db_path):
         raise RuntimeError("trusted privacy-ledger path is missing or unsafe")
-    if not os.path.isfile(db_path):
-        raise RuntimeError("privacy ledger does not exist")
+    path_state = _ledger_path_state(db_path)
 
     message_id = _message_id(msg)
-    con = sqlite3.connect(db_path, timeout=10.0, isolation_level=None)
+    # mode=rw prevents SQLite from creating a replacement database if the path
+    # disappears after validation.  URI quoting is handled by pathlib.
+    db_uri = Path(db_path).as_uri() + "?mode=rw"
     try:
+        con = sqlite3.connect(
+            db_uri, timeout=10.0, isolation_level=None, uri=True
+        )
+    except sqlite3.Error as exc:
+        raise RuntimeError("privacy ledger could not be opened safely") from exc
+    try:
+        _assert_ledger_path_unchanged(db_path, path_state)
         con.execute("PRAGMA busy_timeout = 10000")
         con.execute("PRAGMA foreign_keys = ON")
         con.execute("BEGIN IMMEDIATE")

@@ -30,6 +30,32 @@
   xgboost                   = list(framework = "xgboost",       requires_secagg = FALSE)
 )
 
+# Public vocabulary implemented by runner ABI 2.  These are capabilities of the
+# node-resident, hash-pinned executor; they are not names of executable app
+# templates. Keep this list in lockstep with model_spec.py, dp_harness.py,
+# dp_gbdt.py, and server_app.py when the runner ABI changes.
+.RUNNER_PUBLIC_CAPABILITIES <- list(
+  dp_tracks = c("neural", "trees", "egress"),
+  declarative_model_ops = list(
+    layers = c(
+      "linear", "relu", "gelu", "tanh", "sigmoid", "elu", "silu",
+      "leaky_relu", "dropout", "layernorm", "softmax", "reshape",
+      "flatten", "conv1d", "conv2d", "maxpool2d", "adaptiveavgpool2d",
+      "upsample", "lstm", "gru"
+    ),
+    graph = c("add", "mul", "sub", "div", "affine", "concat", "matmul",
+              "transpose")
+  ),
+  declarative_losses = c(
+    "bce_logits", "cross_entropy", "mse", "poisson_nll",
+    "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll"
+  ),
+  tree_objectives = "binary:logistic",
+  aggregation_strategies = c(
+    "fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm"
+  )
+)
+
 
 #' Validate target distribution against trust profile thresholds
 #'
@@ -176,17 +202,13 @@
                         getOption("default.nfilter.levels.max", 40))),
     # --- dsFlower-specific settings ---
     max_rounds = as.numeric(.dsf_option("max_rounds", 500)),
-    allow_custom_config = as.logical(.dsf_option("allow_custom_config", FALSE)),
-    allowed_templates = c("sklearn_logreg", "sklearn_ridge",
-                          "sklearn_sgd", "pytorch_mlp",
-                          "pytorch_logreg", "pytorch_linear_regression",
-                          "pytorch_coxph", "pytorch_multiclass",
-                          "pytorch_poisson", "pytorch_multilabel",
-                          "pytorch_lognormal_aft", "pytorch_cause_specific_cox",
-                          "pytorch_resnet18",
-                          "pytorch_densenet121", "pytorch_unet2d",
-                          "pytorch_tcn", "pytorch_lstm",
-                          "xgboost"),
+    allow_custom_config = FALSE,
+    allow_custom_config_deprecated = TRUE,
+    # Retained as an empty compatibility field. Model flexibility is expressed
+    # through the declarative runner vocabulary, not legacy executable template
+    # names.
+    allowed_templates = character(),
+    allowed_templates_deprecated = TRUE,
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
     max_concurrent_runs = as.numeric(.dsf_option("max_concurrent_runs", Inf))
   )
@@ -275,7 +297,7 @@
   list(
     dp_unit = unit,
     patient_column = patient_column,
-    canonicalization = "trim-utf8-v1"
+    canonicalization = "trim-utf8-v2"
   )
 }
 
@@ -312,13 +334,38 @@
   explicit
 }
 
+#' Canonicalise patient identifiers with the v2 cross-language contract
+#'
+#' Conversion is strict UTF-8 followed by trimming only ASCII space, tab, CR,
+#' and LF.  The exact trim set is intentionally narrower than R's
+#' \code{trimws()} and Python's \code{str.strip()} so both runtimes agree for
+#' every Unicode string. Invalid encodings become missing record values.
+#' @keywords internal
+.canonicalPatientIdText <- function(values) {
+  value_count <- length(values)
+  text <- tryCatch(
+    as.character(values),
+    error = function(e) rep(NA_character_, value_count)
+  )
+  text <- tryCatch(
+    suppressWarnings(iconv(text, from = "", to = "UTF-8", sub = NA)),
+    error = function(e) rep(NA_character_, length(text))
+  )
+  gsub("^[ \\t\\r\\n]+|[ \\t\\r\\n]+$", "", text, perl = TRUE)
+}
+
+#' Identify values outside the v2 patient identifier domain
+#' @keywords internal
+.invalidPatientIds <- function(ids) {
+  is.na(ids) | !nzchar(ids) |
+    tolower(ids) %in% c("na", "nan", "null", "<na>", "nat")
+}
+
 #' Canonicalise and validate a complete patient roster
 #' @keywords internal
 .canonicalPatientIds <- function(values) {
-  missing <- is.na(values)
-  ids <- trimws(enc2utf8(as.character(values)))
-  reserved_missing <- tolower(ids) %in% c("na", "nan", "null")
-  if (any(missing | !nzchar(ids) | reserved_missing)) {
+  ids <- .canonicalPatientIdText(values)
+  if (any(.invalidPatientIds(ids))) {
     stop("The configured patient identifier must be complete and non-empty.",
          call. = FALSE)
   }
@@ -515,27 +562,16 @@
   lines
 }
 
-#' Validate that a template is in the allowed list
+#' Reject retired named-template inputs
 #'
-#' When \code{dsflower.allow_custom_config} is FALSE (default), only
-#' pre-approved app templates bundled with dsFlower can be used.
+#' Models are data-only declarative specifications in the current runner. Named
+#' executable templates are retained only as a legacy argument shape and are not
+#' an authorization mechanism.
 #'
 #' @param app_template Character; the template name to validate
 #' @return TRUE invisibly, or stops with an error
 #' @keywords internal
 .validateTemplate <- function(app_template) {
-  settings <- .flowerDisclosureSettings()
-
-  if (!settings$allow_custom_config &&
-      !app_template %in% settings$allowed_templates) {
-    stop(
-      "Template '", app_template, "' is not in the approved list. ",
-      "Allowed templates: ",
-      paste(settings$allowed_templates, collapse = ", "), ". ",
-      "Contact your server administrator to enable custom configs ",
-      "(dsflower.allow_custom_config = TRUE).",
-      call. = FALSE
-    )
-  }
-  invisible(TRUE)
+  stop("Named executable templates are retired. Submit a declarative model ",
+       "specification through the hash-pinned runner instead.", call. = FALSE)
 }

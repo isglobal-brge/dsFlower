@@ -66,14 +66,19 @@ hash, launches a fresh isolated child with a minimal environment, validates the
 numeric result, clips the complete update to the `C` ball, and applies an
 RDP-calibrated Gaussian mechanism with sensitivity `2C`.
 
-When an attested Bubblewrap filesystem/network sandbox and a constant-time
-envelope are available, the node may run the hook on a fixed, public `k` disjoint,
+When an attested Bubblewrap filesystem/network sandbox and a minimum-duration
+timing envelope are available, the node may run the hook on a fixed, public `k` disjoint,
 isolated blocks and release the clipped mean at conservative sensitivity
 `min(2C, 4C/k)` (a changed patient identifier may affect two blocks). `k` is
 administrator-pinned and never derived from private cohort size, because a
 data-dependent Gaussian variance would itself leak.
 Without all required controls, HookApps are not executed and the Flower operation
 returns the incoming public model unchanged.
+
+The timing envelope is a defense-in-depth lower bound, not a formal
+constant-time guarantee. Cleanup, resource exhaustion and availability remain
+outside the numeric mechanism proof unless the deployment adds system-level
+quotas and an outer release deadline.
 
 Arbitrary code cannot generically receive DP-SGD granularity. Static inspection
 cannot prove that a custom training loop has per-sample-independent gradients or
@@ -125,11 +130,18 @@ are disjoint. A federation-wide guarantee over overlapping sites therefore
 requires a shared person-level accountant beyond this package's node ledger.
 
 The SQLite ledger uses `BEGIN IMMEDIATE`, WAL, `synchronous=FULL`, unique run and
-release constraints, and mode `0600`. Policy values are bound on first use;
-changing them later fails closed. SQLite is a single-host backend. Replicas that
-protect the same population require one shared transactional accountant and
-anti-rollback operational controls; independent local ledgers multiply the
-declared guarantee.
+release constraints, and mode `0600`. The ledger file and its parent directory
+must be owned by the Rock process, and the directory must not be writable by
+group or other users. The Python release guard compares the directory and ledger
+device/inode before and after `sqlite3.connect()`; R performs the portable
+owner/mode/path checks before and after DBI opens it. Policy values are bound on
+first use; changing them later fails closed. These path checks prevent another
+UID from replacing database entries when the enclosing mount path is trusted,
+but cannot close a swap-out-and-back race by a malicious process sharing the
+Rock UID. SQLite is a single-host backend and the checks are not anti-rollback
+storage. Replicas that protect the same population require one shared
+transactional accountant and anti-rollback operational controls; independent
+local ledgers multiply the declared guarantee.
 
 ## 4. Deterministic randomness
 
@@ -142,8 +154,11 @@ subkey      = HMAC-SHA256(release_key, mechanism_axis)
 ```
 
 The dedicated node secret is 32 bytes from `/dev/urandom`, created at runtime,
-stored outside staging with mode `0600`, and never exposed to a HookApp. There is
-no fallback to R's RNG, a client seed, `datashield.seed`, a predictable constant
+stored outside staging with mode `0600`, and never exposed to a HookApp. The key
+file is owned by the Rock service UID. Its non-symlink parent may be owned by that
+UID or root, must not be writable by group/other, and is checked before and after
+the key is opened. There is no fallback to R's RNG, a client seed,
+`datashield.seed`, a predictable constant
 or a secret baked into a container image.
 
 DP Gaussian values come from a ChaCha20 stream with domain-separated subkeys.
@@ -157,6 +172,13 @@ A single fixed noise vector for all distinct queries is unsafe because correlate
 answers can cancel it. Sticky noise only solves repeated identical queries. In
 dsFlower, exact protocol retries are memoized, while distinct releases receive
 unique keys and are covered by the lifetime accountant.
+
+The Gaussian implementation uses a hardened Box--Muller transform over a finite
+IEEE-754 support. The keyed ChaCha20 stream prevents prediction and averaging,
+but this remains a practical computational-DP implementation rather than a
+formally verified exact continuous Gaussian. A discrete-Gaussian or
+interval-refining replacement must be introduced as a versioned mechanism with
+matching sensitivity/accountant proofs and ledger-policy migration.
 
 ## 5. Server-authoritative manifest
 
@@ -211,6 +233,12 @@ execution and mounted read-only in the HookApp sandbox.
   its global per-sample L2 clip, every `grad_sample` is coordinate-totalised at
   the same server-owned `C`, preventing an overflowing backward pass from
   turning `inf * 0` into a noise-erasing `NaN`.
+- Vision decoders enforce regular-file, byte, header-shape and decoded-element
+  ceilings before materialising pixels/voxels. Resized records flow from paths
+  through a 128 MiB batch buffer rather than a cohort-sized image list.
+  Detached NRRD and `.mhd` sidecars are rejected before opening their payload
+  and totalised to the fixed zero-image record; inline NRRD and `.mha` remain
+  supported.
 - Admission does not inspect class/event frequencies, because success versus
   error would otherwise be a label-dependent release outside DP. It has no
   minimum row/patient threshold either: tiny and empty runs reach the trusted
@@ -254,15 +282,25 @@ important privacy options are:
 | `tunnel_loss_tolerance` | `180` | Relay-heartbeat timeout in seconds (`5`--`86400`) |
 | `hook_enabled` | `FALSE` | Permit HookApp execution |
 | `hook_sandbox_attested` | `FALSE` | Custodian attests the Bubblewrap boundary |
+| `hook_resource_isolation_attested` | `FALSE` | Custodian attests external cgroup and writable-volume quotas |
 | `dp_sample_aggregate` | `FALSE` | Enable fixed-block HookApp sample-and-aggregate behind every sandbox gate |
 | `dp_sa_blocks` | `8` | Fixed public block count in `[2, 64]`; never private-size adaptive |
 | `dp_egress_timeout` | `900` | Hook child timeout in seconds |
-| `dp_egress_time_pad` | `0` | Zero disables HookApp execution; otherwise at least `dp_egress_timeout + 5` |
+| `dp_egress_time_pad` | `0` | One release-global minimum duration across all S&A children; zero disables HookApp execution; otherwise at least `dp_egress_timeout + 5` |
 | `dp_egress_memory_mb` | `8192` | Hook child address-space limit in MiB (`512` to `131072`) |
 | `dp_egress_file_mb` | `1024` | Per-file Hook child write limit in MiB (`16` to `16384`) |
 | `dp_egress_processes` | `128` | Hook child process/thread limit (`1` to `1024`, where supported) |
 | `expose_privacy_status` | `FALSE` | Expose allocation count/status to clients |
 | `allow_untrusted_coordinator` | `FALSE` | Permit observation of already-private per-node updates |
+
+The resource-isolation attestation is valid only when the SuperNode process and
+all Hook descendants inherit cgroup v2 `memory.max`, `pids.max` and `cpu.max`
+controls, and the writable Hook temporary directory resides on a size-limited
+tmpfs or quota-enforced volume. It is independent of the Bubblewrap filesystem/
+network attestation and RLIMIT defense in depth; both attestations are required.
+The timing pad wraps one complete Hook release, not every S&A block, while every
+child retains its own timeout. It remains a minimum-duration mitigation rather
+than a constant-time or availability guarantee.
 
 Example node policy:
 
@@ -292,18 +330,33 @@ windows and cached exact replies so retired key versions can be destroyed.
 
 The DSI tunnel is authorized only by a valid session capability whose exact
 forwarder process is alive and has published readiness after binding loopback.
+Startup requires the same explicit tunnel ABI in both directions, so an
+incompatible server/client deployment fails before stream bytes are exchanged.
 Startup is transactional on both sides: failures kill/clean the node process and
 the client aborts and tears down every attempted site. Per-session exchange
 locks, negotiated chunks, bounded client buffers and capped node spools prevent
 unbounded request, memory and disk growth. Spools reset at connection-generation
-boundaries; they are not compacted concurrently because doing so without a
-cross-language transactional offset protocol could duplicate or drop bytes.
+boundaries. Within a generation they carry absolute offsets and compact only
+acknowledged prefixes under the shared exchange lock, preserving reconnect and
+retry semantics while keeping long-lived transfers within the configured cap.
+Because DSI 1.8 maps per-node failures to named `NULL` values, all mutating paths
+require an exact node-bound success ACK. Tunnel and upload ACKs additionally bind
+generation, offset, length and content identity; an ambiguous attempt can replay
+only the identical in-flight bytes against an idempotent store, without changing
+chunk geometry.
 
 A pre-unit legacy ledger is not migrated automatically. Its historical adjacency
 cannot be inferred from stored state: changing a patient identifier can affect
 two patient groups even when only one row changes. Such a ledger therefore fails
 closed until an administrator performs a separately audited migration with an
 explicitly attested historical unit and adjacency contract.
+
+The narrower identifier-canonicalisation migration from `trim-utf8-v1` to
+`trim-utf8-v2` is automatic for row adjacency because identifiers do not define
+the unit. In patient mode it is automatic only when the ledger proves that no v1
+release was claimed; the same transaction exhausts all outstanding v1 tokens
+before binding the v2 hash. A patient ledger with any v1 claim remains fail
+closed pending an offline roster-equivalence audit.
 
 ### Deployment reproducibility and state
 

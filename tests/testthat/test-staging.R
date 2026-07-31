@@ -62,7 +62,7 @@ test_that(".loadTrainingData reads CSV correctly", {
 test_that(".loadTrainingData errors on missing file", {
   expect_error(
     dsFlower:::.loadTrainingData("/nonexistent/file.csv", "csv"),
-    "not found"
+    "configured training data source is unavailable"
   )
 })
 
@@ -289,7 +289,7 @@ test_that("privacy reservation update is atomic and keeps exact no-op budgets", 
     delta = 9.31322574615479e-15,
     dp_unit = "row",
     patient_column = NULL,
-    unit_canonicalization = "trim-utf8-v1"
+    unit_canonicalization = "trim-utf8-v2"
   )
   dsFlower:::.apply_privacy_reservation(staging_dir, reservation)
 
@@ -335,6 +335,50 @@ test_that("public target levels give cohort-independent codes", {
   expect_equal(staged$y, c(2L, 0L, 1L))
   expect_equal(manifest[["target-levels"]]$values, c("b", "c", "d"))
   expect_true(manifest[["target-preencoded"]])
+})
+
+test_that("multilabel staging applies one public binary contract per target", {
+  cfg <- dsFlower:::.normalizePublicTargetConfig(list(
+    "task-type" = "classification", "dp-track" = "neural",
+    "loss-name" = "multilabel_bce", "num-classes" = 2L,
+    "num-labels" = 2L, "target-levels" = c("absent", "present")))
+  data <- data.frame(
+    x = 1:3,
+    first = c("absent", "present", "unknown"),
+    second = c("present", "present", "absent"))
+
+  transformed <- dsFlower:::.transformPublicTarget(
+    data, c("first", "second"), cfg)
+  expect_identical(transformed$first, c(0L, 1L, 0L))
+  expect_identical(transformed$second, c(1L, 1L, 0L))
+
+  token <- .test_run_token(70)
+  staging_dir <- dsFlower:::.stageData(
+    data, token, c("first", "second"), "x", cfg)
+  withr::defer(unlink(staging_dir, recursive = TRUE))
+  manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  staged <- dsFlower:::.loadTrainingData(
+    file.path(staging_dir, manifest$data_file), manifest$data_format)
+  expect_identical(manifest$target_column, c("first", "second"))
+  expect_equal(staged[c("first", "second")],
+               transformed[c("first", "second")])
+
+  expect_error(
+    dsFlower:::.transformPublicTarget(data, "first", cfg),
+    "num-labels=2"
+  )
+  expect_error(
+    dsFlower:::.transformPublicTarget(data, c("first", "first"), cfg),
+    "unique"
+  )
+})
+
+test_that("legacy template routing is rejected before private staging", {
+  expect_error(
+    dsFlower:::.validate_client_run_config(
+      list(template_name = "pytorch_logreg")),
+    "retired"
+  )
 })
 
 test_that("public target bounds are mandatory and clip numeric targets", {
@@ -396,25 +440,44 @@ test_that(".stageData totalises incomplete rows without a count oracle", {
   expect_true(all(is.finite(staged$target)))
 })
 
-test_that("patient staging collapses unusable identifiers into one safe unit", {
+test_that("patient staging applies the exact v2 identifier contract", {
   withr::local_options(list(dsflower.dp_unit = "patient",
                             dsflower.patient_column = "patient_id"))
+  missing_unit <- "__dsflower_missing_patient_unit__"
   data <- data.frame(
-    patient_id = c("p1", NA, " ", "null", "p2"),
-    f1 = seq_len(5),
-    target = c(0, 1, 0, 1, 0)
+    patient_id = c(
+      NA, "", "  \t\r\n", "NA", "NaN", "NULL", "<NA>", "NaT",
+      " patient ", "patient", "\u00a0patient\u00a0", missing_unit
+    ),
+    f1 = seq_len(12),
+    target = rep(0:1, 6)
   )
   token <- .test_run_token(81)
   staging_dir <- dsFlower:::.stageData(data, token, "target", "f1")
   withr::defer(unlink(staging_dir, recursive = TRUE))
 
   manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
-  expect_equal(manifest$n_samples, 5L)
+  expect_equal(manifest$n_samples, 12L)
   expect_equal(manifest$n_units, 3L)
+  expect_equal(manifest[["patient-id-canonicalization"]], "trim-utf8-v2")
   staged <- dsFlower:::.loadTrainingData(
     file.path(staging_dir, manifest$data_file), manifest$data_format)
   expect_false(anyNA(staged$patient_id))
-  expect_equal(sum(staged$patient_id == "__dsflower_missing_patient_unit__"), 3L)
+  expect_equal(sum(staged$patient_id == missing_unit), 9L)
+  expect_equal(staged$patient_id[9:10], rep("patient", 2L))
+  # Non-ASCII whitespace is deliberately not trimmed in v2; this keeps R and
+  # Python on one exact, locale-independent contract.
+  expect_equal(staged$patient_id[[11]], "\u00a0patient\u00a0")
+})
+
+test_that("patient identifier v2 totalizes invalid encodings per value", {
+  invalid_utf8 <- rawToChar(as.raw(0xff))
+  Encoding(invalid_utf8) <- "bytes"
+  expect_equal(
+    dsFlower:::.canonicalPatientIdText(
+      c(" \tpatient\r\n", "\u00a0patient\u00a0", invalid_utf8)),
+    c("patient", "\u00a0patient\u00a0", NA_character_)
+  )
 })
 
 test_that("client config cannot preserve non-finite private rows", {
@@ -469,6 +532,113 @@ test_that(".ensureImagePathColumn derives paths from dsImaging manifests", {
                c("LUNG1-001.nii.gz", "LUNG1-002.nii.gz"))
 })
 
+test_that("image path failures are record-local and preserve row order", {
+  root <- withr::local_tempdir()
+  dir.create(file.path(root, "nested"))
+  writeLines("image", file.path(root, "valid.png"))
+  writeLines("image", file.path(root, "nested", "fallback.png"))
+
+  samples <- data.frame(
+    row_marker = seq_len(5),
+    sample_id = c("valid", "unsafe", "missing", "fallback", "bad/id"),
+    relative_path = c("valid.png", "../private", "missing.png", "", NA),
+    label = c(1L, 0L, 1L, 0L, 1L)
+  )
+  sample_manifests <- data.frame(
+    sample_id = "fallback",
+    primary_uri = "nested/fallback.png"
+  )
+
+  out <- dsFlower:::.ensureImagePathColumn(
+    samples,
+    sample_manifests = sample_manifests,
+    image_root = root
+  )
+
+  expect_equal(out$row_marker, seq_len(5))
+  expect_equal(nrow(out), nrow(samples))
+  expect_equal(
+    out$relative_path,
+    c(
+      "valid.png",
+      "__dsflower_invalid_image__",
+      "__dsflower_invalid_image__",
+      "nested/fallback.png",
+      "__dsflower_invalid_image__"
+    )
+  )
+
+  outside <- withr::local_tempdir()
+  writeLines("private", file.path(outside, "outside.png"))
+  linked <- file.path(root, "linked")
+  if (isTRUE(suppressWarnings(file.symlink(outside, linked)))) {
+    linked_out <- dsFlower:::.ensureImagePathColumn(
+      data.frame(relative_path = "linked/outside.png", label = 1L),
+      image_root = root
+    )
+    expect_equal(linked_out$relative_path, "__dsflower_invalid_image__")
+  }
+})
+
+test_that("malformed sample-manifest cells totalize independently", {
+  samples <- data.frame(sample_id = c("outside", "traversal", "bad-json"))
+  sample_manifests <- data.frame(
+    sample_id = samples$sample_id,
+    primary_uri = c(
+      "s3://other/private/scan.png",
+      "../private/scan.png",
+      ""
+    ),
+    files_json = c("[]", "[]", "{not-json")
+  )
+
+  out <- dsFlower:::.ensureImagePathColumn(
+    samples,
+    sample_manifests = sample_manifests,
+    image_uri = "s3://imaging/site/images/"
+  )
+
+  expect_equal(nrow(out), 3L)
+  expect_equal(
+    out$relative_path,
+    rep("__dsflower_invalid_image__", 3L)
+  )
+})
+
+test_that("image descriptor and root failures remain global preconditions", {
+  expect_error(
+    dsFlower:::.ensureImagePathColumn(data.frame(label = 1L)),
+    "requires either"
+  )
+  expect_error(
+    dsFlower:::.ensureImagePathColumn(
+      data.frame(relative_path = "scan.png", label = 1L),
+      image_root = file.path(tempdir(), "missing-global-image-root")
+    ),
+    "configured image asset root is unavailable"
+  )
+})
+
+test_that("image label joins are stable one-to-one and totalizable", {
+  samples <- data.frame(
+    row_marker = 1:4,
+    sample_id = c("p2", " ", "p1", "p1"),
+    existing = letters[1:4]
+  )
+  labels <- data.frame(
+    sample_id = c("p1", "p2", "p2", NA),
+    target = c(1L, 1L, 0L, 1L)
+  )
+
+  joined <- dsFlower:::.leftJoinImageLabels(samples, labels)
+  expect_equal(joined$row_marker, 1:4)
+  expect_equal(nrow(joined), nrow(samples))
+  expect_equal(joined$target, c(NA, NA, 1L, 1L))
+
+  totalized <- dsFlower:::.transformPublicTarget(joined, "target", list())
+  expect_equal(totalized$target, c(0L, 0L, 1L, 1L))
+})
+
 test_that("image metadata paths cannot escape their configured root", {
   expect_equal(
     dsFlower:::.safeRelativeAssetPath("nested/scan.png"),
@@ -508,25 +678,52 @@ test_that("image metadata paths cannot escape their configured root", {
   )
 })
 
-test_that("image path failures never echo private sample identifiers", {
+test_that("image path failures become one fixed non-identifying marker", {
   sentinel <- "PRIVATE_SAMPLE_ID_7329"
   root <- withr::local_tempdir()
-  err <- tryCatch(
-    dsFlower:::.ensureImagePathColumn(
-      data.frame(sample_id = paste0("../", sentinel), label = 1L),
-      image_root = root
-    ),
-    error = identity
+  out <- dsFlower:::.ensureImagePathColumn(
+    data.frame(sample_id = paste0("../", sentinel), label = 1L),
+    image_root = root
   )
-  expect_s3_class(err, "error")
-  expect_false(grepl(sentinel, conditionMessage(err), fixed = TRUE))
+  expect_equal(out$relative_path, "__dsflower_invalid_image__")
+  expect_false(grepl(sentinel, out$relative_path, fixed = TRUE))
 
-  expect_error(
-    dsFlower:::.ensureImagePathColumn(
-      data.frame(relative_path = "../secret", label = 1L)
-    ),
-    "unsafe relative path"
+  out <- dsFlower:::.ensureImagePathColumn(
+    data.frame(relative_path = "../secret", label = 1L)
   )
+  expect_equal(out$relative_path, "__dsflower_invalid_image__")
+})
+
+test_that("image descriptor staging totalizes private rows end to end", {
+  root <- withr::local_tempdir()
+  writeLines("image", file.path(root, "valid.png"))
+  desc <- list(
+    metadata = list(),
+    table_data = data.frame(
+      row_marker = 1:3,
+      sample_id = c("valid", "unsafe", "missing"),
+      relative_path = c("valid.png", "../private", "missing.png"),
+      target = c(1L, 99L, NA)
+    ),
+    assets = list(images = list(
+      type = "image_root", root = root, path_col = "relative_path")),
+    manifest = list(),
+    dataset_id = "private-image-test"
+  )
+  staging_dir <- dsFlower:::.stageFromDescriptor_image(
+    desc, .test_run_token(13), "target", NULL, list())
+  withr::defer(unlink(staging_dir, recursive = TRUE))
+
+  manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  staged <- dsFlower:::.readStagedSamples(
+    file.path(staging_dir, manifest$samples_file))
+  expect_equal(manifest$n_samples, 3L)
+  expect_equal(staged$row_marker, 1:3)
+  expect_equal(
+    staged$relative_path,
+    c("valid.png", rep("__dsflower_invalid_image__", 2L))
+  )
+  expect_equal(staged$target, c(1L, 0L, 0L))
 })
 
 test_that("image descriptor asset names cannot traverse staging", {

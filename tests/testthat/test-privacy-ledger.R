@@ -109,6 +109,102 @@ test_that("reservation is atomic and idempotent by run token", {
                2L)
 })
 
+test_that("privacy ledger is a private regular file and unsafe paths fail closed", {
+  ledger <- local_test_privacy_ledger()
+  dsFlower:::.reserve_privacy_run(paste0("run_", strrep("9", 32)), 1L)
+
+  expect_true(utils::file_test("-f", ledger))
+  expect_false(dsFlower:::.path_is_symlink(ledger))
+  if (.Platform$OS.type == "unix") {
+    expected_mode <- as.integer(strtoi("600", base = 8))
+    expect_identical(as.integer(file.info(ledger)$mode[[1]]), expected_mode)
+
+    Sys.chmod(ledger, "0644")
+    con <- dsFlower:::.privacy_db_connect(ledger)
+    DBI::dbDisconnect(con)
+    expect_identical(as.integer(file.info(ledger)$mode[[1]]), expected_mode)
+  }
+
+  directory <- tempfile()
+  dir.create(directory)
+  expect_error(
+    dsFlower:::.privacy_db_connect(directory),
+    "regular file"
+  )
+
+  if (.Platform$OS.type == "unix") {
+    target <- tempfile(fileext = ".sqlite")
+    file.create(target)
+    link <- tempfile(fileext = ".sqlite")
+    expect_true(file.symlink(target, link))
+    expect_error(
+      dsFlower:::.privacy_db_connect(link),
+      "symbolic link"
+    )
+  }
+})
+
+test_that("privacy ledger ownership and parent-directory trust fail closed", {
+  skip_on_os("windows")
+  root <- tempfile()
+  dir.create(root, mode = "0700")
+  on.exit(unlink(root, recursive = TRUE), add = TRUE)
+  Sys.chmod(root, "0700")
+  ledger <- file.path(root, "ledger.sqlite")
+  con <- dsFlower:::.privacy_db_connect(ledger)
+  DBI::dbDisconnect(con)
+
+  euid <- dsFlower:::.privacy_effective_uid()
+  expect_identical(as.integer(file.info(ledger)$uid[[1]]), euid)
+  expect_error(
+    dsFlower:::.privacy_validate_ledger_file(ledger, euid + 1L),
+    "owned by the node EUID"
+  )
+  expect_error(
+    dsFlower:::.privacy_validate_ledger_parent(ledger, euid + 1L),
+    "owned by the node EUID"
+  )
+
+  Sys.chmod(root, "0770", use_umask = FALSE)
+  expect_error(
+    dsFlower:::.privacy_db_connect(ledger),
+    "group or other"
+  )
+  Sys.chmod(root, "0700")
+
+  parent_link <- paste0(root, "-link")
+  expect_true(file.symlink(root, parent_link))
+  on.exit(unlink(parent_link), add = TRUE)
+  expect_error(
+    dsFlower:::.privacy_validate_ledger_parent(
+      file.path(parent_link, "ledger.sqlite"), euid),
+    "real directory"
+  )
+})
+
+test_that("new privacy ledger and directory are private at creation", {
+  skip_on_os("windows")
+  parent <- tempfile()
+  expect_true(dsFlower:::.privacy_dir_writable(parent))
+  on.exit(unlink(parent, recursive = TRUE), add = TRUE)
+  expect_identical(
+    as.integer(file.info(parent)$mode[[1]]),
+    as.integer(strtoi("700", base = 8))
+  )
+
+  ledger <- file.path(parent, "ledger.sqlite")
+  old_umask <- Sys.umask("0000")
+  on.exit(Sys.umask(old_umask), add = TRUE)
+  con <- dsFlower:::.privacy_db_connect(ledger)
+  DBI::dbDisconnect(con)
+  expect_identical(
+    as.integer(file.info(ledger)$mode[[1]]),
+    as.integer(strtoi("600", base = 8))
+  )
+  observed <- Sys.umask()
+  expect_identical(as.integer(observed), as.integer(strtoi("0", base = 8)))
+})
+
 test_that("policy drift and accidental domain resets fail closed", {
   local_test_privacy_ledger()
   dsFlower:::.reserve_privacy_run(paste0("run_", strrep("1", 32)), 1L)
@@ -151,6 +247,118 @@ test_that("lifetime policy hash binds the DP unit, patient column, and adjacency
   expect_equal(patient_a$dp_unit, "patient")
   expect_equal(patient_a$patient_column, "patient_id")
   expect_identical(patient_a$adjacency, "replace_one")
+})
+
+test_that("row ledgers migrate v1 to v2 without resetting accounting state", {
+  ledger <- local_test_privacy_ledger()
+  first_token <- paste0("run_", strrep("a", 32))
+  next_token <- paste0("run_", strrep("b", 32))
+  dsFlower:::.reserve_privacy_run(first_token, 2L)
+  policy <- dsFlower:::.privacy_policy()
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+  DBI::dbExecute(
+    con, "UPDATE privacy_policy SET policy_hash = ? WHERE domain = ?",
+    params = list(policy$legacy_v1_policy_hash, policy$domain))
+  DBI::dbExecute(
+    con,
+    "UPDATE privacy_reservations SET claimed_releases = 1 WHERE run_token = ?",
+    params = list(first_token))
+  DBI::dbExecute(con, paste(
+    "INSERT INTO privacy_release_claims",
+    "(run_token,message_id,release_index,created_at) VALUES (?,?,?,?)"),
+    params = list(first_token, "v1-message", 1L, "2026-01-01T00:00:00Z"))
+  DBI::dbDisconnect(con)
+
+  next_run <- dsFlower:::.reserve_privacy_run(next_token, 2L)
+  expect_equal(next_run$allocation_index, 2L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  stored <- DBI::dbGetQuery(
+    con, "SELECT policy_hash, next_index FROM privacy_policy WHERE domain = ?",
+    params = list(policy$domain))
+  expect_identical(stored$policy_hash[[1]], policy$policy_hash)
+  expect_equal(stored$next_index[[1]], 3L)
+  expect_equal(DBI::dbGetQuery(
+    con, "SELECT COUNT(*) AS n FROM privacy_release_claims")$n, 1L)
+})
+
+test_that("patient migration exhausts legacy tokens and claimed v1 fails closed", {
+  unclaimed_ledger <- local_test_privacy_ledger()
+  withr::local_options(list(
+    dsflower.dp_unit = "patient",
+    dsflower.patient_column = "patient_id"
+  ))
+  policy <- dsFlower:::.privacy_policy()
+  first_token <- paste0("run_", strrep("c", 32))
+  next_token <- paste0("run_", strrep("d", 32))
+  dsFlower:::.reserve_privacy_run(first_token, 2L)
+  con <- DBI::dbConnect(RSQLite::SQLite(), unclaimed_ledger)
+  DBI::dbExecute(
+    con, "UPDATE privacy_policy SET policy_hash = ? WHERE domain = ?",
+    params = list(policy$legacy_v1_policy_hash, policy$domain))
+  DBI::dbDisconnect(con)
+  migrated <- dsFlower:::.reserve_privacy_run(next_token, 1L)
+  expect_equal(migrated$allocation_index, 2L)
+
+  con <- DBI::dbConnect(RSQLite::SQLite(), unclaimed_ledger)
+  reservations <- DBI::dbGetQuery(
+    con,
+    paste(
+      "SELECT run_token, claimed_releases, max_releases",
+      "FROM privacy_reservations ORDER BY allocation_index"))
+  expect_identical(reservations$run_token, c(first_token, next_token))
+  expect_equal(reservations$claimed_releases, c(2L, 0L))
+  expect_equal(reservations$max_releases, c(2L, 1L))
+  expect_equal(DBI::dbExecute(
+    con,
+    paste(
+      "UPDATE privacy_reservations",
+      "SET claimed_releases = claimed_releases + 1",
+      "WHERE run_token = ? AND claimed_releases = ?",
+      "AND claimed_releases < max_releases"),
+    params = list(first_token, 2L)), 0L)
+  expect_equal(DBI::dbExecute(
+    con,
+    paste(
+      "UPDATE privacy_reservations",
+      "SET claimed_releases = claimed_releases + 1",
+      "WHERE run_token = ? AND claimed_releases = ?",
+      "AND claimed_releases < max_releases"),
+    params = list(next_token, 0L)), 1L)
+  DBI::dbDisconnect(con)
+
+  claimed_ledger <- tempfile(fileext = ".sqlite")
+  withr::local_options(list(dsflower.privacy_ledger_path = claimed_ledger))
+  claimed_token <- paste0("run_", strrep("e", 32))
+  dsFlower:::.reserve_privacy_run(claimed_token, 1L)
+  con <- DBI::dbConnect(RSQLite::SQLite(), claimed_ledger)
+  DBI::dbExecute(
+    con, "UPDATE privacy_policy SET policy_hash = ? WHERE domain = ?",
+    params = list(policy$legacy_v1_policy_hash, policy$domain))
+  DBI::dbExecute(
+    con,
+    "UPDATE privacy_reservations SET claimed_releases = 1 WHERE run_token = ?",
+    params = list(claimed_token))
+  DBI::dbExecute(con, paste(
+    "INSERT INTO privacy_release_claims",
+    "(run_token,message_id,release_index,created_at) VALUES (?,?,?,?)"),
+    params = list(claimed_token, "v1-message", 1L, "2026-01-01T00:00:00Z"))
+  DBI::dbDisconnect(con)
+
+  expect_error(
+    dsFlower:::.reserve_privacy_run(
+      paste0("run_", strrep("f", 32)), 1L),
+    "privacy policy differs"
+  )
+  con <- DBI::dbConnect(RSQLite::SQLite(), claimed_ledger)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  expect_identical(
+    DBI::dbGetQuery(
+      con, "SELECT policy_hash FROM privacy_policy WHERE domain = ?",
+      params = list(policy$domain))$policy_hash[[1]],
+    policy$legacy_v1_policy_hash)
 })
 
 test_that("ambiguous legacy policy fails closed without mutating its ledger", {
@@ -250,6 +458,31 @@ test_that("node secret is generated from exactly 32 bytes and rejects trailing d
     writeLines(c(strrep("a", 64), "trailing-content"), secret, useBytes = TRUE)
     Sys.chmod(secret, "0600")
     expect_error(dsFlower:::.validate_node_secret(secret), "exactly 32 bytes")
+  })
+})
+
+test_that("node-secret parent is private, owned and stable", {
+  skip_if(.Platform$OS.type != "unix")
+  withr::with_tempdir({
+    root <- file.path(getwd(), "secret-root")
+    secret <- file.path(root, "node-secret")
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
+    ))
+
+    expect_invisible(dsFlower:::.ensure_node_secret())
+    mode <- suppressWarnings(as.integer(file.info(root)$mode[[1L]]))
+    expect_identical(
+      bitwAnd(mode, as.integer(strtoi("077", base = 8))), 0L
+    )
+
+    withr::defer(Sys.chmod(root, "0700"))
+    Sys.chmod(root, "0770", use_umask = FALSE)
+    expect_error(
+      dsFlower:::.validate_node_secret(secret),
+      "must not be writable by group or other users"
+    )
   })
 })
 

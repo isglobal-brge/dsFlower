@@ -69,6 +69,13 @@ test_that("trust-profile API has been removed", {
   expect_false(exists(".validateTemplateProfile", where = ns, inherits = FALSE))
 })
 
+test_that("legacy template allowlist is empty", {
+  settings <- dsFlower:::.flowerDisclosureSettings()
+  expect_identical(settings$allowed_templates, character())
+  expect_true(settings$allowed_templates_deprecated)
+  expect_error(dsFlower:::.validateTemplate("pytorch_logreg"), "retired")
+})
+
 test_that("DP unit is server-owned, explicit, and has no auto fallback", {
   withr::local_options(list(dsflower.dp_unit = "row",
                             dsflower.patient_column = NULL))

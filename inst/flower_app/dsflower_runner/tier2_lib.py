@@ -70,7 +70,9 @@ _REQUIRED_HOOKS = ("initial_arrays", "local_update")
 _CHILD = os.path.join(_HERE, "egress_child.py")
 _DEFAULT_TIMEOUT = 900                 # wall-clock seconds per child run
 _NPY_HEADER_SLACK = 4096               # bytes of .npy header allowed above the array payload
-_PAD_GUARD = 5.0                       # seconds reserved for kill+cleanup inside a padded envelope
+_PAD_GUARD = 5.0                       # required policy margin above one child timeout
+_MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
+_ASCII_ID_TRIM = " \t\r\n"
 
 
 def load_user_module(module_name):
@@ -91,6 +93,53 @@ def load_user_module(module_name):
 
 def _as_f64_list(weights):
     return [np.asarray(w, dtype=np.float64) for w in weights]
+
+
+def _load_expected_f64_npy(path, expected_shape):
+    """Load one child result only after its bounded ``.npy`` header proves that
+    the allocation is exactly the expected float64 tensor."""
+    file_size = os.path.getsize(path)
+    expected_shape = tuple(expected_shape)
+    expected_payload = int(np.prod(expected_shape, dtype=np.int64)) * 8
+    if file_size > expected_payload + _NPY_HEADER_SLACK:
+        raise ValueError("child array file is too large")
+
+    with open(path, "rb") as handle:
+        prefix = handle.read(12)
+        if len(prefix) < 10 or prefix[:6] != b"\x93NUMPY":
+            raise ValueError("child array has an invalid npy header")
+        version = (prefix[6], prefix[7])
+        if version == (1, 0):
+            header_length = int.from_bytes(prefix[8:10], "little")
+        elif version == (2, 0):
+            if len(prefix) < 12:
+                raise ValueError("child array has a truncated npy header")
+            header_length = int.from_bytes(prefix[8:12], "little")
+        else:
+            # np.save emits v1/v2 for the child's plain numeric arrays. Reject
+            # other versions instead of asking a version-specific parser to read
+            # an attacker-declared length.
+            raise ValueError("unsupported child npy version")
+        if header_length > _NPY_HEADER_SLACK:
+            raise ValueError("child npy header is too large")
+
+        handle.seek(0)
+        parsed_version = np.lib.format.read_magic(handle)
+        if parsed_version == (1, 0):
+            shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(
+                handle, max_header_size=_NPY_HEADER_SLACK)
+        else:
+            shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(
+                handle, max_header_size=_NPY_HEADER_SLACK)
+        if (tuple(shape) != expected_shape
+                or np.dtype(dtype) != np.dtype(np.float64)
+                or np.dtype(dtype).hasobject):
+            raise ValueError("child array header does not match the expected tensor")
+        if file_size != handle.tell() + expected_payload:
+            raise ValueError("child array payload length is invalid")
+
+        handle.seek(0)
+        return np.load(handle, allow_pickle=False)
 
 
 def _take_rows(D, idx):
@@ -251,13 +300,19 @@ def _full_sandbox_ok(caps):
                 and os.environ.get("DSF_SAA_SANDBOX_OK") == "1")
 
 
+def _resource_isolation_ok():
+    """The node operator attests externally enforced cgroup/quota isolation."""
+    return os.environ.get("DSF_HOOK_RESOURCE_ISOLATION_OK") == "1"
+
+
 def hook_execution_caps(pcfg, caps=None):
-    """Return attested sandbox caps iff a HookApp may touch private data."""
+    """Return caps iff every sandbox, resource and timing gate is attested."""
     caps = sandbox_caps() if caps is None else caps
     timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
     pad_to = float(pcfg.get("egress_time_pad", 0))
     if (not bool(pcfg.get("hook_enabled", False))
             or not _full_sandbox_ok(caps)
+            or not _resource_isolation_ok()
             or pad_to < float(timeout) + _PAD_GUARD):
         return None
     return caps
@@ -293,20 +348,12 @@ def _is_regular(path):
         return False
 
 
-def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps, timeout,
-                  pad_to=0.0):
+def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps, timeout):
     """Run the untrusted local_update on (X, y) in a FRESH interpreter. Returns f64 arrays,
     or None on ANY failure (crash, timeout, wrong count/shape, non-finite, unreadable). The
     parent never imports or executes the upload; the result is loaded allow_pickle=False so
-    it can never execute code here.
-
-    pad_to>0 pads the call to a CONSTANT wall-clock of pad_to seconds so a child that sleeps
-    (or returns fast) on a data predicate cannot leak it via round duration -- a timing
-    side-channel outside the DP release. For EXACT constant time the child is killed at an
-    absolute deadline (t0 + pad_to - guard), leaving the guard for kill+cleanup, then the call
-    sleeps to exactly t0 + pad_to; so set pad_to > timeout + guard (the custodian sets
-    egress_time_pad above egress_timeout). Default 0 = off."""
-    t0 = time.monotonic()
+    it can never execute code here. Every child retains its own fixed timeout; release-level
+    minimum-duration padding is applied once by ``gated_local_update``."""
     td = tempfile.mkdtemp(prefix="dsf_egress_")
     try:
         inp = os.path.join(td, "in.npz")
@@ -336,23 +383,17 @@ def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps, timeout,
         except Exception:
             return None
         pgid = p.pid   # == process-group id (start_new_session); cache BEFORE wait reaps it
-        # With padding on, kill the child at an ABSOLUTE deadline that leaves a cleanup guard
-        # inside the pad envelope, so even a deliberately-timing-out child finishes (killed +
-        # reaped) before t0+pad_to -> exact constant time after the final pad-sleep.
-        eff_timeout = timeout
-        if pad_to > 0:
-            eff_timeout = max(1.0, min(timeout, (t0 + pad_to - _PAD_GUARD) - time.monotonic()))
         try:
-            p.wait(timeout=eff_timeout)
+            p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             return None
         finally:
             _killpg(pgid)   # kill the whole group -> reaps any backgrounded grandchild
         if p.returncode != 0:
             return None
-        # Parse defensively: exact count FIRST, per-file size cap BEFORE loading (a hostile
-        # child cannot exhaust parent memory with a giant/wrong-count/wrong-dtype .npy), and
-        # everything in one try so ANY error -> None -> the caller's zero delta.
+        # Parse defensively: exact count FIRST, then validate each bounded .npy
+        # header, dtype, shape and payload length BEFORE np.load can allocate.
+        # Everything is in one try so ANY error -> None -> a zero delta.
         try:
             okf = os.path.join(outd, "_ok")
             if not _is_regular(okf) or os.path.getsize(okf) > 64:   # bounded, regular-file only
@@ -365,18 +406,13 @@ def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps, timeout,
                 wf = os.path.join(outd, "w_%d.npy" % i)
                 if not _is_regular(wf):                             # no FIFO/symlink/device
                     return None
-                if os.path.getsize(wf) > int(o.nbytes) + _NPY_HEADER_SLACK:  # size cap before load
-                    return None
-                res.append(np.asarray(np.load(wf, allow_pickle=False), np.float64))
+                res.append(np.asarray(
+                    _load_expected_f64_npy(wf, o.shape), np.float64))
             return res
         except Exception:
             return None
     finally:
         shutil.rmtree(td, ignore_errors=True)
-        if pad_to > 0:                                   # constant-time padding (anti timing leak)
-            rem = float(pad_to) - (time.monotonic() - t0)
-            if rem > 0:
-                time.sleep(rem)
 
 
 def _validate(res, old):
@@ -405,6 +441,18 @@ def _choose_blocks(pcfg, full_sandbox):
     return max(2, min(64, int(pcfg.get("sa_blocks", 8))))
 
 
+def _canonical_patient_id(value):
+    try:
+        text = ("" if value is None else str(value)).strip(_ASCII_ID_TRIM)
+        text.encode("utf-8", errors="strict")
+    except (TypeError, UnicodeError, ValueError):
+        return _MISSING_PATIENT_UNIT
+    if (not text
+            or text.lower() in ("na", "nan", "null", "<na>", "nat")):
+        return _MISSING_PATIENT_UNIT
+    return text
+
+
 def _patient_row_blocks(unit_ids, n_rows, k, partition_seed):
     """Assign every row for one privacy unit to exactly one S&A block.
 
@@ -423,15 +471,12 @@ def _patient_row_blocks(unit_ids, n_rows, k, partition_seed):
     blocks = [[] for _ in range(int(k))]
     assigned = {}
     for row_index, raw in enumerate(ids.tolist()):
-        if raw is None:
-            raise RuntimeError("patient identifiers contain missing values")
-        patient_id = str(raw).strip()
-        if not patient_id or patient_id.lower() in ("nan", "<na>", "nat"):
-            raise RuntimeError("patient identifiers contain missing values")
+        patient_id = _canonical_patient_id(raw)
         if patient_id not in assigned:
             digest = hmac.new(
                 bytes(partition_seed),
-                b"dsflower/patient-block/v1\x00" + patient_id.encode("utf-8"),
+                b"dsflower/patient-block/v1\x00"
+                + patient_id.encode("utf-8"),
                 hashlib.sha256,
             ).digest()
             assigned[patient_id] = int.from_bytes(digest[:8], "big") % int(k)
@@ -458,57 +503,67 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
         raise RuntimeError("X and y must contain the same number of rows")
     caps = hook_execution_caps(pcfg, hook_caps)
     timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
-    pad_to = float(pcfg.get("egress_time_pad", 0))   # 0=off; >=timeout for constant-time runs
-    # Arbitrary hooks have filesystem/network/timing channels outside the numeric
-    # DP gate.  Without all three operator-attested controls, do not execute the
-    # upload: complete the Flower operation with a data-independent unchanged model.
+    pad_to = float(pcfg.get("egress_time_pad", 0))   # 0=off; minimum-duration padding
+    # Arbitrary hooks have filesystem/network/resource/timing channels outside
+    # the numeric DP gate. Without every operator-attested control, do not touch
+    # private data and complete with a data-independent unchanged model.
     if caps is None:
         return [o.astype(np.float32) for o in old]
-    module_file = _pinned_user_package(module_name)
-    partition_seed = seeding.sub_seed(seed, "partition")
-    if unit_ids is None:
-        n_units = n
-        row_blocks = None
-    else:
-        # Validate/group before choosing k.  First obtain the unique-unit count
-        # with k=1; assignment is recomputed below for the final, fixed k.
-        _, n_units = _patient_row_blocks(unit_ids, n, 1, partition_seed)
-        row_blocks = None
-    k = _choose_blocks(pcfg, True)
-
-    if k >= 2:
-        # A patient privacy unit may span many rows. Keep all those rows in one
-        # independently sandboxed block; otherwise one neighbouring patient could
-        # change several block outputs and invalidate a row-level sensitivity bound.
+    release_started = time.monotonic()
+    try:
+        module_file = _pinned_user_package(module_name)
+        partition_seed = seeding.sub_seed(seed, "partition")
         if unit_ids is None:
-            perm = seeding.np_rng(partition_seed).permutation(n)
-            row_blocks = np.array_split(perm, k)
+            n_units = n
+            row_blocks = None
         else:
-            row_blocks, _ = _patient_row_blocks(unit_ids, n, k, partition_seed)
-        block_updates = []
-        for idx in row_blocks:
-            r = _validate(_run_isolated(module_name, module_file, old, _take_rows(X, idx),
-                                        _take_rows(y, idx), cfg, pcfg, caps, timeout,
-                                        pad_to), old)
-            block_updates.append(r if r is not None else [o.copy() for o in old])
-        gated = dp_harness.sample_and_aggregate(
-            block_updates, old,
-            clipping_norm=pcfg["clipping_norm"],
-            epsilon=pcfg["epsilon"],
-            delta=pcfg["delta"],
-            num_releases=pcfg.get("composition_releases", 1),
-            rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
-        )
-    else:
-        r = _validate(_run_isolated(module_name, module_file, old, X, y, cfg, pcfg,
-                                    caps, timeout, pad_to), old)
-        new = r if r is not None else [o.copy() for o in old]   # validate-or-zero
-        gated = dp_harness.output_perturbation(
-            new, old,
-            clipping_norm=pcfg["clipping_norm"],
-            epsilon=pcfg["epsilon"],
-            delta=pcfg["delta"],
-            num_releases=pcfg.get("composition_releases", 1),
-            rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
-        )
-    return [g.astype(np.float32) for g in gated]
+            # Validate/group before choosing k. First obtain the unique-unit
+            # count with k=1; assignment is recomputed for the fixed final k.
+            _, n_units = _patient_row_blocks(unit_ids, n, 1, partition_seed)
+            row_blocks = None
+        k = _choose_blocks(pcfg, True)
+
+        if k >= 2:
+            # A patient privacy unit may span many rows. Keep all those rows in
+            # one independently sandboxed block so one neighbour changes at
+            # most one block output.
+            if unit_ids is None:
+                perm = seeding.np_rng(partition_seed).permutation(n)
+                row_blocks = np.array_split(perm, k)
+            else:
+                row_blocks, _ = _patient_row_blocks(
+                    unit_ids, n, k, partition_seed)
+            block_updates = []
+            for idx in row_blocks:
+                r = _validate(_run_isolated(
+                    module_name, module_file, old, _take_rows(X, idx),
+                    _take_rows(y, idx), cfg, pcfg, caps, timeout), old)
+                block_updates.append(
+                    r if r is not None else [o.copy() for o in old])
+            gated = dp_harness.sample_and_aggregate(
+                block_updates, old,
+                clipping_norm=pcfg["clipping_norm"],
+                epsilon=pcfg["epsilon"],
+                delta=pcfg["delta"],
+                num_releases=pcfg.get("composition_releases", 1),
+                rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
+            )
+        else:
+            r = _validate(_run_isolated(
+                module_name, module_file, old, X, y, cfg, pcfg, caps, timeout), old)
+            new = r if r is not None else [o.copy() for o in old]
+            gated = dp_harness.output_perturbation(
+                new, old,
+                clipping_norm=pcfg["clipping_norm"],
+                epsilon=pcfg["epsilon"],
+                delta=pcfg["delta"],
+                num_releases=pcfg.get("composition_releases", 1),
+                rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
+            )
+        return [g.astype(np.float32) for g in gated]
+    finally:
+        # One minimum-duration envelope covers the complete release, including
+        # all k S&A children. Each child still has its independent timeout.
+        remaining = pad_to - (time.monotonic() - release_started)
+        if remaining > 0:
+            time.sleep(remaining)

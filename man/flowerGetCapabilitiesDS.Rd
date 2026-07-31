@@ -7,13 +7,16 @@
 flowerGetCapabilitiesDS(handle_symbol = NULL)
 }
 \arguments{
-\item{handle_symbol}{Character; symbol of the handle (optional).}
+\item{handle_symbol}{Ignored compatibility argument.}
 }
 \value{
 Named list of capabilities.
 }
 \description{
 DataSHIELD AGGREGATE method. Returns information about the server's
-Flower capabilities including Python version, available templates,
-and disclosure settings.
+Flower capabilities including Python version, the hash-pinned declarative
+runner vocabulary, and disclosure settings. The response is independent of
+cohort contents, handle state, filesystem paths, and other sessions. The
+legacy template catalogue is retained as an explicitly deprecated empty
+field.
 }

@@ -7,9 +7,9 @@
 flowerMetricsDS(handle_symbol, since_round = 0L)
 }
 \arguments{
-\item{handle_symbol}{Character; symbol of the handle.}
+\item{handle_symbol}{Ignored compatibility argument.}
 
-\item{since_round}{Integer; return only metrics from this round onward.}
+\item{since_round}{Ignored compatibility argument.}
 }
 \value{
 Empty data.frame with columns: round, metric, value.

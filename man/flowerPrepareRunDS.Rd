@@ -25,6 +25,8 @@ Updated handle with staging information.
 }
 \description{
 DataSHIELD ASSIGN method. Reserves the server-owned lifetime allocation,
-loads training data, applies total public preprocessing, and stages data with
-a JSON manifest. No minimum-size or private-value admission bit is returned.
+and, when that allocation is numerically viable, applies total public
+preprocessing and stages the training data. A non-viable geometric-tail
+allocation stages only a public no-op manifest and never opens the private
+source. No minimum-size or private-value admission bit is returned.
 }

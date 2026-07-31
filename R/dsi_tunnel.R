@@ -2,11 +2,12 @@
 # over the DataSHIELD channel instead of gRPC/Tor.
 #
 # A node-side forwarder (dsi_tunnel_forward.py) bridges the SuperNode's local TCP
-# connection to an append-only byte spool; these DataSHIELD methods let the
+# connection to a bounded, compactable byte spool; these DataSHIELD methods let the
 # researcher's R relay drain/fill that spool, carrying the bytes to/from the
-# SuperLink. Flower (SuperLink, SuperNode, SecAgg+) is untouched -- only the
-# transport changes. Spool files are append-only; flowerTunnelExchangeDS owns
-# the acknowledged offsets in both directions.
+# SuperLink. The Flower SuperLink/SuperNode protocol is untouched; this relay
+# does not add Secure Aggregation -- only the transport changes. External
+# offsets are absolute while acknowledged prefixes are compacted atomically;
+# flowerTunnelExchangeDS owns those offsets.
 
 #' Validate the unguessable capability identifying one tunnel session
 #' @keywords internal
@@ -57,12 +58,17 @@
   )
 }
 
-#' Maximum encoded fan-out request accepted before JSON decoding
+#' Maximum legacy encoded request accepted before JSON decoding
 #' @keywords internal
 .tunnel_request_max_bytes <- function(chunk_bytes = .tunnel_chunk_bytes()) {
+  # The raw chunk is base64-encoded inside JSON and that JSON is base64-encoded
+  # once more for the DataSHIELD expression transport.
+  minimum_request <- 4 * ceiling(
+    (4 * ceiling(as.numeric(chunk_bytes) / 3) + 1024) / 3
+  ) + 4096
   .tunnel_limit(
     "tunnel_request_max_bytes", 64 * 1024^2,
-    max(1024^2, 4 * ceiling(as.numeric(chunk_bytes) / 3) + 4096),
+    max(1024^2, minimum_request),
     256 * 1024^2
   )
 }
@@ -72,10 +78,111 @@
 .tunnel_offset <- function(value) {
   value <- suppressWarnings(as.numeric(value))
   if (length(value) != 1L || is.na(value) || !is.finite(value) ||
-      value < 0 || value != floor(value)) {
+      value < 0 || value > 2^53 || value != floor(value)) {
     stop("Invalid tunnel byte offset.", call. = FALSE)
   }
   value
+}
+
+#' Validate a tunnel connection generation
+#' @keywords internal
+.tunnel_generation <- function(value) {
+  value <- suppressWarnings(as.numeric(value))
+  if (length(value) != 1L || is.na(value) || !is.finite(value) ||
+      value < 0 || value != floor(value)) {
+    stop("Invalid tunnel generation.", call. = FALSE)
+  }
+  value
+}
+
+#' Read the generation published by the node-side forwarder
+#' @keywords internal
+.tunnel_current_generation <- function(spool) {
+  path <- file.path(spool, "gen")
+  if (!file.exists(path)) return(0)
+  value <- readLines(path, n = 1L, warn = FALSE)
+  if (length(value) == 0L) return(0)
+  .tunnel_generation(value)
+}
+
+#' Bytes occupied by the absolute-base header in each compactable spool
+#' @keywords internal
+.tunnel_spool_header_bytes <- function() 8L
+
+#' Replace one spool with an empty stream starting at an absolute offset
+#' @keywords internal
+.tunnel_reset_spool_file <- function(spool, binname, base = 0) {
+  base <- .tunnel_offset(base)
+  path <- file.path(spool, binname)
+  con <- file(path, "wb")
+  on.exit(close(con))
+  writeBin(as.double(base), con, size = 8L, endian = "big")
+  invisible(TRUE)
+}
+
+#' Read the absolute base and EOF of one compactable spool
+#' @keywords internal
+.tunnel_spool_state <- function(spool, binname, create = FALSE) {
+  path <- file.path(spool, binname)
+  if (!file.exists(path)) {
+    if (!isTRUE(create)) return(list(base = 0, bytes = 0, eof = 0))
+    .tunnel_reset_spool_file(spool, binname)
+  }
+  size <- file.size(path)
+  header <- .tunnel_spool_header_bytes()
+  if (is.na(size) || size < header) {
+    if (isTRUE(create) && identical(as.numeric(size), 0)) {
+      .tunnel_reset_spool_file(spool, binname)
+      size <- header
+    } else {
+      stop("Invalid tunnel spool header.", call. = FALSE)
+    }
+  }
+  con <- file(path, "rb")
+  on.exit(close(con))
+  base <- readBin(con, "double", n = 1L, size = 8L, endian = "big")
+  base <- .tunnel_offset(base)
+  bytes <- as.numeric(size) - header
+  list(base = base, bytes = bytes, eof = base + bytes)
+}
+
+#' Publish one monotonic absolute tunnel acknowledgement
+#' @keywords internal
+.tunnel_publish_ack <- function(spool, name, offset) {
+  offset <- .tunnel_offset(offset)
+  if (!name %in% c("up.ack", "down.ack")) {
+    stop("Invalid tunnel acknowledgment stream.", call. = FALSE)
+  }
+  path <- file.path(spool, name)
+  if (file.exists(path)) {
+    current <- tryCatch(
+      .tunnel_offset(readLines(path, n = 1L, warn = FALSE)),
+      error = function(e) NULL
+    )
+    if (!is.null(current) && current == offset) return(invisible(offset))
+    if (!is.null(current) && current > offset) {
+      stop("Tunnel acknowledgment cannot move backwards.", call. = FALSE)
+    }
+  }
+  tmp <- paste0(path, ".", Sys.getpid(), ".tmp")
+  writeLines(format(offset, scientific = FALSE, trim = TRUE), tmp)
+  if (!file.rename(tmp, path)) {
+    unlink(tmp)
+    stop("Could not publish tunnel acknowledgement.", call. = FALSE)
+  }
+  invisible(offset)
+}
+
+#' Publish the relay's absolute node-to-SuperLink acknowledgement
+#' @keywords internal
+.tunnel_publish_up_ack <- function(spool, offset) {
+  .tunnel_publish_ack(spool, "up.ack", offset)
+}
+
+#' Publish the relay's absolute SuperLink-to-node acknowledgement
+#' @keywords internal
+.tunnel_publish_down_ack <- function(spool, offset) {
+  .tunnel_publish_ack(spool, "down.ack", offset)
 }
 
 #' Registry key for the forwarder owned by one tunnel session
@@ -123,7 +230,7 @@
       !nzchar(s) || !startsWith(s, "B64:")) {
     stop("Invalid tunnel payload.", call. = FALSE)
   }
-  b64 <- substring(s, 5)
+  b64 <- substring(s, first = 5L, last = nchar(s, type = "chars"))
   max_encoded <- 4 * ceiling(as.numeric(max_bytes) / 3) + 4
   if (is.finite(max_bytes) && nchar(b64, type = "bytes") > max_encoded) {
     stop("Tunnel payload exceeds the configured chunk size.", call. = FALSE)
@@ -140,6 +247,7 @@
 
 #' @keywords internal
 .tunnel_append <- function(spool, binname, raw) {
+  .tunnel_spool_state(spool, binname, create = TRUE)
   con <- file(file.path(spool, binname), "ab"); on.exit(close(con))
   if (length(raw) > 0) writeBin(raw, con)
   invisible(TRUE)
@@ -150,51 +258,80 @@
 .tunnel_read_at <- function(spool, binname, from, max_bytes = Inf) {
   bin <- file.path(spool, binname)
   if (!file.exists(bin)) return(list(data = raw(0), eof = 0))
-  sz <- file.size(bin)
+  state <- .tunnel_spool_state(spool, binname)
   from <- .tunnel_offset(from)
-  if (sz <= from) return(list(data = raw(0), eof = sz))
+  if (from < state$base) {
+    stop("Tunnel offset precedes the compacted spool base.", call. = FALSE)
+  }
+  if (state$eof <= from) return(list(data = raw(0), eof = state$eof))
   con <- file(bin, "rb"); on.exit(close(con))
-  seek(con, from)
-  to_read <- min(sz - from, as.numeric(max_bytes))
+  seek(con, .tunnel_spool_header_bytes() + from - state$base)
+  to_read <- min(state$eof - from, as.numeric(max_bytes))
   data <- readBin(con, "raw", to_read)
   list(data = data, eof = from + length(data))
 }
 
-#' Idempotent append: 'at' is the size the relay believes the file has; append
-#' only the bytes of 'raw' not already present, so a retried push never
-#' duplicates or loses bytes. Returns the new file size.
+#' Idempotent append with fixed message geometry
+#'
+#' A new message must start exactly at EOF. A replay is accepted only when its
+#' offset, length, and every retained byte match the one complete message already
+#' stored. Returns the new absolute EOF.
 #' @keywords internal
 .tunnel_append_at <- function(spool, binname, at, raw, max_bytes = Inf) {
-  bin <- file.path(spool, binname)
-  sz <- if (file.exists(bin)) file.size(bin) else 0
+  state <- .tunnel_spool_state(spool, binname, create = TRUE)
+  sz <- state$eof
   at <- .tunnel_offset(at)
-  already <- sz - at                          # bytes of 'raw' already appended
-  if (already < 0) return(sz)                 # gap (at > sz): refuse, report size
-  if (already >= length(raw)) return(sz)      # nothing new to append
-  pending <- length(raw) - already
-  if (sz + pending > max_bytes) {
+  if (!is.raw(raw) || length(raw) < 1L) {
+    stop("Invalid tunnel append payload.", call. = FALSE)
+  }
+  end <- at + length(raw)
+  if (!is.finite(end) || end > 2^53) {
+    stop("Invalid tunnel append geometry.", call. = FALSE)
+  }
+  if (at > sz) return(sz)                     # gap: refuse and report current EOF
+  if (at == sz) {
+    if (state$bytes + length(raw) > max_bytes) {
+      stop("Tunnel spool limit exceeded.", call. = FALSE)
+    }
+    .tunnel_append(spool, binname, raw)
+    return(.tunnel_spool_state(spool, binname)$eof)
+  }
+  if (at < state$base || end != sz) {
+    stop("Conflicting tunnel replay geometry.", call. = FALSE)
+  }
+  existing <- .tunnel_read_at(
+    spool, binname, at, max_bytes = length(raw))$data
+  if (!identical(existing, raw)) {
+    stop("Conflicting tunnel replay payload.", call. = FALSE)
+  }
+  if (state$bytes > max_bytes) {
     stop("Tunnel spool limit exceeded.", call. = FALSE)
   }
-  .tunnel_append(spool, binname, raw[(already + 1):length(raw)])
-  if (file.exists(bin)) file.size(bin) else 0
+  sz
 }
 
 #' Idempotent bidirectional tunnel exchange in one fan-out call (AGGREGATE)
 #'
 #' The RELAY owns the byte offsets, so this method is loss-free and idempotent: a
 #' retried call re-delivers / re-reads the same byte ranges without duplication
-#' or loss. \code{req} is a \code{.ds_encode}'d named list keyed by node name;
-#' this node's entry is list(pa = down append-offset the relay believes,
-#' pd = "B64:" SuperLink->SuperNode bytes, pf = up read-offset). Returns this
-#' node's list(sz = new down.bin size, ud = "B64:" SuperNode->SuperLink bytes
-#' from pf, ue = new up.bin EOF, g = connection generation). Payloads are
+#' or loss. Current clients pass the scalar \code{pa}, \code{pd}, \code{pf}, and
+#' \code{g} arguments directly, avoiding a second JSON/base64 layer. The legacy
+#' \code{req} envelope (direct or keyed by node name) remains accepted. Returns this
+#' node's list(ok = TRUE, node, sz = new down-stream absolute EOF,
+#' ud = "B64:" SuperNode->SuperLink bytes from pf, ue = new up.bin EOF,
+#' g = connection generation). Payloads are
 #' bounded to the node-owned chunk size and exchanges are serialized per tunnel.
 #' @param conn_id Character; tunnel connection id.
-#' @param req Character; \code{.ds_encode}'d named request map, or "".
-#' @return list(sz, ud, ue, g) for this node.
+#' @param req Character; legacy \code{.ds_encode}'d request, or "".
+#' @param pa Numeric; down append-offset believed by the relay.
+#' @param pd Character; URL-safe base64 SuperLink-to-SuperNode bytes.
+#' @param pf Numeric; up read-offset acknowledged by the relay.
+#' @param g Numeric; expected forwarder connection generation.
+#' @return list(ok, node, sz, ud, ue, g) for this node.
 #' @keywords internal
 #' @export
-flowerTunnelExchangeDS <- function(conn_id, req = "") {
+flowerTunnelExchangeDS <- function(conn_id, req = "", pa = NULL, pd = "",
+                                   pf = 0, g = NULL) {
   cid <- .tunnel_conn_id(conn_id)
   p <- .dsflower_env[[.tunnel_forwarder_key(cid)]]
   if (!identical(.dsflower_env$tunnel_conn_id, cid) ||
@@ -218,39 +355,65 @@ flowerTunnelExchangeDS <- function(conn_id, req = "") {
     # the SuperLink is gone and self-terminate too.
     cat(".", file = file.path(spool, "relay_hb"))
     nm <- .dsflower_env[[paste0("tunnel_name_", cid)]]
-    pa <- NA; pd <- ""; pf <- 0
-    if (is.character(req) && length(req) == 1L && !is.na(req) && nzchar(req)) {
-      rm <- tryCatch(.ds_arg(req), error = function(e) NULL)
-      if (is.list(rm) && !is.null(nm) && !is.null(rm[[nm]])) {
-        r <- rm[[nm]]
-        if (!is.null(r$pa)) pa <- r$pa
-        if (!is.null(r$pd)) pd <- r$pd
-        if (!is.null(r$pf)) pf <- r$pf
+    r <- if (!is.null(pa) || !is.null(g)) {
+      list(pa = pa, pd = pd, pf = pf, g = g)
+    } else {
+      NULL
+    }
+    if (is.null(r) && is.character(req) && length(req) == 1L &&
+        !is.na(req) && nzchar(req)) {
+      decoded <- tryCatch(.ds_arg(req), error = function(e) NULL)
+      if (is.list(decoded)) {
+        # Accept both former envelope shapes when they carry a generation fence.
+        if (all(c("pa", "pd", "pf", "g") %in% names(decoded))) {
+          r <- decoded
+        } else if (!is.null(nm) && is.list(decoded[[nm]])) {
+          r <- decoded[[nm]]
+        }
       }
     }
-    # down: idempotently append one bounded SuperLink->SuperNode chunk
-    down_sz <- if (is.character(pd) && length(pd) == 1L &&
-                   !is.na(pd) && nzchar(pd)) {
-      .tunnel_append_at(
-        spool, "down.bin", pa, .tunnel_dec(pd, chunk_bytes),
-        max_bytes = spool_max_bytes
+    gen <- .tunnel_current_generation(spool)
+    request_gen <- if (!is.null(r) && !is.null(r$g)) {
+      tryCatch(.tunnel_generation(r$g), error = function(e) NULL)
+    } else {
+      NULL
+    }
+    if (is.null(request_gen) || request_gen != gen) {
+      # A reconnect may have truncated both spools after the relay built this
+      # request. Never apply stale bytes: only advertise the new generation so
+      # the relay can reset its socket and offsets.
+      list(ok = TRUE, node = nm, sz = 0, ud = "", ue = 0, g = gen)
+    } else {
+      pa <- .tunnel_offset(r$pa %||% NA)
+      pd <- r$pd %||% ""
+      pf <- .tunnel_offset(r$pf %||% 0)
+      up_state <- .tunnel_spool_state(spool, "up.bin", create = TRUE)
+      if (pf < up_state$base || pf > up_state$eof) {
+        stop("Invalid tunnel read acknowledgment.", call. = FALSE)
+      }
+      .tunnel_publish_up_ack(spool, pf)
+      down_state <- .tunnel_spool_state(spool, "down.bin", create = TRUE)
+      if (pa < down_state$base || pa > down_state$eof) {
+        stop("Invalid tunnel append acknowledgment.", call. = FALSE)
+      }
+      .tunnel_publish_down_ack(spool, pa)
+      # down: idempotently append one bounded SuperLink->SuperNode chunk
+      down_sz <- if (is.character(pd) && length(pd) == 1L &&
+                     !is.na(pd) && nzchar(pd)) {
+        .tunnel_append_at(
+          spool, "down.bin", pa, .tunnel_dec(pd, chunk_bytes),
+          max_bytes = spool_max_bytes
+        )
+      } else {
+        .tunnel_spool_state(spool, "down.bin", create = TRUE)$eof
+      }
+      # up: return at most one bounded SuperNode->SuperLink chunk
+      up <- .tunnel_read_at(spool, "up.bin", pf, max_bytes = chunk_bytes)
+      list(
+        ok = TRUE, node = nm, sz = down_sz,
+        ud = .tunnel_enc(up$data), ue = up$eof, g = gen
       )
-    } else {
-      b <- file.path(spool, "down.bin")
-      if (file.exists(b)) file.size(b) else 0
     }
-    # up: return at most one bounded SuperNode->SuperLink chunk
-    up <- .tunnel_read_at(spool, "up.bin", pf, max_bytes = chunk_bytes)
-    # generation: bumps each time the forwarder accepts a new SuperNode connection,
-    # signalling the relay to reset its socket + offsets for the fresh stream.
-    gf <- file.path(spool, "gen")
-    gen <- if (file.exists(gf)) {
-      suppressWarnings(as.numeric(readLines(gf, n = 1, warn = FALSE)))
-    } else {
-      0
-    }
-    if (length(gen) == 0 || is.na(gen)) gen <- 0
-    list(sz = down_sz, ud = .tunnel_enc(up$data), ue = up$eof, g = gen)
   })
 }
 
@@ -310,12 +473,20 @@ flowerTunnelExchangeDS <- function(conn_id, req = "") {
 #' @param conn_id Character; tunnel connection id.
 #' @param listen_port Integer; local port the SuperNode will dial.
 #' @param node_name Character; this node's federation name.
-#' @return list(ok, listen, chunk_bytes).
+#' @param protocol_abi Numeric; exact tunnel protocol ABI expected by the client.
+#' @return list(ok, listen, chunk_bytes, protocol_abi). The ABI marker makes a
+#'   mixed client/server deployment fail before exchanging stream bytes.
 #' @keywords internal
 #' @export
-flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "") {
+flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
+                             protocol_abi = NULL) {
   cid <- .tunnel_conn_id(conn_id)
   port <- .tunnel_port(listen_port)
+  abi <- suppressWarnings(as.numeric(protocol_abi))
+  if (length(abi) != 1L || is.na(abi) || !is.finite(abi) || abi != 2) {
+    stop("Incompatible dsFlower tunnel protocol ABI; deploy matching server and client versions.",
+         call. = FALSE)
+  }
   chunk_bytes <- .tunnel_chunk_bytes()
   spool_max_bytes <- .tunnel_spool_max_bytes(chunk_bytes)
   .tunnel_request_max_bytes(chunk_bytes)
@@ -327,8 +498,24 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "") {
   if (!is.null(active_cid)) {
     valid_active_cid <- tryCatch(.tunnel_conn_id(active_cid),
                                  error = function(e) NULL)
-    if (!is.null(valid_active_cid) &&
-        !is.null(.active_tunnel_port())) {
+    active_port <- if (!is.null(valid_active_cid)) {
+      .active_tunnel_port()
+    } else {
+      NULL
+    }
+    if (!is.null(active_port) && identical(valid_active_cid, cid)) {
+      active_name <- .dsflower_env[[paste0("tunnel_name_", cid)]]
+      if (!identical(active_port, port) || !identical(active_name, node_name)) {
+        stop("Conflicting tunnel startup replay.", call. = FALSE)
+      }
+      return(list(
+        ok = TRUE,
+        listen = paste0("127.0.0.1:", port),
+        chunk_bytes = chunk_bytes,
+        protocol_abi = 2L
+      ))
+    }
+    if (!is.null(active_port)) {
       stop("A tunnel session is already active in this DataSHIELD session.",
            call. = FALSE)
     }
@@ -342,9 +529,13 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "") {
   spool <- .tunnel_spool(cid)
   unlink(list.files(spool, full.names = TRUE))
   for (f in c("up.bin", "down.bin")) {
-    file.create(file.path(spool, f))
+    .tunnel_reset_spool_file(spool, f)
     Sys.chmod(file.path(spool, f), mode = "0600")
   }
+  writeLines("0", file.path(spool, "up.ack"))
+  Sys.chmod(file.path(spool, "up.ack"), mode = "0600")
+  writeLines("0", file.path(spool, "down.ack"))
+  Sys.chmod(file.path(spool, "down.ack"), mode = "0600")
   cat(".", file = file.path(spool, "relay_hb"))   # seed the relay heartbeat
   started <- FALSE
   on.exit(if (!started) .cleanup_tunnel(cid), add = TRUE)
@@ -390,7 +581,8 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "") {
   list(
     ok = TRUE,
     listen = paste0("127.0.0.1:", port),
-    chunk_bytes = chunk_bytes
+    chunk_bytes = chunk_bytes,
+    protocol_abi = 2L
   )
 }
 

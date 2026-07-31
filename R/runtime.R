@@ -180,7 +180,9 @@
     DSFLOWER_NODE_SECRET_FILE = secret_path,
     DSFLOWER_PRIVACY_LEDGER_PATH = ledger_path,
     DSF_SAA_SANDBOX_OK = if (isTRUE(as.logical(
-      .dsf_option("hook_sandbox_attested", FALSE)))) "1" else "0")
+      .dsf_option("hook_sandbox_attested", FALSE)))) "1" else "0",
+    DSF_HOOK_RESOURCE_ISOLATION_OK = if (isTRUE(as.logical(
+      .dsf_option("hook_resource_isolation_attested", FALSE)))) "1" else "0")
 
   if (!is.null(extra_pypath))
     env <- c(env, PYTHONPATH = extra_pypath)
@@ -318,8 +320,8 @@
   log_name <- gsub("[^a-zA-Z0-9._-]", "_", superlink_address)
   log_path <- file.path(log_dir, paste0(log_name, ".log"))
 
-  # TLS mode requires a CA cert; the DSI tunnel runs insecure (the bytes already
-  # travel inside the TLS DataSHIELD channel) and needs none.
+  # TLS mode requires a CA cert. The DSI tunnel's inner gRPC is loopback-only;
+  # confidentiality and integrity belong to the outer connector/network policy.
   if (!isTRUE(insecure) && (is.null(ca_cert_path) || !file.exists(ca_cert_path))) {
     stop("CA certificate not found. The SuperLink must provide a TLS certificate.",
          call. = FALSE)
@@ -385,8 +387,8 @@
   clientappio_port <- NULL
   for (attempt in seq_len(3L)) {
     clientappio_port <- .random_available_port()
-    # DSI tunnel: the inner Flower gRPC runs insecure because the bytes already
-    # travel inside the (TLS) DataSHIELD channel; otherwise use TLS to the CA.
+    # DSI tunnel: the inner Flower gRPC is loopback-only and runs insecure;
+    # otherwise use TLS to the CA.
     tls_args <- if (isTRUE(insecure)) "--insecure"
                 else c("--root-certificates", ca_cert_path)
     # SuperNode authentication: if the operator configured this node's auth
@@ -444,19 +446,14 @@
 
     # Process died -- likely port collision or config error
     if (attempt < 3L) {
-      log_tail <- tryCatch(
-        paste(utils::tail(readLines(log_path, warn = FALSE), 5), collapse = "\n"),
-        error = function(e) "")
       warning("SuperNode failed on attempt ", attempt, " (port ", clientappio_port,
               "). Retrying...", call. = FALSE)
     }
   }
 
   if (!proc$is_alive()) {
-    log_tail <- tryCatch(
-      paste(utils::tail(readLines(log_path, warn = FALSE), 10), collapse = "\n"),
-      error = function(e) "(no log)")
-    stop("SuperNode failed to start after 3 attempts.\nLog:\n", log_tail,
+    stop("SuperNode failed to start after 3 attempts. ",
+         "The node administrator can inspect the local SuperNode log.",
          call. = FALSE)
   }
 

@@ -2,15 +2,13 @@
 % Please edit documentation in R/dsi_tunnel.R
 \name{.tunnel_append_at}
 \alias{.tunnel_append_at}
-\title{Idempotent append: 'at' is the size the relay believes the file has; append
-only the bytes of 'raw' not already present, so a retried push never
-duplicates or loses bytes. Returns the new file size.}
+\title{Idempotent append with fixed message geometry}
 \usage{
 .tunnel_append_at(spool, binname, at, raw, max_bytes = Inf)
 }
 \description{
-Idempotent append: 'at' is the size the relay believes the file has; append
-only the bytes of 'raw' not already present, so a retried push never
-duplicates or loses bytes. Returns the new file size.
+A new message must start exactly at EOF. A replay is accepted only when its
+offset, length, and every retained byte match the one complete message already
+stored. Returns the new absolute EOF.
 }
 \keyword{internal}

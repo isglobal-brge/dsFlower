@@ -54,6 +54,18 @@ test_that("the trusted Python environment does not inherit injection variables",
   expect_false(any(names(env) %in% c(
     "PYTHONSTARTUP", "PYTHONINSPECT", "LD_PRELOAD", "DSFLOWER_ATTACKER_VALUE")))
   expect_identical(unname(env[["PYTHONNOUSERSITE"]]), "1")
+  expect_identical(unname(env[["DSF_SAA_SANDBOX_OK"]]), "0")
+  expect_identical(
+    unname(env[["DSF_HOOK_RESOURCE_ISOLATION_OK"]]), "0")
+
+  attested <- withr::with_options(list(
+    dsflower.hook_sandbox_attested = TRUE,
+    dsflower.hook_resource_isolation_attested = TRUE
+  ), dsFlower:::.build_clean_python_env(
+    tempfile("venv-"), withr::local_tempdir()))
+  expect_identical(unname(attested[["DSF_SAA_SANDBOX_OK"]]), "1")
+  expect_identical(
+    unname(attested[["DSF_HOOK_RESOURCE_ISOLATION_OK"]]), "1")
 })
 
 test_that(".supernode_lookup returns NULL for unknown manifest_dir", {

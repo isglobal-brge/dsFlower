@@ -28,11 +28,13 @@ per-sample gradient sensitivity bound holds:
   * ``dropout``                         (independent per-sample mask)
   * ``layernorm``                       (normalizes over FEATURES, per-sample;
                                          affine params, NO batch-coupled buffers)
+  * reshape/flatten, pooling, upsampling and allowlisted 1D/2D convolutions
+  * node-owned recurrent blocks and typed DAG operations for residual,
+    branching and concatenation topologies
 BatchNorm and anything that mixes across the batch are deliberately NOT in the
 vocabulary -- they break per-sample DP-SGD (Opacus' ModuleValidator rejects them
-too). Residual/branching graphs and convolutions are clean future ops (still DATA,
-still node-built); the current vocabulary is the universal feed-forward space and
-covers every first-party model (tabular heads + frozen-backbone vision heads).
+too). Every accepted operation remains data-only, node-built and independent
+across the batch dimension.
 """
 
 import math

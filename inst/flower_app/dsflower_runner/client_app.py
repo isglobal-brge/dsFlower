@@ -410,11 +410,12 @@ def _pool_by_patient(X, y, groups, loss_name):
     outcomes use a deterministic mode, and multilabel outcomes use majority per
     label. These are local preprocessing operations on one privacy unit.
     """
-    g = [("" if gv is None else str(gv)) for gv in groups]
-    g = np.asarray([gv if (gv and gv.lower() != "nan") else f"__row_{i}"
-                    for i, gv in enumerate(g)], dtype=object)
+    g = np.asarray(
+        [task_module._canonical_patient_id(gv) for gv in groups],
+        dtype=object)
     Xp, yp = [], []
-    categorical = loss_name in _CLASSIFICATION_LOSSES
+    categorical = (loss_name in _CLASSIFICATION_LOSSES
+                   or loss_name == "multilabel_bce")
     for key in dict.fromkeys(g.tolist()):
         m = g == key
         Xp.append(np.asarray(X[m], dtype=np.float64).mean(axis=0))
@@ -494,7 +495,7 @@ def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
     if manifest_image:
         from . import vision
         backbone = vision.normalize_backbone(cfg.get("backbone", cfg.get("model", "resnet18")))
-        image_size = int(cfg.get("image-size", 224))
+        image_size = vision._validate_image_size(cfg.get("image-size", 224))
         paths, y, groups = load_image_collection(context)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
         if pins["loss_name"] in _CLASSIFICATION_LOSSES:
@@ -502,15 +503,8 @@ def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
         encoder, feat_dim = vision.build_backbone(backbone)
         if int(feat_dim) != int(input_dim):
             raise RuntimeError("backbone feature width changed after model validation")
-        read = vision.read_image_3d if vision.is_3d_backbone(backbone) else vision.read_image_2d
-        try:
-            images = [read(p, image_size) for p in paths]      # the ONLY pass over pixels
-        except Exception as e:
-            raise RuntimeError(f"failed to read an image in the collection: {e}")
-        if not images:
-            raise RuntimeError("no images could be read from the collection")
-        X = vision.extract_features(encoder, images)           # frozen, no grad
-        del images
+        X = vision.extract_features_from_paths(
+            encoder, paths, image_size, vision.is_3d_backbone(backbone))
     else:
         X, y = load_data(context)
         if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
@@ -525,6 +519,7 @@ def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
     if groups is not None:
         X, y = _pool_by_patient(X, y, groups, pins["loss_name"])
         X = _totalize_private_features(X)
+    task_module.assert_pinned_unit_count(context, len(y))
 
     return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master)
 
@@ -544,7 +539,9 @@ def _booster_to_array(booster):
 def _train_trees(context, pcfg, cfg, private_release_id):
     spec = load_gbdt_spec(context)                 # validated, manifest-authoritative
     X, y = load_data(context)
+    X = _totalize_private_features(X)
     pids = load_tabular_patient_ids(context)       # per-patient DP unit when present
+    task_module.assert_pinned_unit_count(context, len(y), pids)
     master = seeding.master_seed(cfg, X, y, private_release_id)
     booster = dp_gbdt.fit_dp_gbdt(
         X, y, objective=spec["objective"], depth=spec["max_depth"],
@@ -671,6 +668,7 @@ def train(msg: Message, context: Context) -> Message:
             module_name = str(cfg["user-module"])
             X, y = load_data(context)
             unit_ids = load_tabular_patient_ids(context)
+            task_module.assert_pinned_unit_count(context, len(y), unit_ids)
             master = seeding.master_seed(cfg, X, y, private_release_id)
             new_arrays = tier2_lib.gated_local_update(
                 module_name, old, X, y, cfg, pcfg_round,

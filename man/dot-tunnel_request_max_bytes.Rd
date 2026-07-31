@@ -2,11 +2,11 @@
 % Please edit documentation in R/dsi_tunnel.R
 \name{.tunnel_request_max_bytes}
 \alias{.tunnel_request_max_bytes}
-\title{Maximum encoded fan-out request accepted before JSON decoding}
+\title{Maximum legacy encoded request accepted before JSON decoding}
 \usage{
 .tunnel_request_max_bytes(chunk_bytes = .tunnel_chunk_bytes())
 }
 \description{
-Maximum encoded fan-out request accepted before JSON decoding
+Maximum legacy encoded request accepted before JSON decoding
 }
 \keyword{internal}

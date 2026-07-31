@@ -4,7 +4,7 @@ A ready-to-run **DataSHIELD rock node with dsFlower preinstalled** — server-en
 differential privacy for federated learning, with the PyTorch (CPU) Flower runtime baked
 in so the first federated run is instant.
 
-Source release image: **`davidsarrat/dsflower-rock:0.3.0`**. Deploy and derive
+Source release image: **`davidsarrat/dsflower-rock:0.4.0`**. Deploy and derive
 other images from an immutable digest, not from a mutable tag.
 
 ## What's inside
@@ -25,8 +25,8 @@ mv dsFlower_*.tar.gz docker/dsFlower.tar.gz
 # build (native linux/amd64 for the federation hosts)
 docker build \
   --build-arg ROCK_BASE_IMAGE='datashield/rock-base@sha256:<reviewed-digest>' \
-  -t davidsarrat/dsflower-rock:0.3.0 docker/
-docker push davidsarrat/dsflower-rock:0.3.0
+  -t davidsarrat/dsflower-rock:0.4.0 docker/
+docker push davidsarrat/dsflower-rock:0.4.0
 ```
 
 `ROCK_BASE_IMAGE` should be the digest recorded during base-image review. A tag
@@ -68,7 +68,13 @@ rescheduling and image upgrades:
 
 Do not mount all of `/var/lib/dsflower` over this image: that would hide the baked
 `venvs/` directory. Mount the privacy and appstore subdirectories separately and
-inject the secret file. A ledger and secret form one node identity: do not clone
+inject the secret file. The mounted privacy directory must be owned by the Rock
+process UID and must not be writable by group or other users (`0700` is the
+recommended mode); the ledger itself is enforced as `0600`. The secret file must
+also be owned by the Rock process UID with exact mode `0600`; its real parent may
+be owned by that UID or root, but must not be writable by group or other users. A
+ledger and secret
+form one node identity: do not clone
 them to a second node, restore only one of them, or roll either one back. Backups
 must retain both consistently. dsFlower deliberately declares no Docker `VOLUME`,
 because the correct persistent-volume and secret wiring belongs to the
