@@ -7,3 +7,4 @@
 ^pkgdown$
 __pycache__$
 \.pyc$
+^docker/dsImaging[.]tar[.]gz$

@@ -152,6 +152,17 @@
     stop("The privacy ledger was not initialized before SuperNode launch.",
          call. = FALSE)
   }
+  flwr_home <- file.path(staging_dir, ".flwr")
+  if (.path_is_symlink(flwr_home) ||
+      ((file.exists(flwr_home) || dir.exists(flwr_home)) &&
+       !dir.exists(flwr_home))) {
+    stop("The per-run Flower home is unsafe.", call. = FALSE)
+  }
+  dir.create(flwr_home, mode = "0700", showWarnings = FALSE)
+  if (!dir.exists(flwr_home) || .path_is_symlink(flwr_home)) {
+    stop("Could not create the private per-run Flower home.", call. = FALSE)
+  }
+  Sys.chmod(flwr_home, "0700")
 
   # Inherit only variables needed for locale, TLS/proxies, accelerators and
   # temporary-file placement. In particular, never inherit PYTHONPATH,
@@ -176,6 +187,7 @@
     PYTHONNOUSERSITE = "1",
     VIRTUAL_ENV = venv_path,
     PATH = paste0(venv_bin, ":", current_path),
+    FLWR_HOME = flwr_home,
     DSFLOWER_MANIFEST_DIR = staging_dir,
     DSFLOWER_NODE_SECRET_FILE = secret_path,
     DSFLOWER_PRIVACY_LEDGER_PATH = ledger_path,

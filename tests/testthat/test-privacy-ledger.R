@@ -461,6 +461,58 @@ test_that("node secret is generated from exactly 32 bytes and rejects trailing d
   })
 })
 
+test_that("concurrent first use installs one stable node secret", {
+  skip_on_os("windows")
+  source_root <- normalizePath(testthat::test_path("..", ".."))
+  withr::with_tempdir({
+    secret <- file.path(getwd(), "node-secret")
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
+    ))
+
+    command <- file.path(R.home("bin"), "Rscript")
+    expression <- paste(
+      "loadNamespace('dsFlower');",
+      "if (exists('.ensure_node_secret', asNamespace('dsFlower'),",
+      "inherits=FALSE)) {",
+      "getFromNamespace('.ensure_node_secret', 'dsFlower')()",
+      "} else {",
+      "root <- Sys.getenv('DSFLOWER_TEST_SOURCE_ROOT');",
+      "for (f in list.files(file.path(root, 'R'), pattern='[.]R$',",
+      "full.names=TRUE)) sys.source(f, envir=.GlobalEnv);",
+      ".ensure_node_secret()",
+      "}"
+    )
+    workers <- lapply(seq_len(8L), function(...) {
+      processx::process$new(
+        command, c("-e", expression),
+        env = c(
+          "current",
+          DSFLOWER_TEST_SOURCE_ROOT = source_root,
+          DSFLOWER_NODE_SECRET_FILE = secret,
+          DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
+        ),
+        stdout = "|", stderr = "|", cleanup = TRUE
+      )
+    })
+    withr::defer(lapply(workers, function(worker) {
+      if (worker$is_alive()) worker$kill_tree()
+    }))
+    lapply(workers, function(worker) worker$wait(timeout = 10000))
+    expect_true(all(vapply(
+      workers, function(worker) identical(worker$get_exit_status(), 0L),
+      logical(1)
+    )))
+    expect_length(readLines(secret, warn = FALSE), 1L)
+    expect_match(readLines(secret, warn = FALSE), "^[0-9a-f]{64}$")
+    expect_false(any(grepl(
+      "^\\.node-secret-", list.files(getwd(), all.files = TRUE)
+    )))
+    expect_identical(dsFlower:::.validate_node_secret(secret), secret)
+  })
+})
+
 test_that("node-secret parent is private, owned and stable", {
   skip_if(.Platform$OS.type != "unix")
   withr::with_tempdir({

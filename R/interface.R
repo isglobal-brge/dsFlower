@@ -871,7 +871,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   }
   if (!isTRUE(conn_check$reachable)) {
     stop("This node cannot reach the configured SuperLink. ",
-         "Open outbound access from this server (v2 transport ",
+         "Open outbound access from this server (the DSI tunnel transport ",
          "is the DataSHIELD tunnel, so this path is normally unused).",
          call. = FALSE)
   }

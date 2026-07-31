@@ -9,7 +9,7 @@
 # Build (from this directory; place the dsFlower source tarball here first):
 #   cd dsFlower && R CMD build . && mv dsFlower_*.tar.gz docker/dsFlower.tar.gz
 #   docker build --build-arg ROCK_BASE_IMAGE='datashield/rock-base@sha256:<digest>' \
-#     -t davidsarrat/dsflower-rock:0.4.0 docker/
+#     -t davidsarrat/dsflower-rock:0.4.1 docker/
 #
 # After deploying the image as an Opal rock, register its DataSHIELD methods once:
 #   opalr::dsadmin.set_package_methods(opal, "dsFlower")
@@ -20,7 +20,7 @@ ARG ROCK_BASE_IMAGE
 FROM ${ROCK_BASE_IMAGE}
 
 ARG ROCK_BASE_IMAGE
-ARG DSFLOWER_VERSION=0.4.0
+ARG DSFLOWER_VERSION=0.4.1
 
 LABEL org.opencontainers.image.title="dsflower-rock" \
       org.opencontainers.image.description="DataSHIELD rock node with dsFlower (server-enforced DP federated learning) preinstalled" \

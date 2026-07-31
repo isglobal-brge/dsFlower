@@ -58,6 +58,17 @@ def _reap_available():
         reaped.append(pid)
 
 
+def _process_group_exists(pgid):
+    """Return whether a process group still has at least one member."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def main():
     cmd = sys.argv[1:]
     if not cmd:
@@ -86,7 +97,7 @@ def main():
     def _begin_shutdown(_signum=None, _frame=None):
         if not state["shutdown"]:
             state["shutdown"] = True
-            state["deadline"] = time.time() + _GRACE_SECS
+            state["deadline"] = time.monotonic() + _GRACE_SECS
             try:
                 os.killpg(sn_pgid, signal.SIGTERM)   # the supernode group, never us
             except OSError:
@@ -100,9 +111,14 @@ def main():
         if sn_pid in reaped and state["sn_rc"] is None:
             state["sn_rc"] = 0
             _begin_shutdown()              # supernode gone -> drain any lingering clientapp
-        if not any_left:
-            break                          # everything reaped; we're done
-        if state["shutdown"] and not state["killed"] and time.time() > state["deadline"]:
+        # Outside Linux, PR_SET_CHILD_SUBREAPER is unavailable and descendants
+        # can be reparented before we observe them. ECHILD therefore does not
+        # prove that the SuperNode process group is empty.
+        group_alive = _process_group_exists(sn_pgid)
+        if not any_left and not group_alive:
+            break                          # children and process group are gone
+        if (state["shutdown"] and not state["killed"]
+                and time.monotonic() > state["deadline"]):
             state["killed"] = True
             try:
                 os.killpg(sn_pgid, signal.SIGKILL)   # force the group (not the wrapper)

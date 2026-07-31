@@ -276,7 +276,7 @@ important privacy options are:
 | `dp_allow_multiple_domains` | `FALSE` | Requires certified disjoint populations |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound |
 | `node_secret_path` | `/var/lib/dsflower/node_secret` | Dedicated 256-bit key |
-| `tunnel_chunk_bytes` | `1048576` | Per-exchange decoded tunnel payload cap (16 KiB--8 MiB) |
+| `tunnel_chunk_bytes` | `524288` | Per-exchange decoded tunnel payload cap (16--512 KiB); larger streams use multiple exact chunks below DSI's expression-parser limit |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; TCP backpressure when full |
 | `tunnel_request_max_bytes` | `67108864` | Pre-decode cap for an encoded fan-out request |
 | `tunnel_loss_tolerance` | `180` | Relay-heartbeat timeout in seconds (`5`--`86400`) |
