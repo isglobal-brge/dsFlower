@@ -146,20 +146,84 @@
                                      extra_pypath = NULL) {
   venv_bin <- file.path(venv_path, "bin")
   current_path <- Sys.getenv("PATH", "")
+  secret_path <- .validate_node_secret(.node_secret_path())
+  ledger_path <- .privacy_ledger_path()
+  if (!file.exists(ledger_path)) {
+    stop("The privacy ledger was not initialized before SuperNode launch.",
+         call. = FALSE)
+  }
 
-  env <- c("current",
+  # Inherit only variables needed for locale, TLS/proxies, accelerators and
+  # temporary-file placement. In particular, never inherit PYTHONPATH,
+  # PYTHONSTARTUP, PYTHONINSPECT, LD_PRELOAD or arbitrary DSFLOWER_* values into
+  # the trusted Python boundary.
+  inherited_names <- c(
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+    "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES",
+    "NVIDIA_DRIVER_CAPABILITIES", "ROCR_VISIBLE_DEVICES",
+    "XDG_CACHE_HOME"
+  )
+  inherited <- Sys.getenv(inherited_names, unset = NA_character_)
+  inherited <- inherited[!is.na(inherited)]
+
+  env <- c(inherited,
     LD_LIBRARY_PATH = "",
     DYLD_LIBRARY_PATH = "",
     PYTHONHOME = "",
     PYTHONNOUSERSITE = "1",
     VIRTUAL_ENV = venv_path,
     PATH = paste0(venv_bin, ":", current_path),
-    DSFLOWER_MANIFEST_DIR = staging_dir)
+    DSFLOWER_MANIFEST_DIR = staging_dir,
+    DSFLOWER_NODE_SECRET_FILE = secret_path,
+    DSFLOWER_PRIVACY_LEDGER_PATH = ledger_path,
+    DSF_SAA_SANDBOX_OK = if (isTRUE(as.logical(
+      .dsf_option("hook_sandbox_attested", FALSE)))) "1" else "0")
 
   if (!is.null(extra_pypath))
     env <- c(env, PYTHONPATH = extra_pypath)
 
   env
+}
+
+#' Install the mandatory Python code-integrity bootstrap
+#' @keywords internal
+.install_integrity_hook <- function(
+    staging_dir,
+    hook_src = system.file("python", "sitecustomize.py", package = "dsFlower")) {
+  if (!is.character(hook_src) || length(hook_src) != 1L || is.na(hook_src) ||
+      !nzchar(hook_src) || !file.exists(hook_src) || dir.exists(hook_src) ||
+      .path_is_symlink(hook_src) || !utils::file_test("-f", hook_src)) {
+    stop("The mandatory dsFlower Python integrity hook is unavailable.",
+         call. = FALSE)
+  }
+  hook_dir <- file.path(staging_dir, ".dsflower_hook")
+  if (.path_is_symlink(hook_dir) ||
+      ((file.exists(hook_dir) || dir.exists(hook_dir)) && !dir.exists(hook_dir))) {
+    stop("The dsFlower integrity-hook directory is unsafe.", call. = FALSE)
+  }
+  dir.create(hook_dir, mode = "0700", showWarnings = FALSE)
+  if (!dir.exists(hook_dir) || .path_is_symlink(hook_dir)) {
+    stop("Could not create the dsFlower integrity-hook directory.",
+         call. = FALSE)
+  }
+  Sys.chmod(hook_dir, "0700")
+  hook_dst <- file.path(hook_dir, "sitecustomize.py")
+  if (.path_is_symlink(hook_dst) || dir.exists(hook_dst)) {
+    stop("The dsFlower integrity-hook destination is unsafe.", call. = FALSE)
+  }
+  copied <- file.copy(hook_src, hook_dst, overwrite = TRUE, copy.mode = FALSE)
+  if (length(copied) != 1L || !isTRUE(copied) || !file.exists(hook_dst) ||
+      !utils::file_test("-f", hook_dst) || .path_is_symlink(hook_dst) ||
+      !identical(digest::digest(file = hook_src, algo = "sha256"),
+                 digest::digest(file = hook_dst, algo = "sha256"))) {
+    stop("Could not install and verify the mandatory dsFlower integrity hook.",
+         call. = FALSE)
+  }
+  Sys.chmod(hook_dst, "0600")
+  hook_dir
 }
 
 #' Ensure a SuperNode is running (idempotent)
@@ -261,30 +325,24 @@
          call. = FALSE)
   }
 
-  # Inject code integrity hook via PYTHONPATH + sitecustomize.py
-  hook_src <- system.file("python", "sitecustomize.py", package = "dsFlower")
-  hook_dir <- file.path(manifest_dir, ".dsflower_hook")
-  dir.create(hook_dir, showWarnings = FALSE)
-  if (nzchar(hook_src) && file.exists(hook_src)) {
-    file.copy(hook_src, file.path(hook_dir, "sitecustomize.py"),
-              overwrite = TRUE)
-  }
+  # Missing or unverifiable bootstrap code is a hard stop: launching without it
+  # would let a coordinator-selected FAB bypass package-hash and entrypoint pins.
+  hook_dir <- .install_integrity_hook(manifest_dir)
 
-  existing_pypath <- Sys.getenv("PYTHONPATH", "")
-  new_pypath <- if (nzchar(existing_pypath)) {
-    paste0(hook_dir, ":", existing_pypath)
-  } else {
-    hook_dir
-  }
+  # The mandatory hook is the only parent import root outside the verified
+  # environment. Never append an inherited PYTHONPATH here.
+  new_pypath <- hook_dir
 
-  # Tier-2: make the verified uploaded app importable by the trusted runner. The
-  # path is recorded by flowerTier2PinDS; the integrity hook (loaded from hook_dir
-  # first) verifies the app against the node-computed pin before it loads.
+  # Tier-2: pass the verified upload root out-of-band to the isolated child.  Never
+  # put it on the trusted parent's PYTHONPATH: otherwise a top-level torch.py,
+  # hashlib.py, flwr/, etc. from the FAB could shadow a parent import before the
+  # integrity hook gets a chance to inspect it.  egress_child loads the exact
+  # re-hashed package __init__.py by path inside the mandatory sandbox.
   tier2_pp_file <- file.path(manifest_dir, "tier2_pythonpath.txt")
   if (file.exists(tier2_pp_file)) {
     extra <- trimws(readLines(tier2_pp_file, n = 1, warn = FALSE))
     if (length(extra) == 1 && nzchar(extra) && dir.exists(extra)) {
-      new_pypath <- paste0(new_pypath, ":", extra)
+      tier2_app_dir <- extra
     }
   }
 
@@ -294,6 +352,9 @@
                else ""
   spawn_env <- .build_clean_python_env(venv_path, manifest_dir,
                                         extra_pypath = new_pypath)
+  if (exists("tier2_app_dir", inherits = FALSE)) {
+    spawn_env <- c(spawn_env, DSFLOWER_PINNED_APP_DIR = tier2_app_dir)
+  }
   # Keep more weight objects in flight to hide per-RTT latency on the DSI tunnel;
   # ignored / harmless on a fast or local link.
   spawn_env <- c(spawn_env,
@@ -357,6 +418,10 @@
       # otherwise retry-connect forever and orphan, counting against the
       # concurrent-SuperNode limit. Generous enough to survive tunnel reconnects.
       "--max-wait-time", as.character(.dsf_option("tunnel_loss_tolerance", "180")),
+      # Make the trust boundary explicit instead of depending on a Flower
+      # version's default. The subprocess executes only the hash-pinned trusted
+      # ClientApp; any HookApp code is isolated again by its mandatory sandbox.
+      "--isolation", "subprocess",
       "--node-config", paste0('manifest-dir="', manifest_dir, '"'),
       # ClientAppIO is loopback-only IPC between the SuperNode and its local
       # ClientApp on this data-holding node -- never dialed remotely.

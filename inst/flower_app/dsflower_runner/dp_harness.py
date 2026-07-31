@@ -6,8 +6,9 @@ guarantee cannot be disabled or weakened by uploaded app code.
 
 Design (dsFlower 2.0):
   * DP is ALWAYS applied — there are no privacy profiles and no "off" path.
-  * Local DP only — there is no Secure Aggregation. Each node adds the full
-    noise calibrated to the target (epsilon, delta); the aggregate is the mean
+  * Node-side central DP — each data node is the trusted curator for its local
+    dataset. There is no Secure Aggregation. Each node adds the full noise
+    calibrated to the target (epsilon, delta); the aggregate is the mean
     of already-private updates (post-processing, so the guarantee composes).
   * Two enforcement tiers (see ARCHITECTURE.md §5):
       - Tier 1 (model submission): `make_private_dpsgd` runs Opacus DP-SGD with
@@ -15,9 +16,10 @@ Design (dsFlower 2.0):
       - Tier 2 (arbitrary app):    `output_perturbation` hard-clips the whole
         weight delta to L2 norm C and adds Gaussian noise; coarse but holds for
         ANY update.
-  * Accounting uses the PRV accountant when available (tighter than RDP ⇒ less
-    noise for the same epsilon), falling back to RDP, then to the analytic
-    Gaussian mechanism.
+  * DP-SGD calibration uses the PRV accountant when available (tighter than RDP
+    ⇒ less noise for the same epsilon), falling back to RDP and then failing
+    closed.  Tier-2 output perturbation uses its separate, closed-form
+    RDP-calibrated Gaussian bound.
 
 All privacy parameters MUST come from the server-written, tamper-proof
 manifest.json — never from client-controlled pyproject config.
@@ -27,43 +29,194 @@ import math
 
 import numpy as np
 
+try:
+    from .seeding import SecureNumpyRng
+except ImportError:  # Direct execution by the standalone regression script.
+    import sys
+    if "_dsftrusted_seeding" in sys.modules:
+        SecureNumpyRng = sys.modules["_dsftrusted_seeding"].SecureNumpyRng
+    else:
+        from seeding import SecureNumpyRng
+
+
+# Public, data-independent saturation bound for numeric model releases.  It is
+# far outside useful model ranges but prevents IEEE-754 overflow from becoming
+# a bypass around the finite-output gate.  Clamping a DP result is post-processing.
+MAX_RELEASE_ABS = 1.0e6
+MAX_PARAMETER_ABS = 1.0e6
+
+
+def _require_secure_rng(rng, purpose):
+    if not isinstance(rng, SecureNumpyRng):
+        raise RuntimeError(
+            "%s requires an explicit release-scoped SecureNumpyRng" % purpose)
+    if not callable(getattr(rng, "normal", None)):
+        raise RuntimeError("the secure RNG must provide normal()")
+    return rng
+
 
 # --------------------------------------------------------------------------- #
 # Tier 1 — Opacus DP-SGD (per-sample gradient clipping + Gaussian noise)
 # --------------------------------------------------------------------------- #
 
-def calibrate_noise_multiplier(epsilon, delta, sample_rate, total_epochs):
-    """Noise multiplier for the target (epsilon, delta) over all DP-SGD steps.
+def totalize_grad_samples(parameters, clipping_norm):
+    """Coordinate-totalise Opacus grad_sample tensors before its global L2 clip."""
+    import torch
 
-    Prefers the PRV accountant (tighter than RDP), then RDP, then the analytic
-    Gaussian mechanism as a conservative single-shot fallback. The noise is
+    try:
+        bound = float(clipping_norm)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "DP-SGD clipping norm must be finite and positive") from exc
+    if not math.isfinite(bound) or bound <= 0.0:
+        raise RuntimeError("DP-SGD clipping norm must be finite and positive")
+    for parameter in parameters:
+        grad_sample = getattr(parameter, "grad_sample", None)
+        if grad_sample is None:
+            raise RuntimeError(
+                "DP-SGD parameter has no per-sample gradient; refusing training")
+        samples = grad_sample if isinstance(grad_sample, list) else [grad_sample]
+        if not samples or any(not isinstance(value, torch.Tensor) for value in samples):
+            raise RuntimeError(
+                "DP-SGD per-sample gradient has an invalid representation")
+        with torch.no_grad():
+            for value in samples:
+                value.nan_to_num_(nan=0.0, posinf=bound, neginf=-bound)
+                value.clamp_(-bound, bound)
+                if not bool(torch.isfinite(value).all()):
+                    raise RuntimeError(
+                        "DP-SGD per-sample gradient could not be totalized")
+
+class _SecurePoissonBatchSampler:
+    """Poisson batches driven only by the node's ChaCha20 release stream."""
+
+    def __init__(self, *, num_samples, steps, rng):
+        self.num_samples = int(num_samples)
+        self.steps = int(steps)
+        if self.num_samples < 1 or self.steps < 1:
+            raise ValueError("secure Poisson sampling needs samples and steps")
+        if not callable(getattr(rng, "bernoulli_mask_one_in", None)):
+            raise RuntimeError("secure Poisson sampling needs a ChaCha20 RNG")
+        self.rng = rng
+        self.sample_rate = 1.0 / float(self.steps)
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        for _ in range(self.steps):
+            mask = self.rng.bernoulli_mask_one_in(
+                self.steps, self.num_samples)
+            yield np.flatnonzero(mask).tolist()
+
+
+def _make_secure_poisson_loader(trainloader, *, steps_per_epoch,
+                                secure_sampling_rng):
+    """Replace the canonical tensor loader with exact ChaCha Poisson batches."""
+    from opacus.data_loader import (dtype_safe, shape_safe,
+                                    wrap_collate_with_empty)
+    from torch.utils.data import DataLoader, IterableDataset
+
+    dataset = trainloader.dataset
+    if isinstance(dataset, IterableDataset):
+        raise ValueError("secure Poisson sampling needs an indexed dataset")
+    if len(dataset) < 1:
+        raise ValueError("DP-SGD needs a non-empty dataset")
+
+    # The trusted runner builds a TensorDataset, as did the Opacus loader this
+    # replaces.  Pin the same empty-batch shapes up front so a first empty draw
+    # is valid as well.
+    sample = dataset[0]
+    if not isinstance(sample, (list, tuple)) or not sample:
+        raise ValueError("secure DP-SGD expects a non-empty tuple/list sample")
+    sample_empty_shapes = [(0, *shape_safe(value)) for value in sample]
+    dtypes = [dtype_safe(value) for value in sample]
+    collate_fn = wrap_collate_with_empty(
+        collate_fn=trainloader.collate_fn,
+        sample_empty_shapes=sample_empty_shapes,
+        dtypes=dtypes,
+    )
+    batch_sampler = _SecurePoissonBatchSampler(
+        num_samples=len(dataset), steps=steps_per_epoch,
+        rng=secure_sampling_rng,
+    )
+    return DataLoader(
+        dataset=dataset,
+        batch_sampler=batch_sampler,
+        num_workers=trainloader.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=trainloader.pin_memory,
+        timeout=trainloader.timeout,
+        worker_init_fn=trainloader.worker_init_fn,
+        multiprocessing_context=trainloader.multiprocessing_context,
+        generator=None,
+        prefetch_factor=trainloader.prefetch_factor,
+        persistent_workers=trainloader.persistent_workers,
+    )
+
+
+def _replace_one_to_add_remove_budget(epsilon, delta):
+    """Convert a bounded/replace-one target to an add/remove target for Opacus.
+
+    A replacement is one removal followed by one addition. If the underlying
+    mechanism is (epsilon0, delta0)-DP for add/remove neighbours, two-step group
+    privacy gives (2*epsilon0, (1+exp(epsilon0))*delta0)-DP for replace-one.
+    """
+    try:
+        epsilon = float(epsilon)
+        delta = float(delta)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("epsilon and delta must be finite numeric values") from exc
+    if (not math.isfinite(epsilon) or epsilon <= 0.0
+            or not math.isfinite(delta) or not 0.0 < delta < 1.0):
+        raise ValueError("require finite epsilon > 0 and finite 0 < delta < 1")
+    epsilon0 = epsilon / 2.0
+    try:
+        delta0 = delta / (1.0 + math.exp(epsilon0))
+    except OverflowError as exc:
+        raise ValueError("epsilon is too large for bounded-DP calibration") from exc
+    if not math.isfinite(delta0) or delta0 <= 0.0:
+        raise ValueError("bounded-DP conversion produced an invalid add/remove delta")
+    return epsilon0, delta0
+
+
+def calibrate_noise_multiplier(epsilon, delta, sample_rate, total_epochs,
+                               total_steps=None):
+    """Noise multiplier for a replace-one target over all DP-SGD steps.
+
+    Prefers the PRV accountant (tighter than RDP), then RDP, and fails closed if
+    neither can calibrate the full run. Opacus accounts add/remove neighbours, so
+    the node's bounded/replace-one target is converted to the two-step
+    group-privacy target before calling it. The noise is
     calibrated over the TOTAL number of local epochs (num_rounds * local_epochs)
     because RDP/PRV compose over steps, independent of how many federated rounds
     those steps are spread across — this is what makes one-shot training cost the
     same epsilon as many rounds.
     """
-    if epsilon <= 0 or delta <= 0:
-        raise ValueError("epsilon and delta must be positive")
+    epsilon0, delta0 = _replace_one_to_add_remove_budget(epsilon, delta)
     sample_rate = min(1.0, max(1e-12, float(sample_rate)))
     total_epochs = max(1, int(total_epochs))
+    if total_steps is not None and int(total_steps) < 1:
+        raise ValueError("total_steps must be positive")
     try:
         from opacus.accountants.utils import get_noise_multiplier
         for accountant in ("prv", "rdp"):
             try:
+                horizon = ({"steps": int(total_steps)} if total_steps is not None
+                           else {"epochs": total_epochs})
                 return float(get_noise_multiplier(
-                    target_epsilon=float(epsilon),
-                    target_delta=float(delta),
+                    target_epsilon=epsilon0,
+                    target_delta=delta0,
                     sample_rate=sample_rate,
-                    epochs=total_epochs,
                     accountant=accountant,
+                    **horizon,
                 ))
             except Exception:
                 continue
     except Exception:
         pass
-    # Analytic Gaussian mechanism (conservative, single-shot).
     # PRV/RDP both failed (should not happen with opacus installed). Do NOT fall
-    # back to the single-shot analytic Gaussian sigma: applied per step over the
+    # back to a single-shot output-perturbation Gaussian sigma: applied per step over the
     # many DP-SGD steps it UNDER-noises (composes to >> the target epsilon) -> a
     # privacy violation. Fail closed rather than train with a wrong guarantee.
     raise RuntimeError(
@@ -75,7 +228,8 @@ def calibrate_noise_multiplier(epsilon, delta, sample_rate, total_epochs):
 def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
                        epsilon, delta, local_epochs, num_rounds=1,
                        noise_multiplier=None, n_samples=None, batch_size=None,
-                       noise_generator=None):
+                       noise_generator=None, secure_noise_rng=None,
+                       secure_sampling_rng=None):
     """Wrap model/optimizer/dataloader with Opacus for per-example DP-SGD.
 
     Returns (model, optimizer, trainloader, privacy_engine). The sensitivity
@@ -98,20 +252,42 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
             "must be rejected in validation, not silently rewritten."
         )
 
+    # The canonical loader's length pins both the configured Poisson rate and
+    # the number of optimizer/accountant steps.  Sampling itself must not fall
+    # back to torch.Generator (MT19937); that would truncate the release key and
+    # would not provide the cryptographic threat model used for DP noise.
+    steps_per_epoch = len(trainloader)
+    if steps_per_epoch < 1:
+        raise ValueError("DP-SGD needs a non-empty data loader")
+    if secure_sampling_rng is None:
+        raise RuntimeError("DP-SGD requires the node ChaCha20 sampling RNG")
+    if not isinstance(secure_sampling_rng, SecureNumpyRng):
+        raise RuntimeError(
+            "DP-SGD sampling requires an explicit release-scoped SecureNumpyRng")
+    secure_noise_rng = _require_secure_rng(secure_noise_rng, "DP-SGD noise")
+    if noise_generator is not None:
+        raise RuntimeError("DP-SGD does not accept an alternate noise generator")
+    trainloader = _make_secure_poisson_loader(
+        trainloader,
+        steps_per_epoch=steps_per_epoch,
+        secure_sampling_rng=secure_sampling_rng,
+    )
+
     if noise_multiplier is None:
-        n = int(n_samples) if n_samples else len(trainloader.dataset)
-        bs = int(batch_size) if batch_size else (
-            getattr(trainloader, "batch_size", None) or max(1, n))
-        sample_rate = float(bs) / max(1, n)
+        # The secure sampler includes every row independently with rate exactly
+        # 1/steps_per_epoch.  Calibrate against that rate and the exact number of
+        # steps; using epochs with batch_size/n can under-count at ceil boundaries.
+        total_epochs = max(1, int(num_rounds)) * max(1, int(local_epochs))
+        sample_rate = 1.0 / float(steps_per_epoch)
         noise_multiplier = calibrate_noise_multiplier(
             epsilon=epsilon, delta=delta, sample_rate=sample_rate,
-            total_epochs=max(1, int(num_rounds)) * max(1, int(local_epochs)),
+            total_epochs=total_epochs,
+            total_steps=steps_per_epoch * total_epochs,
         )
 
     privacy_engine = PrivacyEngine()
-    # noise_generator: when seeded (from the node secret + data + config) the DP noise is
-    # deterministic across identical repeats yet unpredictable to the analyst (defeats the
-    # averaging attack); when None, Opacus draws fresh randomness (non-reproducible, safe).
+    # DP noise is replaced below by a ChaCha20 stream derived from the node secret
+    # and a unique accountant release identity. It is independent of private data.
     model, optimizer, trainloader = privacy_engine.make_private(
         module=model,
         optimizer=optimizer,
@@ -119,7 +295,55 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
         noise_multiplier=noise_multiplier,
         max_grad_norm=float(clipping_norm),
         noise_generator=noise_generator,
+        # The supplied loader already is genuine Poisson sampling.  False here
+        # only prevents Opacus from replacing its ChaCha sampler; Opacus still
+        # attaches its accountant hook with q=1/len(trainloader).
+        poisson_sampling=False,
     )
+    if not isinstance(trainloader.batch_sampler, _SecurePoissonBatchSampler):
+        raise RuntimeError("Opacus replaced the trusted Poisson sampler")
+    # Modern torchcsprng wheels do not exist for current PyTorch/Python.  Keep
+    # Opacus' clipping/accounting, but replace only DPOptimizer.add_noise with
+    # a trusted ChaCha20-backed Gaussian source.  Four independent Gaussian
+    # draws are summed / 2 (the floating-point hardening used by Opacus secure
+    # mode), then copied to the parameter device.
+    import types
+    import torch
+    from opacus.optimizers.optimizer import (
+        _check_processed_flag, _mark_as_processed)
+
+    original_clip_and_accumulate = optimizer.clip_and_accumulate
+
+    def _clip_and_accumulate_finite(self):
+        totalize_grad_samples(self.params, self.max_grad_norm)
+        return original_clip_and_accumulate()
+
+    def _add_secure_noise(self):
+        for param in self.params:
+            _check_processed_flag(param.summed_grad)
+            if not bool(torch.isfinite(param.summed_grad).all()):
+                raise RuntimeError(
+                    "Opacus produced a non-finite clipped gradient; refusing release")
+            values = secure_noise_rng.normal(
+                0.0,
+                self.noise_multiplier * self.max_grad_norm,
+                size=tuple(param.summed_grad.shape),
+            )
+            noise = torch.as_tensor(
+                values,
+                dtype=param.summed_grad.dtype,
+                device=param.summed_grad.device,
+            )
+            private_grad = param.summed_grad + noise
+            if not bool(torch.isfinite(private_grad).all()):
+                raise RuntimeError(
+                    "DP-SGD noise addition produced a non-finite gradient")
+            param.grad = private_grad.view_as(param)
+            _mark_as_processed(param.summed_grad)
+
+    optimizer.clip_and_accumulate = types.MethodType(
+        _clip_and_accumulate_finite, optimizer)
+    optimizer.add_noise = types.MethodType(_add_secure_noise, optimizer)
     return model, optimizer, trainloader, privacy_engine
 
 
@@ -144,86 +368,176 @@ def resolve_dp_track(run_config, manifest_track):
     return "egress"
 
 
-def _std_normal_cdf(x):
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+def compute_output_sigma(epsilon, delta, clipping_norm, num_releases=1):
+    """Conservative per-release Gaussian std for a composed transcript.
 
+    Calibration uses the closed-form RDP guarantee, avoiding subtraction of two
+    nearly equal Gaussian tails (which can under-noise at small epsilon/delta in
+    ordinary double precision).  For ``z = sensitivity / sigma`` and
+    ``L = log(1/delta)``, Gaussian RDP converted at its optimal Renyi order gives
 
-def compute_output_sigma(epsilon, delta, clipping_norm):
-    """Minimal Gaussian std `sigma` such that releasing f(D) + N(0, sigma^2 I) with L2
-    sensitivity `clipping_norm` is (epsilon, delta)-DP, via the ANALYTIC Gaussian mechanism
-    (Balle & Wang 2018, "Improving the Gaussian Mechanism..."). Exact for ALL epsilon.
+        epsilon_bound = z^2/2 + z*sqrt(2L).
 
-    The classic sigma = sqrt(2 ln(1.25/delta)) * S / epsilon is only valid for epsilon <= 1
-    and UNDER-noises above it -- at epsilon=10, delta=1e-5 it leaks ~2.3x the target delta,
-    a real hole since the node ceiling allows epsilon up to 10. The analytic mechanism has
-    no such gap. sigma still scales LINEARLY in the sensitivity, so the sample-and-aggregate
-    2C/k-vs-2C ratio (k-fold less noise) is preserved exactly.
-
-    For multi-round Tier-2 training the caller must compose epsilon over rounds (DP-FedAvg,
-    McMahan et al. 2018) before passing the per-round epsilon here.
+    For ``R`` releases with the same sensitivity and noise scale, total RDP gives
+    ``epsilon_bound = R*z^2/2 + z*sqrt(2*R*L)``. Solving the same quadratic for
+    ``z*sqrt(R)`` makes the per-release standard deviation ``sqrt(R)`` times the
+    single-release value. This is valid for every finite epsilon > 0 and
+    0 < delta < 1, and is intentionally conservative relative to exact optimal
+    Gaussian calibration.
     """
-    if epsilon <= 0 or delta <= 0 or clipping_norm <= 0:
-        raise ValueError("epsilon, delta, and clipping_norm must be positive")
-
-    def _delta_of_sigma(sigma):
-        a = float(clipping_norm) / (2.0 * sigma)
-        b = float(epsilon) * sigma / float(clipping_norm)
-        return _std_normal_cdf(a - b) - math.exp(float(epsilon)) * _std_normal_cdf(-a - b)
-
-    # delta(sigma) is monotic decreasing from 1 (sigma->0) to 0 (sigma->inf); bisect for
-    # the smallest sigma whose analytic delta does not exceed the target.
-    lo, hi = 1e-12, max(float(clipping_norm), 1.0)
-    while _delta_of_sigma(hi) > delta:
-        hi *= 2.0
-        if hi > 1e15:
-            break
-    if _delta_of_sigma(hi) > delta:   # FAIL CLOSED: refuse rather than release under-noised
+    try:
+        epsilon = float(epsilon)
+        delta = float(delta)
+        sensitivity = float(clipping_norm)
+        releases_float = float(num_releases)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
-            "cannot achieve (epsilon=%g, delta=%g) at sensitivity %g: no sigma brackets "
-            "the target delta" % (epsilon, delta, clipping_norm))
-    for _ in range(200):
-        mid = 0.5 * (lo + hi)
-        if _delta_of_sigma(mid) > delta:
-            lo = mid
-        else:
-            hi = mid
-    return hi
+            "epsilon, delta, clipping_norm, and num_releases must be numeric"
+        ) from exc
+    if (not math.isfinite(epsilon) or epsilon <= 0.0
+            or not math.isfinite(delta) or not 0.0 < delta < 1.0
+            or not math.isfinite(sensitivity) or sensitivity <= 0.0
+            or not math.isfinite(releases_float) or releases_float < 1.0
+            or releases_float != math.floor(releases_float)
+            or releases_float > 1_000_000):
+        raise ValueError(
+            "require epsilon > 0, 0 < delta < 1, clipping_norm > 0, and "
+            "integer num_releases in [1, 1000000]"
+        )
+    releases = int(releases_float)
+
+    root_log = math.sqrt(2.0 * -math.log(delta))
+    positive_root = math.hypot(root_log, math.sqrt(2.0 * epsilon))
+    z = (2.0 * epsilon) / (positive_root + root_log)
+    sigma = sensitivity * math.sqrt(float(releases)) / z
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("Gaussian RDP calibration is outside the numeric range")
+    # Leave a tiny explicit safety margin for the independent floating-point
+    # evaluation of the RDP inequality at extreme policy values.
+    return math.nextafter(sigma * (1.0 + 1.0e-12), math.inf)
 
 
 def clip_update(new_weights, old_weights, clipping_norm):
-    """Clip the global L2 norm of the weight delta (new - old) to clipping_norm."""
-    delta = [np.asarray(w) - np.asarray(o)
-             for w, o in zip(new_weights, old_weights)]
-    flat = np.concatenate([d.ravel() for d in delta]) if delta else np.array([])
-    l2 = float(np.linalg.norm(flat))
-    if l2 > clipping_norm and l2 > 0:
-        scale = clipping_norm / l2
-        delta = [d * scale for d in delta]
-    return [np.asarray(o) + d for o, d in zip(old_weights, delta)]
+    """Validate and clip one untrusted global update in float64.
+
+    Count/shape mismatches are rejected.  A numeric candidate containing NaN,
+    infinity, or a subtraction overflow maps deterministically to the zero
+    delta.  Finite extreme values are clipped with a scaled norm calculation
+    that never squares their original magnitude.
+    """
+    try:
+        clipping_norm = float(clipping_norm)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("clipping_norm must be finite and positive") from exc
+    if not math.isfinite(clipping_norm) or clipping_norm <= 0.0:
+        raise ValueError("clipping_norm must be finite and positive")
+    if not isinstance(old_weights, (list, tuple)) or not old_weights:
+        raise ValueError("old_weights must be a non-empty list/tuple")
+    if (not isinstance(new_weights, (list, tuple))
+            or len(new_weights) != len(old_weights)):
+        raise ValueError("candidate weight count does not match old_weights")
+
+    old = []
+    candidates = []
+    invalid_candidate = False
+    for index, (raw_new, raw_old) in enumerate(zip(new_weights, old_weights)):
+        old_array = np.asarray(raw_old)
+        new_array = np.asarray(raw_new)
+        if old_array.dtype.kind not in "biuf" or old_array.size < 1:
+            raise ValueError("old weight %d is not a non-empty real array" % index)
+        if new_array.dtype.kind not in "biuf":
+            raise ValueError("candidate weight %d is not a real array" % index)
+        if new_array.shape != old_array.shape:
+            raise ValueError("candidate weight %d has the wrong shape" % index)
+        old_array = np.asarray(old_array, dtype=np.float64)
+        new_array = np.asarray(new_array, dtype=np.float64)
+        if not bool(np.all(np.isfinite(old_array))):
+            raise ValueError("old weight %d contains non-finite values" % index)
+        if not bool(np.all(np.isfinite(new_array))):
+            invalid_candidate = True
+        old.append(old_array)
+        candidates.append(new_array)
+
+    if invalid_candidate:
+        return [value.copy() for value in old]
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        deltas = [new - previous
+                  for new, previous in zip(candidates, old)]
+    if any(not bool(np.all(np.isfinite(delta))) for delta in deltas):
+        return [value.copy() for value in old]
+
+    max_abs = max(float(np.max(np.abs(delta))) for delta in deltas)
+    if max_abs == 0.0:
+        return [value.copy() for value in old]
+    scaled_sq = sum(float(np.sum(np.square(delta / max_abs), dtype=np.float64))
+                    for delta in deltas)
+    scaled_norm = math.sqrt(scaled_sq)
+    scale = 1.0
+    # Compare without forming max_abs * scaled_norm, which itself can overflow.
+    if max_abs > clipping_norm / scaled_norm:
+        scale = (clipping_norm / max_abs) / scaled_norm
+    clipped = [previous + delta * scale
+               for previous, delta in zip(old, deltas)]
+    if any(not bool(np.all(np.isfinite(value))) for value in clipped):
+        return [value.copy() for value in old]
+    return clipped
 
 
 def add_gaussian_noise(weights, old_weights, std, rng=None):
     """Add N(0, std^2) noise to the (already clipped) weight delta. `std` is the FULL
-    Gaussian-mechanism standard deviation (sensitivity * sqrt(2 ln(1.25/delta)) / eps),
-    with the sensitivity already folded in by the caller.
+    RDP-calibrated Gaussian-mechanism standard deviation, with the sensitivity
+    already folded in by the caller.
 
-    `rng` is a numpy Generator. When None, a fresh OS-entropy generator is used (noise is
-    unpredictable but non-reproducible). When a SEEDED generator is passed -- derived from
-    the node secret + data + config -- the noise is deterministic across identical repeats
-    yet still unpredictable to the analyst, defeating the averaging attack without a
-    budget. A predictable (secret-less) seed would VOID DP, so the seed must fold in the
-    node secret; the caller guarantees this."""
-    _rng = rng if rng is not None else np.random.default_rng()
+    `rng` is the trusted release-scoped CSPRNG. A predictable or private-data-derived
+    seed would void the mechanism assumptions, so callers must use the node-secret
+    derivation in ``seeding.py``."""
+    rng = _require_secure_rng(rng, "private output perturbation")
+    try:
+        std = float(std)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("noise std must be finite and non-negative") from exc
+    if not math.isfinite(std) or std < 0.0:
+        raise ValueError("noise std must be finite and non-negative")
+    if (not isinstance(weights, (list, tuple))
+            or not isinstance(old_weights, (list, tuple))
+            or not old_weights or len(weights) != len(old_weights)):
+        raise ValueError("weight count does not match old_weights")
+
     out = []
-    for w, o in zip(weights, old_weights):
-        w = np.asarray(w); o = np.asarray(o)
-        delta = w - o
-        noise = _rng.normal(0.0, float(std), size=delta.shape)
-        out.append(o + delta + noise.astype(delta.dtype))
+    for index, (raw_weight, raw_old) in enumerate(zip(weights, old_weights)):
+        weight = np.asarray(raw_weight)
+        old = np.asarray(raw_old)
+        if (weight.dtype.kind not in "biuf" or old.dtype.kind not in "biuf"
+                or weight.shape != old.shape or weight.size < 1):
+            raise ValueError("weight %d does not match old_weights" % index)
+        weight = np.asarray(weight, dtype=np.float64)
+        old = np.asarray(old, dtype=np.float64)
+        if (not bool(np.all(np.isfinite(weight)))
+                or not bool(np.all(np.isfinite(old)))):
+            raise ValueError("noise input %d contains non-finite values" % index)
+        noise = np.asarray(
+            rng.normal(0.0, std, size=weight.shape), dtype=np.float64)
+        if noise.shape != weight.shape or not bool(np.all(np.isfinite(noise))):
+            raise RuntimeError("secure Gaussian RNG returned an invalid draw")
+
+        # Absolute clipping before noise is 1-Lipschitz, so it cannot enlarge the
+        # already bounded sensitivity.  Clipping again after noise is ordinary DP
+        # post-processing.  Limiting noise to +/-2B before the addition is exactly
+        # equivalent in the saturated tails and avoids an intermediate overflow.
+        base = np.clip(weight, -MAX_RELEASE_ABS, MAX_RELEASE_ABS)
+        safe_noise = np.clip(noise, -2.0 * MAX_RELEASE_ABS,
+                             2.0 * MAX_RELEASE_ABS)
+        released = np.clip(base + safe_noise,
+                           -MAX_RELEASE_ABS, MAX_RELEASE_ABS)
+        if not bool(np.all(np.isfinite(released))):
+            raise RuntimeError("Gaussian post-processing produced non-finite output")
+        out.append(np.asarray(released, dtype=np.float64))
     return out
 
 
-def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta, rng=None):
+def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta,
+                        rng=None, num_releases=1):
     """Tier-2 / universal-floor DP in one call: clip the update to C, then add Gaussian
     noise calibrated to the L2 SENSITIVITY of a C-clipped release, which is 2*C -- NOT C.
     Two adjacent datasets each yield an update inside the C-ball, so they can differ by
@@ -232,29 +546,34 @@ def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta,
     per-sample-gradient SUM is sensitivity C and is accounted separately by Opacus; this
     floor is the only release where the 2C diameter applies.)"""
     clipped = clip_update(new_weights, old_weights, clipping_norm)
-    std = compute_output_sigma(epsilon, delta, 2.0 * clipping_norm)   # full Gaussian std for sensitivity 2C
+    std = compute_output_sigma(
+        epsilon, delta, 2.0 * clipping_norm, num_releases=num_releases)
     return add_gaussian_noise(clipped, old_weights, std, rng=rng)
 
 
-def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, delta, rng=None):
+def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, delta,
+                         rng=None, num_releases=1):
     """Improved universal floor (Nissim-Raskhodnikova-Smith sample-and-aggregate): given
     the user's black-box update computed INDEPENDENTLY on each of k DISJOINT, data-
     independent blocks of the private data, release the clip-and-average aggregate under
     the Gaussian mechanism.
 
-    Why it is sound AND tighter than `output_perturbation`: each record lives in exactly
-    ONE block, so under replace-one adjacency one record perturbs exactly ONE block
-    update. Every block delta is clipped into the C-ball, so that one block can move by at
-    most the diameter 2C; the k-block MEAN therefore moves by at most 2C/k. The released
-    L2 sensitivity is 2C/k -- a k-fold reduction vs the plain floor's 2C, i.e. k-times-
-    smaller noise for the SAME (epsilon, delta), and it still composes as an ordinary
-    per-round Gaussian release in the RDP/PRV ledger (same epsilon spent, better utility).
+    Why it is sound AND tighter than `output_perturbation`: each privacy unit (a patient
+    when patient IDs are pinned, otherwise one row) lives in exactly ONE block, so under
+    replace-one adjacency a fixed-ID unit perturbs one block. We do not assume the patient
+    roster/identifier is public or fixed, however: replacing a unit may remove it from one
+    keyed block and add it to another. At most TWO block outputs can therefore change, each
+    by the C-ball diameter 2C. The mean sensitivity is conservatively
+    min(2C, 4C/k), where the outer 2C is the diameter of the mean's own C-ball. Thus k=2
+    claims no amplification; k>2 can still improve utility. It composes as an ordinary
+    per-round Gaussian release in the RDP/PRV ledger.
 
-    The CALLER must (1) build the block partition independently of the data VALUES (a
-    random permutation of row indices -- never sorted/stratified by a feature/label) and
+    The CALLER must (1) build the block partition independently of feature/label VALUES
+    (a random row permutation, or a keyed assignment that keeps each patient's rows
+    together -- never sorting/stratifying on model inputs) and
     (2) map any failed/non-finite block to a zero delta. Both are leak-safe: a zero delta
-    is inside the C-ball, so it cannot escape the 2C/k bound, and a data-independent
-    partition cannot encode the data."""
+    is inside the C-ball, so it cannot escape the conservative multi-block bound, and
+    the partition cannot encode feature/label values."""
     k = len(block_updates)
     if k < 1:
         raise ValueError("sample_and_aggregate needs at least one block update")
@@ -266,7 +585,12 @@ def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, del
             mean_delta[i] = mean_delta[i] + (np.asarray(c) - o)
     mean_delta = [md / float(k) for md in mean_delta]
     mean_new = [o + md for o, md in zip(old, mean_delta)]
-    std = compute_output_sigma(epsilon, delta, 2.0 * float(clipping_norm) / float(k))  # sensitivity 2C/k
+    sensitivity = min(
+        2.0 * float(clipping_norm),
+        4.0 * float(clipping_norm) / float(k),
+    )
+    std = compute_output_sigma(
+        epsilon, delta, sensitivity, num_releases=num_releases)
     return add_gaussian_noise(mean_new, old, std, rng=rng)
 
 
@@ -327,7 +651,7 @@ def assert_releasable(model):
 # node-built interpreter. Admitted by EXACT name+module (not isinstance -> no subclass
 # smuggling). The Opacus DP layers (DPLSTM/DPGRU/DPMultiheadAttention) will be added
 # here when wired, with their hook/cell_type tolerance handled explicitly.
-_VETTED_NODE_CLASSES = frozenset({"GraphModule", "RecurrentBlock"})
+_VETTED_NODE_CLASSES = frozenset({"FiniteClamp", "GraphModule", "RecurrentBlock"})
 
 # Exact Opacus DP-layer classes the node may instantiate (DP-friendly RNN replacements).
 # Admitted by exact module + name (the researcher submits only op-enums, never classes,
@@ -447,8 +771,8 @@ def _negbin_nll_factory(cfg):
     hostile r can only hurt the client's own fit, never privacy. Mean reduction
     (Opacus calibrates noise assuming it). Decomposes per sample -> DP-SGD-safe."""
     r = float(cfg.get("nb-dispersion", 1.0))
-    if not math.isfinite(r) or r <= 0.0:
-        raise ValueError("nb-dispersion must be a positive finite float, got %r" % (r,))
+    if not math.isfinite(r) or not 1.0e-6 <= r <= 1.0e12:
+        raise ValueError("nb-dispersion must be in [1e-6, 1e12], got %r" % (r,))
     log_r, lgamma_r = math.log(r), math.lgamma(r)
 
     def negbin_nll(pred, target):
@@ -470,8 +794,8 @@ def _gamma_nll_factory(cfg):
     -- it shapes the loss, never the clip/noise, so it is no DP lever. Mean reduction;
     decomposes per sample -> DP-SGD-safe. At k=1 this is the exponential NLL z + y*exp(-z)."""
     k = float(cfg.get("gamma-shape", 1.0))
-    if not math.isfinite(k) or k <= 0.0:
-        raise ValueError("gamma-shape must be a positive finite float, got %r" % (k,))
+    if not math.isfinite(k) or not 1.0e-6 <= k <= 1.0e12:
+        raise ValueError("gamma-shape must be in [1e-6, 1e12], got %r" % (k,))
     lgamma_k, log_k = math.lgamma(k), math.log(k)
 
     def gamma_nll(pred, target):

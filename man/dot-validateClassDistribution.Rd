@@ -13,8 +13,6 @@
 
 \item{task_type}{Character task type ("classification", "regression",
 "survival", etc.) or NULL.}
-
-\item{trust}{Named list; the trust profile settings.}
 }
 \value{
 TRUE invisibly, or stops with an error.

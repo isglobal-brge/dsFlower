@@ -51,7 +51,7 @@
   )
 }
 
-#' Whether a host is loopback / private (RFC1918) / link-local / non-routable
+#' Whether a host is non-global, local, or otherwise unsafe to probe
 #'
 #' Used to stop flowerCheckConnectivityDS from being used as an internal port
 #' scanner. Non-literal hostnames are treated as private (deny by default) when
@@ -69,12 +69,20 @@
   if (grepl("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$", h)) {
     o <- suppressWarnings(as.integer(strsplit(h, ".", fixed = TRUE)[[1]]))
     if (any(is.na(o)) || any(o < 0L) || any(o > 255L)) return(TRUE)
+    if (o[1] == 0L) return(TRUE)                                    # this network
+    if (o[1] == 10L) return(TRUE)                                   # RFC1918 10/8
+    if (o[1] == 100L && o[2] >= 64L && o[2] <= 127L) return(TRUE)   # RFC6598 100.64/10
     if (o[1] == 127L) return(TRUE)                                  # loopback
-    if (o[1] == 10L) return(TRUE)                                   # 10/8
-    if (o[1] == 172L && o[2] >= 16L && o[2] <= 31L) return(TRUE)    # 172.16/12
-    if (o[1] == 192L && o[2] == 168L) return(TRUE)                  # 192.168/16
     if (o[1] == 169L && o[2] == 254L) return(TRUE)                  # link-local
-    if (o[1] == 0L) return(TRUE)
+    if (o[1] == 172L && o[2] >= 16L && o[2] <= 31L) return(TRUE)    # RFC1918 172.16/12
+    if (o[1] == 192L && o[2] == 0L && o[3] == 0L) return(TRUE)      # IETF protocol assignments
+    if (o[1] == 192L && o[2] == 0L && o[3] == 2L) return(TRUE)      # TEST-NET-1
+    if (o[1] == 192L && o[2] == 88L && o[3] == 99L) return(TRUE)    # deprecated 6to4 relay
+    if (o[1] == 192L && o[2] == 168L) return(TRUE)                  # RFC1918 192.168/16
+    if (o[1] == 198L && o[2] %in% 18:19) return(TRUE)               # benchmarking 198.18/15
+    if (o[1] == 198L && o[2] == 51L && o[3] == 100L) return(TRUE)   # TEST-NET-2
+    if (o[1] == 203L && o[2] == 0L && o[3] == 113L) return(TRUE)    # TEST-NET-3
+    if (o[1] >= 224L) return(TRUE)                                  # multicast/reserved
     return(FALSE)
   }
   # Non-literal hostname, no coordinator pinned: deny by default.

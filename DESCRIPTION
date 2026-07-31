@@ -1,26 +1,30 @@
 Package: dsFlower
 Type: Package
 Title: DataSHIELD Server-Side Integration for Flower Federated Learning
-Version: 0.2.8
+Version: 0.3.0
 Authors@R: c(
     person("David", "Sarrat González", role = c("aut", "cre"), email = "david.sarrat@isglobal.org"),
     person("Juan R", "González", role = "aut", email = "juanr.gonzalez@isglobal.org"))
-Description: Server-side DataSHIELD package that bridges DataSHIELD's governance
-    and privacy model with the Flower federated learning framework. Manages
-    Flower SuperNode processes, training data preparation, and disclosure-controlled
-    metric reporting. Model weights flow exclusively through Flower's gRPC channels,
-    never through DataSHIELD, while only sanitized metrics and status information
-    pass through DataSHIELD aggregate methods.
+Description: Server-side DataSHIELD package that runs Flower federated learning
+    through a node-installed, hash-pinned runner with server-authoritative
+    differential privacy. Provides persistent lifetime privacy accounting,
+    release-scoped cryptographic randomness, declarative DP-SGD and DP-GBDT
+    training, and a fail-closed sandbox gate for untrusted hook code. Raw data
+    remains on the node; exact feature statistics, node logs, metrics, and cohort
+    weights are not released through DataSHIELD.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Depends:
     R (>= 4.1.0)
 Imports:
     arrow,
+    DBI,
     digest,
+    filelock,
     jsonlite,
     processx,
     rappdirs,
+    RSQLite,
     tools,
     utils
 Suggests:
@@ -38,25 +42,16 @@ AggregateMethods:
     flowerCheckConnectivityDS,
     flowerPrivacyBudgetDS,
     flowerFeatureStatsDS,
-    flowerTunnelResetDS,
-    flowerTunnelPollDS,
-    flowerTunnelPushDS,
+    flowerImageLabelsDS,
+    flowerImageAssetsDS,
+    flowerImageMasksDS,
     flowerTunnelExchangeDS,
-    flowerTunnelInjectDS,
-    flowerTunnelDrainDS,
     flowerTunnelUpDS,
-    flowerTunnelReapDS,
-    flowerTunnelTestClientDS,
-    flowerTunnelTestResultDS,
     flowerTunnelDownDS,
-    flowerTunnelSupernodeDS,
-    flowerTunnelLogDS,
     flowerAppPushDS,
     flowerAppInstallDS,
     flowerAppDeleteDS,
-    flowerTier2PinDS,
-    c=base::c,
-    list=base::list
+    flowerTier2PinDS
 AssignMethods:
     flowerInitDS,
     flowerPrepareRunDS,

@@ -97,6 +97,11 @@ test_that("flowerInitDS accepts FlowerDatasetDescriptor", {
   assign("flowerInitDS", dsFlower::flowerInitDS, envir = env)
 
   result <- eval(quote(flowerInitDS("my_desc")), envir = env)
-  expect_equal(result$source, "descriptor")
-  expect_equal(result$dataset_id, "test.init")
+  expect_named(result, "capability")
+  expect_false("source" %in% names(result))
+  assign("flower", result, envir = env)
+  state <- evalq(dsFlower:::.getHandle("flower"), envir = env)
+  expect_equal(state$source, "descriptor")
+  expect_equal(state$dataset_id, "test.init")
+  evalq(dsFlower:::.removeHandle("flower"), envir = env)
 })

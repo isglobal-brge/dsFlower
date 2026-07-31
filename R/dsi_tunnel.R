@@ -5,16 +5,108 @@
 # connection to an append-only byte spool; these DataSHIELD methods let the
 # researcher's R relay drain/fill that spool, carrying the bytes to/from the
 # SuperLink. Flower (SuperLink, SuperNode, SecAgg+) is untouched -- only the
-# transport changes. Spool files (append-only + reader offset, no locking):
-#   up.bin   : SuperNode -> SuperLink  (forwarder appends; flowerTunnelPollDS reads)
-#   down.bin : SuperLink -> SuperNode  (flowerTunnelPushDS appends; forwarder reads)
+# transport changes. Spool files are append-only; flowerTunnelExchangeDS owns
+# the acknowledged offsets in both directions.
+
+#' Validate the unguessable capability identifying one tunnel session
+#' @keywords internal
+.tunnel_conn_id <- function(conn_id) {
+  if (!is.character(conn_id) || length(conn_id) != 1L || is.na(conn_id) ||
+      !grepl("^dsf_[0-9a-f]{32}$", conn_id)) {
+    stop("Invalid tunnel connection id.", call. = FALSE)
+  }
+  conn_id
+}
+
+#' Validate a TCP port used only by the node-local tunnel forwarder
+#' @keywords internal
+.tunnel_port <- function(port) {
+  value <- suppressWarnings(as.numeric(port))
+  if (length(value) != 1L || is.na(value) || !is.finite(value) ||
+      value != floor(value) || value < 1 || value > 65535) {
+    stop("Invalid tunnel listen port.", call. = FALSE)
+  }
+  as.integer(value)
+}
+
+#' Return one bounded, server-owned tunnel resource limit
+#' @keywords internal
+.tunnel_limit <- function(name, default, minimum, maximum) {
+  value <- suppressWarnings(as.numeric(.dsf_option(name, default)))
+  if (length(value) != 1L || is.na(value) || !is.finite(value) ||
+      value != floor(value) || value < minimum || value > maximum) {
+    stop("Invalid dsflower.", name, " option.", call. = FALSE)
+  }
+  value
+}
+
+#' Tunnel payload chunk size selected by the node administrator
+#' @keywords internal
+.tunnel_chunk_bytes <- function() {
+  as.integer(.tunnel_limit(
+    "tunnel_chunk_bytes", 1024^2, 16 * 1024, 8 * 1024^2
+  ))
+}
+
+#' Maximum bytes retained in either tunnel spool file
+#' @keywords internal
+.tunnel_spool_max_bytes <- function(chunk_bytes = .tunnel_chunk_bytes()) {
+  .tunnel_limit(
+    "tunnel_spool_max_bytes", 1024^3,
+    max(8 * as.numeric(chunk_bytes), 1024^2), 64 * 1024^3
+  )
+}
+
+#' Maximum encoded fan-out request accepted before JSON decoding
+#' @keywords internal
+.tunnel_request_max_bytes <- function(chunk_bytes = .tunnel_chunk_bytes()) {
+  .tunnel_limit(
+    "tunnel_request_max_bytes", 64 * 1024^2,
+    max(1024^2, 4 * ceiling(as.numeric(chunk_bytes) / 3) + 4096),
+    256 * 1024^2
+  )
+}
+
+#' Validate one absolute byte offset in a tunnel stream
+#' @keywords internal
+.tunnel_offset <- function(value) {
+  value <- suppressWarnings(as.numeric(value))
+  if (length(value) != 1L || is.na(value) || !is.finite(value) ||
+      value < 0 || value != floor(value)) {
+    stop("Invalid tunnel byte offset.", call. = FALSE)
+  }
+  value
+}
+
+#' Registry key for the forwarder owned by one tunnel session
+#' @keywords internal
+.tunnel_forwarder_key <- function(conn_id) {
+  paste0("tunnel_fwd_", .tunnel_conn_id(conn_id))
+}
 
 #' @keywords internal
-.tunnel_spool <- function(conn_id) {
-  cid <- gsub("[^A-Za-z0-9_]", "", as.character(conn_id))
+.tunnel_spool <- function(conn_id, create = TRUE) {
+  cid <- .tunnel_conn_id(conn_id)
   d <- file.path(tempdir(), "dsflower_tunnel", cid)
-  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  if (isTRUE(create)) {
+    dir.create(d, recursive = TRUE, showWarnings = FALSE, mode = "0700")
+    Sys.chmod(d, mode = "0700")
+  }
   d
+}
+
+#' Serialize aggregate exchanges belonging to one tunnel session
+#' @keywords internal
+.with_tunnel_lock <- function(spool, code) {
+  lock <- tryCatch(
+    filelock::lock(file.path(spool, "exchange.lock"), timeout = 5000),
+    error = function(e) NULL
+  )
+  if (is.null(lock)) {
+    stop("Tunnel session is busy.", call. = FALSE)
+  }
+  on.exit(filelock::unlock(lock), add = TRUE)
+  force(code)
 }
 
 #' @keywords internal
@@ -26,30 +118,24 @@
 }
 
 #' @keywords internal
-.tunnel_dec <- function(s) {
-  if (!is.character(s) || length(s) != 1 || !nzchar(s) || !startsWith(s, "B64:")) {
-    return(raw(0))
+.tunnel_dec <- function(s, max_bytes = Inf) {
+  if (!is.character(s) || length(s) != 1 || is.na(s) ||
+      !nzchar(s) || !startsWith(s, "B64:")) {
+    stop("Invalid tunnel payload.", call. = FALSE)
   }
   b64 <- substring(s, 5)
+  max_encoded <- 4 * ceiling(as.numeric(max_bytes) / 3) + 4
+  if (is.finite(max_bytes) && nchar(b64, type = "bytes") > max_encoded) {
+    stop("Tunnel payload exceeds the configured chunk size.", call. = FALSE)
+  }
   b64 <- gsub("-", "+", b64); b64 <- gsub("_", "/", b64)
   pad <- (4 - nchar(b64) %% 4) %% 4
   if (pad > 0) b64 <- paste0(b64, strrep("=", pad))
-  jsonlite::base64_dec(b64)
-}
-
-#' @keywords internal
-.tunnel_drain <- function(spool, binname, offname) {
-  bin <- file.path(spool, binname); offf <- file.path(spool, offname)
-  if (!file.exists(bin)) return(raw(0))
-  off <- if (file.exists(offf)) suppressWarnings(as.numeric(readLines(offf, n = 1, warn = FALSE))) else 0
-  if (length(off) == 0 || is.na(off)) off <- 0
-  sz <- file.size(bin)
-  if (sz <= off) return(raw(0))
-  con <- file(bin, "rb"); on.exit(close(con))
-  seek(con, off)
-  r <- readBin(con, "raw", sz - off)
-  writeLines(as.character(sz), offf)
-  r
+  value <- tryCatch(jsonlite::base64_dec(b64), error = function(e) NULL)
+  if (is.null(value) || length(value) > max_bytes) {
+    stop("Invalid or oversized tunnel payload.", call. = FALSE)
+  }
+  value
 }
 
 #' @keywords internal
@@ -61,64 +147,36 @@
 
 #' Read a byte range [from, EOF) from a spool file (relay-owned offset).
 #' @keywords internal
-.tunnel_read_at <- function(spool, binname, from) {
+.tunnel_read_at <- function(spool, binname, from, max_bytes = Inf) {
   bin <- file.path(spool, binname)
   if (!file.exists(bin)) return(list(data = raw(0), eof = 0))
   sz <- file.size(bin)
-  from <- suppressWarnings(as.numeric(from))
-  if (length(from) == 0 || is.na(from) || from < 0) from <- 0
+  from <- .tunnel_offset(from)
   if (sz <= from) return(list(data = raw(0), eof = sz))
   con <- file(bin, "rb"); on.exit(close(con))
   seek(con, from)
-  list(data = readBin(con, "raw", sz - from), eof = sz)
+  to_read <- min(sz - from, as.numeric(max_bytes))
+  data <- readBin(con, "raw", to_read)
+  list(data = data, eof = from + length(data))
 }
 
 #' Idempotent append: 'at' is the size the relay believes the file has; append
 #' only the bytes of 'raw' not already present, so a retried push never
 #' duplicates or loses bytes. Returns the new file size.
 #' @keywords internal
-.tunnel_append_at <- function(spool, binname, at, raw) {
+.tunnel_append_at <- function(spool, binname, at, raw, max_bytes = Inf) {
   bin <- file.path(spool, binname)
   sz <- if (file.exists(bin)) file.size(bin) else 0
-  at <- suppressWarnings(as.numeric(at))
-  if (length(at) == 0 || is.na(at)) at <- sz
+  at <- .tunnel_offset(at)
   already <- sz - at                          # bytes of 'raw' already appended
   if (already < 0) return(sz)                 # gap (at > sz): refuse, report size
   if (already >= length(raw)) return(sz)      # nothing new to append
+  pending <- length(raw) - already
+  if (sz + pending > max_bytes) {
+    stop("Tunnel spool limit exceeded.", call. = FALSE)
+  }
   .tunnel_append(spool, binname, raw[(already + 1):length(raw)])
   if (file.exists(bin)) file.size(bin) else 0
-}
-
-#' Reset/initialise a tunnel spool (DataSHIELD AGGREGATE)
-#' @param conn_id Character; tunnel connection id.
-#' @return TRUE.
-#' @keywords internal
-#' @export
-flowerTunnelResetDS <- function(conn_id) {
-  d <- .tunnel_spool(conn_id)
-  unlink(list.files(d, full.names = TRUE))
-  for (f in c("up.bin", "down.bin")) file.create(file.path(d, f))
-  TRUE
-}
-
-#' Drain SuperNode->SuperLink bytes for the relay (DataSHIELD AGGREGATE)
-#' @param conn_id Character; tunnel connection id.
-#' @return URL-safe base64 of the new up bytes, or "" if none.
-#' @keywords internal
-#' @export
-flowerTunnelPollDS <- function(conn_id) {
-  .tunnel_enc(.tunnel_drain(.tunnel_spool(conn_id), "up.bin", "up.read_offset"))
-}
-
-#' Deliver SuperLink->SuperNode bytes from the relay (DataSHIELD AGGREGATE)
-#' @param conn_id Character; tunnel connection id.
-#' @param data_b64 Character; B64: url-safe payload to append to down.bin.
-#' @return TRUE.
-#' @keywords internal
-#' @export
-flowerTunnelPushDS <- function(conn_id, data_b64) {
-  .tunnel_append(.tunnel_spool(conn_id), "down.bin", .tunnel_dec(data_b64))
-  TRUE
 }
 
 #' Idempotent bidirectional tunnel exchange in one fan-out call (AGGREGATE)
@@ -129,63 +187,71 @@ flowerTunnelPushDS <- function(conn_id, data_b64) {
 #' this node's entry is list(pa = down append-offset the relay believes,
 #' pd = "B64:" SuperLink->SuperNode bytes, pf = up read-offset). Returns this
 #' node's list(sz = new down.bin size, ud = "B64:" SuperNode->SuperLink bytes
-#' from pf, ue = new up.bin EOF).
+#' from pf, ue = new up.bin EOF, g = connection generation). Payloads are
+#' bounded to the node-owned chunk size and exchanges are serialized per tunnel.
 #' @param conn_id Character; tunnel connection id.
 #' @param req Character; \code{.ds_encode}'d named request map, or "".
-#' @return list(sz, ud, ue) for this node.
+#' @return list(sz, ud, ue, g) for this node.
 #' @keywords internal
 #' @export
 flowerTunnelExchangeDS <- function(conn_id, req = "") {
+  cid <- .tunnel_conn_id(conn_id)
+  p <- .dsflower_env[[.tunnel_forwarder_key(cid)]]
+  if (!identical(.dsflower_env$tunnel_conn_id, cid) ||
+      is.null(.active_tunnel_port()) ||
+      is.null(p) || !inherits(p, "process") ||
+      !isTRUE(tryCatch(p$is_alive(), error = function(e) FALSE))) {
+    stop("Unknown or inactive tunnel session.", call. = FALSE)
+  }
   spool <- .tunnel_spool(conn_id)
-  # Relay heartbeat: the forwarder self-terminates if this stops updating (the
-  # researcher's relay died / lost connection), which lets its SuperNode notice
-  # the SuperLink is gone and self-terminate too.
-  cat(".", file = file.path(spool, "relay_hb"))
-  nm <- .dsflower_env$tunnel_name
-  pa <- NA; pd <- ""; pf <- 0
-  if (is.character(req) && length(req) == 1L && nzchar(req)) {
-    rm <- tryCatch(.ds_arg(req), error = function(e) NULL)
-    if (is.list(rm) && !is.null(nm) && !is.null(rm[[nm]])) {
-      r <- rm[[nm]]
-      if (!is.null(r$pa)) pa <- r$pa
-      if (!is.null(r$pd)) pd <- r$pd
-      if (!is.null(r$pf)) pf <- r$pf
+  chunk_bytes <- .tunnel_chunk_bytes()
+  spool_max_bytes <- .tunnel_spool_max_bytes(chunk_bytes)
+  if (!is.character(req) || length(req) != 1L || is.na(req)) {
+    stop("Invalid tunnel request.", call. = FALSE)
+  }
+  if (nchar(req, type = "bytes") > .tunnel_request_max_bytes(chunk_bytes)) {
+    stop("Tunnel request exceeds the configured size limit.", call. = FALSE)
+  }
+  .with_tunnel_lock(spool, {
+    # Relay heartbeat: the forwarder self-terminates if this stops updating (the
+    # researcher's relay died / lost connection), which lets its SuperNode notice
+    # the SuperLink is gone and self-terminate too.
+    cat(".", file = file.path(spool, "relay_hb"))
+    nm <- .dsflower_env[[paste0("tunnel_name_", cid)]]
+    pa <- NA; pd <- ""; pf <- 0
+    if (is.character(req) && length(req) == 1L && !is.na(req) && nzchar(req)) {
+      rm <- tryCatch(.ds_arg(req), error = function(e) NULL)
+      if (is.list(rm) && !is.null(nm) && !is.null(rm[[nm]])) {
+        r <- rm[[nm]]
+        if (!is.null(r$pa)) pa <- r$pa
+        if (!is.null(r$pd)) pd <- r$pd
+        if (!is.null(r$pf)) pf <- r$pf
+      }
     }
-  }
-  # down: idempotently append the relay's SuperLink->SuperNode bytes
-  down_sz <- if (is.character(pd) && nzchar(pd)) {
-    .tunnel_append_at(spool, "down.bin", pa, .tunnel_dec(pd))
-  } else {
-    b <- file.path(spool, "down.bin"); if (file.exists(b)) file.size(b) else 0
-  }
-  # up: read SuperNode->SuperLink bytes from the relay-owned offset
-  up <- .tunnel_read_at(spool, "up.bin", pf)
-  # generation: bumps each time the forwarder accepts a new SuperNode connection,
-  # signalling the relay to reset its socket + offsets for the fresh stream.
-  gf <- file.path(spool, "gen")
-  gen <- if (file.exists(gf)) suppressWarnings(as.numeric(readLines(gf, n = 1, warn = FALSE))) else 0
-  if (length(gen) == 0 || is.na(gen)) gen <- 0
-  list(sz = down_sz, ud = .tunnel_enc(up$data), ue = up$eof, g = gen)
-}
-
-#' TEST: inject bytes as if the SuperNode sent them (DataSHIELD AGGREGATE)
-#' @param conn_id Character; tunnel connection id.
-#' @param data_b64 Character; B64: url-safe payload to append to up.bin.
-#' @return TRUE.
-#' @keywords internal
-#' @export
-flowerTunnelInjectDS <- function(conn_id, data_b64) {
-  .tunnel_append(.tunnel_spool(conn_id), "up.bin", .tunnel_dec(data_b64))
-  TRUE
-}
-
-#' TEST: drain down bytes as the forwarder would (DataSHIELD AGGREGATE)
-#' @param conn_id Character; tunnel connection id.
-#' @return URL-safe base64 of the new down bytes, or "" if none.
-#' @keywords internal
-#' @export
-flowerTunnelDrainDS <- function(conn_id) {
-  .tunnel_enc(.tunnel_drain(.tunnel_spool(conn_id), "down.bin", "down.read_offset"))
+    # down: idempotently append one bounded SuperLink->SuperNode chunk
+    down_sz <- if (is.character(pd) && length(pd) == 1L &&
+                   !is.na(pd) && nzchar(pd)) {
+      .tunnel_append_at(
+        spool, "down.bin", pa, .tunnel_dec(pd, chunk_bytes),
+        max_bytes = spool_max_bytes
+      )
+    } else {
+      b <- file.path(spool, "down.bin")
+      if (file.exists(b)) file.size(b) else 0
+    }
+    # up: return at most one bounded SuperNode->SuperLink chunk
+    up <- .tunnel_read_at(spool, "up.bin", pf, max_bytes = chunk_bytes)
+    # generation: bumps each time the forwarder accepts a new SuperNode connection,
+    # signalling the relay to reset its socket + offsets for the fresh stream.
+    gf <- file.path(spool, "gen")
+    gen <- if (file.exists(gf)) {
+      suppressWarnings(as.numeric(readLines(gf, n = 1, warn = FALSE)))
+    } else {
+      0
+    }
+    if (length(gen) == 0 || is.na(gen)) gen <- 0
+    list(sz = down_sz, ud = .tunnel_enc(up$data), ue = up$eof, g = gen)
+  })
 }
 
 #' @keywords internal
@@ -196,180 +262,143 @@ flowerTunnelDrainDS <- function(conn_id) {
   py
 }
 
+#' Test whether the registered tunnel is an operator-created live endpoint
+#'
+#' A stored port alone is never authorization: the capability must still be
+#' valid, its exact forwarder process alive, and that process must have published
+#' the ready marker after binding its loopback listener.
+#' @keywords internal
+.active_tunnel_port <- function() {
+  cid <- tryCatch(.tunnel_conn_id(.dsflower_env$tunnel_conn_id),
+                  error = function(e) NULL)
+  if (is.null(cid)) return(NULL)
+  port <- tryCatch(.tunnel_port(.dsflower_env$tunnel_forwarder_port),
+                   error = function(e) NULL)
+  if (is.null(port)) return(NULL)
+  p <- .dsflower_env[[.tunnel_forwarder_key(cid)]]
+  alive <- !is.null(p) && inherits(p, "process") &&
+    isTRUE(tryCatch(p$is_alive(), error = function(e) FALSE))
+  ready <- file.exists(file.path(.tunnel_spool(cid, create = FALSE), "ready"))
+  if (!alive || !ready) return(NULL)
+  port
+}
+
+#' Kill and forget one tunnel forwarder and its private spool
+#' @keywords internal
+.cleanup_tunnel <- function(conn_id) {
+  cid <- .tunnel_conn_id(conn_id)
+  key <- .tunnel_forwarder_key(cid)
+  p <- .dsflower_env[[key]]
+  if (!is.null(p) && inherits(p, "process")) {
+    tryCatch(p$kill(), error = function(e) NULL)
+    tryCatch(p$wait(timeout = 1000), error = function(e) NULL)
+  }
+  .dsflower_env[[key]] <- NULL
+  unlink(.tunnel_spool(cid, create = FALSE), recursive = TRUE)
+  .dsflower_env[[paste0("tunnel_name_", cid)]] <- NULL
+  if (identical(.dsflower_env$tunnel_conn_id, cid)) {
+    .dsflower_env$tunnel_conn_id <- NULL
+    .dsflower_env$tunnel_forwarder_port <- NULL
+  }
+  invisible(TRUE)
+}
+
 #' Start the node-side tunnel forwarder (DataSHIELD AGGREGATE)
 #'
 #' Spawns dsi_tunnel_forward.py listening on 127.0.0.1:listen_port; the Flower
 #' SuperNode dials that local port and its bytes are bridged to the spool.
 #' @param conn_id Character; tunnel connection id.
 #' @param listen_port Integer; local port the SuperNode will dial.
-#' @return list(ok, listen).
+#' @param node_name Character; this node's federation name.
+#' @return list(ok, listen, chunk_bytes).
 #' @keywords internal
 #' @export
 flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "") {
-  spool <- .tunnel_spool(conn_id)
+  cid <- .tunnel_conn_id(conn_id)
+  port <- .tunnel_port(listen_port)
+  chunk_bytes <- .tunnel_chunk_bytes()
+  spool_max_bytes <- .tunnel_spool_max_bytes(chunk_bytes)
+  .tunnel_request_max_bytes(chunk_bytes)
+  if (!is.character(node_name) || length(node_name) != 1L ||
+      is.na(node_name) || !nzchar(node_name)) {
+    stop("Invalid tunnel node name.", call. = FALSE)
+  }
+  active_cid <- .dsflower_env$tunnel_conn_id
+  if (!is.null(active_cid)) {
+    valid_active_cid <- tryCatch(.tunnel_conn_id(active_cid),
+                                 error = function(e) NULL)
+    if (!is.null(valid_active_cid) &&
+        !is.null(.active_tunnel_port())) {
+      stop("A tunnel session is already active in this DataSHIELD session.",
+           call. = FALSE)
+    }
+    if (!is.null(valid_active_cid)) {
+      .cleanup_tunnel(valid_active_cid)
+    } else {
+      .dsflower_env$tunnel_conn_id <- NULL
+      .dsflower_env$tunnel_forwarder_port <- NULL
+    }
+  }
+  spool <- .tunnel_spool(cid)
   unlink(list.files(spool, full.names = TRUE))
-  for (f in c("up.bin", "down.bin")) file.create(file.path(spool, f))
+  for (f in c("up.bin", "down.bin")) {
+    file.create(file.path(spool, f))
+    Sys.chmod(file.path(spool, f), mode = "0600")
+  }
   cat(".", file = file.path(spool, "relay_hb"))   # seed the relay heartbeat
+  started <- FALSE
+  on.exit(if (!started) .cleanup_tunnel(cid), add = TRUE)
   # Record this node's federation name so flowerTunnelExchangeDS can pick its
   # slice out of the single fan-out down-payload.
-  if (is.character(node_name) && nzchar(node_name)) .dsflower_env$tunnel_name <- node_name
+  .dsflower_env[[paste0("tunnel_name_", cid)]] <- node_name
   fwd <- system.file("python", "dsi_tunnel_forward.py", package = "dsFlower")
   # One configurable knob (default 180s) drives both the forwarder's relay-loss
   # tolerance and the SuperNode's --max-wait-time; set per node via
   # options(dsflower.tunnel_loss_tolerance = <seconds>).
-  ttl <- as.character(.dsf_option("tunnel_loss_tolerance", 180))
+  ttl <- as.character(.tunnel_limit(
+    "tunnel_loss_tolerance", 180, 5, 86400
+  ))
   p <- processx::process$new(
     .tunnel_python(),
-    c(fwd, "--listen", paste0("127.0.0.1:", as.integer(listen_port)), "--spool", spool),
-    env = c("current", DSFLOWER_RELAY_TTL = ttl),
+    c(fwd, "--listen", paste0("127.0.0.1:", port), "--spool", spool),
+    env = c(
+      "current",
+      DSFLOWER_RELAY_TTL = ttl,
+      DSFLOWER_TUNNEL_SPOOL_MAX_BYTES = as.character(spool_max_bytes)
+    ),
     stdout = file.path(spool, "fwd.log"), stderr = "2>&1",
     cleanup = FALSE, cleanup_tree = FALSE)
-  .dsflower_env[[paste0("tunnel_fwd_", conn_id)]] <- p
-  # Signal to flowerEnsureSuperNodeDS that the SuperNode must dial this loopback
-  # forwarder (insecure) instead of a remote/Tor SuperLink address.
-  .dsflower_env$tunnel_forwarder_port <- as.integer(listen_port)
+  .dsflower_env[[.tunnel_forwarder_key(cid)]] <- p
+  .dsflower_env$tunnel_conn_id <- cid
   ready <- FALSE
-  for (i in 1:60) { if (file.exists(file.path(spool, "ready"))) { ready <- TRUE; break }; Sys.sleep(0.1) }
-  list(ok = ready, listen = paste0("127.0.0.1:", as.integer(listen_port)))
-}
-
-#' TEST: spawn a local client that round-trips through the forwarder (AGGREGATE)
-#' @keywords internal
-#' @export
-flowerTunnelTestClientDS <- function(conn_id, listen_port, msg = "HELLO-TUNNEL", nrep = 1000L) {
-  spool <- .tunnel_spool(conn_id)
-  out <- file.path(spool, "testclient.bin"); unlink(out)
-  cli <- system.file("python", "dsi_tunnel_testclient.py", package = "dsFlower")
-  p <- processx::process$new(
-    .tunnel_python(),
-    c(cli, "--port", as.integer(listen_port), "--msg", msg, "--nrep", as.integer(nrep), "--out", out),
-    stdout = file.path(spool, "tc.log"), stderr = "2>&1",
-    cleanup = FALSE, cleanup_tree = FALSE)
-  .dsflower_env[[paste0("tunnel_tc_", conn_id)]] <- p
-  list(ok = TRUE, expected_bytes = nchar(msg) * as.integer(nrep))
-}
-
-#' TEST: read the round-tripped bytes the client received (AGGREGATE)
-#' @keywords internal
-#' @export
-flowerTunnelTestResultDS <- function(conn_id) {
-  out <- file.path(.tunnel_spool(conn_id), "testclient.bin")
-  if (!file.exists(out)) return(list(done = FALSE, bytes = 0L, data = ""))
-  raw <- readBin(out, "raw", file.size(out))
-  list(done = TRUE, bytes = length(raw), data = .tunnel_enc(raw))
-}
-
-#' Reap orphaned tunnel SuperNodes + forwarders (DataSHIELD AGGREGATE)
-#'
-#' A clean slate for the DSI tunnel: kills any lingering flower-supernode /
-#' flower-superexec and dsi_tunnel_forward processes (e.g. from a researcher run
-#' that was killed without link.down -- Flower SuperNodes otherwise retry-connect
-#' forever) and clears their PID files + the in-session registry, so a fresh
-#' link.up never hits the concurrent-SuperNode limit or contends with stale
-#' processes. Called at link.up (clean slate) and link.down.
-#' @return list(ok, supernodes_killed, forwarders_killed).
-#' @keywords internal
-#' @export
-flowerTunnelReapDS <- function() {
-  me <- Sys.getpid()
-  pgrep_kill <- function(pat) {
-    pids <- tryCatch(suppressWarnings(as.integer(
-      system(paste("pgrep -f", shQuote(pat)), intern = TRUE, ignore.stderr = TRUE))),
-      error = function(e) integer())
-    pids <- pids[!is.na(pids) & pids != me]
-    # SIGTERM first so a live SuperNode reaps its own SuperExec children before
-    # exiting (otherwise they orphan as zombies under the container's non-reaping
-    # PID 1 and never clear); then SIGKILL any straggler still alive.
-    for (p in pids) tryCatch(system(paste("kill -TERM", p), ignore.stderr = TRUE),
-                             error = function(e) NULL)
-    Sys.sleep(0.5)
-    for (p in pids) if (isTRUE(tryCatch(.pid_is_alive(p), error = function(e) FALSE)))
-      tryCatch(system(paste("kill -9", p), ignore.stderr = TRUE), error = function(e) NULL)
-    length(pids)
-  }
-  sn  <- pgrep_kill("flower-super")        # flower-supernode + flower-superexec (no superlink on a node)
-  fwd <- pgrep_kill("dsi_tunnel_forward")
-  pid_dir <- tryCatch(.supernode_pid_dir(), error = function(e) NULL)
-  if (!is.null(pid_dir))
-    unlink(list.files(pid_dir, pattern = "\\.pid$", full.names = TRUE))
-  tryCatch(rm(list = ls(.supernode_registry), envir = .supernode_registry),
-           error = function(e) NULL)
-  # GC orphaned app spools: a researcher run killed before flowerAppDeleteDS leaves
-  # its uploaded package on disk. Delete spool dirs older than the TTL so disk
-  # residue self-cleans the same way the processes do (cleanliness by design).
-  gc_spools <- 0L
-  spool_root <- file.path(tempdir(), "dsflower_appstore")
-  if (dir.exists(spool_root)) {
-    ttl <- as.numeric(.dsf_option("spool_ttl_seconds", 7200))
-    for (d in list.dirs(spool_root, recursive = FALSE, full.names = TRUE)) {
-      age <- tryCatch(as.numeric(difftime(Sys.time(), file.info(d)$mtime, units = "secs")),
-                      error = function(e) NA_real_)
-      if (is.finite(age) && age > ttl) {
-        unlink(d, recursive = TRUE); gc_spools <- gc_spools + 1L
-      }
+  for (i in 1:60) {
+    alive <- isTRUE(tryCatch(p$is_alive(), error = function(e) FALSE))
+    if (!alive) break
+    if (file.exists(file.path(spool, "ready"))) {
+      ready <- TRUE
+      break
     }
+    Sys.sleep(0.1)
   }
-  list(ok = TRUE, supernodes_killed = sn, forwarders_killed = fwd, spools_gc = gc_spools)
+  ready <- ready && isTRUE(tryCatch(p$is_alive(), error = function(e) FALSE))
+  if (!ready) {
+    stop("Tunnel forwarder failed to start.", call. = FALSE)
+  }
+  # Publish the port only after bind/listen readiness and a final liveness check.
+  .dsflower_env$tunnel_forwarder_port <- port
+  started <- TRUE
+  list(
+    ok = TRUE,
+    listen = paste0("127.0.0.1:", port),
+    chunk_bytes = chunk_bytes
+  )
 }
 
-#' Stop the node-side tunnel forwarder/test processes and clean the spool (AGGREGATE)
+#' Stop this tunnel session's forwarder and clean its spool (AGGREGATE)
 #' @keywords internal
 #' @export
 flowerTunnelDownDS <- function(conn_id) {
-  for (k in c("tunnel_fwd_", "tunnel_tc_", "tunnel_sn_")) {
-    p <- .dsflower_env[[paste0(k, conn_id)]]
-    if (!is.null(p) && inherits(p, "process")) {
-      tryCatch({ p$kill() }, error = function(e) NULL)
-    }
-    .dsflower_env[[paste0(k, conn_id)]] <- NULL
-  }
-  unlink(.tunnel_spool(conn_id), recursive = TRUE)
-  .dsflower_env$tunnel_forwarder_port <- NULL
-  .dsflower_env$tunnel_name <- NULL
+  cid <- .tunnel_conn_id(conn_id)
+  .cleanup_tunnel(cid)
   TRUE
-}
-
-#' Start a Flower SuperNode pointed at the local tunnel forwarder (AGGREGATE)
-#'
-#' The SuperNode dials 127.0.0.1:forwarder_port (the forwarder), so its entire
-#' Fleet-API conversation with the SuperLink is carried over DSI -- no Tor, no
-#' public address. Flower + SecAgg+ run unchanged.
-#' @keywords internal
-#' @export
-flowerTunnelSupernodeDS <- function(conn_id, forwarder_port, clientappio_port = 19000L) {
-  spool <- .tunnel_spool(conn_id)
-  cands <- c(Sys.glob("/srv/dsflower/venvs/*/bin/flower-supernode"),
-             Sys.glob(file.path(tools::R_user_dir("dsFlower", "data"), "venvs", "*", "bin", "flower-supernode")),
-             Sys.which("flower-supernode"))
-  cands <- cands[nzchar(cands) & file.exists(cands)]
-  if (length(cands) == 0) stop("flower-supernode binary not found on node.", call. = FALSE)
-  sn <- cands[1]
-  # The SuperNode spawns sibling binaries (flower-superexec); put the venv bin/
-  # on PATH so they are found.
-  child_env <- Sys.getenv()
-  child_env[["PATH"]] <- paste0(dirname(sn), ":", child_env[["PATH"]])
-  p <- processx::process$new(
-    sn,
-    c("--insecure",
-      "--superlink", paste0("127.0.0.1:", as.integer(forwarder_port)),
-      "--clientappio-api-address", paste0("127.0.0.1:", as.integer(clientappio_port))),
-    env = child_env,
-    stdout = file.path(spool, "sn.log"), stderr = "2>&1",
-    cleanup = FALSE, cleanup_tree = FALSE)
-  .dsflower_env[[paste0("tunnel_sn_", conn_id)]] <- p
-  Sys.sleep(2.5)
-  list(ok = p$is_alive(), supernode = sn)
-}
-
-#' Read a tunnel-related log tail (DataSHIELD AGGREGATE)
-#' @param conn_id Character; tunnel id.
-#' @param which One of "sn" (supernode), "fwd" (forwarder), "tc" (test client).
-#' @return Character; last lines of the log.
-#' @keywords internal
-#' @export
-flowerTunnelLogDS <- function(conn_id, which = "sn") {
-  base <- if (identical(which, "fwd")) "fwd" else if (identical(which, "tc")) "tc" else "sn"
-  f <- file.path(.tunnel_spool(conn_id), paste0(base, ".log"))
-  if (!file.exists(f)) return("")
-  paste(utils::tail(readLines(f, warn = FALSE), 40), collapse = "\n")
 }

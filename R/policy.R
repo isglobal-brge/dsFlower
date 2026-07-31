@@ -44,7 +44,6 @@
 #'
 #' @param data Data.frame or Arrow Table; the training data.
 #' @param target_column Character; name(s) of the target column(s).
-#' @param trust Named list; the trust profile settings.
 #' @param task_type Character task type ("classification", "regression",
 #'   "survival", etc.) or NULL.
 #' @return TRUE invisibly, or stops with an error.
@@ -230,8 +229,11 @@
 .assertMinSamples <- function(n_samples, min_n = NULL) {
   threshold <- if (!is.null(min_n)) min_n else .disclosure_min_rows()
 
-  n <- as.numeric(n_samples)
-  if (is.na(n) || n < threshold) {
+  n <- suppressWarnings(as.numeric(unlist(n_samples, use.names = FALSE)))
+  threshold <- suppressWarnings(as.numeric(unlist(threshold, use.names = FALSE)))
+  if (length(n) != 1L || length(threshold) != 1L ||
+      !is.finite(n) || !is.finite(threshold) ||
+      n < 0 || threshold < 0 || n < threshold) {
     stop(
       "Disclosive: operation blocked -- insufficient training samples to ",
       "meet disclosure threshold. No further details available.",
@@ -241,81 +243,142 @@
   invisible(TRUE)
 }
 
-#' Auto-detect a patient / subject identifier column for imaging disclosure
+#' Resolve the server-owned differential-privacy unit
 #'
-#' Image collections hold one row per IMAGE, but several images can belong to the
-#' same patient. The right disclosure unit for medical imaging is the PATIENT, so
-#' we group by a patient identifier when one is present. Detection is
-#' case-insensitive over common identifiers; a server admin may pin an exact
-#' column with \code{dsflower.patient_column} (or the run_config
-#' \code{patient_column}/\code{group_column}).
+#' The adjacency relation is a lifetime policy, not a per-run heuristic.
+#' \code{dsflower.dp_unit} defaults to \code{"row"}.  Selecting
+#' \code{"patient"} requires one explicit, stable
+#' \code{dsflower.patient_column}; no column-name auto-detection or row fallback
+#' is allowed.
 #'
-#' @param df Data.frame; the samples / training metadata table.
-#' @param run_config Named list; the run configuration (optional override).
-#' @return Character column name, or NULL when no patient column is found.
+#' @return A named list with \code{dp_unit}, \code{patient_column}, and the
+#'   identifier canonicalisation version.
 #' @keywords internal
-.detectPatientColumn <- function(df, run_config = list()) {
-  if (is.null(df) || !is.data.frame(df) || !ncol(df)) return(NULL)
-  explicit <- run_config[["patient_column"]] %||% run_config[["group_column"]] %||%
-    .dsf_option("patient_column", NA)
-  if (!is.null(explicit) && !is.na(explicit) && nzchar(as.character(explicit)) &&
-      as.character(explicit) %in% names(df)) {
-    return(as.character(explicit))
+.dpUnitPolicy <- function() {
+  unit <- tolower(trimws(as.character(.dsf_option("dp_unit", "row"))))
+  if (length(unit) != 1L || is.na(unit) || !unit %in% c("row", "patient")) {
+    stop("dsflower.dp_unit must be exactly 'row' or 'patient'.", call. = FALSE)
   }
-  candidates <- c("patient_id", "patientid", "patient", "subject_id",
-                  "subjectid", "subject", "participant_id", "case_id",
-                  "person_id", "pid", "mrn")
-  lc <- tolower(names(df))
-  for (cand in candidates) {
-    hit <- which(lc == cand)
-    if (length(hit)) return(names(df)[hit[1]])
+
+  patient_column <- NULL
+  if (identical(unit, "patient")) {
+    configured <- .dsf_option("patient_column", NA_character_)
+    configured <- as.character(unlist(configured, use.names = FALSE))
+    if (length(configured) != 1L || is.na(configured) ||
+        !nzchar(trimws(configured))) {
+      stop("dsflower.patient_column must name one column when ",
+           "dsflower.dp_unit='patient'.", call. = FALSE)
+    }
+    patient_column <- trimws(configured)
   }
-  NULL
+
+  list(
+    dp_unit = unit,
+    patient_column = patient_column,
+    canonicalization = "trim-utf8-v1"
+  )
 }
 
-#' Reduce an image samples table to its disclosure UNIT (distinct patients)
+#' Resolve a server-owned patient / subject identifier column
 #'
-#' When a patient column exists, the admission checks should count distinct
-#' PATIENTS (a patient with many slices counts once) for both the minimum
-#' collection size and the minimum per-class count. Returns the distinct-patient
-#' count plus a frame with one row per (patient, label) so the existing
-#' class-distribution check counts patients-per-class. Returns NULL when no
-#' patient column is found, so the caller falls back to per-image counts.
+#' This helper applies \code{.dpUnitPolicy()} to a concrete frame.  In row mode
+#' it always returns \code{NULL}. In patient mode the configured column must be
+#' present; missing columns fail closed rather than silently changing adjacency.
 #'
-#' NOTE: this groups the DISCLOSURE/ADMISSION unit by patient. The DP-SGD noise
-#' in the trusted harness is applied per-IMAGE example, so the formal DP unit
-#' remains the image; a patient contributing k images has a per-patient guarantee
-#' weaker by up to a factor k (group privacy). This is documented in ARCHITECTURE.
+#' @param df Data.frame; the samples / training metadata table.
+#' @param run_config Named list; trusted server-authored run configuration.
+#' @return Character column name, or NULL in row mode.
+#' @keywords internal
+.detectPatientColumn <- function(df, run_config = list()) {
+  policy <- .dpUnitPolicy()
+  pinned_unit <- run_config[["dp-unit"]] %||% policy$dp_unit
+  pinned_unit <- tolower(as.character(unlist(pinned_unit, use.names = FALSE)))
+  if (length(pinned_unit) != 1L || !identical(pinned_unit, policy$dp_unit)) {
+    stop("Prepared DP unit disagrees with the server lifetime policy.",
+         call. = FALSE)
+  }
+  if (identical(policy$dp_unit, "row")) return(NULL)
+
+  explicit <- run_config[["patient_column"]] %||% policy$patient_column
+  explicit <- as.character(unlist(explicit, use.names = FALSE))
+  if (length(explicit) != 1L || !identical(explicit, policy$patient_column)) {
+    stop("Prepared patient column disagrees with the server lifetime policy.",
+         call. = FALSE)
+  }
+  if (is.null(df) || !is.data.frame(df) || !explicit %in% names(df)) {
+    stop("The server-configured patient identifier column is unavailable.",
+         call. = FALSE)
+  }
+  explicit
+}
+
+#' Canonicalise and validate a complete patient roster
+#' @keywords internal
+.canonicalPatientIds <- function(values) {
+  missing <- is.na(values)
+  ids <- trimws(enc2utf8(as.character(values)))
+  reserved_missing <- tolower(ids) %in% c("na", "nan", "null")
+  if (any(missing | !nzchar(ids) | reserved_missing)) {
+    stop("The configured patient identifier must be complete and non-empty.",
+         call. = FALSE)
+  }
+  ids
+}
+
+#' Legacy reduction of a training table to distinct patients
 #'
-#' @param samples Data.frame; the image samples metadata table.
+#' Retained for compatibility with older internal extensions. Current run
+#' admission uses the server-authored \code{n_units} structural manifest field
+#' and deliberately does not inspect labels: a class/event threshold would make
+#' prepare success or failure a label-dependent transcript oracle.
+#'
+#' The canonical runner uses the same server-pinned patient column and collapses
+#' all of a patient's rows/images to one training example before DP-SGD. The
+#' formal privacy unit therefore matches this admission unit. Patient mode
+#' requires a stable, complete roster and never falls back to rows or images.
+#'
+#' @param samples Data.frame; training rows / image samples metadata.
 #' @param target_column Character; label column name(s).
-#' @param run_config Named list; run configuration (for the column override).
+#' @param run_config Named list; trusted server-authored run configuration.
 #' @return list(n_patients, data) or NULL.
 #' @keywords internal
-.imageDisclosureUnits <- function(samples, target_column, run_config = list()) {
+.privacyDisclosureUnits <- function(samples, target_column, run_config = list()) {
   if (is.null(samples) || !is.data.frame(samples) || !nrow(samples)) return(NULL)
   pcol <- .detectPatientColumn(samples, run_config)
   if (is.null(pcol)) return(NULL)
 
-  pid <- as.character(samples[[pcol]])
-  # NA / empty patient ids are NOT patients: exclude them from the distinct-patient
-  # count AND from the per-class frame, else `paste(NA, label)` yields a unique key
-  # ("NA\rlabel") that survives dedup and inflates a class count, letting a class
-  # with too few real patients pass the min-per-class check.
-  valid <- !is.na(pid) & nzchar(pid)
-  n_patients <- length(unique(pid[valid]))
+  pid <- .canonicalPatientIds(samples[[pcol]])
+  n_patients <- length(unique(pid))
 
   tc <- if (!is.null(target_column) && length(target_column) >= 1 &&
             target_column[[1]] %in% names(samples)) target_column[[1]] else NULL
   if (is.null(tc)) {
-    keep <- valid & !duplicated(pid)
+    keep <- !duplicated(pid)
     return(list(n_patients = n_patients, data = samples[keep, , drop = FALSE]))
   }
-  # One row per (patient, label): class-distribution then counts DISTINCT
-  # patients per class (a patient with many same-label slices counts once).
-  key <- paste(pid, as.character(samples[[tc]]), sep = "\r")
-  keep <- valid & !duplicated(key)
-  list(n_patients = n_patients, data = samples[keep, , drop = FALSE])
+  # Exactly one row per patient.  A patient with inconsistent labels must not
+  # count once in every class; choose the deterministic mode (lexical first on
+  # ties), matching the runner's one-unit pooling contract.
+  selected <- vapply(unique(pid), function(id) {
+    idx <- which(pid == id)
+    labels <- samples[[tc]][idx]
+    usable <- !is.na(labels)
+    if (!any(usable)) return(idx[[1]])
+    counts <- table(labels[usable])
+    winners <- names(counts)[counts == max(counts)]
+    winner <- if (is.numeric(labels) || is.integer(labels)) {
+      as.character(min(as.numeric(winners)))
+    } else {
+      sort(winners, method = "radix")[[1]]
+    }
+    idx[which(as.character(labels) == winner)[[1]]]
+  }, integer(1))
+  list(n_patients = n_patients, data = samples[selected, , drop = FALSE])
+}
+
+# Backward-compatible internal name used by older tests/extensions.
+.imageDisclosureUnits <- function(samples, target_column, run_config = list()) {
+  .privacyDisclosureUnits(samples, target_column, run_config)
 }
 
 #' Sanitize training metrics before returning through DataSHIELD
@@ -476,4 +539,3 @@
   }
   invisible(TRUE)
 }
-

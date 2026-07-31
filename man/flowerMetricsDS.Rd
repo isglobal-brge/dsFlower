@@ -2,7 +2,7 @@
 % Please edit documentation in R/interface.R
 \name{flowerMetricsDS}
 \alias{flowerMetricsDS}
-\title{Get Sanitized Training Metrics}
+\title{Disabled node-metrics compatibility endpoint}
 \usage{
 flowerMetricsDS(handle_symbol, since_round = 0L)
 }
@@ -12,9 +12,10 @@ flowerMetricsDS(handle_symbol, since_round = 0L)
 \item{since_round}{Integer; return only metrics from this round onward.}
 }
 \value{
-Data.frame with columns: round, metric, value.
+Empty data.frame with columns: round, metric, value.
 }
 \description{
-DataSHIELD AGGREGATE method. Parses and sanitizes metrics from
-the SuperNode log.
+Node metrics can encode data-dependent loss, counts, failures or timing and
+are outside the model mechanism's DP proof. This DataSHIELD AGGREGATE symbol
+is retained for protocol compatibility and always returns an empty data frame.
 }

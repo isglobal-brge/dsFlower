@@ -2,24 +2,21 @@
 % Please edit documentation in R/policy.R
 \name{.detectPatientColumn}
 \alias{.detectPatientColumn}
-\title{Auto-detect a patient / subject identifier column for imaging disclosure}
+\title{Resolve a server-owned patient / subject identifier column}
 \usage{
 .detectPatientColumn(df, run_config = list())
 }
 \arguments{
 \item{df}{Data.frame; the samples / training metadata table.}
 
-\item{run_config}{Named list; the run configuration (optional override).}
+\item{run_config}{Named list; trusted server-authored run configuration.}
 }
 \value{
-Character column name, or NULL when no patient column is found.
+Character column name, or NULL in row mode.
 }
 \description{
-Image collections hold one row per IMAGE, but several images can belong to the
-same patient. The right disclosure unit for medical imaging is the PATIENT, so
-we group by a patient identifier when one is present. Detection is
-case-insensitive over common identifiers; a server admin may pin an exact
-column with \code{dsflower.patient_column} (or the run_config
-\code{patient_column}/\code{group_column}).
+This helper applies \code{.dpUnitPolicy()} to a concrete frame.  In row mode
+it always returns \code{NULL}. In patient mode the configured column must be
+present; missing columns fail closed rather than silently changing adjacency.
 }
 \keyword{internal}

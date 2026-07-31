@@ -2,11 +2,11 @@
 % Please edit documentation in R/app_store.R
 \name{.compute_app_pkg_hash}
 \alias{.compute_app_pkg_hash}
-\title{Hash a node-resident trusted app package (e.g. the dsflower_tier2 runner).}
+\title{Hash a node-resident trusted app package (for example, the canonical runner).}
 \usage{
 .compute_app_pkg_hash(pkg_name)
 }
 \description{
-Hash a node-resident trusted app package (e.g. the dsflower_tier2 runner).
+Hash a node-resident trusted app package (for example, the canonical runner).
 }
 \keyword{internal}

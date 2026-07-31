@@ -4,36 +4,146 @@
 # Null-coalescing operator
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
-# Session-level handle storage
+# Session-level transport state
 .dsflower_env <- new.env(parent = emptyenv())
+
+# Authoritative Flower-handle state. Session workspaces receive only an opaque
+# capability; sensitive paths, data and lifecycle flags stay in this registry.
+.handle_registry <- new.env(parent = emptyenv())
 
 # SuperNode singleton registry -- keyed by SuperLink address
 .supernode_registry <- new.env(parent = emptyenv())
 
-#' Ensure a per-node secret for deterministic-yet-secret DP noise
+.read_os_entropy <- function(n) {
+  con <- file("/dev/urandom", open = "rb", raw = TRUE)
+  on.exit(close(con), add = TRUE)
+  readBin(con, "raw", n = as.integer(n))
+}
+
+#' Resolve the dedicated dsFlower node-secret path
+#' @keywords internal
+.node_secret_path <- function() {
+  configured <- .dsf_option(
+    "node_secret_path", "/var/lib/dsflower/node_secret")
+  from_env <- Sys.getenv("DSFLOWER_NODE_SECRET_FILE", unset = "")
+  path <- if (nzchar(from_env)) from_env else configured
+  if (length(path) != 1L || is.na(path) || !nzchar(as.character(path)) ||
+      !.path_is_absolute(as.character(path))) {
+    stop("The dsFlower node-secret path must be absolute.", call. = FALSE)
+  }
+  path <- as.character(path)
+  if (.path_is_symlink(path)) {
+    stop("The dsFlower node secret must not be a symbolic link.", call. = FALSE)
+  }
+  path <- .canonical_state_path(path)
+  allow_test_tmp <- identical(
+    Sys.getenv("DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET", ""), "1")
+  if (.privacy_path_is_ephemeral(path) && !allow_test_tmp) {
+    stop("The dsFlower node secret must be persistent; /tmp, /var/tmp and ",
+         "/dev/shm are not allowed.", call. = FALSE)
+  }
+  path
+}
+
+#' Validate a dedicated 256-bit dsFlower node secret
+#' @keywords internal
+.validate_node_secret <- function(path) {
+  if (!file.exists(path) || .path_is_symlink(path)) {
+    stop("The dsFlower node secret is missing or is a symbolic link: ", path,
+         call. = FALSE)
+  }
+  info <- file.info(path)
+  if (isTRUE(info$isdir[[1]])) {
+    stop("The dsFlower node secret must be a regular file.", call. = FALSE)
+  }
+  # Accept 64 hex bytes with no terminator, LF, or CRLF. Read one byte beyond
+  # the largest valid representation so a valid first line plus hidden trailing
+  # content cannot pass validation.
+  bytes <- tryCatch(readBin(path, "raw", n = 67L),
+                    error = function(e) raw(0))
+  if (length(bytes) && identical(bytes[[length(bytes)]], as.raw(0x0a))) {
+    bytes <- bytes[-length(bytes)]
+    if (length(bytes) && identical(bytes[[length(bytes)]], as.raw(0x0d))) {
+      bytes <- bytes[-length(bytes)]
+    }
+  }
+  value <- tryCatch(rawToChar(bytes), error = function(e) "")
+  if (length(bytes) != 64L ||
+      !grepl("^[0-9a-fA-F]{64}$", value, perl = TRUE)) {
+    stop("The dsFlower node secret must contain exactly 32 bytes as 64 hex digits.",
+         call. = FALSE)
+  }
+  if (.Platform$OS.type == "unix") {
+    mode <- suppressWarnings(as.integer(info$mode[[1]]))
+    expected_mode <- as.integer(strtoi("600", base = 8))
+    if (is.na(mode) || !identical(mode, expected_mode)) {
+      stop("The dsFlower node secret must have Unix mode exactly 0600.",
+           call. = FALSE)
+    }
+    current_user <- unname(Sys.info()[["effective_user"]])
+    if (is.null(current_user) || is.na(current_user) || !nzchar(current_user)) {
+      current_user <- unname(Sys.info()[["user"]])
+    }
+    if (is.null(current_user) || is.na(current_user) || !nzchar(current_user) ||
+        is.na(info$uname[[1]]) || !identical(info$uname[[1]], current_user)) {
+      stop("The dsFlower node secret is not owned by the current service user.",
+           call. = FALSE)
+    }
+  }
+  invisible(path)
+}
+
+#' Ensure a dedicated per-node 256-bit secret for deterministic releases
 #'
-#' Created once and persisted, never released. It lets a repeated IDENTICAL run
-#' (same data + same config) return the SAME model, so an analyst cannot average
-#' many runs to cancel the DP noise -- while the secret keeps that noise
-#' unpredictable to the analyst. Best-effort: if the directory is not writable the
-#' Python harness simply falls back to fresh OS-entropy noise (still DP-safe, just
-#' non-deterministic). Stored as a 64-char hex string; the harness reads this file.
+#' The secret is created at RUN TIME, never from `.onLoad`, so an image build cannot
+#' accidentally bake one key into every deployed node.  There is deliberately no
+#' statistical-RNG fallback: missing CSPRNG entropy or unsafe permissions fail closed.
 #' @keywords internal
 .ensure_node_secret <- function() {
-  path <- Sys.getenv(
-    "DSFLOWER_NODE_SECRET_FILE",
-    unset = getOption("dsflower.node_secret_path", "/var/lib/dsflower/node_secret")
-  )
-  if (file.exists(path)) return(invisible(path))
-  tryCatch({
-    dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
-    raw <- tryCatch(readBin("/dev/urandom", "raw", 32L), error = function(e) NULL)
-    if (is.null(raw) || length(raw) < 32L)
-      raw <- as.raw((sample.int(256L, 32L, replace = TRUE) - 1L))
-    writeLines(paste(sprintf("%02x", as.integer(raw)), collapse = ""), path)
-    Sys.chmod(path, "0600")
-  }, error = function(e) NULL)
-  invisible(path)
+  path <- .node_secret_path()
+  if (file.exists(path)) return(.validate_node_secret(path))
+  if (!file.exists("/dev/urandom")) {
+    stop("/dev/urandom is unavailable; refusing to create a DP node secret.",
+         call. = FALSE)
+  }
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  if (!dir.exists(dirname(path))) {
+    stop("Could not create the dsFlower secret directory: ", dirname(path),
+         call. = FALSE)
+  }
+
+  lock <- filelock::lock(paste0(path, ".lock"), timeout = 10000)
+  if (is.null(lock)) stop("Timed out creating the dsFlower node secret.", call. = FALSE)
+  on.exit(filelock::unlock(lock), add = TRUE)
+  if (!file.exists(path)) {
+    entropy <- tryCatch(.read_os_entropy(32L),
+                        error = function(e) raw(0))
+    if (length(entropy) != 32L) {
+      stop("Could not read 32 bytes of operating-system entropy; refusing a DP release.",
+           call. = FALSE)
+    }
+    value <- paste(sprintf("%02x", as.integer(entropy)), collapse = "")
+    tmp <- tempfile(pattern = ".node-secret-", tmpdir = dirname(path))
+    on.exit(unlink(tmp), add = TRUE)
+    # base::file.create() has no `mode` formal: passing mode="0600" is
+    # interpreted through `...` as a second filename. Use a restrictive umask
+    # at creation time so there is no group/world-readable window before chmod.
+    old_umask <- Sys.umask("0077")
+    created <- tryCatch(
+      file.create(tmp),
+      finally = Sys.umask(old_umask)
+    )
+    if (length(created) != 1L || !isTRUE(created)) {
+      stop("Could not create a private temporary node-secret file.",
+           call. = FALSE)
+    }
+    writeLines(value, tmp, useBytes = TRUE)
+    Sys.chmod(tmp, "0600")
+    if (!file.rename(tmp, path)) {
+      stop("Could not atomically install the dsFlower node secret.", call. = FALSE)
+    }
+  }
+  .validate_node_secret(path)
 }
 
 #' Package load hook -- verify Python venv root exists
@@ -88,17 +198,6 @@
     }
   }
 
-  # Per-node secret for deterministic-yet-secret DP noise (see .ensure_node_secret).
-  tryCatch(.ensure_node_secret(), error = function(e) NULL)
-
-  # Check Python availability
-  python <- Sys.which("python3")
-  if (!nzchar(python)) python <- Sys.which("python")
-  if (!nzchar(python)) {
-    packageStartupMessage(
-      "dsFlower: python3 not found. ",
-      "SuperNode operations will not work without Python.")
-  }
 }
 
 #' Package attach hook
@@ -109,6 +208,13 @@
   packageStartupMessage(
     "dsFlower v", utils::packageVersion("dsFlower"), " loaded."
   )
+  python <- Sys.which("python3")
+  if (!nzchar(python)) python <- Sys.which("python")
+  if (!nzchar(python)) {
+    packageStartupMessage(
+      "dsFlower: python3 not found. ",
+      "SuperNode operations will not work without Python.")
+  }
 
   # Stale staging janitor: remove staging directories older than 24 hours
   .cleanup_stale_staging()
@@ -124,11 +230,31 @@
 #' Remove stale staging directories older than 24 hours
 #' @keywords internal
 .cleanup_stale_staging <- function(max_age_hours = 24) {
+  # A long-running federated job may legitimately outlive the age threshold.
+  # Protect both processes owned by this R session and live SuperNodes discovered
+  # through /proc before considering any directory for deletion.
+  active <- character()
+  for (key in ls(.supernode_registry, all.names = TRUE)) {
+    entry <- tryCatch(get(key, envir = .supernode_registry),
+                      error = function(e) NULL)
+    alive <- tryCatch(!is.null(entry$process) && entry$process$is_alive(),
+                      error = function(e) FALSE)
+    if (isTRUE(alive)) active <- c(active, key)
+  }
+  live <- tryCatch(.list_supernode_processes(), error = function(e) NULL)
+  if (!is.null(live) && nrow(live)) {
+    active <- c(active, live$manifest_dir[!is.na(live$manifest_dir)])
+  }
+  active <- unique(vapply(active, function(path)
+    normalizePath(path, winslash = "/", mustWork = FALSE), character(1)))
+
   for (base in c("/dev/shm", tempdir())) {
     dsflower_dir <- file.path(base, "dsflower")
     if (!dir.exists(dsflower_dir)) next
     subdirs <- list.dirs(dsflower_dir, full.names = TRUE, recursive = FALSE)
     for (d in subdirs) {
+      canonical <- normalizePath(d, winslash = "/", mustWork = FALSE)
+      if (canonical %in% active) next
       info <- file.info(d)
       if (!is.na(info$mtime) &&
           difftime(Sys.time(), info$mtime, units = "hours") > max_age_hours) {

@@ -24,6 +24,7 @@ flowerPrepareRunDS(
 Updated handle with staging information.
 }
 \description{
-DataSHIELD ASSIGN method. Loads training data, validates schema,
-asserts minimum sample size, and stages data with a JSON manifest.
+DataSHIELD ASSIGN method. Reserves the server-owned lifetime allocation,
+loads training data, applies total public preprocessing, and stages data with
+a JSON manifest. No minimum-size or private-value admission bit is returned.
 }

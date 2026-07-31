@@ -1,497 +1,370 @@
-# dsFlower 2.0 — Architecture & Implementation Plan
+# dsFlower privacy and security architecture
 
-> Status: **COMPLETE — all three tiers federated-validated** on live nodes
-> (nairobi/dakar/douala), each status 0.
-> Pre-reset recovery tags: `pre-reset-dp-validated` (dsFlower `acf18a1`, dsFlowerClient `aa17da7`).
->
-> Validated end-to-end:
-> - **Tier-1** (model submission): trusted harness, always-on Opacus DP-SGD + PRV,
->   new Message API. 3/3 nodes, status 0.
-> - **Tier-2 ingestion**: chunked FAB upload over DSI (`flowerAppPush/InstallDS`) +
->   sha256 verify + fail-closed exfiltration scan (`exfil_scan.py`) + install.
-> - **Tier-2 execution**: upload *arbitrary* training code → node scans + computes
->   its hash → `flowerTier2PinDS` pins {`dsflower_tier2` runner, user app} with
->   node-computed hashes → the multi-package integrity hook verifies both before
->   load → the trusted runner runs the untrusted `local_update` under the
->   **output-perturbation DP gate** → FedAvg aggregates. "Received 3 results and 0
->   failures", status 0.
->
-> Transport is the salvaged transparent DSI byte tunnel (no SecAgg, no `assign.expr`,
-> no open ports). Trust chain: content-hash code integrity + node-computed pins +
-> tamper-proof manifest DP params + the gate. Remaining is optional polish: a real
-> OS sandbox (gVisor/bwrap needs node root; current containment is `--isolation` +
-> exfiltration scan + DP gate), DataSHIELD-option docs, and inert dead-code cleanup
-> (template-store, coordinator/non-tunnel path).
->
-> Bring-up learnings (live nodes): the DSI-tunnel SuperNode runs the ClientApp from
-> the client-built FAB in the node's framework venv (use a pytorch-family model so a
-> torch+opacus venv is selected); `sitecustomize.py` is **default-deny** and must pin
-> the harness (not a template) hash or it kills the ClientApp; the DP budget ledger
-> (`~/.local/share/dsFlower/privacy/`, cap `dsflower.max_epsilon`=10) accumulates per
-> dataset across *all* runs incl. failed ones — reset it or raise the cap for repeated
-> testing/demos.
+This document describes the enforced contract implemented by the current
+`dsFlower`/`dsFlowerClient` runner. It is a security specification, not a list of
+aspirational features.
 
-A system that lets researchers **upload their own Flower apps** which **install on
-DataSHIELD server nodes**, while **guaranteeing by construction** that:
+## 1. Security objective
 
-1. **Always-on, calibrated local Differential Privacy** protects every release.
-2. **Arbitrary/untrusted app code cannot retrieve raw data or emit anything
-   disclosive** — nothing that reconstructs the data reaches the researcher/SuperLink.
-3. **DataSHIELD disclosure controls** (minimum counts, etc.) are enforced as
-   **DataSHIELD options** (inheriting `nfilter.*`).
-4. **No Secure Aggregation** — only DP + isolation.
-5. The **new Flower Message API** is used (no legacy Strategy/compat layer).
-6. The **DataSHIELD (DSI) channel** is used as efficiently as possible.
+Private rows remain on the data node. Every numeric model release that leaves a
+SuperNode is produced by a node-installed, hash-pinned runner under an explicit
+`(epsilon, delta)` guarantee. The researcher controls what valid computation is
+requested; the data custodian controls the privacy policy and executable trust
+boundary.
 
-Goals: good utility (numbers not destroyed by DP) · disclosure-safe · fast ·
-flexible (bring your own app).
+The trusted computing base is:
 
----
+- the node administrator, R/DataSHIELD service, dsFlower package and Python
+  environment;
+- the canonical `dsflower_runner` whose recursive SHA-256 is computed by the
+  node;
+- the operating-system entropy source, persistent privacy ledger and, for
+  HookApps, the attested OS sandbox.
 
-## 1. The trust model (the core invariant)
+The researcher, Flower ServerApp, submitted configuration and uploaded HookApp
+code are not trusted. A compromised node administrator, kernel, rollbackable
+ledger volume or leaked node secret is outside this guarantee.
 
-You **cannot** statically certify that arbitrary, data-accessing code satisfies
-DP (Rice's theorem), and arbitrary code can **exfiltrate raw records encoded in
-its outputs**. Therefore the only sound posture is: **mediate all data access
-through a trusted boundary the app cannot bypass, and gate every release.**
+dsFlower uses node-side central DP: each data node is a trusted curator for its
+local dataset and applies DP before egress. This is not formal local DP (LDP),
+where every individual randomizes their own record. dsFlower does not implement
+Secure Aggregation. A coordinator can therefore observe each already-private node
+update. Public coordinators are rejected unless the node administrator explicitly
+sets `dsflower.allow_untrusted_coordinator = TRUE`.
 
-Two distinct threats → two distinct controls (ship **both**):
+## 2. Two computation contracts
 
-| Threat | Control |
-|---|---|
-| **Exfiltration** (network / filesystem / env / process escape) | **Sandbox** the app (no net/FS, locked down) |
-| **Leakage through the legitimate model-update channel** (data packed into weights/metrics) | **DP + disclosure egress gate** (clip + noise + count filters) |
+### Declarative DP training (recommended)
 
-The sandbox stops exfiltration; **only DP bounds leakage through the one channel
-the app is allowed to use.**
+The researcher supplies data-only model and training specifications. The node
+builds and executes the computation with the canonical runner:
 
-## 2. Trust separation — who is trusted
+- neural/vision models use Opacus DP-SGD with per-example or per-patient gradient
+  clipping and a CSPRNG-backed Gaussian stream;
+- DP-GBDT uses data-independent tree structure, bounded gradients/Hessians and
+  node-side Gaussian leaf-histogram noise;
+- only allowlisted, per-sample-safe operations and losses are admitted;
+- the manifest pins mechanism, model spec, loss, batch size, local epochs,
+  horizon, feature count and public preprocessing bounds before execution.
 
-The researcher **provisions the app** but is **NOT trusted** by the data custodian.
-On each node, two things coexist with opposite trust levels:
+This contract reaches `nn.Module`-level granularity because the trusted runner
+owns the training loop and observes per-sample gradients. Extending the
+declarative vocabulary is the safe way to add flexibility.
 
-| On the node | Installed by | Trusted? |
-|---|---|---|
-| **dsFlower framework** (sandbox, validation, egress gate, DP harness, relay, disclosure controls) | the **node admin / data custodian** (vetted, audited code) | **YES** |
-| **The researcher's app** (model + training code) | the **researcher**, per-run via upload | **NO** |
+### HookApp (legacy name: Tier2)
 
-The researcher brings the *what to train*; the framework owns the *what may leave
-the node*. The app can never touch the framework's enforcement machinery.
+A HookApp exposes only:
 
-## 3. Runtime topology
-
-```
-[ NODE — data custodian's machine ]                          [ RESEARCHER ]
-  ClientApp (researcher's app / trusted Tier-1 harness, in SANDBOX: no net/FS)
-       │  emits one Flower Message (RecordDict / ArrayRecord)
-       ▼  (ClientAppIo gRPC, localhost)
-  ┌─────────────────────────────────────────┐
-  │  TRUSTED DP + DISCLOSURE EGRESS GATE     │  ← ClientAppIo interceptor: the one
-  │  clip + noise + count-filter the Message │    place the update is in parseable
-  └─────────────────────────────────────────┘    RecordDict form. Sole gate off-node.
-       │  sanitized Message only
-       ▼  (localhost)
-  SuperNode (framework, trusted)
-       │  Fleet-API gRPC bytes (HTTP/2 over TCP)
-       ▼  transparent byte tunnel over DSI (datashield.aggregate; no open ports)
-                                              SuperLink + ServerApp (aggregation)
+```text
+initial_arrays(config, input_dim) -> numeric arrays
+local_update(global_arrays, X, y, config) -> numeric arrays
 ```
 
-- The researcher's **ClientApp runs sandboxed** (`--isolation=process` + gVisor /
-  bubblewrap; no network, read-only data mount, scrubbed env, seccomp, cgroups).
-- The **egress gate is a ClientAppIo interceptor** — trusted framework code sitting
-  between the (untrusted, sandboxed) ClientApp and the SuperNode. This is where the
-  update is still a parseable Flower `RecordDict`, so the gate can clip + noise the
-  tensors and count-filter the metrics. It is a separate trusted process, **not** an
-  in-app Flower Mod (Mods run in-process with the untrusted ClientApp and can be
-  disabled by it). Everything downstream is post-gate, so the SuperNode↔SuperLink
-  transport stays a transparent byte tunnel — no need to parse Fleet RPCs.
-- The **SuperLink + ServerApp (aggregation)** run on the researcher side (standard
-  Flower). They are not trusted for client-egress enforcement (the gate already
-  sanitized everything before it left the node).
+It is not a general node-side Flower App. The node never imports its
+`local_update` in the trusted parent. It verifies the uploaded ZIP and package
+hash, launches a fresh isolated child with a minimal environment, validates the
+numeric result, clips the complete update to the `C` ball, and applies an
+RDP-calibrated Gaussian mechanism with sensitivity `2C`.
 
-## 4. The two disclosure checkpoints
+When an attested Bubblewrap filesystem/network sandbox and a constant-time
+envelope are available, the node may run the hook on a fixed, public `k` disjoint,
+isolated blocks and release the clipped mean at conservative sensitivity
+`min(2C, 4C/k)` (a changed patient identifier may affect two blocks). `k` is
+administrator-pinned and never derived from private cohort size, because a
+data-dependent Gaussian variance would itself leak.
+Without all required controls, HookApps are not executed and the Flower operation
+returns the incoming public model unchanged.
 
-Disclosure control runs at **two moments**, both option-driven (same thresholds):
+Arbitrary code cannot generically receive DP-SGD granularity. Static inspection
+cannot prove that a custom training loop has per-sample-independent gradients or
+that it has no side channel. To obtain Tier-1 granularity, express the operation
+as a declarative spec or add a custodian-reviewed operation to the canonical
+runner.
 
-1. **Admission (input) — before training.** At prepare time the node checks the
-   local dataset is usable + non-disclosive: minimum rows (`nfilter.subset` /
-   `dsflower.min_train_rows`), minimum per-class / event counts (`nfilter.tab`),
-   class-distribution validation. Too small / too imbalanced → **refuse to
-   train** (DataSHIELD convention: never operate below the filter; and DP on a
-   tiny set is both useless and risky).
-2. **Egress (output) — the gate.** Every object leaving the node (weights,
-   metrics, sizes, even the initial-params request) passes the DP + disclosure
-   gate.
+`ds.flower.tier2.run()` remains a compatibility alias for the HookApp API. The
+old independent `dsflower_tier2` runner has been removed so there is only one
+code path to audit and pin.
 
-Defense in depth: admission prevents disclosive-tiny training at all; egress
-guarantees what comes out.
+## 3. Lifetime accounting without query blocking
 
-## 5. The egress gate — DP + disclosure, two tiers
+Exact replays of a Flower message never create a second private release. The
+cached response is reused when available; otherwise the incoming public model is
+returned unchanged. Every new release is claimed transactionally before any
+private computation.
 
-The gate is a trusted node-side component at the **ClientAppIo boundary**,
-intercepting the Message **after** the sandbox produces it and **before** the
-SuperNode can ship it. It treats every Message as adversarial: wrong shape/dtype →
-reject; conforming tensors → **clipped + noised unconditionally**; metrics/sizes →
-deterministic backstop. For **Tier 1** the trusted harness already produced a
-DP-SGD update, so the gate is a backstop; for **Tier 2** the gate is where DP is
-actually applied (output perturbation on the whole update).
+For new run `n`, starting at one, the persistent accountant reserves:
 
-**Tier 1 — submit a MODEL (best utility).** The app provides only a forward-pass
-`nn.Module` + declarative config. The trusted harness runs **Opacus DP-SGD**:
-per-sample gradient clipping to `C`, Gaussian noise, RDP **+ PRV accountant**,
-amplification by subsampling → tight DP, good numbers. The sensitivity bound
-comes from the **harness's clipping**, not user code, so DP holds for *any*
-module.
+```text
+w_n       = s (1 - rho) rho^(n - 1),  s = 1 - 10^-12
+epsilon_n = epsilon_total w_n
+delta_n   = delta_total w_n
+```
 
-**Tier 2 — submit an arbitrary APP (max flexibility).** The gate hard-clips the
-whole returned update to L2 norm `C` and adds Gaussian noise calibrated to
-`(ε, δ)` composed over rounds (DP-FedAvg, McMahan et al. 2018). Guaranteed for
-*any* app, but coarser (no per-sample structure, no amplification → noise larger
-by ~√(model-dim)). Use when arbitrary client code is required and the utility
-cost is accepted.
+Because the weights sum to less than one (the tiny slack avoids floating-point
+overshoot), basic adaptive composition bounds every finite
+prefix and the infinite transcript by
+`(epsilon_total, delta_total)`. A failed execution after reservation is not
+refunded.
 
-**The built-in Tier-1 suite (tight DP by construction).** The node builds every
-Tier-1 model from a declarative SPEC over a fixed, per-sample-safe op + loss
-allowlist — no researcher code runs, so DP-SGD is sound by construction:
+This schedule never rejects a run because a budget counter reached a hard cap.
+However, finite total privacy and infinitely many informative queries are
+mathematically incompatible: `epsilon_n` and `delta_n` must tend to zero. Once an
+allocation is below the node's numerical release threshold, the operation
+completes with a data-independent unchanged model. Adding a positive epsilon
+floor would make the lifetime sum diverge and is not allowed.
 
-- *GLM / tabular:* logistic, linear, multiclass, multilabel, Poisson, **negative
-  binomial**, **gamma**, **ordinal (CORN)**, **linear SVM (hinge)**.
-- *Penalized:* **ridge (L2)**, **lasso (L1)**, **elastic-net** — applied as
-  post-processing of the already-DP update (no privacy lever).
-- *Deep:* MLP, **2D CNN**, **TCN (dilated conv1d)** via the shape-threaded spec
-  vocabulary (`reshape → conv1d/conv2d/maxpool2d/adaptiveavgpool2d/flatten →
-  linear`); frozen-backbone vision heads (ResNet-18, DenseNet-121); DP-GBDT trees.
+The default privacy domain is the entire node, not a dataset fingerprint.
+Subsetting, renaming or changing one row therefore cannot reset the lifetime
+budget. Multiple domains are disabled by default and are sound only when the
+custodian certifies that their populations are disjoint.
 
-Tight DP is GROWN by enriching this vetted allowlist — never by trusting client
-code. Two sound extension points: the **custom-loss factory**
-(`_CUSTOM_LOSS_FACTORY` — vetted node-side per-sample losses; cfg supplies only
-DP-irrelevant shape hyperparameters) and the **op allowlist** (every op
-per-sample, asserted by `per_sample_independence_probe`). Anything that would need
-a cross-sample loss (Cox partial likelihood), a custom forward (RNN take-last), or
-a non-sequential graph (U-Net skips) is **automatically routed to the Tier-2
-output-perturbation floor** — the gateway never grants tight DP it cannot
-guarantee by construction, and never fails open.
+Accounting is per node. For a person present at multiple nodes whose private
+updates are all observed, the node guarantees compose sequentially: their
+epsilons and deltas add. Parallel composition applies only when node populations
+are disjoint. A federation-wide guarantee over overlapping sites therefore
+requires a shared person-level accountant beyond this package's node ledger.
 
-**Server-authoritative DP (the trust boundary).** The node is the only trusted
-party; the client (researcher) is untrusted. The client submits only WHAT to
-compute — the node decides and enforces ALL of how-private, and the client cannot
-weaken it (nor even request stronger — the budget is the custodian's resource):
+The SQLite ledger uses `BEGIN IMMEDIATE`, WAL, `synchronous=FULL`, unique run and
+release constraints, and mode `0600`. Policy values are bound on first use;
+changing them later fails closed. SQLite is a single-host backend. Replicas that
+protect the same population require one shared transactional accountant and
+anti-rollback operational controls; independent local ledgers multiply the
+declared guarantee.
 
-- *Mechanism* is node-pinned and routed by code identity: the DP-SGD path only ever
-  runs the hash-verified harness on a data-only spec; an uploaded user-module is
-  forced to the output-perturbation floor (`client_app.train`). A client cannot
-  route its own code to the tight track.
-- *Parameters* (ε / δ / clip) come from this node's options
-  (`dp_epsilon`/`dp_delta`/`dp_clipping_norm`), OVERRIDING anything the client sends
-  (`.addDpConfigToRunConfig`), bounded by ceilings and an RDP/PRV budget ledger.
-- *Budget* is keyed by DATA identity (table fingerprint + target), never the
-  client-chosen assign symbol — so a sybil client cannot reset the budget by
-  re-assigning the same data to a fresh symbol.
-- *Noise* is drawn from a fresh OS-entropy generator (`np.random.default_rng`),
-  isolated from any global seeding (predictable noise would void DP).
-- The output-perturbation floor calibrates Gaussian noise to the C-ball DIAMETER
-  **2C** (arbitrary code's true L2 sensitivity), not C.
+## 4. Deterministic randomness
 
-Corroborated by an independent design review (Codex) and a multi-source deep-research
-pass: server-authoritative / client-untrusted enforcement is established prior art
-(DataSHIELD custodian-only parameters; Google Confidential Federated Computations); a
-verifiable budget ledger is essential (re-runs average the noise out); and a
-declarative DSL + Opacus covers conv/RNN/LSTM/GRU/attention — but ONLY with the node's
-OWN per-sample-independence gate, because Opacus' ModuleValidator is non-exhaustive (it
-cannot see `x - x.mean(0)`, batch attention, or Cox risk-set coupling). That gate is
-`per_sample_independence_probe` + `assert_stock_architecture`. Sample-and-aggregate and
-PATE are not worth adding as a universal floor in few-site cross-silo; the Gaussian
-output-perturbation floor remains the universal mechanism.
+Determinism is retained only as release-scoped, secret-keyed randomness:
 
-**DataSHIELD backstop (deterministic).** Independent of DP, every release passes
-minimum-count control: counts ≤ threshold are suppressed/bucketed; `num_examples`
-/ sizes are count-bucketed. *Any metric not noised-or-bucketed is an exfiltration
-channel* → the backstop must cover all of them.
+```text
+release_key = HMAC-SHA256(node_secret,
+                          protocol_version || release_id)
+subkey      = HMAC-SHA256(release_key, mechanism_axis)
+```
 
-**Accountant.** RDP **+ PRV** (tighter ⇒ less noise for the same ε). Reject if
-spent ε > `dsflower.dp_max_epsilon`.
+The dedicated node secret is 32 bytes from `/dev/urandom`, created at runtime,
+stored outside staging with mode `0600`, and never exposed to a HookApp. There is
+no fallback to R's RNG, a client seed, `datashield.seed`, a predictable constant
+or a secret baked into a container image.
 
-**Guarantee & boundary.** Output is `(ε, δ)`-DP and passes minimum-count control
-for any app (both are post-processing on enforced-bounded outputs). Boundary: a
-sandbox escape, a metric routed around the gate, or an over-large ε void it.
+DP Gaussian values come from a ChaCha20 stream with domain-separated subkeys.
+Poisson sampling and HookApp partitioning use their own ChaCha20 subkeys. Torch
+initialization/dropout is data-independent and uses a separate HMAC-derived seed
+through the framework PRNG; it is not a DP-noise source. No privacy-critical
+stream is reused. The derivation deliberately does not include configuration or
+private data: mechanism randomness must be independent of the protected dataset.
 
-## 5b. Images (dsImaging collections) — DP linear-probing on frozen features
+A single fixed noise vector for all distinct queries is unsafe because correlated
+answers can cancel it. Sticky noise only solves repeated identical queries. In
+dsFlower, exact protocol retries are memoized, while distinct releases receive
+unique keys and are covered by the lifetime accountant.
 
-Image inputs arrive as **dsImaging collections**, not pixel tables: a manifest +
-a samples metadata table (`sample_id`, a per-sample `relative_path`, the label,
-optional `patient_id`) over a zero-copy image root. The R staging
-(`.stageFromDescriptor_image`) resolves the collection to a local root + samples
-table; the harness reads **paths + labels only** — pixels stay on disk and are
-read lazily during feature extraction. Image bytes never leave the node.
+## 5. Server-authoritative manifest
 
-**Why not naive DP-SGD on the pixels.** DP-SGD noise scales `~ σ·C·√d`; a full
-vision net has enormous `d`, so naive vision DP-SGD is poor (literature: ~61% at
-ε≈47). So the harness **freezes a pretrained backbone** (resnet18/50/densenet121;
-MONAI 3D opt-in) — no gradients, `eval`, no-grad extraction — and DP-trains **only
-a small linear head** on the extracted features. Tiny effective `d` ⇒ small noise
-(last-layer / linear-probe DP, the dominant practical recipe). The frozen
-backbone's BatchNorm never enters the trainable graph, so Opacus' per-sample
-requirement is met without touching it.
+The client can request a valid declarative computation but cannot set or weaken:
 
-**The disclosure vector for images is the model UPDATE.** Gradient-inversion
-attacks (DLG / Inverting-Gradients / GradInversion) reconstruct *training images*
-from a single update; batches `<32` are unsafe, and **dsFlower has no Secure
-Aggregation**, so the per-node **local DP gate is the sole defense**. Mitigations:
-(1) the communicated update is a **low-dim feature-space head gradient**, far
-harder to invert into pixels than a full-network gradient; (2) Opacus **noises**
-it; (3) vision batch size is **floored to ≥32** (clamped up, never down) before
-training. Raw pixels never transit.
+- total or per-run epsilon/delta;
+- clipping norm;
+- privacy domain or allocation index;
+- release horizon;
+- lifetime DP unit, patient column and identifier canonicalisation;
+- HookApp enablement, sandbox attestation, timeout or timing envelope;
+- exact metrics, counts, logs or feature statistics.
 
-**2D/3D, auto + plug-and-play.** File format and dimensionality are auto-detected
-at read time (`.nii/.nii.gz`→nibabel, `.nrrd`→pynrrd, `.mha/.mhd/.dcm`→SimpleITK,
-else PIL). The default **2D backbone handles both** 2D images directly and 3D
-volumes via a representative middle slice; `volumetric=TRUE` opts into a true-3D
-MONAI backbone for precision. `feature_dim` is **fixed per backbone**, so the
-ServerApp builds the head **without any images** and every node shares the same
-feature space (a **pinned** weights enum, not the version-dependent `DEFAULT`) ⇒
-FedAvg over heads is valid. Segmentation (U-Net) is **rejected** — linear-probing
-is classification only. *Air-gap, fail-closed:* 2D backbone weights come from the
-torchvision cache and the 3D backbone needs MONAI; if either is missing the
-harness raises a **clear error** rather than silently substituting random weights
-— a per-node random init would put nodes in different feature spaces and make
-FedAvg over heads invalid. An offline node must pre-seed `TORCH_HOME` / install
-MONAI; all nodes must match.
+Server-owned structural manifest fields cannot be duplicated or overridden by
+the client. The Python release guard cross-checks domain, allocation, horizon,
+epsilon and delta against SQLite; the manifest alone is never authoritative.
 
-**Disclosure unit = the PATIENT (admission).** Image collections hold one row per
-*image*, but several images can share a patient. Admission auto-detects a
-patient/subject column (or `dsflower.patient_column`) and counts **distinct
-patients** for both the minimum collection size *and* the minimum per-class count
-(`.imageDisclosureUnits` dedups to one row per `(patient,label)`). This catches
-the "many images, few patients" leak that per-image counting misses (e.g. 18-vs-12
-*images* but only 2 *patients* in a class → refused). No patient column → per-image.
+The node pins the recursive runner hash. The client's bundled runner must be
+byte-identical, and `tools/check-runner-sync.py` provides a CI check. Uploaded
+archives are capped while streaming, SHA-256 verified, safely extracted without
+path traversal/symlinks/devices/ZIP bombs, scanned, re-hashed immediately before
+execution and mounted read-only in the HookApp sandbox.
 
-**DP unit = the PATIENT when grouped (implemented), else the image.** When a
-patient/subject column is present **and** labels are patient-level, the harness
-**mean-pools the frozen features per patient** before the DP head step, so the DP
-example *is* the patient and the formal DP unit matches the per-patient admission
-unit — no group-privacy gap, and the Opacus sample-rate/accountant automatically
-use the patient count. It stays **per-image** only when there is no patient column,
-or when a patient mixes labels (slice-level labels, where pooling would corrupt
-them); then a patient with `k` images has a per-patient guarantee weaker by up to
-`k` (group privacy). The pooling column is the **same** one admission grouped by
-(pinned in the manifest as `patient_column`), so the two never diverge.
+## 6. Data and release minimization
 
-## 5c. Tier-2 egress hardening — process isolation + sample-and-aggregate
+- Exact feature sums, sums of squares and sample counts are disabled. New runs
+  may use analyst-supplied public lower/upper bounds; training and prediction
+  apply the same clipping and affine transform.
+- Node-side logs and metrics are not returned through DataSHIELD.
+- Flower aggregation weights are fixed to one instead of revealing local cohort
+  size.
+- The node secret, ledger path, staging path and run token are not returned.
+- Patient identifiers are preserved only for local grouping, excluded from model
+  features and selected only by lifetime administrator policy. The default is
+  row-level. Patient mode requires one explicit `dsflower.patient_column`, a
+  stable identifier roster across releases; there is no auto-detection or row
+  fallback. Missing/empty/reserved identifiers are collapsed into one fixed,
+  conservative sentinel unit, so they cannot create a prepare error oracle. A
+  per-person interpretation still requires a complete roster. Unit, column and
+  canonicalisation version are bound into the persistent policy hash.
+- Target labels/ranges are public manifest inputs, not cohort statistics.
+  Ordered `target_levels` define classification codes; regression/count requires
+  finite `target_bounds`. Unknown/missing labels map to public code zero;
+  non-finite/unparseable numeric targets map to the public-bounds midpoint and
+  are clipped. Selected numeric model features use the public-bounds midpoint or
+  zero; numeric values and public bounds are limited to magnitude `1e6` before
+  float32 runner arithmetic. These maps are record-local and never drop a row.
+- Declarative operations are total over that numeric domain: division uses a
+  fixed denominator floor; every operation saturates non-finite/intermediate
+  values; parameters/intermediates are bounded to `1e6`; and heads use `30` for
+  logits/log-links or `1e6` for direct MSE regression. Before Opacus computes
+  its global per-sample L2 clip, every `grad_sample` is coordinate-totalised at
+  the same server-owned `C`, preventing an overflowing backward pass from
+  turning `inf * 0` into a noise-erasing `NaN`.
+- Admission does not inspect class/event frequencies, because success versus
+  error would otherwise be a label-dependent release outside DP. It has no
+  minimum row/patient threshold either: tiny and empty runs reach the trusted
+  mechanism instead of returning an exact prepare-time count predicate.
+- Adjacency is explicitly bounded/replace-one with a fixed number of privacy
+  units. Neighbours replace one row, or one complete configured patient unit.
+  The package does not claim unbounded add/remove membership privacy for a
+  changing unit count.
 
-Arbitrary uploaded `local_update` (the Tier-2 floor) runs **out-of-process**. The node spawns
-a **fresh interpreter** (`egress_child.py` via `subprocess` fork+exec — never multiprocessing
-fork, which inherits gRPC/curl threads and segfaults here) that imports the upload by name and
-runs it on a block of data; it can only hand back plain `.npy` arrays. The **trusted parent
-never imports or executes the upload** and does ALL DP (clip to the C-ball + analytic-Gaussian
-noise), so an upload cannot monkeypatch the DP harness / NumPy / the RNG. Hardening:
+The next lifetime allocation is reserved before prepare reads private contents;
+failed attempts are charged without refund and ensure only repeats the idempotent
+lookup. Accounting alone does not privatise an exception, which is why the
+value-dependent preprocessing above is total rather than merely error-sanitised.
 
-- **Result loaded `allow_pickle=False`**, exact array-count checked first, per-file size capped
-  before load, every file `lstat`-checked as a regular file (no FIFO/symlink/device).
-  **validate-or-zero**: any crash / timeout / wrong-shape / non-finite / oversized → a zero
-  delta (inside the C-ball; sound + leak-safe).
-- **Sealed parent imports**: `dp_harness`/`dp_gbdt` are imported relatively / by explicit
-  co-located path, so an upload on `sys.path` cannot shadow them into the parent.
-- **Process-group kill** by cached pgid (reaps backgrounded grandchildren); rlimits
-  (CPU/FSIZE/CORE); sanitized `cfg` (no DP params, paths, or secrets).
-- **Network**: the child neuters Python sockets *and* installs an unprivileged **seccomp-BPF**
-  (Linux x86_64/aarch64) that EPERMs the socket syscalls. The production boundary remains the
-  **container egress policy** (deny outbound from the data node).
-- **Timing side-channel**: optional **constant-time padding** (`dsflower.dp_egress_time_pad`
-  seconds; set ABOVE the egress timeout, i.e. timeout + a cleanup guard) so a child that
-  sleeps/returns on a data predicate cannot leak it via round duration — the child is killed
-  at an absolute in-envelope deadline, then the call sleeps to the fixed pad. Off by default
-  (adds latency).
-- **Budget reserve-before-release**: the RDP/PRV ledger is charged at **prepare** (idempotent
-  by `run_token`), not at cleanup, so a run that releases but whose cleanup never fires still
-  spent its budget (the safe direction).
+The model itself is the intentional DP release. Model inversion is not made
+impossible; DP bounds how much the output distribution changes when one privacy
+unit is replaced.
 
-**Sample-and-aggregate (2C/k)** is the **node's automatic, server-managed** choice (never a
-researcher opt-in): `_choose_blocks` picks `k = min(sa_max_blocks, n // sa_min_block)` from the
-public row count. It is **sound-or-disabled**: it runs only when `_full_sandbox_ok` holds — a
-**verified minimal bubblewrap sandbox** (`--unshare-all`, fresh tmpfs root, only code dirs +
-the block's own input bound — never other records) AND the custodian attests
-`DSF_SAA_SANDBOX_OK=1`. Otherwise the universal **plain 2C floor** runs (process isolation
-alone). To **enable SAA** an operator must: (1) run the rock container with user namespaces
-enabled (so `bwrap --unshare-all` works — the default containers lack `cap_sys_admin`/userns,
-so SAA stays off), (2) install `bwrap`, (3) audit that `_code_dirs()`/`sys.path` expose only
-code (no data), (4) set `DSF_SAA_SANDBOX_OK=1`, and (5) ideally set `dp_egress_time_pad`. SAA
-then auto-engages where it improves utility.
+## 7. Custodian options
 
-## 6. Transport — DSI as a transparent byte tunnel (salvaged)
+Options follow DataSHIELD's `dsflower.*` / `default.dsflower.*` fallback. The
+important privacy options are:
 
-**The DataSHIELD connection we are handed *is* the channel** — the researcher's R
-client cannot assume any open ports, and the node never dials out. All transport
-rides `datashield.aggregate` (request/response, researcher-initiated polling).
+| Option | Default | Meaning |
+|---|---:|---|
+| `dp_total_epsilon` | `3` | Node/domain lifetime epsilon, maximum `10` |
+| `dp_total_delta` | `1e-5` | Node/domain lifetime delta, maximum `1e-3`; choose materially below `1 / protected_units` |
+| `dp_budget_decay` | `0.5` | Geometric `rho`, in `[0.5, 0.99]` |
+| `dp_min_release_epsilon` | `1e-6` | Per-message numerical viability threshold and hard safety minimum, not an allocation floor |
+| `dp_min_release_delta` | `1e-12` | Per-message numerical viability threshold and hard safety minimum |
+| `privacy_ledger_path` | persistent node path | SQLite ledger; ephemeral paths rejected |
+| `dp_privacy_domain` | `node` | Accountant domain |
+| `dp_unit` | `row` | Lifetime adjacency unit (`row` or `patient`) |
+| `patient_column` | unset | Required explicit stable ID column in patient mode |
+| `dp_allow_multiple_domains` | `FALSE` | Requires certified disjoint populations |
+| `dp_clipping_norm` | `1` | Server-owned clipping bound |
+| `node_secret_path` | `/var/lib/dsflower/node_secret` | Dedicated 256-bit key |
+| `tunnel_chunk_bytes` | `1048576` | Per-exchange decoded tunnel payload cap (16 KiB--8 MiB) |
+| `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; TCP backpressure when full |
+| `tunnel_request_max_bytes` | `67108864` | Pre-decode cap for an encoded fan-out request |
+| `tunnel_loss_tolerance` | `180` | Relay-heartbeat timeout in seconds (`5`--`86400`) |
+| `hook_enabled` | `FALSE` | Permit HookApp execution |
+| `hook_sandbox_attested` | `FALSE` | Custodian attests the Bubblewrap boundary |
+| `dp_sample_aggregate` | `FALSE` | Enable fixed-block HookApp sample-and-aggregate behind every sandbox gate |
+| `dp_sa_blocks` | `8` | Fixed public block count in `[2, 64]`; never private-size adaptive |
+| `dp_egress_timeout` | `900` | Hook child timeout in seconds |
+| `dp_egress_time_pad` | `0` | Zero disables HookApp execution; otherwise at least `dp_egress_timeout + 5` |
+| `dp_egress_memory_mb` | `8192` | Hook child address-space limit in MiB (`512` to `131072`) |
+| `dp_egress_file_mb` | `1024` | Per-file Hook child write limit in MiB (`16` to `16384`) |
+| `dp_egress_processes` | `128` | Hook child process/thread limit (`1` to `1024`, where supported) |
+| `expose_privacy_status` | `FALSE` | Expose allocation count/status to clients |
+| `allow_untrusted_coordinator` | `FALSE` | Permit observation of already-private per-node updates |
 
-**Mechanics (the hard constraint).** Payloads move as **base64 string arguments
-of `aggregate` function calls** (`flowerTunnelExchangeDS(cid, <b64>)`), never via
-`datashield.assign(assign.expr=…)` — building data into an assigned R expression
-hits R/Opal's expression-size ceiling and forces pathological chunking. The
-aggregate-with-direct-string path is the efficient one; we do our **own** offset
-framing on top of it for anything over a single call's ceiling.
+Example node policy:
 
-**Transparent, not RPC-parsing.** The new Fleet API is discrete RPCs, but on the
-wire it is still gRPC/HTTP-2 **over a TCP byte stream**. We tunnel those bytes
-verbatim — no need to parse `PullMessages`/`PushMessages`, because the egress gate
-already sanitized the update upstream at ClientAppIo (§5). This keeps the relay
-simple, Flower-version-agnostic, and protocol-agnostic.
+```r
+options(
+  default.dsflower.dp_total_epsilon = 3,
+  default.dsflower.dp_total_delta = 1e-5,
+  default.dsflower.dp_budget_decay = 0.5,
+  default.dsflower.dp_unit = "row",
+  default.dsflower.privacy_ledger_path = "/var/lib/dsflower/privacy/ledger.sqlite",
+  default.dsflower.node_secret_path = "/run/secrets/dsflower_node_key",
+  default.dsflower.hook_enabled = FALSE
+)
+```
 
-- **Salvage ~verbatim** the loss-free, offset-based idempotent relay
-  (`dsi_pump.R` researcher side / `dsi_tunnel.R` node side): the relay owns the
-  byte offsets (`up_off`/`down_sent`), one fan-out `flowerTunnelExchangeDS` per
-  cycle keeps all nodes lock-step, a generation counter resets a node on SuperNode
-  redial, `relay_hb` gives the forwarder a liveness TTL, orphan reaper cleans up.
-- **Keep** the node-side `dsi_tunnel_forward.py` TCP↔spool bridge: the SuperNode
-  must dial a local TCP endpoint, and the bridge is what moves those bytes into the
-  spool the relay drains. It is protocol-agnostic loopback IPC (not an open
-  cross-host port), so it satisfies the no-open-ports constraint.
-- **Few-round / one-shot default** (`dsflower.default_rounds = 1`): DP-SGD's RDP
-  accounting composes over total local steps regardless of round count, so many
-  local epochs in few rounds = same ε, far fewer expensive round-trips. The ~1-min
-  federation setup + per-round latency dominate, so minimizing rounds is the main
-  speed lever (SecAgg removal already gave ~1.8×; one-shot adds more).
+Changing a bound after the ledger has been initialized is rejected. To rotate a
+node secret without changing past releases, keep the old key available until no
+active/retryable run references it; production secret rotation should use key IDs
+and a secret manager.
 
-## 7. App lifecycle: build → upload → install → validate → run
+Deterministic noise is generated from HMAC(node secret, unique ledger release
+identity) and a domain-separated ChaCha20 stream. It gives computational DP
+conditional on key secrecy and identity non-reuse. A later compromise of a
+persistent key can recreate historical streams for known release identities;
+high-assurance deployments should use versioned KMS/HSM keys, bounded retry
+windows and cached exact replies so retired key versions can be destroyed.
 
-1. Researcher: `flwr build` → **FAB** (zip) + **sha256**.
-2. `flowerAppPushDS(chunk_b64, offset)` (**aggregate**-side, idempotent offset
-   append — same direct-string discipline as the relay, never `assign.expr`) until
-   complete → `flowerAppInstallDS(token, expected_hash)`.
-3. Node: reassemble, **verify sha256 == expected_hash** (reject mismatch), unpack
-   into an isolated venv.
-4. **Validation pipeline** (gates install — see §8). Pass → register by hash;
-   fail → purge + generic error.
-5. Run executes **only the validated FAB, by hash** — the researcher cannot run
-   un-validated code.
+The DSI tunnel is authorized only by a valid session capability whose exact
+forwarder process is alive and has published readiness after binding loopback.
+Startup is transactional on both sides: failures kill/clean the node process and
+the client aborts and tears down every attempted site. Per-session exchange
+locks, negotiated chunks, bounded client buffers and capped node spools prevent
+unbounded request, memory and disk growth. Spools reset at connection-generation
+boundaries; they are not compacted concurrently because doing so without a
+cross-language transactional offset protocol could duplicate or drop bytes.
 
-**How the node runs *trusted* code without Flower node-pinning.** In Flower
-deployment the SuperNode runs the ClientApp from the **submitted FAB** (even under
-`--isolation=process`), so we cannot simply substitute a node-local app. Instead we
-use **content-hash verification** (`flowerVerifyAppHashDS`, already present):
+A pre-unit legacy ledger is not migrated automatically. Its historical adjacency
+cannot be inferred from stored state: changing a patient identifier can affect
+two patient groups even when only one row changes. Such a ledger therefore fails
+closed until an administrator performs a separately audited migration with an
+explicitly attested historical unit and adjacency contract.
 
-- **Tier 1 (model submission).** The node ships the canonical harness app + its
-  content hash. The client builds a bit-identical copy and submits it; the node
-  **verifies the submitted app's content hash == its trusted harness hash** and
-  rejects any mismatch. The Opacus DP-SGD loop is therefore guaranteed to be the
-  trusted one. The model architecture + hyperparameters arrive **only via the
-  server-written, tamper-proof manifest** (`model_zoo` builds the module from the
-  spec) — the client ships *no* training code.
-- **Tier 2 (arbitrary app).** The submitted FAB's hash will not match the harness,
-  so it is treated as untrusted: the **exfiltration scan** (§8) gates install, then
-  it runs in the **sandbox** behind the **ClientAppIo egress gate**
-  (output-perturbation DP). Code is contained + every release is gated, so
-  node-trust is not required.
+### Deployment reproducibility and state
 
-## 8. Validation pipeline (before any real data is touched)
+The provisioner admits Flower 1.31.x, Torch 2.x, Opacus 1.x and torchvision 0.x,
+then records the exact resolved environment in `.dsflower_versions.txt`. The
+capability response includes the core versions and that manifest's SHA-256. This
+records a range-based resolution but cannot reproduce it later. Production nodes
+should instead provide a complete, root-owned `DSFLOWER_PYTHON_LOCK` whose every
+transitive artifact is pinned and hashed; `uv pip install --require-hashes` then
+fails closed
+on an incomplete lock. `DSFLOWER_REQUIRE_PYTHON_LOCK=true` prevents accidental
+fallback to range resolution. `DSFLOWER_PYTHON_VERSION` should also name an exact
+patch release to prevent patch drift (the default `3.11` is a compatibility
+selector); the immutable container digest remains the exact deployment identity.
+Missing `uv` is bootstrapped only from an exact release
+tag plus an administrator-provided archive SHA-256, never `latest` or `curl|sh`.
+Production images should be selected by immutable digest, including the Rock base
+image used to build dsFlower; the supplied Dockerfiles deliberately have no base
+image default.
 
-Validation differs by tier, because the tiers carry DP differently. (These are
-distinct checks — do **not** apply Tier-1's per-sample-gradient rules to a Tier-2
-app, which legitimately runs its own `.backward`.)
+The ledger directory and node secret are persistent state, not image contents.
+They must survive rescheduling/upgrades and be backed up consistently as one node
+identity; neither may be rolled back or cloned to another node. Container
+deployments should persist `/var/lib/dsflower/privacy/` and inject the secret file
+separately. Mounting all of `/var/lib/dsflower` would hide the baked `venvs/` and
+is therefore not recommended. The package intentionally leaves volume/secret
+wiring to the Rock or cluster orchestrator.
 
-**Tier 1 (model submission) — MODEL validation.** The researcher ships only an
-`nn.Module` + config; the trusted harness owns the loop, so we validate the
-*architecture* is DP-SGD-compatible:
-1. **Opacus `ModuleValidator.is_valid`** — hard reject if false (no silent
-   `fix()`). DP-incompatible layers (BatchNorm couples samples) break the
-   per-sample sensitivity bound.
-2. **Synthetic dry-run** in the harness on tiny synthetic data: confirm per-sample
-   grads attach (`.grad_sample` per param) and the output is a fixed,
-   row-independent shape — catches batch-coupled losses (Cox risk sets,
-   contrastive) that silently break the bound.
+## 8. Residual boundaries
 
-**Tier 2 (arbitrary app) — EXFILTRATION scan.** The app trains itself and the
-egress gate applies output-perturbation DP, so the app *may* call `.backward`
-freely; validation is purely about containment (defence-in-depth for the sandbox,
-which is the real boundary):
-1. **AST scan** (Python `ast`): reject dynamic-code / process-escape / network-exfil
-   constructs — `eval`/`exec`/`compile`/`__import__`, dunder reflection, and imports
-   of `os`/`subprocess`/`socket`/`ctypes`/`requests`/`urllib`/`pickle`/`marshal`.
-2. **Hash-pin the reviewed FAB** (§7): only the exact validated bytes may run.
+The formal guarantee covers numeric releases from the canonical
+mechanisms. It does not claim protection against:
 
-The scan only closes trivial bypasses; the sandbox (M4) + egress gate (DP +
-disclosure) are the actual guarantees. The exact import allow/deny list is settled
-together with the sandbox's filesystem/data-access model (a Tier-2 app reads the
-staged data, so `open` on the data mount must be permitted while everything else
-is denied).
+- administrator or kernel compromise;
+- ledger deletion, snapshot rollback or cloning;
+- independent replicas with independent ledgers;
+- denial of service, process crashes or all timing/availability channels in the
+  declarative Tier-1 runtime;
+- privacy loss accumulated by other DataSHIELD packages or outputs outside
+  dsFlower;
+- populations that overlap across explicitly enabled privacy domains.
 
-## 9. DataSHIELD options (all node-side, the `.dsf_option` double-fallback chain)
+The R preparation layer totalises target-domain, selected-feature completeness,
+minimum-size and missing-patient-ID cases. Other schema, storage, image-decoding
+and runtime failures can still depend on inputs outside the supported mechanism
+domain.
 
-All read via `getOption("dsflower.X", getOption("default.dsflower.X", default))`,
-so a node operator sets them like any DataSHIELD option.
+The ClientApp transport boundary catches ordinary Python exceptions and returns
+the same Flower record schema with a constant aggregation weight and public/no-op
+arrays; it never sends the exception reason or traceback. This prevents direct
+private-value disclosure through errors, but does not make an invalid input or a
+data-dependent failure indistinguishable from a successful model: no-op content,
+process termination, availability and execution time remain outside the formal
+valid-input transcript guarantee. Covering those channels would require total
+preprocessing and a fixed execution envelope for every declarative mechanism.
+The canonical validators and numeric gates are therefore required to make
+data-dependent exceptions unreachable throughout the declared valid-input
+domain; a runtime that violates that requirement is a mechanism bug, not a
+property repaired by the transport fallback. Architecture probes use only
+public synthetic fixtures in tests and are never run on private training rows.
 
-- **Inherited disclosure filters:** `nfilter.subset` (min rows, default 3),
-  `nfilter.tab` (min cell count, default 3), `nfilter.levels.max` (default 40).
-- **DP budget / mechanism:** `dsflower.max_epsilon` (cumulative ε cap per dataset,
-  default 10), `dsflower.max_delta`, `dsflower.dp_epsilon_ceiling` (per-run ε
-  ceiling, default 10), `dsflower.privacy_ledger_path` / `dsflower.privacy_ledger_namespace`.
-- **Disclosure:** `dsflower.min_train_rows`, `dsflower.min_cell_count`.
-- **Run / upload limits:** `dsflower.max_rounds`, `dsflower.max_fab_bytes`
-  (Tier-2 upload cap, default 50 MiB), `dsflower.max_concurrent_runs`,
-  `dsflower.staging_root`, `dsflower.tunnel_loss_tolerance`, `dsflower.venv_root`,
-  `dsflower.max_obj_pulls` / `dsflower.max_obj_pushes`,
-  `dsflower.supernode_orphan_grace_minutes`.
-
-## 10. Package module layout
-
-**dsFlowerClient (researcher side):**
-`options.R` · `app_build.R` (FAB + hash) · `app_upload.R` (chunked push + install)
-· `dsi_relay.R` (salvaged, RPC-envelope framing) · `run.R` (install→validate→run)
-· `collect.R` (pull sanitized results) · `dp_request.R` (declare ε/δ/clip; server
-re-validates).
-
-**dsFlower (node side):**
-`options.R` · `app_store.R` (receive + hash-verify FAB) · `validate.R`
-(AST + ModuleValidator + dry-run) · `sandbox.R` (locked-down exec) ·
-`superlink.R` (per-run loopback SuperLink + SuperNode) · `dsi_exchange.R`
-(salvaged, RPC-envelope framing) · **`egress_gate.R` (trusted DP + disclosure
-gate)** · `dp_harness.R` (Opacus + RDP/PRV, always on) · `admission.R`
-(input disclosure checks) · `policy.R` (salvaged disclosure controls, no
-templates) · `staging.R` (salvaged manifest/descriptors) · `lifecycle.R`
-(link up/down, orphan reaper).
-
-## 11. Salvage / Rebuild / Delete
-
-- **Salvage (port ~verbatim):** offset-based idempotent relay framing +
-  generation/reap/heartbeat (`dsi_tunnel.R`/`dsi_pump.R`); `policy.R` disclosure
-  controls (`.disclosure_min_cell/rows`, `.assertMinSamples`,
-  `.validateClassDistribution`, `.sanitizeMetrics`, `.bucket_count`) minus the
-  `.TEMPLATE_*` matrices; `staging.R` manifest/zero-copy; the `.dsf_option` chain;
-  the client-side orphan reaper fix.
-- **Rebuild (new):** `app_build/upload/store` + fab-hash; `sandbox.R`;
-  `egress_gate.R` (ClientAppIo interceptor); `dp_harness.R` (RDP/PRV); `validate.R`;
-  `admission.R`.
-- **Delete:** all SecAgg paths; the `secure_aggregation` flag + `.resolve_secagg`
-  + `use_secagg` plumbing; `.TEMPLATE_*` matrices + the 18 built-in templates;
-  the legacy Strategy/compat (`start_grid`/`LegacyContext`) server entry; Tor /
-  remote-SuperLink addressing. (The `dsi_tunnel_forward.py` bridge is **kept** — the
-  transparent tunnel needs it; only the RPC-envelope idea was dropped.)
-
-## 12. Implementation milestones (incremental, recoverable)
-
-- **M0 — Reset.** Clean slate on a branch; remove deleted items; keep salvaged
-  primitives; scaffold the new module layout. (Recovery tag in place.)
-- **M1 — Transport.** RPC-envelope relay + per-run loopback SuperLink/SuperNode +
-  one-shot loop → validate a plain (no-DP) run end-to-end over DSI.
-- **M2 — DP harness (Tier 1) + minimal egress gate.** Opacus + PRV; validate DP
-  on an uploaded model federated.
-- **M3 — App lifecycle + validation.** Build/upload/install + hash verify; AST +
-  ModuleValidator + synthetic dry-run.
-- **M4 — Sandbox + Tier-2 gate.** gVisor/bwrap isolation; output-perturbation DP
-  for arbitrary apps.
-- **M5 — DataSHIELD options + disclosure backstop** on every output; admission
-  checks.
-- **M6 — Hardening.** Large payloads, reaping, concurrency limits, federated
-  smoke tests, docs.
-
-## 13. Key decisions (locked)
-
-- Egress gate **at the ClientAppIo boundary** as a trusted interceptor (no Flower
-  fork, not an in-app Mod). Transport stays a transparent DSI byte tunnel.
-- Standard Flower **ServerApp aggregation on the researcher side** (revisit custom
-  relay-side aggregation only if round-trips must be cut further).
-- **Tier-1 (model submission)** is the recommended path for good numbers;
-  **Tier-2 (arbitrary app)** is the flexible, coarser-DP fallback.
-- **Cox / coupled-loss survival:** rigorous DP via **output perturbation on the
-  dfbeta sensitivity**, or run as **Tier-2**; never present coupled-loss DP-SGD
-  as rigorous.
+HookApps have the stricter timing/network/filesystem gate because arbitrary code
+can intentionally create such channels. Declarative apps remain the only
+recommended path for strong privacy, useful accuracy and broad model support.

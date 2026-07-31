@@ -2,11 +2,11 @@
 % Please edit documentation in R/dsi_tunnel.R
 \name{flowerTunnelDownDS}
 \alias{flowerTunnelDownDS}
-\title{Stop the node-side tunnel forwarder/test processes and clean the spool (AGGREGATE)}
+\title{Stop this tunnel session's forwarder and clean its spool (AGGREGATE)}
 \usage{
 flowerTunnelDownDS(conn_id)
 }
 \description{
-Stop the node-side tunnel forwarder/test processes and clean the spool (AGGREGATE)
+Stop this tunnel session's forwarder and clean its spool (AGGREGATE)
 }
 \keyword{internal}

@@ -35,6 +35,8 @@ still node-built); the current vocabulary is the universal feed-forward space an
 covers every first-party model (tabular heads + frozen-backbone vision heads).
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -42,6 +44,39 @@ import torch.nn as nn
 _MAX_LAYERS = 64
 _MAX_WIDTH = 8192          # cap on a LITERAL linear width (symbolic @out is trusted)
 _MAX_DIM = 1 << 20         # sanity bound on any resolved dimension
+_MAX_PARAMETERS = 8_000_000
+_MAX_SAMPLE_ELEMENTS = 1 << 20
+_MAX_SPEC_B64_BYTES = 256 * 1024
+_MAX_SPEC_JSON_BYTES = 128 * 1024
+_MAX_NODE_INPUTS = 64
+_MAX_ACTIVATION_ABS = 1.0e6
+_MAX_OUTPUT_ABS = 30.0
+_MIN_DIVISOR_ABS = 1.0e-6
+_MAX_PUBLIC_SCALAR_ABS = 1.0e6
+
+
+def output_limit_for_loss(loss_name):
+    """Finite head domain: wide for direct regression, tight for logits/log-links."""
+    return _MAX_ACTIVATION_ABS if str(loss_name) == "mse" else _MAX_OUTPUT_ABS
+
+
+def _finite_tensor(value, limit):
+    """Total, sample-wise saturation for the declarative numeric domain."""
+    return torch.clamp(
+        torch.nan_to_num(value, nan=0.0, posinf=float(limit),
+                         neginf=-float(limit)),
+        min=-float(limit), max=float(limit))
+
+
+class FiniteClamp(nn.Module):
+    """Node-owned parameter-free finiteness gate inserted after every layer."""
+
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = float(limit)
+
+    def forward(self, value):
+        return _finite_tensor(value, self.limit)
 
 
 def output_width(loss_name, cfg):
@@ -69,8 +104,14 @@ def read_spec(cfg):
     raw = cfg.get("model-spec-b64")
     if not raw:
         raise ValueError("run config missing 'model-spec-b64' (neural track needs a spec)")
+    if not isinstance(raw, str):
+        raise ValueError("'model-spec-b64' must be a base64 string")
+    if len(raw) > _MAX_SPEC_B64_BYTES:
+        raise ValueError("encoded model spec exceeds %d-byte cap" % _MAX_SPEC_B64_BYTES)
     try:
-        data = base64.b64decode(str(raw), validate=True)
+        data = base64.b64decode(raw, validate=True)
+        if len(data) > _MAX_SPEC_JSON_BYTES:
+            raise ValueError("decoded model spec exceeds %d-byte cap" % _MAX_SPEC_JSON_BYTES)
         spec = json.loads(data.decode("utf-8"))
     except Exception as e:
         raise ValueError("could not decode model spec: %s" % e)
@@ -87,7 +128,11 @@ def _resolve_dim(v, dims):
         if v not in dims:
             raise ValueError("unknown symbolic dim %r (allowed: %s)"
                              % (v, ", ".join(sorted(dims))))
-        return int(dims[v])
+        resolved = int(dims[v])
+        if resolved < 1 or resolved > _MAX_DIM:
+            raise ValueError("resolved dim %r out of range [1, %d]: %d"
+                             % (v, _MAX_DIM, resolved))
+        return resolved
     if isinstance(v, bool) or not isinstance(v, int):
         raise ValueError("dim must be a positive int or a symbolic name, got %r" % (v,))
     if v < 1 or v > _MAX_DIM:
@@ -123,6 +168,40 @@ def _prod(shape):
     for s in shape:
         p *= int(s)
     return p
+
+
+class _BuildDims(dict):
+    """Symbolic dimensions plus a per-build parameter-allocation budget."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.parameter_count = 0
+
+
+def _validate_shape(shape, where):
+    """Reject hostile activation shapes before they reach a model forward pass."""
+    if not isinstance(shape, (tuple, list)) or not shape:
+        raise ValueError("%s produced an invalid per-sample shape %r" % (where, shape))
+    total = 1
+    for dim in shape:
+        if isinstance(dim, bool) or not isinstance(dim, int) or dim < 1 or dim > _MAX_DIM:
+            raise ValueError("%s has a dimension outside [1, %d]: %r"
+                             % (where, _MAX_DIM, dim))
+        total *= dim
+        if total > _MAX_SAMPLE_ELEMENTS:
+            raise ValueError("%s has %d per-sample elements (cap %d)"
+                             % (where, total, _MAX_SAMPLE_ELEMENTS))
+    return tuple(shape)
+
+
+def _reserve_parameters(dims, count, op):
+    """Reserve parameter storage before invoking any torch/opacus constructor."""
+    count = int(count)
+    total = dims.parameter_count + count
+    if count < 0 or total > _MAX_PARAMETERS:
+        raise ValueError("%s would bring the model to %d parameters (cap %d)"
+                         % (op, total, _MAX_PARAMETERS))
+    dims.parameter_count = total
 
 
 def _pos_int(v, name, hi=_MAX_DIM):
@@ -161,7 +240,9 @@ def _b_linear(s, shape, dims):
         raise ValueError("linear 'bias' must be a bool, got %r" % (bias,))
     # Applies to the LAST (feature) dim: [.., in] -> [.., out]. Works flat (MLP) AND
     # token-wise ([T, d] -> [T, out]) for transformers. Per-sample (no batch mixing).
-    return nn.Linear(shape[-1], out, bias=bias), tuple(shape[:-1]) + (out,)
+    out_shape = _validate_shape(tuple(shape[:-1]) + (out,), "linear")
+    _reserve_parameters(dims, shape[-1] * out + (out if bias else 0), "linear")
+    return nn.Linear(shape[-1], out, bias=bias), out_shape
 
 
 def _b_relu(s, shape, dims):     return nn.ReLU(), shape
@@ -185,6 +266,7 @@ def _b_layernorm(s, shape, dims):
     # Normalizes over the LAST (feature) dim, per-sample: DP-safe, affine params, and --
     # unlike BatchNorm -- no running-stat buffers (assert_releasable holds). Works flat
     # and token-wise ([T, d] -> normalize each token's d features), for transformers.
+    _reserve_parameters(dims, 2 * shape[-1], "layernorm")
     return nn.LayerNorm(shape[-1]), shape
 
 
@@ -232,8 +314,11 @@ def _b_conv1d(s, shape, dims):
     c_in, length = shape
     c_out = _pos_int(s.get("out_channels", c_in), "out_channels", hi=_MAX_CHANNELS)
     k, stride, pad, dil = _conv_hparams(s)
+    out_shape = _validate_shape(
+        (c_out, _conv_out(length, k, stride, pad, dil)), "conv1d")
+    _reserve_parameters(dims, c_out * (c_in * k + 1), "conv1d")
     return (nn.Conv1d(c_in, c_out, k, stride=stride, padding=pad, dilation=dil),
-            (c_out, _conv_out(length, k, stride, pad, dil)))
+            out_shape)
 
 
 def _b_conv2d(s, shape, dims):
@@ -241,8 +326,12 @@ def _b_conv2d(s, shape, dims):
     c_in, h, w = shape
     c_out = _pos_int(s.get("out_channels", c_in), "out_channels", hi=_MAX_CHANNELS)
     k, stride, pad, dil = _conv_hparams(s)
+    out_shape = _validate_shape(
+        (c_out, _conv_out(h, k, stride, pad, dil),
+         _conv_out(w, k, stride, pad, dil)), "conv2d")
+    _reserve_parameters(dims, c_out * (c_in * k * k + 1), "conv2d")
     return (nn.Conv2d(c_in, c_out, k, stride=stride, padding=pad, dilation=dil),
-            (c_out, _conv_out(h, k, stride, pad, dil), _conv_out(w, k, stride, pad, dil)))
+            out_shape)
 
 
 def _b_maxpool2d(s, shape, dims):
@@ -306,6 +395,8 @@ def _b_recurrent(kind):
             raise ValueError("%s needs a (T, F) sequence input -- reshape first, got %r"
                              % (kind, shape))
         h = _pos_int(s.get("hidden", 64), "hidden", hi=_MAX_WIDTH)
+        gates = 4 if kind == "lstm" else 3
+        _reserve_parameters(dims, gates * h * (shape[-1] + h + 2), kind)
         return RecurrentBlock(shape[-1], h, kind=kind), (h,)
     return build
 
@@ -323,17 +414,24 @@ _OPS = {
 }
 
 
-def build_from_spec(spec, in_dim, out_dim, *, num_labels=None):
+def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
+                    output_limit=_MAX_OUTPUT_ABS):
     """Build a genuinely-stock nn.Module from a declarative spec. No researcher code
     executes. ``in_dim`` (@in) and ``out_dim`` (@out) are node-decided -- the latter
     from the pinned loss -- so the researcher controls only the hidden structure. The
     running per-sample SHAPE threads through (flat -> reshape -> conv/pool -> flatten
     -> linear head), and the final shape must equal ``(out_dim,)``."""
+    output_limit = float(output_limit)
+    if (not math.isfinite(output_limit) or output_limit <= 0.0
+            or output_limit > _MAX_ACTIVATION_ABS):
+        raise ValueError("output_limit must be in (0, %g]" % _MAX_ACTIVATION_ABS)
     if not isinstance(spec, dict):
         raise ValueError("spec must be a JSON object, got %s" % type(spec).__name__)
     kind = spec.get("kind", "sequential")
     if kind == "graph":
-        return build_from_graph(spec, in_dim, out_dim, num_labels=num_labels)
+        return build_from_graph(
+            spec, in_dim, out_dim, num_labels=num_labels,
+            output_limit=output_limit)
     if kind != "sequential":
         raise ValueError("unsupported spec kind %r (only 'sequential' or 'graph')" % (kind,))
     layers = spec.get("layers")
@@ -341,12 +439,15 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None):
         raise ValueError("spec.layers must be a non-empty list")
     if len(layers) > _MAX_LAYERS:
         raise ValueError("spec has %d layers (cap %d)" % (len(layers), _MAX_LAYERS))
+    if not isinstance(layers[-1], dict) or layers[-1].get("op") != "linear":
+        raise ValueError("the final layer must be 'linear' (the head emits logits)")
 
-    dims = {"@in": int(in_dim), "@out": int(out_dim)}
+    dims = _BuildDims({"@in": _pos_int(in_dim, "in_dim"),
+                       "@out": _pos_int(out_dim, "out_dim")})
     if num_labels is not None:
-        dims["@nlabels"] = int(num_labels)
+        dims["@nlabels"] = _pos_int(num_labels, "num_labels")
 
-    modules, shape = [], (int(in_dim),)
+    modules, shape = [], _validate_shape((dims["@in"],), "model input")
     for i, ls in enumerate(layers):
         if not isinstance(ls, dict):
             raise ValueError("layer %d must be an object, got %s" % (i, type(ls).__name__))
@@ -355,14 +456,15 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None):
             raise ValueError("layer %d has unknown op %r (allowed: %s)"
                              % (i, op, ", ".join(sorted(_OPS))))
         m, shape = _OPS[op](ls, shape, dims)
+        shape = _validate_shape(shape, "layer %d (%s)" % (i, op))
         modules.append(m)
+        modules.append(FiniteClamp(
+            output_limit if i == len(layers) - 1 else _MAX_ACTIVATION_ABS))
 
     # The head must emit raw logits at the loss-determined width: the final layer is
     # a linear projection onto @out. A trailing activation (would double-apply with
     # the pinned loss) or a wrong width is rejected here, before any training.
-    if layers[-1].get("op") != "linear":
-        raise ValueError("the final layer must be 'linear' (the head emits logits)")
-    if shape != (int(out_dim),):
+    if shape != (dims["@out"],):
         raise ValueError("spec output shape %r != required (%d,) (end with a linear to @out)"
                          % (shape, out_dim))
 
@@ -387,46 +489,54 @@ class GraphModule(nn.Module):
     never researcher code -- with no hooks, no instance method overrides and no
     non-stock parameters."""
 
-    def __init__(self, graph, output_name, mods):
+    def __init__(self, graph, output_name, mods, output_limit):
         super().__init__()
         self._dsflower_graph = graph              # data (list of {name, op, inputs, ...})
         self._dsflower_output = str(output_name)  # data
+        self._dsflower_output_limit = float(output_limit)
         self._mods = nn.ModuleDict(mods)          # stock op modules (params live here)
 
     def forward(self, x):
-        env = {"@in": x}
+        env = {"@in": _finite_tensor(x, _MAX_ACTIVATION_ABS)}
         for nd in self._dsflower_graph:
             ins = [env[t] for t in nd["inputs"]]
             mod = nd.get("module")
             if mod is not None:                    # single-input param/stock op
-                env[nd["name"]] = self._mods[mod](ins[0])
-                continue
-            op = nd["op"]
-            if op == "add":
-                t = ins[0]
-                for o in ins[1:]:
-                    t = t + o
-                env[nd["name"]] = t
-            elif op == "mul":
-                t = ins[0]
-                for o in ins[1:]:
-                    t = t * o
-                env[nd["name"]] = t
-            elif op == "concat":
-                env[nd["name"]] = torch.cat(ins, dim=nd["axis"] + 1)   # +1: never the batch dim
-            elif op == "sub":
-                env[nd["name"]] = ins[0] - ins[1]
-            elif op == "div":
-                env[nd["name"]] = ins[0] / ins[1]
-            elif op == "affine":
-                env[nd["name"]] = nd["scale"] * ins[0] + nd["shift"]
-            elif op == "matmul":
-                env[nd["name"]] = torch.matmul(ins[0], ins[1])
-            elif op == "transpose":
-                d = nd["dims"]
-                env[nd["name"]] = ins[0].transpose(d[0] + 1, d[1] + 1)  # +1: skip the batch dim
+                value = self._mods[mod](ins[0])
             else:
-                raise ValueError("graph forward: unsupported functional op %r" % (op,))
+                op = nd["op"]
+                if op == "add":
+                    value = ins[0]
+                    for other in ins[1:]:
+                        value = _finite_tensor(value + other, _MAX_ACTIVATION_ABS)
+                elif op == "mul":
+                    value = ins[0]
+                    for other in ins[1:]:
+                        value = _finite_tensor(value * other, _MAX_ACTIVATION_ABS)
+                elif op == "concat":
+                    value = torch.cat(ins, dim=nd["axis"] + 1)  # +1: never batch
+                elif op == "sub":
+                    value = ins[0] - ins[1]
+                elif op == "div":
+                    denominator = ins[1]
+                    sign = torch.where(denominator < 0, -1.0, 1.0)
+                    denominator = torch.where(
+                        denominator.abs() < _MIN_DIVISOR_ABS,
+                        sign * _MIN_DIVISOR_ABS, denominator)
+                    value = ins[0] / denominator
+                elif op == "affine":
+                    value = nd["scale"] * ins[0] + nd["shift"]
+                elif op == "matmul":
+                    value = torch.matmul(ins[0], ins[1])
+                elif op == "transpose":
+                    d = nd["dims"]
+                    value = ins[0].transpose(d[0] + 1, d[1] + 1)  # +1: skip batch
+                else:
+                    raise ValueError("graph forward: unsupported functional op %r" % (op,))
+            limit = (self._dsflower_output_limit
+                     if nd["name"] == self._dsflower_output
+                     else _MAX_ACTIVATION_ABS)
+            env[nd["name"]] = _finite_tensor(value, limit)
         return env[self._dsflower_output]
 
 
@@ -474,6 +584,14 @@ def _g_affine(nd, in_shapes):
     # scale * x + shift with PUBLIC constants (enables 1-x gates, scaling, shifts).
     if len(in_shapes) != 1:
         raise ValueError("affine takes 1 input")
+    for name in ("scale", "shift"):
+        value = nd.get(name, 1.0 if name == "scale" else 0.0)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or abs(float(value)) > _MAX_PUBLIC_SCALAR_ABS):
+            raise ValueError(
+                "affine %r must be finite with magnitude <= %g, got %r"
+                % (name, _MAX_PUBLIC_SCALAR_ABS, value))
     return in_shapes[0]
 
 
@@ -530,7 +648,8 @@ _GRAPH_OPS = {"add": _g_add, "mul": _g_mul, "sub": _g_sub, "div": _g_div,
               "matmul": _g_matmul, "transpose": _g_transpose}
 
 
-def build_from_graph(spec, in_dim, out_dim, *, num_labels=None):
+def build_from_graph(spec, in_dim, out_dim, *, num_labels=None,
+                     output_limit=_MAX_OUTPUT_ABS):
     """Build a node-owned GraphModule from a declarative DAG. Nodes must be listed in
     TOPOLOGICAL order (every input already defined). Single-input ops come from the
     sequential allowlist ``_OPS``; multi-input/functional ops from ``_GRAPH_OPS``. The
@@ -544,12 +663,16 @@ def build_from_graph(spec, in_dim, out_dim, *, num_labels=None):
     output_name = spec.get("output")
     if not isinstance(output_name, str) or not output_name:
         raise ValueError("graph spec needs an 'output' tensor name")
+    if (not isinstance(nodes[-1], dict) or nodes[-1].get("name") != output_name
+            or nodes[-1].get("op") != "linear"):
+        raise ValueError("the final node must be the 'linear' projection to @out (emits raw logits)")
 
-    dims = {"@in": int(in_dim), "@out": int(out_dim)}
+    dims = _BuildDims({"@in": _pos_int(in_dim, "in_dim"),
+                       "@out": _pos_int(out_dim, "out_dim")})
     if num_labels is not None:
-        dims["@nlabels"] = int(num_labels)
+        dims["@nlabels"] = _pos_int(num_labels, "num_labels")
 
-    shapes = {"@in": (int(in_dim),)}
+    shapes = {"@in": _validate_shape((dims["@in"],), "model input")}
     graph, mods = [], {}
     for i, nd in enumerate(nodes):
         if not isinstance(nd, dict):
@@ -560,6 +683,9 @@ def build_from_graph(spec, in_dim, out_dim, *, num_labels=None):
         if not isinstance(ins, list) or not ins or any(t not in shapes for t in ins):
             raise ValueError("graph node %r has an undefined/forward input (list nodes in "
                              "topological order): %r" % (name, ins))
+        if len(ins) > _MAX_NODE_INPUTS:
+            raise ValueError("graph node %r has %d inputs (cap %d)"
+                             % (name, len(ins), _MAX_NODE_INPUTS))
         if op in _OPS:
             if len(ins) != 1:
                 raise ValueError("op %r (node %r) takes exactly 1 input, got %d" % (op, name, len(ins)))
@@ -576,13 +702,11 @@ def build_from_graph(spec, in_dim, out_dim, *, num_labels=None):
         else:
             raise ValueError("graph node %r has unknown op %r (allowed: %s)"
                              % (name, op, ", ".join(sorted(list(_OPS) + list(_GRAPH_OPS)))))
-        shapes[name] = out_shape
+        shapes[name] = _validate_shape(out_shape, "graph node %r (%s)" % (name, op))
 
     if output_name not in shapes:
         raise ValueError("graph 'output' %r is not produced by any node" % (output_name,))
-    if shapes[output_name] != (int(out_dim),):
+    if shapes[output_name] != (dims["@out"],):
         raise ValueError("graph output shape %r != required (%d,) (end with a linear to @out)"
                          % (shapes[output_name], out_dim))
-    if nodes[-1].get("name") != output_name or nodes[-1].get("op") != "linear":
-        raise ValueError("the final node must be the 'linear' projection to @out (emits raw logits)")
-    return GraphModule(graph, output_name, mods)
+    return GraphModule(graph, output_name, mods, output_limit)

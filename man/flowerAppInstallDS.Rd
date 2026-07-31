@@ -12,12 +12,12 @@ flowerAppInstallDS(token, expected_sha256)
 \item{expected_sha256}{Character; sha256 the client computed over the FAB.}
 }
 \value{
-list(ok, sha256, size, path).
+list(ok, sha256, size, packages).
 }
 \description{
 Enforces the size cap (\code{dsflower.max_fab_bytes}) and sha256 integrity
 before unpacking. On any failure the spool is destroyed so no unverified code
-can run. Returns the validated hash and unpack path; the run executes only the
-app registered by this hash.
+can run. Returns only public installation metadata; the node keeps the unpack
+path private and executes only the app registered by the validated hash.
 }
 \keyword{internal}

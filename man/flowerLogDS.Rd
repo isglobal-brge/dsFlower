@@ -2,7 +2,7 @@
 % Please edit documentation in R/interface.R
 \name{flowerLogDS}
 \alias{flowerLogDS}
-\title{Get Sanitized Log Output}
+\title{Disabled node-log compatibility endpoint}
 \usage{
 flowerLogDS(handle_symbol, last_n = 50L)
 }
@@ -12,9 +12,10 @@ flowerLogDS(handle_symbol, last_n = 50L)
 \item{last_n}{Integer; number of lines to return (max 200).}
 }
 \value{
-Character vector of sanitized log lines.
+Empty character vector.
 }
 \description{
-DataSHIELD AGGREGATE method. Returns sanitized log output from the
-SuperNode.
+Node logs can encode data-dependent failures and timing and are not a DP
+mechanism. This DataSHIELD AGGREGATE symbol is retained for protocol
+compatibility and always returns an empty character vector.
 }

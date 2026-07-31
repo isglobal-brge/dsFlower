@@ -12,18 +12,20 @@ PROCESS-ISOLATED TRUST BOUNDARY. On the data node the untrusted `local_update` i
 FRESH, separate interpreter (`egress_child.py`); the trusted PARENT never imports or executes
 the upload. The child can only ever hand back plain numeric arrays (loaded with
 allow_pickle=False), which the parent validates and then privatises itself -- clip the delta
-to the C-ball and add analytic-Gaussian noise. So the upload cannot monkeypatch the DP
+to the C-ball and add RDP-calibrated Gaussian noise. So the upload cannot monkeypatch the DP
 harness / NumPy / the RNG, cannot leak via a crash/traceback, and (with a sufficient
 sandbox) cannot carry state across sample-and-aggregate blocks. DP parameters always come
 from the server-written manifest, never from the app.
 
 Mechanism selection is the NODE's automatic, server-authoritative decision -- never the
 researcher's: the plain 2C output-perturbation floor universally, and the sample-and-aggregate
-2C/k floor when (a) the platform provides a sandbox strong enough to GUARANTEE per-block
-independence and (b) policy thresholds say it helps.
+min(2C,4C/k) floor when (a) the platform provides a sandbox strong enough to GUARANTEE per-block
+independence and (b) the custodian enables a fixed public block count.
 """
 
 import json
+import hashlib
+import hmac
 import os
 import shutil
 import signal
@@ -43,19 +45,29 @@ def _trusted_import(name):
     parent. (Plain `import dp_harness` would honour sys.path; the upload's dir may be on it.)"""
     import importlib.util
     path = os.path.join(_HERE, name + ".py")
-    spec = importlib.util.spec_from_file_location("_dsftrusted_" + name, path)
+    private_name = "_dsftrusted_" + name
+    existing = sys.modules.get(private_name)
+    if existing is not None:
+        if os.path.realpath(getattr(existing, "__file__", "")) != os.path.realpath(path):
+            raise RuntimeError("trusted module name is already bound to another path")
+        return existing
+    spec = importlib.util.spec_from_file_location(private_name, path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    sys.modules[private_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(private_name, None)
+        raise
     return mod
 
 
-dp_harness = _trusted_import("dp_harness")
 seeding = _trusted_import("seeding")
+dp_harness = _trusted_import("dp_harness")
 
 
 _REQUIRED_HOOKS = ("initial_arrays", "local_update")
 _CHILD = os.path.join(_HERE, "egress_child.py")
-_FSIZE_LIMIT = 1024 * 1024 * 1024     # 1 GiB cap on child file writes
 _DEFAULT_TIMEOUT = 900                 # wall-clock seconds per child run
 _NPY_HEADER_SLACK = 4096               # bytes of .npy header allowed above the array payload
 _PAD_GUARD = 5.0                       # seconds reserved for kill+cleanup inside a padded envelope
@@ -112,7 +124,7 @@ def _code_dirs():
     """Read-only dirs the child needs to import Python + numpy + the user module -- and
     NOTHING else (crucially NOT the node's data/manifest dir). Binding only these means a
     sample-and-aggregate child can read code + its OWN block input, never other blocks'
-    records, which is exactly what the 2C/k independence argument requires."""
+    records, which is exactly what the bounded-block sensitivity argument requires."""
     import sysconfig
     dirs = [sys.prefix, sys.exec_prefix, os.path.dirname(os.path.abspath(sys.executable))]
     try:
@@ -120,12 +132,63 @@ def _code_dirs():
         dirs += [paths.get(k) for k in ("stdlib", "platstdlib", "purelib", "platlib")]
     except Exception:
         pass
-    dirs += list(sys.path)
+    pinned = os.environ.get("DSFLOWER_PINNED_APP_DIR")
+    if pinned:
+        dirs.append(pinned)
     seen, out = set(), []
     for d in dirs:
         if d and d not in seen and os.path.isdir(d):
             out.append(d); seen.add(d)
     return out
+
+
+def _pinned_user_package(module_name):
+    """Re-hash the exact node-installed package immediately before execution."""
+    if not module_name or not module_name.replace("_", "a").isalnum() or not (
+            module_name[0].isalpha() or module_name[0] == "_"):
+        raise RuntimeError("invalid pinned hook module name")
+    root = os.environ.get("DSFLOWER_PINNED_APP_DIR", "")
+    manifest_dir = os.environ.get("DSFLOWER_MANIFEST_DIR", "")
+    if not root or not manifest_dir:
+        raise RuntimeError("pinned hook paths are missing")
+    root = os.path.realpath(root)
+    pkg = os.path.realpath(os.path.join(root, module_name))
+    if not pkg.startswith(root + os.sep) or not os.path.isdir(pkg):
+        raise RuntimeError("pinned hook package is outside its installed root")
+    init_file = os.path.join(pkg, "__init__.py")
+    try:
+        import stat
+        if (os.path.realpath(init_file) != init_file
+                or not stat.S_ISREG(os.lstat(init_file).st_mode)):
+            raise RuntimeError
+    except Exception as exc:
+        raise RuntimeError(
+            "pinned hook package needs a regular __init__.py") from exc
+    with open(os.path.join(manifest_dir, "pinned_packages.json"), encoding="utf-8") as fh:
+        pins = json.load(fh)
+    expected = str(pins.get(module_name, ""))
+    if not expected:
+        raise RuntimeError("hook package is not present in the node pin map")
+    digest = hashlib.sha256()
+    entries = []
+    for current, dirs, files in os.walk(pkg):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for filename in files:
+            if filename.endswith((".pyc", ".pyo")):
+                continue
+            full = os.path.join(current, filename)
+            rel = os.path.relpath(full, pkg).replace(os.sep, "/")
+            entries.append((rel, full))
+    for rel, full in sorted(entries):
+        with open(full, "rb") as fh:
+            content = fh.read()
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\n")
+        digest.update(content)
+        digest.update(b"\x00")
+    if not hmac.compare_digest(digest.hexdigest(), expected):
+        raise RuntimeError("node-installed hook package changed after verification")
+    return init_file
 
 
 def _bwrap_mount(path, td):
@@ -178,7 +241,7 @@ def sandbox_caps():
 
 
 def _full_sandbox_ok(caps):
-    """Sample-and-aggregate's 2C/k bound needs GUARANTEED per-block independence (no
+    """Sample-and-aggregate's multi-block bound needs GUARANTEED independence (no
     cross-block state via shared network OR filesystem). It is enabled ONLY when the minimal
     net+fs sandbox is verified AND the custodian has attested (DSF_SAA_SANDBOX_OK=1) that, on
     THIS host, that sandbox exposes only per-block input + code -- never other records. So SAA
@@ -186,6 +249,18 @@ def _full_sandbox_ok(caps):
     floor (which needs only process isolation) is the universal mechanism."""
     return bool(caps.get("subprocess") and caps.get("net_lock") and caps.get("fs_isolation")
                 and os.environ.get("DSF_SAA_SANDBOX_OK") == "1")
+
+
+def hook_execution_caps(pcfg, caps=None):
+    """Return attested sandbox caps iff a HookApp may touch private data."""
+    caps = sandbox_caps() if caps is None else caps
+    timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
+    pad_to = float(pcfg.get("egress_time_pad", 0))
+    if (not bool(pcfg.get("hook_enabled", False))
+            or not _full_sandbox_ok(caps)
+            or pad_to < float(timeout) + _PAD_GUARD):
+        return None
+    return caps
 
 
 def _wrap_sandbox(cmd, caps, td):
@@ -218,7 +293,8 @@ def _is_regular(path):
         return False
 
 
-def _run_isolated(module_name, old, X, y, cfg, caps, timeout, pad_to=0.0):
+def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps, timeout,
+                  pad_to=0.0):
     """Run the untrusted local_update on (X, y) in a FRESH interpreter. Returns f64 arrays,
     or None on ANY failure (crash, timeout, wrong count/shape, non-finite, unreadable). The
     parent never imports or executes the upload; the result is loaded allow_pickle=False so
@@ -240,13 +316,19 @@ def _run_isolated(module_name, old, X, y, cfg, caps, timeout, pad_to=0.0):
                  X=np.asarray(X), y=np.asarray(y))
         with open(cfgf, "w") as f:
             json.dump(_sanitize_cfg(cfg), f)
-        syspath = os.pathsep.join(p for p in sys.path if p)
-        base = [sys.executable, "-B", "-E", "-s", _CHILD,
+        base = [sys.executable, "-I", "-B", _CHILD,
                 "--in", inp, "--out", outd, "--cfg", cfgf,
-                "--module", str(module_name), "--syspath", syspath]
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TMPDIR": td,
-               "DSF_RLIMIT_CPU": str(int(timeout)), "DSF_RLIMIT_FSIZE": str(_FSIZE_LIMIT),
-               "DSF_NO_NET": "1"}
+                "--module", str(module_name), "--module-file", module_file]
+        mib = 1024 * 1024
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMPDIR": td,
+            "DSF_RLIMIT_CPU": str(int(timeout)),
+            "DSF_RLIMIT_AS": str(int(pcfg.get("egress_memory_mb", 8192)) * mib),
+            "DSF_RLIMIT_FSIZE": str(int(pcfg.get("egress_file_mb", 1024)) * mib),
+            "DSF_RLIMIT_NPROC": str(int(pcfg.get("egress_processes", 128))),
+            "DSF_NO_NET": "1",
+        }
         cmd = _wrap_sandbox(base, caps, td)
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -308,25 +390,60 @@ def _validate(res, old):
     return res
 
 
-def _choose_blocks(n, pcfg, full_sandbox):
-    """Server-managed ADAPTIVE mechanism selection (never a researcher choice): use
-    sample-and-aggregate (k>=2) only when the FULL sandbox guarantees per-block independence
-    AND policy thresholds say it applies; otherwise the plain 2C floor. k is derived from
-    the PUBLIC row count only -- sound because n is invariant under replace-one adjacency.
-    `sample_aggregate` here is a CUSTODIAN governance switch (default on where sound), not a
-    researcher/analyst knob."""
+def _choose_blocks(pcfg, full_sandbox):
+    """Select only the fixed custodian-pinned S&A mechanism.
+
+    The block count must be independent of private row/patient counts. Otherwise
+    neighbouring datasets can receive Gaussian distributions with different
+    variances, whose likelihood ratio is unbounded. The switch and fixed k are
+    server policy, never researcher inputs.
+    """
     if not full_sandbox:
         return 1
     if not bool(pcfg.get("sample_aggregate", True)):
         return 1
-    min_block = max(1, int(pcfg.get("sa_min_block", 64)))
-    max_blocks = max(1, int(pcfg.get("sa_max_blocks", 8)))
-    return max(1, min(max_blocks, int(n) // min_block))
+    return max(2, min(64, int(pcfg.get("sa_blocks", 8))))
 
 
-def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None):
+def _patient_row_blocks(unit_ids, n_rows, k, partition_seed):
+    """Assign every row for one privacy unit to exactly one S&A block.
+
+    Assignment is a keyed, data-independent hash of the server-pinned patient
+    identifier.  It does not depend on row values, row multiplicity, or encounter
+    order, so changing one patient's records cannot reshuffle other patients.
+    Empty blocks are retained: the caller maps a failed/empty block update to zero,
+    preserving the fixed ``k`` denominator and bounded sensitivity.
+    """
+    ids = np.asarray(unit_ids, dtype=object)
+    if ids.ndim != 1 or len(ids) != int(n_rows):
+        raise RuntimeError("patient identifiers must be one-dimensional and match X")
+    if not isinstance(partition_seed, (bytes, bytearray)) or len(partition_seed) != 32:
+        raise RuntimeError("patient partitioning requires a 256-bit release seed")
+
+    blocks = [[] for _ in range(int(k))]
+    assigned = {}
+    for row_index, raw in enumerate(ids.tolist()):
+        if raw is None:
+            raise RuntimeError("patient identifiers contain missing values")
+        patient_id = str(raw).strip()
+        if not patient_id or patient_id.lower() in ("nan", "<na>", "nat"):
+            raise RuntimeError("patient identifiers contain missing values")
+        if patient_id not in assigned:
+            digest = hmac.new(
+                bytes(partition_seed),
+                b"dsflower/patient-block/v1\x00" + patient_id.encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+            assigned[patient_id] = int.from_bytes(digest[:8], "big") % int(k)
+        blocks[assigned[patient_id]].append(row_index)
+    return [np.asarray(rows, dtype=np.int64) for rows in blocks], len(assigned)
+
+
+def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
+                       hook_caps=None, unit_ids=None):
     """Run the upload out-of-process from the global model, then apply the DP gate in the
-    trusted parent. The NODE picks the mechanism: sample-and-aggregate (2C/k) when the
+    trusted parent. The NODE picks the mechanism: sample-and-aggregate
+    (conservative sensitivity min(2C,4C/k)) when the
     platform can guarantee block independence and policy says so, else the plain 2C floor.
     `module_name` (not an imported module) is passed so the parent never imports the upload.
 
@@ -337,36 +454,61 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None):
                         "imports the untrusted upload in-process")
     old = _as_f64_list(global_arrays)
     n = int(len(X))
-    caps = sandbox_caps()
-    k = _choose_blocks(n, pcfg, _full_sandbox_ok(caps))
+    if int(len(y)) != n:
+        raise RuntimeError("X and y must contain the same number of rows")
+    caps = hook_execution_caps(pcfg, hook_caps)
     timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
     pad_to = float(pcfg.get("egress_time_pad", 0))   # 0=off; >=timeout for constant-time runs
+    # Arbitrary hooks have filesystem/network/timing channels outside the numeric
+    # DP gate.  Without all three operator-attested controls, do not execute the
+    # upload: complete the Flower operation with a data-independent unchanged model.
+    if caps is None:
+        return [o.astype(np.float32) for o in old]
+    module_file = _pinned_user_package(module_name)
+    partition_seed = seeding.sub_seed(seed, "partition")
+    if unit_ids is None:
+        n_units = n
+        row_blocks = None
+    else:
+        # Validate/group before choosing k.  First obtain the unique-unit count
+        # with k=1; assignment is recomputed below for the final, fixed k.
+        _, n_units = _patient_row_blocks(unit_ids, n, 1, partition_seed)
+        row_blocks = None
+    k = _choose_blocks(pcfg, True)
 
     if k >= 2:
-        # Data-INDEPENDENT random partition into k disjoint blocks (fresh-entropy permutation
-        # of row INDICES, never by feature/label). One record lands in exactly one block, and
-        # each block runs in its OWN isolated interpreter -> genuine independence.
-        perm = seeding.np_rng(seeding.sub_seed(seed, "partition")).permutation(n)
+        # A patient privacy unit may span many rows. Keep all those rows in one
+        # independently sandboxed block; otherwise one neighbouring patient could
+        # change several block outputs and invalidate a row-level sensitivity bound.
+        if unit_ids is None:
+            perm = seeding.np_rng(partition_seed).permutation(n)
+            row_blocks = np.array_split(perm, k)
+        else:
+            row_blocks, _ = _patient_row_blocks(unit_ids, n, k, partition_seed)
         block_updates = []
-        for idx in np.array_split(perm, k):
-            r = _validate(_run_isolated(module_name, old, _take_rows(X, idx),
-                                        _take_rows(y, idx), cfg, caps, timeout, pad_to), old)
+        for idx in row_blocks:
+            r = _validate(_run_isolated(module_name, module_file, old, _take_rows(X, idx),
+                                        _take_rows(y, idx), cfg, pcfg, caps, timeout,
+                                        pad_to), old)
             block_updates.append(r if r is not None else [o.copy() for o in old])
         gated = dp_harness.sample_and_aggregate(
             block_updates, old,
             clipping_norm=pcfg["clipping_norm"],
             epsilon=pcfg["epsilon"],
             delta=pcfg["delta"],
+            num_releases=pcfg.get("composition_releases", 1),
             rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
         )
     else:
-        r = _validate(_run_isolated(module_name, old, X, y, cfg, caps, timeout, pad_to), old)
+        r = _validate(_run_isolated(module_name, module_file, old, X, y, cfg, pcfg,
+                                    caps, timeout, pad_to), old)
         new = r if r is not None else [o.copy() for o in old]   # validate-or-zero
         gated = dp_harness.output_perturbation(
             new, old,
             clipping_norm=pcfg["clipping_norm"],
             epsilon=pcfg["epsilon"],
             delta=pcfg["delta"],
+            num_releases=pcfg.get("composition_releases", 1),
             rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
         )
     return [g.astype(np.float32) for g in gated]

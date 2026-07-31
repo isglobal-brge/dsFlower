@@ -2,11 +2,11 @@
 % Please edit documentation in R/app_store.R
 \name{.run_exfil_scan}
 \alias{.run_exfil_scan}
-\title{Run the Tier-2 exfiltration scan on an unpacked app (fail-closed).}
+\title{Run the HookApp exfiltration scan on an unpacked app (fail-closed).}
 \usage{
 .run_exfil_scan(app_dir)
 }
 \description{
-Run the Tier-2 exfiltration scan on an unpacked app (fail-closed).
+Run the HookApp exfiltration scan on an unpacked app (fail-closed).
 }
 \keyword{internal}

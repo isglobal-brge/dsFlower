@@ -17,7 +17,8 @@
 TRUE invisibly, or stops with an error.
 }
 \description{
-Checks that the target column exists, feature columns (if specified)
-exist, and the dataset is not empty.
+Checks that the target column exists and feature columns (if specified)
+exist. Empty frames are valid inputs: staging preserves their public schema
+and the trusted runner produces its normal data-independent no-op.
 }
 \keyword{internal}

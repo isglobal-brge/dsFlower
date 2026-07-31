@@ -2,7 +2,7 @@
 % Please edit documentation in R/app_store.R
 \name{flowerTier2PinDS}
 \alias{flowerTier2PinDS}
-\title{Pin a Tier-2 run: trusted runner + verified uploaded app (DataSHIELD AGGREGATE)}
+\title{Pin a HookApp run: trusted runner + verified upload (DataSHIELD AGGREGATE)}
 \usage{
 flowerTier2PinDS(handle_symbol, app_token)
 }
@@ -12,14 +12,15 @@ flowerTier2PinDS(handle_symbol, app_token)
 \item{app_token}{Character; the uploaded app's token.}
 }
 \value{
-list(ok, pinned, user_path).
+list(ok, pinned, user_module).
 }
 \description{
 Writes \code{pinned_packages.json} into the run's staging dir so the integrity
 hook (multi-package, default-deny) allows exactly the node-resident
-\code{dsflower_tier2} runner AND the uploaded user app — both pinned to
-\emph{node-computed} hashes, so a client cannot dictate what runs. Records the
-user app's import directory for the SuperNode PYTHONPATH. The uploaded app must
+canonical \code{dsflower_runner} AND the uploaded user app — both pinned to
+\emph{node-computed} hashes, so a client cannot dictate what runs. The upload
+must contain exactly one regular top-level Python package; its package name is
+pinned authoritatively in the server-owned run manifest. The uploaded app must
 already be pushed + installed (sha256-verified + exfiltration-scanned).
 }
 \keyword{internal}

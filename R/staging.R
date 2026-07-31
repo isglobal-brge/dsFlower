@@ -2,18 +2,38 @@
 # Replaces env-var approach with per-run token directories containing
 # training data and a JSON manifest.
 
+# Keep public tabular values well below the float32 representation edge so the
+# runner's public center/span arithmetic does not overflow before training.
+# This is representation hardening, not a proof that every user model is
+# numerically total (activations/losses remain part of the valid-input contract).
+.DSFLOWER_FLOAT32_SAFE_MAX <- 1e6
+
 #' Generate a unique run token
 #'
-#' Creates a token in the format \code{run_YYYYMMDD_HHMMSS_PID_XXXXXXXXXXXX}
-#' where PID is the R process ID and X is a 12-character random hex suffix.
-#' This provides sufficient uniqueness even when multiple users on the
-#' same server create runs at the same second.
+#' Creates a token in the format \code{run_<32 hex digits>} from 128 bits of
+#' operating-system entropy.  The token is also a primary key in the persistent
+#' privacy ledger, so it must not depend on R's mutable statistical RNG.
 #'
 #' @return Character; the run token string.
 #' @keywords internal
 .generate_run_token <- function() {
-  hex <- paste(sample(c(0:9, letters[1:6]), 12, replace = TRUE), collapse = "")
-  paste0("run_", format(Sys.time(), "%Y%m%d_%H%M%S"), "_", Sys.getpid(), "_", hex)
+  entropy <- tryCatch(.read_os_entropy(16L),
+                      error = function(e) raw(0))
+  if (length(entropy) != 16L) {
+    stop("Could not obtain 128 bits of operating-system entropy for a run token.",
+         call. = FALSE)
+  }
+  paste0("run_", paste(sprintf("%02x", as.integer(entropy)), collapse = ""))
+}
+
+#' Validate a server-generated run token
+#' @keywords internal
+.validate_run_token <- function(run_token) {
+  if (!is.character(run_token) || length(run_token) != 1L ||
+      is.na(run_token) || !grepl("^run_[0-9a-f]{32}$", run_token)) {
+    stop("Invalid dsFlower run token.", call. = FALSE)
+  }
+  run_token
 }
 
 #' Load training data from a file path
@@ -56,8 +76,9 @@
 
 #' Validate that training data has the expected schema
 #'
-#' Checks that the target column exists, feature columns (if specified)
-#' exist, and the dataset is not empty.
+#' Checks that the target column exists and feature columns (if specified)
+#' exist. Empty frames are valid inputs: staging preserves their public schema
+#' and the trusted runner produces its normal data-independent no-op.
 #'
 #' @param data Data.frame of training data.
 #' @param target_column Character; name of the target column.
@@ -65,17 +86,11 @@
 #' @return TRUE invisibly, or stops with an error.
 #' @keywords internal
 .validateDataSchema <- function(data, target_column, feature_columns = NULL) {
-  if (nrow(data) == 0) {
-    stop("Training data is empty.", call. = FALSE)
-  }
-
   # Support vector target_column for survival models (e.g. c("time", "event"))
   if (!is.null(target_column)) {
     missing_targets <- setdiff(target_column, names(data))
     if (length(missing_targets) > 0) {
-      stop("Target column(s) '", paste(missing_targets, collapse = "', '"),
-           "' not found in training data. ",
-           "Available columns: ", paste(names(data), collapse = ", "),
+      stop("One or more requested target columns were not found.",
            call. = FALSE)
     }
   }
@@ -83,8 +98,7 @@
   if (!is.null(feature_columns) && length(feature_columns) > 0) {
     missing <- setdiff(feature_columns, names(data))
     if (length(missing) > 0) {
-      stop("Feature column(s) not found in training data: ",
-           paste(missing, collapse = ", "),
+      stop("One or more requested feature columns were not found.",
            call. = FALSE)
     }
   }
@@ -92,13 +106,17 @@
   invisible(TRUE)
 }
 
-.trainingColumns <- function(data, target_column, feature_columns = NULL) {
+.trainingColumns <- function(data, target_column, feature_columns = NULL,
+                             patient_column = NULL) {
+  has_explicit_features <- !is.null(feature_columns)
   target_column <- as.character(unlist(target_column, use.names = FALSE))
   feature_columns <- as.character(unlist(feature_columns, use.names = FALSE))
   feature_columns <- feature_columns[nzchar(feature_columns)]
+  patient_column <- as.character(unlist(patient_column, use.names = FALSE))
+  patient_column <- patient_column[nzchar(patient_column)]
 
-  if (length(feature_columns) > 0L) {
-    unique(c(target_column, feature_columns))
+  if (has_explicit_features) {
+    unique(c(target_column, feature_columns, patient_column))
   } else {
     names(data)
   }
@@ -106,10 +124,12 @@
 
 .prepareTrainingFrame <- function(data, target_column, feature_columns = NULL,
                                   drop_missing = TRUE,
-                                  select_columns = TRUE) {
+                                  select_columns = TRUE,
+                                  patient_column = NULL) {
   .validateDataSchema(data, target_column, feature_columns)
 
-  cols <- .trainingColumns(data, target_column, feature_columns)
+  cols <- .trainingColumns(
+    data, target_column, feature_columns, patient_column = patient_column)
   cols <- intersect(cols, names(data))
   input_n <- nrow(data)
 
@@ -121,6 +141,10 @@
         ok <- ok & is.finite(x)
       }
     }
+    if (length(patient_column) == 1L && patient_column %in% names(data)) {
+      patient_id <- trimws(as.character(data[[patient_column]]))
+      ok <- ok & !is.na(patient_id) & nzchar(patient_id)
+    }
     data <- data[ok, , drop = FALSE]
   }
 
@@ -129,17 +153,208 @@
     data <- data[, cols, drop = FALSE]
   }
 
-  if (nrow(data) == 0L) {
-    stop("Training data has no complete rows after applying target and ",
-         "feature-column missing-value filters.", call. = FALSE)
-  }
-
   list(
     data = data,
     n_input_samples = input_n,
     n_samples = nrow(data),
     dropped_missing = input_n - nrow(data)
   )
+}
+
+#' Totalise numeric model features with public defaults
+#'
+#' The runner accepts numeric tensors. Coercion failures and non-finite values
+#' must not turn prepare success/failure into a private-value predicate, so each
+#' selected feature is mapped independently to a fixed public value. When valid
+#' public feature bounds are present their midpoint is used; otherwise zero is
+#' used. This preserves row count and replace-one adjacency.
+#' @keywords internal
+.coerceNumericOrMissing <- function(value) {
+  tryCatch(
+    suppressWarnings(if (is.factor(value) || is.character(value)) {
+      as.numeric(as.character(value))
+    } else {
+      as.numeric(value)
+    }),
+    error = function(e) rep(NA_real_, length(value))
+  )
+}
+
+#' @keywords internal
+.totalizeModelFeatures <- function(data, feature_columns, run_config = list()) {
+  columns <- as.character(unlist(feature_columns, use.names = FALSE))
+  columns <- unique(columns[nzchar(columns)])
+  if (!length(columns)) return(data)
+
+  defaults <- rep(0, length(columns))
+  bounds <- run_config[["feature-bounds"]] %||% NULL
+  if (is.list(bounds)) {
+    lower <- suppressWarnings(as.numeric(unlist(bounds$lower, use.names = FALSE)))
+    upper <- suppressWarnings(as.numeric(unlist(bounds$upper, use.names = FALSE)))
+    if (length(lower) == length(columns) && length(upper) == length(columns) &&
+        all(is.finite(lower)) && all(is.finite(upper)) && all(lower < upper)) {
+      defaults <- lower / 2 + upper / 2
+    }
+  }
+
+  for (i in seq_along(columns)) {
+    name <- columns[[i]]
+    value <- data[[name]]
+    numeric_value <- .coerceNumericOrMissing(value)
+    invalid <- is.na(numeric_value) | !is.finite(numeric_value)
+    numeric_value[invalid] <- defaults[[i]]
+    numeric_value <- pmin(.DSFLOWER_FLOAT32_SAFE_MAX,
+                          pmax(-.DSFLOWER_FLOAT32_SAFE_MAX, numeric_value))
+    data[[name]] <- numeric_value
+  }
+  data
+}
+
+#' Apply the server-owned DP unit to a concrete training frame
+#' @keywords internal
+.prepareDpUnitFrame <- function(data, run_config = list()) {
+  policy <- .dpUnitPolicy()
+  patient_column <- .detectPatientColumn(data, run_config)
+  if (!is.null(patient_column)) {
+    values <- data[[patient_column]]
+    missing <- is.na(values)
+    ids <- trimws(enc2utf8(as.character(values)))
+    invalid <- missing | !nzchar(ids) |
+      tolower(ids) %in% c("na", "nan", "null")
+    # A single fixed unit is conservative: every row without a usable stable
+    # identifier is protected together, rather than falling back to row-level
+    # DP or exposing an error bit. A real identifier equal to the sentinel is
+    # simply merged into the same (larger) protected unit.
+    ids[invalid] <- "__dsflower_missing_patient_unit__"
+    data[[patient_column]] <- ids
+  }
+  list(
+    data = data,
+    dp_unit = policy$dp_unit,
+    patient_column = patient_column,
+    canonicalization = policy$canonicalization
+  )
+}
+
+#' Count the privacy units in the exact frame consumed by training
+#'
+#' This is an internal staging invariant, not an analyst-visible statistic.
+#' Row mode counts rows. Patient mode counts the complete, canonical identifiers
+#' selected by the lifetime server policy and never falls back to rows.
+#' @keywords internal
+.countDpUnits <- function(data, dp_unit, patient_column = NULL) {
+  unit <- tolower(as.character(unlist(dp_unit, use.names = FALSE)))
+  if (length(unit) != 1L || is.na(unit) || !unit %in% c("row", "patient")) {
+    stop("Invalid staged DP unit.", call. = FALSE)
+  }
+  if (!is.data.frame(data)) {
+    stop("Staged training data must be a data.frame.", call. = FALSE)
+  }
+  if (identical(unit, "row")) return(nrow(data))
+
+  pcol <- as.character(unlist(patient_column, use.names = FALSE))
+  if (length(pcol) != 1L || is.na(pcol) || !nzchar(pcol) ||
+      !pcol %in% names(data)) {
+    stop("Patient-mode staging is missing its configured identifier column.",
+         call. = FALSE)
+  }
+  length(unique(.canonicalPatientIds(data[[pcol]])))
+}
+
+#' Remove the protected patient identifier from model features
+#' @keywords internal
+.excludePatientFeature <- function(feature_columns, patient_column) {
+  if (is.null(feature_columns) || !length(feature_columns) ||
+      is.null(patient_column)) return(feature_columns)
+  original <- as.character(unlist(feature_columns, use.names = FALSE))
+  kept <- setdiff(original, patient_column)
+  if (length(original) > 0L && length(kept) == 0L) {
+    stop("The patient identifier cannot be the only model feature.", call. = FALSE)
+  }
+  kept
+}
+
+#' Resolve an explicit, identifier-free tabular model feature set
+#' @keywords internal
+.resolveModelFeatures <- function(data, target_column, feature_columns,
+                                  patient_column) {
+  resolved <- if (is.null(feature_columns)) {
+    setdiff(names(data), c(as.character(target_column), patient_column))
+  } else {
+    .excludePatientFeature(feature_columns, patient_column)
+  }
+  resolved <- unique(as.character(unlist(resolved, use.names = FALSE)))
+  resolved <- resolved[nzchar(resolved)]
+  if (!length(resolved)) {
+    stop("Training data must contain at least one non-identifier feature.",
+         call. = FALSE)
+  }
+  resolved
+}
+
+#' Apply the public target contract without cohort-derived inference
+#' @keywords internal
+.transformPublicTarget <- function(data, target_column, run_config) {
+  target_column <- as.character(unlist(target_column, use.names = FALSE))
+  if (length(target_column) != 1L || !target_column %in% names(data)) {
+    stop("The enforced-DP runner requires exactly one target column.",
+         call. = FALSE)
+  }
+  target <- data[[target_column]]
+  task_type <- tolower(as.character(unlist(
+    run_config[["task-type"]] %||% "classification", use.names = FALSE)))
+
+  if (task_type %in% c("regression", "count", "continuous")) {
+    bounds <- run_config[["target-bounds"]]
+    numeric_target <- .coerceNumericOrMissing(target)
+    lower <- as.numeric(bounds$lower)
+    upper <- as.numeric(bounds$upper)
+    invalid <- is.na(numeric_target) | !is.finite(numeric_target)
+    numeric_target[invalid] <- lower / 2 + upper / 2
+    numeric_target <- pmin(upper, pmax(lower, numeric_target))
+    data[[target_column]] <- numeric_target
+    return(data)
+  }
+
+  spec <- run_config[["target-levels"]] %||% NULL
+  if (!is.null(spec)) {
+    level_type <- as.character(spec$type)
+    levels <- unlist(spec$values, use.names = FALSE)
+    if (identical(level_type, "character")) {
+      observed <- enc2utf8(as.character(target))
+      levels <- enc2utf8(as.character(levels))
+    } else if (identical(level_type, "logical")) {
+      observed <- tryCatch(suppressWarnings(as.logical(target)),
+                           error = function(e) rep(NA, length(target)))
+      levels <- as.logical(levels)
+    } else if (identical(level_type, "numeric")) {
+      observed <- .coerceNumericOrMissing(target)
+      levels <- as.numeric(levels)
+    } else {
+      stop("Pinned target-levels have an unsupported type.", call. = FALSE)
+    }
+    encoded <- match(observed, levels) - 1L
+    # Code zero is a public catch-all. This makes the transformation total and
+    # record-local; no success/error bit reveals whether a private value was
+    # missing or outside the declared vocabulary.
+    encoded[is.na(encoded)] <- 0L
+    data[[target_column]] <- encoded
+    return(data)
+  }
+
+  # Compatibility path: classification labels may already be public integer
+  # codes. Validate against the public model class count; never infer a mapping.
+  encoded <- .coerceNumericOrMissing(target)
+  expected <- run_config[["num-classes"]] %||% 2L
+  expected <- as.integer(unlist(expected, use.names = FALSE))
+  if (length(expected) != 1L || is.na(expected) || expected < 2L) {
+    stop("The public model class count must be at least two.", call. = FALSE)
+  }
+  invalid <- is.na(encoded) | !is.finite(encoded) | encoded != floor(encoded) |
+    encoded < 0 | encoded >= expected
+  encoded[invalid] <- 0L
+  data[[target_column]] <- encoded
+  data
 }
 
 .as_nonempty_character <- function(x) {
@@ -215,26 +430,79 @@
        "DSFLOWER_STAGING_ROOT.", call. = FALSE)
 }
 
+.expectedStagingDirs <- function(run_token, create_roots = FALSE) {
+  token <- .validate_run_token(run_token)
+  bases <- .stagingBaseCandidates(create = create_roots)
+  unique(vapply(bases, function(base) {
+    root <- file.path(base, "dsflower")
+    if (isTRUE(create_roots)) {
+      dir.create(root, recursive = TRUE, showWarnings = FALSE)
+    }
+    if (.path_is_symlink(root)) {
+      stop("The dsFlower staging root must not be a symbolic link.",
+           call. = FALSE)
+    }
+    if (dir.exists(root)) {
+      root <- normalizePath(root, winslash = "/", mustWork = TRUE)
+    } else {
+      root <- .canonical_state_path(root)
+    }
+    .canonical_state_path(file.path(root, token))
+  }, character(1)))
+}
+
+#' Validate a canonical staging path against its run token and allowed roots
+#' @keywords internal
+.validateStagingDir <- function(staging_dir, run_token, must_exist = TRUE) {
+  token <- .validate_run_token(run_token)
+  if (!is.character(staging_dir) || length(staging_dir) != 1L ||
+      is.na(staging_dir) || !.path_is_absolute(staging_dir)) {
+    stop("Invalid dsFlower staging directory.", call. = FALSE)
+  }
+  if (.path_is_symlink(staging_dir)) {
+    stop("The dsFlower staging directory must not be a symbolic link.",
+         call. = FALSE)
+  }
+  exists <- dir.exists(staging_dir)
+  if (isTRUE(must_exist) && !exists) {
+    stop("The dsFlower staging directory does not exist.", call. = FALSE)
+  }
+  supplied <- if (exists) {
+    normalizePath(staging_dir, winslash = "/", mustWork = TRUE)
+  } else {
+    .canonical_state_path(staging_dir)
+  }
+  allowed <- .expectedStagingDirs(token, create_roots = FALSE)
+  if (!supplied %in% allowed || !identical(basename(supplied), token)) {
+    stop("The dsFlower staging directory is outside the permitted run roots.",
+         call. = FALSE)
+  }
+  supplied
+}
+
 .ensureStagingDir <- function(run_token, required_bytes = 0) {
+  run_token <- .validate_run_token(run_token)
   base_dir <- .chooseStagingBase(required_bytes)
   staging_dir <- file.path(base_dir, "dsflower", run_token)
+  staging_dir <- .validateStagingDir(
+    staging_dir, run_token, must_exist = FALSE)
+  if (file.exists(staging_dir) && !dir.exists(staging_dir)) {
+    stop("The dsFlower staging path is not a directory.", call. = FALSE)
+  }
   dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
+  staging_dir <- .validateStagingDir(staging_dir, run_token, must_exist = TRUE)
   Sys.chmod(staging_dir, "0700")
   staging_dir
 }
 
-#' Stage data for a training run
+#' Force the always-on DP contract into a staging manifest
 #'
-#' Creates a run-specific directory under \code{{tempdir()}/dsflower/{run_token}/},
-#' writes the training data as CSV and a JSON manifest describing the data.
-#'
-#' @param data Data.frame of training data.
-#' @param run_token Character; the unique run token.
-#' Force the DP-always contract into a staging manifest.
-#'
-#' Differential privacy is always enforced (local DP, no Secure Aggregation) and
+#' Differential privacy is always enforced by the node-side trusted curator
+#' (central DP before egress, no Secure Aggregation), and
 #' disclosure is non-disclosive by default, so every manifest carries dp_enabled
 #' + suppressed metrics/counts + fixed sampling.
+#' @param manifest Named list containing the server-authored run manifest.
+#' @return The manifest with mandatory privacy flags applied.
 #' @keywords internal
 .normalize_dp_manifest <- function(manifest) {
   manifest[["dp_enabled"]]               <- TRUE
@@ -244,6 +512,294 @@
   manifest
 }
 
+.manifest_structural_fields <- function() {
+  c(
+    "run_token", "data_file", "data_format", "samples_file", "n_samples",
+    "n_units",
+    "n_input_samples", "dropped_missing", "target", "target_column",
+    "feature_columns", "staged_at", "data_root", "dp-unit", "patient_column",
+    "patient-id-canonicalization",
+    "target-preencoded",
+    "group_column", "dataset_id", "source_kind", "assets", "data_type",
+    "drop_missing"
+  )
+}
+
+#' Validate public feature bounds before private staging
+#' @keywords internal
+.normalizePublicFeatureBounds <- function(run_config) {
+  bounds <- run_config[["feature-bounds"]] %||% NULL
+  if (is.null(bounds)) return(run_config)
+  if (!is.list(bounds) || is.null(bounds$lower) || is.null(bounds$upper)) {
+    stop("feature-bounds must contain public lower and upper vectors.",
+         call. = FALSE)
+  }
+  lower <- suppressWarnings(as.numeric(unlist(bounds$lower, use.names = FALSE)))
+  upper <- suppressWarnings(as.numeric(unlist(bounds$upper, use.names = FALSE)))
+  if (!length(lower) || length(lower) != length(upper) ||
+      any(!is.finite(lower)) || any(!is.finite(upper)) || any(lower >= upper) ||
+      any(abs(lower) > .DSFLOWER_FLOAT32_SAFE_MAX) ||
+      any(abs(upper) > .DSFLOWER_FLOAT32_SAFE_MAX)) {
+    stop("feature-bounds must be equal-length finite vectors with lower < ",
+         "upper inside the declared [-1e6, 1e6] numeric domain.", call. = FALSE)
+  }
+  run_config[["feature-bounds"]] <- list(lower = lower, upper = upper)
+  run_config
+}
+
+#' Validate and canonicalise public target semantics
+#'
+#' These values are supplied by the analyst as public constants and then pinned
+#' into the server-written manifest. They are never inferred from a node cohort.
+#' @keywords internal
+.normalizePublicTargetConfig <- function(run_config) {
+  task_type <- tolower(as.character(unlist(
+    run_config[["task-type"]] %||% run_config[["task_type"]] %||%
+      "classification", use.names = FALSE)))
+  if (length(task_type) != 1L || is.na(task_type) || !nzchar(task_type)) {
+    stop("task-type must be one non-empty value.", call. = FALSE)
+  }
+
+  levels <- run_config[["target-levels"]] %||% NULL
+  bounds <- run_config[["target-bounds"]] %||% NULL
+  numeric_task <- task_type %in% c("regression", "count", "continuous")
+
+  if (isTRUE(numeric_task)) {
+    if (!is.null(levels)) {
+      stop("target-levels is only valid for classification targets.",
+           call. = FALSE)
+    }
+    if (!is.list(bounds) || is.null(bounds$lower) || is.null(bounds$upper)) {
+      stop("Public target_bounds=list(lower=..., upper=...) is required for ",
+           "regression/count models.", call. = FALSE)
+    }
+    lower <- suppressWarnings(as.numeric(unlist(bounds$lower, use.names = FALSE)))
+    upper <- suppressWarnings(as.numeric(unlist(bounds$upper, use.names = FALSE)))
+    if (length(lower) != 1L || length(upper) != 1L ||
+        !is.finite(lower) || !is.finite(upper) || lower >= upper ||
+        abs(lower) > .DSFLOWER_FLOAT32_SAFE_MAX ||
+        abs(upper) > .DSFLOWER_FLOAT32_SAFE_MAX) {
+      stop("target-bounds must contain finite scalar lower < upper inside ",
+           "the declared [-1e6, 1e6] numeric domain.",
+           call. = FALSE)
+    }
+    loss_name <- tolower(as.character(unlist(
+      run_config[["loss-name"]] %||% "", use.names = FALSE)))
+    if (identical(task_type, "count") && lower < 0) {
+      stop("Count target bounds require lower >= 0.", call. = FALSE)
+    }
+    if (identical(loss_name, "gamma_nll") && lower <= 0) {
+      stop("gamma_nll target bounds require lower > 0.", call. = FALSE)
+    }
+    run_config[["target-bounds"]] <- list(lower = lower, upper = upper)
+    run_config[["target-levels"]] <- NULL
+    return(run_config)
+  }
+
+  if (!is.null(bounds)) {
+    stop("target-bounds is only valid for regression/count targets.",
+         call. = FALSE)
+  }
+  if (is.null(levels)) return(run_config)
+
+  if (is.factor(levels)) levels <- as.character(levels)
+  if (is.list(levels)) {
+    if (!is.null(names(levels)) || !length(levels) ||
+        any(vapply(levels, length, integer(1)) != 1L)) {
+      stop("target-levels must be a public vector, not an object.",
+           call. = FALSE)
+    }
+    kinds <- vapply(levels, function(value) {
+      if (is.character(value)) "character" else
+        if (is.logical(value)) "logical" else
+          if (is.numeric(value)) "numeric" else "unsupported"
+    }, character(1))
+    if (length(unique(kinds)) != 1L || identical(kinds[[1]], "unsupported")) {
+      stop("target-levels values must all have one public scalar type.",
+           call. = FALSE)
+    }
+  }
+  values <- unlist(levels, use.names = FALSE)
+  if (!is.atomic(values) || length(values) < 2L || length(values) > 1024L ||
+      anyNA(values)) {
+    stop("target-levels must contain 2 to 1024 public, non-missing values.",
+         call. = FALSE)
+  }
+  if (is.character(values)) {
+    values <- enc2utf8(values)
+    if (any(!nzchar(values))) {
+      stop("target-levels cannot contain empty strings.", call. = FALSE)
+    }
+    level_type <- "character"
+  } else if (is.logical(values)) {
+    level_type <- "logical"
+  } else if (is.numeric(values)) {
+    values <- as.numeric(values)
+    if (any(!is.finite(values))) {
+      stop("Numeric target-levels must be finite.", call. = FALSE)
+    }
+    level_type <- "numeric"
+  } else {
+    stop("target-levels must be character, logical, or numeric.", call. = FALSE)
+  }
+  if (anyDuplicated(values)) {
+    stop("target-levels must be unique and ordered.", call. = FALSE)
+  }
+
+  expected <- run_config[["num-classes"]] %||% NULL
+  if (identical(tolower(as.character(run_config[["dp-track"]] %||% "")),
+                "trees")) expected <- 2L
+  if (!is.null(expected)) {
+    expected <- suppressWarnings(as.integer(unlist(expected, use.names = FALSE)))
+    if (length(expected) != 1L || is.na(expected) ||
+        expected != length(values)) {
+      stop("target-levels length must equal the public model class count.",
+           call. = FALSE)
+    }
+  }
+  run_config[["target-levels"]] <- list(type = level_type, values = values)
+  run_config[["target-bounds"]] <- NULL
+  run_config
+}
+
+.server_owned_run_config_fields <- function() {
+  c(
+    .manifest_structural_fields()[.manifest_structural_fields() != "data_type"],
+    "dp_enabled", "allow_per_node_metrics", "allow_exact_num_examples",
+    "fixed_client_sampling", "privacy-domain", "privacy-adjacency",
+    "privacy-reserved",
+    "privacy-release-enabled", "privacy-max-releases", "privacy-epsilon",
+    "privacy-delta", "privacy-clipping_norm", "privacy-sample_aggregate",
+    "privacy-sa_blocks", "privacy-egress_time_pad",
+    "privacy-egress_timeout", "privacy-egress_memory_mb",
+    "privacy-egress_file_mb", "privacy-egress_processes",
+    "privacy-hook_enabled",
+    "privacy-allocation-index", "user-module"
+  )
+}
+
+# Validate the untrusted analyst run_config before server-owned privacy fields
+# are injected. data_type is intentionally allowed as a routing request; the
+# selected branch removes it and writes its own authoritative manifest value.
+.validate_client_run_config <- function(run_config) {
+  if (!is.list(run_config)) {
+    stop("run_config must be a JSON object or named list.", call. = FALSE)
+  }
+  if (!length(run_config)) return(run_config)
+  keys <- names(run_config)
+  if (is.null(keys) || length(keys) != length(run_config) ||
+      any(is.na(keys) | !nzchar(keys)) || anyDuplicated(keys)) {
+    stop("run_config must have unique, non-empty field names.", call. = FALSE)
+  }
+  conflicts <- intersect(keys, .server_owned_run_config_fields())
+  if (length(conflicts)) {
+    stop("run_config cannot set server-owned manifest field(s): ",
+         paste(conflicts, collapse = ", "), ".", call. = FALSE)
+  }
+  run_config
+}
+
+.merge_manifest_config <- function(manifest, extra_config) {
+  if (!length(extra_config)) return(manifest)
+  if (!is.list(extra_config)) {
+    stop("Manifest configuration must be a named list.", call. = FALSE)
+  }
+  keys <- names(extra_config)
+  if (is.null(keys) || any(is.na(keys) | !nzchar(keys)) || anyDuplicated(keys)) {
+    stop("Manifest configuration must have unique, non-empty field names.",
+         call. = FALSE)
+  }
+  conflicts <- intersect(keys, names(manifest))
+  if (length(conflicts)) {
+    stop("Manifest configuration cannot duplicate server-owned field(s): ",
+         paste(conflicts, collapse = ", "), ".", call. = FALSE)
+  }
+  manifest[keys] <- extra_config
+  manifest
+}
+
+.validate_manifest_extra_config <- function(extra_config) {
+  extra_config <- .merge_manifest_config(list(), extra_config)
+  conflicts <- intersect(names(extra_config), .manifest_structural_fields())
+  if (length(conflicts)) {
+    stop("Manifest configuration cannot provide server-owned field(s): ",
+         paste(conflicts, collapse = ", "), ".", call. = FALSE)
+  }
+  extra_config
+}
+
+#' Atomically replace a JSON manifest in its own directory
+#' @keywords internal
+.write_manifest_atomic <- function(manifest, manifest_path) {
+  tmp <- tempfile(pattern = ".manifest-", tmpdir = dirname(manifest_path))
+  on.exit(unlink(tmp), add = TRUE)
+  jsonlite::write_json(manifest, tmp, auto_unbox = TRUE, pretty = TRUE,
+                       null = "null", digits = NA)
+  Sys.chmod(tmp, "0600")
+  if (!file.rename(tmp, manifest_path)) {
+    stop("Could not atomically update the run manifest.", call. = FALSE)
+  }
+  invisible(manifest_path)
+}
+
+#' Bind an accountant reservation to a prepared manifest
+#' @keywords internal
+.apply_privacy_reservation <- function(staging_dir, reservation) {
+  manifest_path <- file.path(staging_dir, "manifest.json")
+  if (!file.exists(manifest_path)) {
+    stop("Prepared run manifest is missing.", call. = FALSE)
+  }
+  manifest <- tryCatch(
+    jsonlite::fromJSON(manifest_path, simplifyVector = FALSE),
+    error = function(e) stop("Prepared run manifest is unreadable: ",
+                             conditionMessage(e), call. = FALSE))
+  if (length(manifest[["run_token"]]) != 1L ||
+      !identical(as.character(manifest[["run_token"]]),
+                 as.character(reservation$run_token))) {
+    stop("Privacy reservation run token does not match the prepared manifest.",
+         call. = FALSE)
+  }
+  expected_horizon <- as.integer(manifest[["privacy-max-releases"]] %||% NA)
+  if (is.na(expected_horizon) ||
+      expected_horizon != as.integer(reservation$max_releases)) {
+    stop("Privacy reservation horizon does not match the prepared manifest.",
+         call. = FALSE)
+  }
+  manifest_unit <- as.character(manifest[["dp-unit"]] %||% "")
+  reservation_unit <- as.character(reservation$dp_unit %||% "")
+  manifest_patient <- manifest[["patient_column"]] %||% NULL
+  reservation_patient <- reservation$patient_column %||% NULL
+  manifest_canonicalization <- as.character(
+    manifest[["patient-id-canonicalization"]] %||% "")
+  reservation_canonicalization <- as.character(
+    reservation$unit_canonicalization %||% "")
+  manifest_adjacency <- as.character(
+    manifest[["privacy-adjacency"]] %||% "")
+  reservation_adjacency <- as.character(reservation$adjacency %||% "")
+  if (!identical(manifest_unit, reservation_unit) ||
+      !identical(manifest_patient, reservation_patient) ||
+      !identical(manifest_canonicalization, reservation_canonicalization) ||
+      !identical(manifest_adjacency, reservation_adjacency)) {
+    stop("Privacy reservation unit does not match the prepared manifest.",
+         call. = FALSE)
+  }
+  manifest[["privacy-reserved"]] <- TRUE
+  manifest[["privacy-release-enabled"]] <- isTRUE(reservation$release_enabled)
+  manifest[["privacy-domain"]] <- reservation$domain
+  manifest[["privacy-allocation-index"]] <- reservation$allocation_index
+  manifest[["privacy-epsilon"]] <- reservation$epsilon
+  manifest[["privacy-delta"]] <- reservation$delta
+  .write_manifest_atomic(manifest, manifest_path)
+}
+
+#' Stage a validated tabular training frame
+#'
+#' Writes the selected model columns and server-owned manifest into an isolated
+#' run directory. A resolved patient identifier is retained only for local
+#' grouping and is never added to model features.
+#'
+#' @param data Data.frame containing the local training rows.
+#' @param run_token Server-generated run identifier.
 #' @param target_column Character; name of the target column.
 #' @param feature_columns Character vector or NULL; names of feature columns.
 #' @param extra_config Named list of additional configuration to include in manifest.
@@ -251,13 +807,21 @@
 #' @keywords internal
 .stageData <- function(data, run_token, target_column,
                        feature_columns = NULL, extra_config = list()) {
-  drop_missing <- !identical(extra_config[["drop_missing"]], FALSE)
+  extra_config <- .validate_manifest_extra_config(extra_config)
+  data <- .transformPublicTarget(data, target_column, extra_config)
+  unit <- .prepareDpUnitFrame(data)
+  data <- unit$data
+  patient_column <- unit$patient_column
+  feature_columns <- .resolveModelFeatures(
+    data, target_column, feature_columns, patient_column)
+  data <- .totalizeModelFeatures(data, feature_columns, extra_config)
   prepared <- .prepareTrainingFrame(
     data,
     target_column = target_column,
     feature_columns = feature_columns,
-    drop_missing = drop_missing,
-    select_columns = TRUE
+    drop_missing = FALSE,
+    select_columns = TRUE,
+    patient_column = patient_column
   )
   data <- prepared$data
 
@@ -281,27 +845,30 @@
   # Build manifest
   manifest <- list(
     run_token       = run_token,
+    data_type       = "tabular",
     data_file       = data_file,
     data_format     = data_format,
     n_samples       = prepared$n_samples,
+    n_units         = .countDpUnits(
+      data, unit$dp_unit, unit$patient_column),
     n_input_samples = prepared$n_input_samples,
     dropped_missing = prepared$dropped_missing,
     target_column   = target_column,
     feature_columns = feature_columns,
+    "dp-unit"       = unit$dp_unit,
+    patient_column  = patient_column,
+    "patient-id-canonicalization" = unit$canonicalization,
+    "target-preencoded" = TRUE,
     staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
   # Merge extra config (includes privacy settings from trust profile)
-  if (length(extra_config) > 0) {
-    manifest <- c(manifest, extra_config)
-  }
+  manifest <- .merge_manifest_config(manifest, extra_config)
 
   # Write manifest
   manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
-  jsonlite::write_json(manifest, manifest_path,
-                       auto_unbox = TRUE, pretty = TRUE, null = "null")
-  Sys.chmod(manifest_path, "0600")
+  .write_manifest_atomic(manifest, manifest_path)
 
   staging_dir
 }
@@ -316,11 +883,13 @@
 .cleanupStaging <- function(run_token) {
   if (is.null(run_token)) return(invisible(TRUE))
 
-  # Check configured and default base directories. Older runs may exist in
-  # either tmpfs or tempdir, so cleanup intentionally scans all candidates.
-  for (base in .stagingBaseCandidates(create = FALSE)) {
-    staging_dir <- file.path(base, "dsflower", run_token)
+  run_token <- .validate_run_token(run_token)
+  # Check every permitted root. Exact token validation and canonical containment
+  # happen before recursive deletion; traversal and symlink aliases fail closed.
+  for (staging_dir in .expectedStagingDirs(run_token, create_roots = FALSE)) {
     if (dir.exists(staging_dir)) {
+      staging_dir <- .validateStagingDir(
+        staging_dir, run_token, must_exist = TRUE)
       unlink(staging_dir, recursive = TRUE)
     }
   }
@@ -360,58 +929,66 @@
 #' @keywords internal
 .stage_image_manifest <- function(run_token, target_column,
                                    samples_data, extra_config = list()) {
+  extra_config <- .validate_manifest_extra_config(extra_config)
   data_root <- .resolve_image_data_root()
-
-  staging_dir <- .ensureStagingDir(run_token)
-
-  # Write samples metadata to staging
   if (is.data.frame(samples_data)) {
     samples_basename <- "samples.csv"
-    staged_samples <- file.path(staging_dir, samples_basename)
-    utils::write.csv(samples_data, staged_samples, row.names = FALSE)
-    n_samples <- nrow(samples_data)
   } else if (is.character(samples_data) && file.exists(samples_data)) {
     samples_basename <- basename(samples_data)
-    staged_samples <- file.path(staging_dir, samples_basename)
-    file.copy(samples_data, staged_samples)
     if (grepl("\\.parquet$", samples_basename, ignore.case = TRUE)) {
       if (!requireNamespace("arrow", quietly = TRUE)) {
         stop("arrow package required for Parquet support.", call. = FALSE)
       }
-      n_samples <- nrow(arrow::read_parquet(staged_samples))
+      samples_data <- as.data.frame(arrow::read_parquet(samples_data))
     } else {
-      n_samples <- nrow(utils::read.csv(staged_samples))
+      samples_data <- utils::read.csv(samples_data, stringsAsFactors = FALSE)
     }
   } else {
     stop("samples_data must be a data.frame or a path to an existing file.",
          call. = FALSE)
   }
+
+  samples_data <- .transformPublicTarget(
+    samples_data, target_column, extra_config)
+  unit <- .prepareDpUnitFrame(samples_data)
+  prepared <- .prepareTrainingFrame(
+    unit$data,
+    target_column = target_column,
+    feature_columns = character(0),
+    drop_missing = FALSE,
+    select_columns = FALSE,
+    patient_column = unit$patient_column
+  )
+  samples_data <- prepared$data
+
+  staging_dir <- .ensureStagingDir(run_token)
+  staged_samples <- file.path(staging_dir, samples_basename)
+  .writeStagedSamples(samples_data, staged_samples)
   Sys.chmod(staged_samples, "0600")
 
-  # Build manifest (patient_column pins the per-patient DP unit to the admission
-  # grouping column when samples are in-memory; the harness auto-detects otherwise).
-  patient_column <- if (is.data.frame(samples_data))
-    .detectPatientColumn(samples_data, extra_config) else NULL
   manifest <- list(
     run_token    = run_token,
     data_type    = "image",
     data_root    = data_root,
     samples_file = samples_basename,
-    n_samples    = n_samples,
+    n_samples    = prepared$n_samples,
+    n_units      = .countDpUnits(
+      samples_data, unit$dp_unit, unit$patient_column),
+    n_input_samples = prepared$n_input_samples,
+    dropped_missing = prepared$dropped_missing,
     target_column = target_column,
-    patient_column = patient_column,
+    "dp-unit" = unit$dp_unit,
+    patient_column = unit$patient_column,
+    "patient-id-canonicalization" = unit$canonicalization,
+    "target-preencoded" = TRUE,
     staged_at    = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
-  if (length(extra_config) > 0) {
-    manifest <- c(manifest, extra_config)
-  }
+  manifest <- .merge_manifest_config(manifest, extra_config)
 
   manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
-  jsonlite::write_json(manifest, manifest_path,
-                       auto_unbox = TRUE, pretty = TRUE, null = "null")
-  Sys.chmod(manifest_path, "0600")
+  .write_manifest_atomic(manifest, manifest_path)
 
   staging_dir
 }
@@ -438,6 +1015,7 @@
 .stageFromDescriptor <- function(desc, run_token, target_column,
                                   feature_columns = NULL,
                                   extra_config = list()) {
+  extra_config <- .validate_manifest_extra_config(extra_config)
   kind <- desc$source_kind
 
   if (identical(kind, "in_memory_df")) {
@@ -521,6 +1099,7 @@
 #' @keywords internal
 .stageFromDescriptor_parquet <- function(desc, run_token, target_column,
                                           feature_columns, extra_config) {
+  extra_config <- .validate_manifest_extra_config(extra_config)
   if (!requireNamespace("arrow", quietly = TRUE)) {
     stop("Package 'arrow' is required for staged_parquet descriptors.",
          call. = FALSE)
@@ -542,10 +1121,15 @@
   if (is.list(feature_columns)) feature_columns <- unlist(feature_columns)
   feature_columns <- as.character(feature_columns)
   feature_columns <- feature_columns[nzchar(feature_columns)]
-  cols_needed <- NULL
-  if (!is.null(feature_columns) && length(feature_columns) > 0L) {
-    cols_needed <- unique(c(target_column, feature_columns))
-  }
+  schema_names <- arrow::open_dataset(src_path, format = "parquet")$schema$names
+  schema_proxy <- as.data.frame(
+    stats::setNames(rep(list(logical(0)), length(schema_names)), schema_names),
+    optional = TRUE
+  )
+  patient_column <- .detectPatientColumn(schema_proxy, list())
+  feature_columns <- .resolveModelFeatures(
+    schema_proxy, target_column, feature_columns, patient_column)
+  cols_needed <- unique(c(target_column, feature_columns, patient_column))
 
   staging_dir <- .ensureStagingDir(
     run_token,
@@ -553,17 +1137,20 @@
   )
 
   # Read with column selection, drop incomplete rows, and write to staging.
-  tbl <- if (is.null(cols_needed)) {
-    arrow::read_parquet(src_path)
-  } else {
-    arrow::read_parquet(src_path, col_select = cols_needed)
-  }
+  all_of <- utils::getFromNamespace("all_of", "tidyselect")
+  tbl <- arrow::read_parquet(src_path, col_select = all_of(cols_needed))
+  transformed <- .transformPublicTarget(
+    as.data.frame(tbl), target_column, extra_config)
+  unit <- .prepareDpUnitFrame(transformed)
+  transformed <- .totalizeModelFeatures(
+    unit$data, feature_columns, extra_config)
   prepared <- .prepareTrainingFrame(
-    as.data.frame(tbl),
+    transformed,
     target_column = target_column,
     feature_columns = feature_columns,
-    drop_missing = !identical(extra_config[["drop_missing"]], FALSE),
-    select_columns = TRUE
+    drop_missing = FALSE,
+    select_columns = TRUE,
+    patient_column = patient_column
   )
   data_file <- "train.parquet"
   arrow::write_parquet(prepared$data, file.path(staging_dir, data_file))
@@ -572,26 +1159,29 @@
   # Build manifest
   manifest <- list(
     run_token       = run_token,
+    data_type       = "tabular",
     data_file       = data_file,
     data_format     = "parquet",
     n_samples       = prepared$n_samples,
+    n_units         = .countDpUnits(
+      prepared$data, unit$dp_unit, unit$patient_column),
     n_input_samples = prepared$n_input_samples,
     dropped_missing = prepared$dropped_missing,
     target_column   = target_column,
     feature_columns = feature_columns,
+    "dp-unit"       = unit$dp_unit,
+    patient_column  = patient_column,
+    "patient-id-canonicalization" = unit$canonicalization,
+    "target-preencoded" = TRUE,
     dataset_id      = desc$dataset_id,
     source_kind     = "staged_parquet",
     staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
-  if (length(extra_config) > 0) {
-    manifest <- c(manifest, extra_config)
-  }
+  manifest <- .merge_manifest_config(manifest, extra_config)
 
   manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
-  jsonlite::write_json(manifest, manifest_path,
-                       auto_unbox = TRUE, pretty = TRUE, null = "null")
-  Sys.chmod(manifest_path, "0600")
+  .write_manifest_atomic(manifest, manifest_path)
 
   staging_dir
 }
@@ -627,12 +1217,54 @@
   sub("^s3://[^/]+/?", "", uri)
 }
 
+.s3Bucket <- function(uri) {
+  sub("^s3://([^/]+).*$", "\\1", uri)
+}
+
+#' Validate one path relative to a staged image root
+#'
+#' Image paths can originate in object metadata.  Keep them as portable,
+#' lexical relative paths so neither R nor the Python runner can interpret an
+#' absolute path, a Windows separator, or a traversal component.
+#' @keywords internal
+.safeRelativeAssetPath <- function(path) {
+  if (!is.character(path) || length(path) != 1L || is.na(path) ||
+      !nzchar(path) || grepl("[[:cntrl:]]", path) ||
+      grepl("\\\\", path) || grepl("^/", path) ||
+      grepl("^[A-Za-z]:", path)) {
+    stop("Image metadata contains an unsafe relative path.", call. = FALSE)
+  }
+  parts <- strsplit(path, "/", fixed = TRUE)[[1]]
+  if (!length(parts) || any(!nzchar(parts)) || any(parts %in% c(".", ".."))) {
+    stop("Image metadata contains an unsafe relative path.", call. = FALSE)
+  }
+  paste(parts, collapse = "/")
+}
+
 .s3RelativePath <- function(uri, prefix) {
+  if (!is.character(uri) || length(uri) != 1L || is.na(uri) ||
+      !grepl("^s3://[^/]+/", uri) ||
+      !is.character(prefix) || length(prefix) != 1L || is.na(prefix) ||
+      !grepl("^s3://[^/]+(/|$)", prefix) ||
+      !identical(.s3Bucket(uri), .s3Bucket(prefix))) {
+    stop("Image metadata contains an object outside its configured S3 prefix.",
+         call. = FALSE)
+  }
   key <- .s3ObjectKey(uri)
-  prefix_key <- .s3ObjectKey(prefix)
-  prefix_key <- paste0(sub("/+$", "", prefix_key), "/")
-  rel <- sub(paste0("^", .regex_escape(prefix_key)), "", key)
-  if (!nzchar(rel) || identical(rel, key)) basename(uri) else rel
+  prefix_key <- sub("/+$", "", .s3ObjectKey(prefix))
+  rel <- if (!nzchar(prefix_key)) {
+    key
+  } else if (identical(key, prefix_key)) {
+    basename(key)
+  } else {
+    marker <- paste0(prefix_key, "/")
+    if (!startsWith(key, marker)) {
+      stop("Image metadata contains an object outside its configured S3 prefix.",
+           call. = FALSE)
+    }
+    substring(key, nchar(marker) + 1L)
+  }
+  .safeRelativeAssetPath(rel)
 }
 
 .isDirectoryLikeObject <- function(uri) {
@@ -654,13 +1286,32 @@
 
 .downloadS3DirectoryAsset <- function(backend, s3_uri, local_root, files) {
   dir.create(local_root, recursive = TRUE, showWarnings = FALSE)
+  local_root <- normalizePath(local_root, winslash = "/", mustWork = TRUE)
   rel_paths <- character(0)
   for (f in files) {
     rel <- .s3RelativePath(f, s3_uri)
     if (!nzchar(rel) || .isDirectoryLikeObject(rel)) next
     local_path <- file.path(local_root, rel)
+    dir.create(dirname(local_path), recursive = TRUE, showWarnings = FALSE)
+    parent <- normalizePath(dirname(local_path), winslash = "/", mustWork = TRUE)
+    if (!(identical(parent, local_root) ||
+          startsWith(parent, paste0(local_root, "/"))) ||
+        .path_is_symlink(local_path)) {
+      stop("Image metadata resolves outside its staged asset root.",
+           call. = FALSE)
+    }
     if (!file.exists(local_path)) {
       dsImaging::backend_get_file(backend, f, local_path)
+    }
+    if (!file.exists(local_path) || dir.exists(local_path) ||
+        .path_is_symlink(local_path)) {
+      stop("The image backend did not produce a safe regular file.",
+           call. = FALSE)
+    }
+    resolved <- normalizePath(local_path, winslash = "/", mustWork = TRUE)
+    if (!startsWith(resolved, paste0(local_root, "/"))) {
+      stop("Image metadata resolves outside its staged asset root.",
+           call. = FALSE)
     }
     rel_paths <- c(rel_paths, rel)
   }
@@ -715,7 +1366,10 @@
   primary <- as.character(primary %||% NA_character_)
   if (is.na(primary) || !nzchar(primary)) return(NA_character_)
   if (grepl("^s3://", primary)) return(.s3RelativePath(primary, image_uri %||% primary))
-  primary <- sub("^/+", "", primary)
+  if (grepl("^/", primary) || grepl("\\\\", primary) ||
+      grepl("^[A-Za-z]:", primary)) {
+    stop("Image metadata contains an unsafe relative path.", call. = FALSE)
+  }
   image_key <- if (!is.null(image_uri) && grepl("^s3://", image_uri)) {
     .s3ObjectKey(image_uri)
   } else {
@@ -725,7 +1379,7 @@
   if (nzchar(image_key)) {
     primary <- sub(paste0("^", .regex_escape(image_key)), "", primary)
   }
-  sub("^source/images/", "", primary)
+  .safeRelativeAssetPath(sub("^source/images/", "", primary))
 }
 
 .ensureImagePathColumn <- function(samples_df, path_col = "relative_path",
@@ -735,7 +1389,11 @@
                                    downloaded_rels = character(0)) {
   if (path_col %in% names(samples_df)) {
     current <- as.character(samples_df[[path_col]])
-    if (all(!is.na(current) & nzchar(current))) return(samples_df)
+    if (all(!is.na(current) & nzchar(current))) {
+      samples_df[[path_col]] <- vapply(
+        current, .safeRelativeAssetPath, character(1))
+      return(samples_df)
+    }
   }
 
   if (!("sample_id" %in% names(samples_df))) {
@@ -767,6 +1425,8 @@
 
   missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
   if (any(missing_rel) && length(downloaded_rels) > 0L) {
+    downloaded_rels <- vapply(
+      downloaded_rels, .safeRelativeAssetPath, character(1))
     rel_by_stem <- downloaded_rels
     names(rel_by_stem) <- .stripKnownImageExtension(downloaded_rels)
     rel_paths[missing_rel] <- rel_by_stem[sample_ids[missing_rel]]
@@ -775,8 +1435,12 @@
   missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
   if (any(missing_rel) && !is.null(image_root) && dir.exists(image_root)) {
     for (i in which(missing_rel)) {
+      stem <- tryCatch(
+        .safeRelativeAssetPath(sample_ids[[i]]),
+        error = function(e) NA_character_)
+      if (is.na(stem) || grepl("/", stem, fixed = TRUE)) next
       for (ext in .knownImageExtensions()) {
-        candidate <- paste0(sample_ids[[i]], ext)
+        candidate <- paste0(stem, ext)
         if (file.exists(file.path(image_root, candidate))) {
           rel_paths[[i]] <- candidate
           break
@@ -787,14 +1451,13 @@
 
   missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
   if (any(missing_rel)) {
-    stop("Could not resolve image path for sample_id(s): ",
-         paste(utils::head(sample_ids[missing_rel], 5L), collapse = ", "),
-         if (sum(missing_rel) > 5L) "..." else "",
-         ". Provide a relative path column or a dsImaging sample_manifests table.",
+    stop("Could not resolve one or more image paths. Provide a relative path ",
+         "column or a dsImaging sample_manifests table.",
          call. = FALSE)
   }
 
-  samples_df[[path_col]] <- unname(rel_paths)
+  samples_df[[path_col]] <- unname(vapply(
+    rel_paths, .safeRelativeAssetPath, character(1)))
   samples_df
 }
 
@@ -818,8 +1481,21 @@
 #' @keywords internal
 .stageFromDescriptor_image <- function(desc, run_token, target_column,
                                         feature_columns, extra_config) {
+  extra_config <- .validate_manifest_extra_config(extra_config)
   meta <- desc$metadata
   assets <- desc$assets
+  if (!is.list(assets) ||
+      (length(assets) > 0L &&
+       (is.null(names(assets)) || any(!nzchar(names(assets))) ||
+        anyDuplicated(names(assets))))) {
+    stop("Image descriptors require unique, named assets.", call. = FALSE)
+  }
+  if (length(assets) > 0L) {
+    if (any(!grepl("^[A-Za-z][A-Za-z0-9_.-]{0,63}$", names(assets)))) {
+      stop("Image asset names must be safe single components.",
+           call. = FALSE)
+    }
+  }
   dir_asset_types <- c("image_root", "mask_root", "wsi_root",
                        "dicom_series_root", "rt_struct_root")
   file_asset_types <- c("feature_table", "rt_dose_file", "rt_plan_file")
@@ -897,12 +1573,17 @@
   }
 
   samples_df <- .readStagedSamples(staged_samples)
+  samples_df <- .transformPublicTarget(
+    samples_df, target_column, extra_config)
+  unit <- .prepareDpUnitFrame(samples_df)
+  patient_column <- unit$patient_column
   prepared <- .prepareTrainingFrame(
-    samples_df,
+    unit$data,
     target_column = target_column,
-    feature_columns = feature_columns,
-    drop_missing = !identical(extra_config[["drop_missing"]], FALSE),
-    select_columns = FALSE
+    feature_columns = character(0),
+    drop_missing = FALSE,
+    select_columns = FALSE,
+    patient_column = patient_column
   )
   samples_df <- prepared$data
 
@@ -1005,32 +1686,32 @@
   # Build manifest. patient_column is the column the disclosure admission grouped
   # by (.detectPatientColumn); pinning it here makes the harness train per-PATIENT
   # on the SAME column, so the DP unit matches the admission unit.
-  patient_column <- .detectPatientColumn(samples_df, extra_config)
   manifest <- list(
     run_token     = run_token,
     data_type     = "image",
     data_root     = data_root,
     samples_file  = samples_basename,
     n_samples     = n_samples,
+    n_units       = .countDpUnits(
+      samples_df, unit$dp_unit, unit$patient_column),
     n_input_samples = prepared$n_input_samples,
     dropped_missing = prepared$dropped_missing,
     target_column = target_column,
+    "dp-unit" = unit$dp_unit,
     patient_column = patient_column,
+    "patient-id-canonicalization" = unit$canonicalization,
+    "target-preencoded" = TRUE,
     dataset_id    = desc$dataset_id,
     source_kind   = "image_bundle",
     assets        = validated_assets,
     staged_at     = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
-  if (length(extra_config) > 0) {
-    manifest <- c(manifest, extra_config)
-  }
+  manifest <- .merge_manifest_config(manifest, extra_config)
 
   manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
-  jsonlite::write_json(manifest, manifest_path,
-                       auto_unbox = TRUE, pretty = TRUE, null = "null")
-  Sys.chmod(manifest_path, "0600")
+  .write_manifest_atomic(manifest, manifest_path)
 
   staging_dir
 }

@@ -1,5 +1,61 @@
 # Tests for R/runtime.R — SuperNode Registry
 
+local_runtime_privacy_state <- function(.local_envir = parent.frame()) {
+  state_dir <- tempfile("dsflower-runtime-state-")
+  dir.create(state_dir, recursive = TRUE)
+  secret <- file.path(state_dir, "node-secret")
+  ledger <- file.path(state_dir, "ledger.sqlite")
+  writeChar(strrep("a", 64), secret, eos = NULL)
+  Sys.chmod(secret, "0600")
+  file.create(ledger)
+  withr::defer(unlink(state_dir, recursive = TRUE), envir = .local_envir)
+  withr::local_options(list(dsflower.privacy_ledger_path = ledger),
+                       .local_envir = .local_envir)
+  withr::local_envvar(c(
+    DSFLOWER_NODE_SECRET_FILE = secret,
+    DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+    DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+  ), .local_envir = .local_envir)
+  invisible(state_dir)
+}
+
+test_that("the mandatory Python integrity bootstrap installs or fails closed", {
+  staging <- withr::local_tempdir()
+  source_dir <- withr::local_tempdir()
+  source <- file.path(source_dir, "sitecustomize.py")
+  writeLines("PIN = 'trusted'", source)
+
+  hook_dir <- dsFlower:::.install_integrity_hook(staging, source)
+  installed <- file.path(hook_dir, "sitecustomize.py")
+  expect_true(file.exists(installed))
+  expect_identical(
+    digest::digest(file = installed, algo = "sha256"),
+    digest::digest(file = source, algo = "sha256")
+  )
+  expect_error(
+    dsFlower:::.install_integrity_hook(
+      staging, file.path(source_dir, "missing.py")),
+    "mandatory"
+  )
+})
+
+test_that("the trusted Python environment does not inherit injection variables", {
+  local_runtime_privacy_state()
+  withr::local_envvar(c(
+    PYTHONPATH = "/attacker/path",
+    PYTHONSTARTUP = "/attacker/startup.py",
+    PYTHONINSPECT = "1",
+    LD_PRELOAD = "/attacker/preload.so",
+    DSFLOWER_ATTACKER_VALUE = "present"
+  ))
+  env <- dsFlower:::.build_clean_python_env(
+    tempfile("venv-"), withr::local_tempdir(), extra_pypath = "/trusted/hook")
+  expect_identical(unname(env[["PYTHONPATH"]]), "/trusted/hook")
+  expect_false(any(names(env) %in% c(
+    "PYTHONSTARTUP", "PYTHONINSPECT", "LD_PRELOAD", "DSFLOWER_ATTACKER_VALUE")))
+  expect_identical(unname(env[["PYTHONNOUSERSITE"]]), "1")
+})
+
 test_that(".supernode_lookup returns NULL for unknown manifest_dir", {
   result <- dsFlower:::.supernode_lookup("/nonexistent/path")
   expect_null(result)
@@ -144,6 +200,7 @@ test_that(".supernode_ensure blocks when policy disables spawning", {
 })
 
 test_that(".supernode_ensure uses --root-certificates when ca_cert_path provided", {
+  local_runtime_privacy_state()
   reg <- dsFlower:::.supernode_registry
   rm(list = ls(reg), envir = reg)
 
@@ -220,6 +277,69 @@ test_that(".supernode_ensure errors when no ca_cert_path", {
   )
 
   rm(list = ls(reg), envir = reg)
+})
+
+test_that("resolved Python dependency versions are recorded deterministically", {
+  venv <- withr::local_tempdir()
+  site <- file.path(venv, "lib", "python3.11", "site-packages")
+  dir.create(file.path(site, "flwr-1.31.0.dist-info"), recursive = TRUE)
+  dir.create(file.path(site, "opacus-1.6.0.dist-info"), recursive = TRUE)
+  writeLines(c("Name: flwr", "Version: 1.31.0"),
+             file.path(site, "flwr-1.31.0.dist-info", "METADATA"))
+  writeLines(c("Name: opacus", "Version: 1.6.0"),
+             file.path(site, "opacus-1.6.0.dist-info", "METADATA"))
+
+  expect_true(dsFlower:::.record_venv_versions(venv))
+  expect_equal(readLines(file.path(venv, ".dsflower_versions.txt")),
+               c("flwr==1.31.0", "opacus==1.6.0"))
+})
+
+test_that("uv bootstrap requires an immutable release and archive digest", {
+  withr::local_envvar(c(DSFLOWER_UV_VERSION = "", DSFLOWER_UV_SHA256 = ""))
+  withr::local_options(list(dsflower.uv_version = "", dsflower.uv_sha256 = ""))
+  expect_error(dsFlower:::.uv_bootstrap_config(), "mutable 'latest'.*disabled")
+
+  withr::local_envvar(c(
+    DSFLOWER_UV_VERSION = "0.11.14",
+    DSFLOWER_UV_SHA256 = strrep("a", 64)
+  ))
+  expect_equal(
+    dsFlower:::.uv_bootstrap_config(),
+    list(version = "0.11.14", sha256 = strrep("a", 64))
+  )
+
+  withr::local_envvar(DSFLOWER_UV_SHA256 = "not-a-digest")
+  expect_error(dsFlower:::.uv_bootstrap_config(), "64 hexadecimal")
+
+  withr::local_envvar(c(
+    DSFLOWER_UV_VERSION = "latest",
+    DSFLOWER_UV_SHA256 = strrep("a", 64)
+  ))
+  expect_error(dsFlower:::.uv_bootstrap_config(), "valid release tag")
+})
+
+test_that("hash-locked Python requirements bind the venv marker", {
+  lock <- withr::local_tempfile()
+  writeLines("example==1.0 --hash=sha256:aaaaaaaa", lock)
+  withr::local_envvar(c(DSFLOWER_PYTHON_LOCK = lock,
+                        DSFLOWER_PYTHON_VERSION = "",
+                        DSFLOWER_REQUIRE_PYTHON_LOCK = ""))
+  withr::local_options(dsflower.python_version = "3.11")
+
+  expected <- paste0("python=3.11;lock-sha256:",
+                     digest::digest(file = lock, algo = "sha256"))
+  expect_equal(dsFlower:::.python_env_spec_hash("pytorch"), expected)
+})
+
+test_that("strict Python provisioning fails closed without a lock", {
+  withr::local_envvar(c(
+    DSFLOWER_PYTHON_LOCK = "",
+    DSFLOWER_REQUIRE_PYTHON_LOCK = "true"
+  ))
+  withr::local_options(dsflower.python_lock = "")
+  expect_error(dsFlower:::.python_lock_path(must_exist = TRUE),
+               "hash-locked Python environment is required")
+  expect_true(is.na(dsFlower:::.python_env_spec_hash("pytorch")))
 })
 
 test_that(".supernode_read_log returns empty for unknown manifest_dir", {

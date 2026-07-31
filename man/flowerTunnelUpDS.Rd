@@ -10,9 +10,11 @@ flowerTunnelUpDS(conn_id, listen_port, node_name = "")
 \item{conn_id}{Character; tunnel connection id.}
 
 \item{listen_port}{Integer; local port the SuperNode will dial.}
+
+\item{node_name}{Character; this node's federation name.}
 }
 \value{
-list(ok, listen).
+list(ok, listen, chunk_bytes).
 }
 \description{
 Spawns dsi_tunnel_forward.py listening on 127.0.0.1:listen_port; the Flower

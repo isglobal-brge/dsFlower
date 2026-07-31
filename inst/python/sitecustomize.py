@@ -11,10 +11,10 @@ module -- one loaded from outside the interpreter's stdlib / site-packages
 pinned for this run, verified by a recursive SHA-256 of its package contents.
 Anything else kills the process immediately.
 
-NOTE: an in-process import hook is a defence-in-depth layer, not an absolute
-boundary (in-process code can tamper with it). The authoritative control is
-running the ClientApp under `flower-supernode --isolation process` inside an
-OS sandbox; this hook closes the trivial "name your FAB anything" bypass.
+NOTE: an import hook is a defence-in-depth layer, not an absolute boundary.
+The SuperNode explicitly uses subprocess isolation and only admits the
+node-hash-pinned trusted ClientApp. Arbitrary HookApp code is never imported by
+that parent; it runs behind the separate mandatory OS sandbox.
 """
 
 import hashlib
@@ -27,6 +27,7 @@ import sysconfig
 MANIFEST_DIR = os.environ.get("DSFLOWER_MANIFEST_DIR", "")
 EXPECTED_HASH_FILE = os.path.join(MANIFEST_DIR, "expected_hash.txt") if MANIFEST_DIR else ""
 EXPECTED_TEMPLATE_FILE = os.path.join(MANIFEST_DIR, "expected_template.txt") if MANIFEST_DIR else ""
+MANIFEST_FILE = os.path.join(MANIFEST_DIR, "manifest.json") if MANIFEST_DIR else ""
 # Multi-package pinning (Tier-2): {package_name: sha256}. When present, EVERY
 # foreign package must be listed and hash-match (default-deny). This lets a run
 # pin a trusted runner package AND a separately-verified uploaded app package.
@@ -44,9 +45,29 @@ def _load_pinned_map():
     except Exception:
         return {}  # present-but-unreadable -> deny everything (fail closed)
 
+
+def _load_user_module_name():
+    """The uploaded HookApp package name, pinned by the node in manifest.json."""
+    if not MANIFEST_FILE or not os.path.exists(MANIFEST_FILE):
+        return ""
+    try:
+        import json
+        with open(MANIFEST_FILE) as f:
+            manifest = json.load(f)
+        value = manifest.get("user-module", "")
+        return value if isinstance(value, str) else ""
+    except Exception:
+        return ""
+
 # Top-level package names that are part of the trusted runtime and never
 # treated as "foreign" application code even if their path looks unusual.
 _RUNTIME_PKGS = {"flwr", "flwr_serverapp", "flwr_clientapp"}
+
+# The node may execute exactly this node-installed, hash-pinned ClientApp.  The
+# FAB controls pyproject.toml, so package hashing alone is insufficient: without
+# this object-reference gate it could point Flower at a trusted stdlib or
+# site-packages callable and avoid importing dsflower_runner altogether.
+_CANONICAL_CLIENTAPP_REF = "dsflower_runner.client_app:app"
 
 _verified_packages = set()
 
@@ -134,6 +155,7 @@ def _read(path):
 
 
 _PINNED_MAP = _load_pinned_map()
+_USER_MODULE = _load_user_module_name()
 
 
 def _verify_foreign(top_name, pkg_dir):
@@ -173,6 +195,49 @@ def _verify_foreign(top_name, pkg_dir):
                "  package:  %s" % (top_name, expected, actual, pkg_dir))
 
 
+def _install_clientapp_load_guard(module):
+    """Pin Flower's resolved ClientApp object reference before it is imported."""
+    original = getattr(module, "load_app", None)
+    if not callable(original):
+        _abort("Flower ClientApp loader is unavailable; refusing an unpinned app.")
+    if getattr(original, "_dsflower_entrypoint_guard", False):
+        return
+
+    def guarded_load_app(module_attribute_str, *args, **kwargs):
+        if (not isinstance(module_attribute_str, str) or
+                module_attribute_str != _CANONICAL_CLIENTAPP_REF):
+            _abort("unexpected ClientApp entrypoint '%s' (node pinned '%s')."
+                   % (module_attribute_str, _CANONICAL_CLIENTAPP_REF))
+        app = original(module_attribute_str, *args, **kwargs)
+        # Importing the canonical reference must have crossed _IntegrityFinder,
+        # which verifies the package before its module body runs.  A cached or
+        # future loader path that skipped that pin is denied as well.
+        if "dsflower_runner" not in _verified_packages:
+            _abort("canonical ClientApp loaded without activating its code hash pin.")
+        return app
+
+    guarded_load_app._dsflower_entrypoint_guard = True
+    module.load_app = guarded_load_app
+
+
+class _PostExecClientAppLoader(object):
+    """Delegate Flower's real loader, then replace its imported load_app alias."""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def create_module(self, spec):
+        create = getattr(self._wrapped, "create_module", None)
+        return create(spec) if create is not None else None
+
+    def exec_module(self, module):
+        self._wrapped.exec_module(module)
+        _install_clientapp_load_guard(module)
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
 class _IntegrityFinder(object):
     """A sys.meta_path finder that verifies foreign (delivered) code BEFORE
     the import machinery executes it. find_spec runs prior to exec_module, so
@@ -180,7 +245,14 @@ class _IntegrityFinder(object):
 
     def find_spec(self, fullname, path=None, target=None):
         top = fullname.split(".")[0]
-        if top in _RUNTIME_PKGS or top in _verified_packages:
+        # The uploaded HookApp is authorized ONLY in egress_child.py, which loads
+        # its exact re-hashed __init__.py inside the OS sandbox.  It must never run
+        # in this trusted parent.  Check before runtime/safe-prefix exemptions so a
+        # package named ``flwr``, ``torch`` or ``numpy`` cannot shadow that runtime.
+        if _USER_MODULE and top == _USER_MODULE:
+            _abort("uploaded HookApp package '%s' may not load in the trusted parent."
+                   % top)
+        if top in _verified_packages:
             return None
         try:
             spec = _PathFinder.find_spec(fullname, path)
@@ -189,7 +261,32 @@ class _IntegrityFinder(object):
         if spec is None:
             return None
         origin = getattr(spec, "origin", None)
+        if top == "dsflower_runner":
+            # The canonical runner is application code, not generic runtime code.
+            # Verify it against the node pin even when its installation path sits
+            # below a normally trusted site-packages prefix.
+            if not origin or origin in ("built-in", "frozen", "namespace"):
+                _abort("canonical dsflower_runner is not a regular pinned package.")
+            locs = getattr(spec, "submodule_search_locations", None)
+            pkg_dir = locs[0] if locs else os.path.dirname(os.path.abspath(origin))
+            _verify_foreign(top, pkg_dir)
+            _verified_packages.add(top)
+            return None
         if not origin or origin in ("built-in", "frozen", "namespace"):
+            return None
+        if top in _RUNTIME_PKGS:
+            # Runtime names are exempt only when they actually resolve inside the
+            # trusted interpreter installation.  An unpinned top-level ``flwr.py``
+            # in an uploaded FAB must not inherit the name-based exemption.
+            if _is_foreign(origin):
+                _abort("runtime package '%s' resolved to foreign code: %s"
+                       % (top, origin))
+            if fullname == "flwr.clientapp.utils":
+                loader = getattr(spec, "loader", None)
+                if loader is None or not hasattr(loader, "exec_module"):
+                    _abort("Flower ClientApp loader cannot be pinned safely.")
+                spec.loader = _PostExecClientAppLoader(loader)
+                return spec
             return None
         if not _is_foreign(origin):
             return None  # trusted runtime: stdlib / site-packages

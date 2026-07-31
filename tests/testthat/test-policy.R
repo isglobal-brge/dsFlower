@@ -69,22 +69,31 @@ test_that("trust-profile API has been removed", {
   expect_false(exists(".validateTemplateProfile", where = ns, inherits = FALSE))
 })
 
-test_that(".detectPatientColumn finds common identifiers + honours overrides", {
-  expect_equal(
-    dsFlower:::.detectPatientColumn(data.frame(patient_id = 1, x = 2)),
-    "patient_id")
-  expect_equal(
-    dsFlower:::.detectPatientColumn(data.frame(SubjectID = 1, x = 2)),
-    "SubjectID")  # case-insensitive
+test_that("DP unit is server-owned, explicit, and has no auto fallback", {
+  withr::local_options(list(dsflower.dp_unit = "row",
+                            dsflower.patient_column = NULL))
+  expect_null(dsFlower:::.detectPatientColumn(
+    data.frame(patient_id = 1, x = 2)))
   expect_null(dsFlower:::.detectPatientColumn(data.frame(x = 1, y = 2)))
-  # run_config override picks a non-standard column name
+
+  withr::local_options(list(dsflower.dp_unit = "patient",
+                            dsflower.patient_column = "subj"))
   expect_equal(
     dsFlower:::.detectPatientColumn(data.frame(subj = 1, x = 2),
-                                    list(patient_column = "subj")),
+                                    list()),
     "subj")
+  expect_error(
+    dsFlower:::.detectPatientColumn(data.frame(patient_id = 1, x = 2)),
+    "unavailable")
+  expect_error(
+    withr::with_options(list(dsflower.patient_column = NULL),
+      dsFlower:::.dpUnitPolicy()),
+    "patient_column")
 })
 
 test_that(".imageDisclosureUnits groups disclosure by distinct patient", {
+  withr::local_options(list(dsflower.dp_unit = "patient",
+                            dsflower.patient_column = "patient_id"))
   # 5 patients x 6 slices; patient-level label, 3 in class 0, 2 in class 1.
   pid <- rep(paste0("P", 1:5), each = 6)
   lab <- rep(c(0, 0, 0, 1, 1), each = 6)
@@ -95,19 +104,32 @@ test_that(".imageDisclosureUnits groups disclosure by distinct patient", {
   expect_equal(as.integer(table(grp$data$y)), c(3L, 2L))  # distinct patients/class
 })
 
-test_that(".imageDisclosureUnits excludes NA/empty patient ids (no count inflation)", {
-  # class 1 has ONE real patient (P5) + 3 NA-patient slices; the NA rows must not
-  # inflate the per-class count (regression for the dedup-key NA leak).
+test_that("patient mode fails closed on an incomplete roster", {
+  withr::local_options(list(dsflower.dp_unit = "patient",
+                            dsflower.patient_column = "patient_id"))
   sm <- data.frame(
     patient_id = c(rep("P1", 4), rep("P2", 4), rep("P3", 4), rep("P4", 4),
                    "P5", NA, NA, NA),
     y = c(rep(0, 16), 1, 1, 1, 1))
+  expect_error(dsFlower:::.imageDisclosureUnits(sm, "y"), "complete")
+})
+
+test_that(".imageDisclosureUnits assigns one modal class per patient", {
+  withr::local_options(list(dsflower.dp_unit = "patient",
+                            dsflower.patient_column = "patient_id"))
+  sm <- data.frame(
+    patient_id = c("p1", "p1", "p1", "p2", "p2"),
+    y = c(0, 1, 1, 0, 0)
+  )
   grp <- dsFlower:::.imageDisclosureUnits(sm, "y")
-  expect_equal(grp$n_patients, 5)                 # NA is not a patient
-  expect_equal(as.integer(table(grp$data$y)), c(4L, 1L))  # class 1 == 1, not 4
+  expect_equal(grp$n_patients, 2)
+  expect_equal(nrow(grp$data), 2)
+  expect_equal(sort(grp$data$y), c(0, 1))
 })
 
 test_that(".imageDisclosureUnits returns NULL when no patient column (per-image)", {
+  withr::local_options(list(dsflower.dp_unit = "row",
+                            dsflower.patient_column = NULL))
   expect_null(dsFlower:::.imageDisclosureUnits(
     data.frame(sample_id = 1:3, y = c(0, 1, 0)), "y"))
 })

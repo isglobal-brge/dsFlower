@@ -108,7 +108,7 @@ def _run_trees(grid, cfg):
     if len(node_ids) < min_nodes:
         raise RuntimeError("only %d node(s) connected after %ds, need >= %d"
                            % (len(node_ids), int(waited), min_nodes))
-    # Each node trains its FULL local DP-GBDT in one round (the booster's n_trees is
+    # Each node trains its FULL curator-side DP-GBDT in one round (the booster's n_trees is
     # the node-internal boosting; one message exchange suffices). No init model.
     empty = RecordDict({"arrays": ArrayRecord(numpy_ndarrays=[np.zeros(1, dtype=np.float64)])})
     # Build messages with the modern Message constructor (mirrors FedAvg's

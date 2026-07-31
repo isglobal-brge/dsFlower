@@ -2,19 +2,11 @@
 % Please edit documentation in R/interface.R
 \name{.getHandle}
 \alias{.getHandle}
-\title{Retrieve a stored Flower handle}
+\title{Retrieve authoritative state for an opaque Flower handle}
 \usage{
 .getHandle(symbol)
 }
-\arguments{
-\item{symbol}{Character; the handle symbol name (e.g. "flower").}
-}
-\value{
-The Flower handle object (a named list).
-}
 \description{
-Looks up the handle by symbol name. First checks the calling session's
-workspace (used by DSLite where handles are stored as session variables),
-then falls back to the global package environment (for Opal single-process).
+Retrieve authoritative state for an opaque Flower handle
 }
 \keyword{internal}

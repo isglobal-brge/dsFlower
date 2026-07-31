@@ -31,18 +31,41 @@ def set_torch_params(model, arrays):
     """Load numpy arrays into the trainable parameters via the stock
     ``nn.Module.named_parameters`` -- NOT ``load_state_dict`` (which runs
     ``_load_state_dict_pre_hooks``). In-place copy into the real param storage.
+
+    The wire dtype and shape must match exactly: ``Tensor.copy_`` permits dtype
+    conversion and broadcasting, neither of which belongs in this serialization
+    boundary. Non-finite values are rejected before touching any parameter.
     """
+    import numpy as np
     import torch
     import torch.nn as nn
     module = getattr(model, "_module", model)
     params = list(nn.Module.named_parameters(module))
+    if not isinstance(arrays, (list, tuple)):
+        raise ValueError("parameters must be supplied as a list/tuple of arrays")
     if len(params) != len(arrays):
         raise ValueError(
             "parameter count mismatch: model has %d params, received %d"
             % (len(params), len(arrays)))
+    checked = []
+    for (name, p), value in zip(params, arrays):
+        if not isinstance(value, np.ndarray):
+            raise ValueError("parameter %s is not a NumPy array" % name)
+        expected_dtype = p.detach().cpu().numpy().dtype
+        if value.shape != tuple(p.shape):
+            raise ValueError(
+                "parameter %s shape mismatch: expected %r, received %r"
+                % (name, tuple(p.shape), value.shape))
+        if value.dtype != expected_dtype:
+            raise ValueError(
+                "parameter %s dtype mismatch: expected %s, received %s"
+                % (name, expected_dtype, value.dtype))
+        if not bool(np.all(np.isfinite(value))):
+            raise ValueError("parameter %s contains non-finite values" % name)
+        checked.append(value)
     with torch.no_grad():
-        for (_, p), a in zip(params, arrays):
-            p.copy_(torch.as_tensor(a, dtype=p.dtype, device=p.device))
+        for (_, p), value in zip(params, checked):
+            p.copy_(torch.as_tensor(value, device=p.device))
 
 
 def load_user_model(cfg, input_dim, loss_name):
@@ -77,7 +100,8 @@ def load_user_model(cfg, input_dim, loss_name):
     out_dim = model_spec.output_width(loss_name, cfg)
     num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None
     model = model_spec.build_from_spec(
-        spec, in_dim=int(input_dim), out_dim=out_dim, num_labels=num_labels)
+        spec, in_dim=int(input_dim), out_dim=out_dim, num_labels=num_labels,
+        output_limit=model_spec.output_limit_for_loss(loss_name))
 
     if not isinstance(model, torch.nn.Module):
         raise ValueError("build_from_spec must return a torch.nn.Module")

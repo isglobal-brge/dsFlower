@@ -10,8 +10,8 @@
 
 # --- Framework dependency map ---
 
-.BASE_PYTHON_DEPS <- c("flwr>=1.31.0", "numpy>=1.21.0", "pandas>=1.3.0",
-                        "pyarrow>=10.0.0")
+.BASE_PYTHON_DEPS <- c("flwr>=1.31.0,<1.32.0", "numpy>=1.21.0", "pandas>=1.3.0",
+                        "pyarrow>=10.0.0", "cryptography>=41.0.0")
 
 # Provisioned frameworks: torch (linear/MLP + DP-SGD), pytorch_vision (imaging),
 # xgboost (gradient-boosted trees — the one model class torch cannot express).
@@ -24,7 +24,8 @@
   # venv via .framework_venv). opacus: DP-SGD (REQUIRED). torchvision/monai: 2D/3D
   # backbones. SimpleITK: .mha/.mhd/.dcm. nibabel/pynrrd: .nii/.nrrd. Keep aligned
   # with the FAB vision deps in dsFlowerClient::.harness_dependencies(vision=TRUE).
-  pytorch = c("torch>=2.0.0", "opacus>=1.4.0", "torchvision>=0.15.0",
+  pytorch = c("torch>=2.0.0,<3.0.0", "opacus>=1.4.0,<2.0.0",
+              "torchvision>=0.15.0,<1.0.0",
               "Pillow>=9.0.0", "nibabel>=5.0.0", "pydicom>=2.4.0",
               "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0")
   # No xgboost venv: the trees track's DP-GBDT (S-GBDT mechanism) is pure numpy,
@@ -33,9 +34,9 @@
 )
 
 .FRAMEWORK_HEALTH_IMPORT <- list(
-  # comma-separated single import: a venv missing opacus (DP) / torchvision / monai
-  # is then reported unhealthy and re-provisioned, not silently accepted.
-  pytorch = "torchvision, opacus, monai"
+  # comma-separated single import: a venv missing opacus (DP), cryptography,
+  # torchvision, or monai is reported unhealthy and re-provisioned.
+  pytorch = "torchvision, opacus, monai, cryptography"
 )
 
 #' Resolve the effective torch backend for THIS run. GPU presence is detected at
@@ -76,8 +77,10 @@
 
 #' Normalize a framework / dp-track to its venv. dsFlower runs in ONE torch venv
 #' (torch + opacus + torchvision + monai + numpy); every dp-track runs there --
-#' neural via Opacus DP-SGD, trees via the pure-numpy DP-GBDT (no xgboost library),
-#' egress via output-perturbation. The backend picks WHICH copy: "pytorch" (cpu,
+#' neural via Opacus DP-SGD and trees via the pure-numpy DP-GBDT (no xgboost
+#' library). The egress track uses output perturbation only when every HookApp
+#' execution gate holds; otherwise it is a data-independent no-op. The backend
+#' picks WHICH copy: "pytorch" (cpu,
 #' the universal default) or "pytorch-gpu" (cuda), resolved as late as possible
 #' (run time) so a GPU added AFTER install is usable with just a re-provision (to
 #' build pytorch-gpu) -- no code change, no install-time backend lock-in.
@@ -153,6 +156,107 @@
                  serialize = FALSE)
 }
 
+# Optional administrator-owned, fully hashed requirements file. When present it
+# replaces range resolution and uv enforces hashes for every transitive package.
+.python_lock_required <- function() {
+  value <- Sys.getenv("DSFLOWER_REQUIRE_PYTHON_LOCK", "")
+  if (nzchar(value)) {
+    value <- tolower(value)
+    if (value %in% c("1", "true", "yes")) return(TRUE)
+    if (value %in% c("0", "false", "no")) return(FALSE)
+    stop("DSFLOWER_REQUIRE_PYTHON_LOCK must be true or false.", call. = FALSE)
+  }
+  isTRUE(as.logical(.dsf_option("require_python_lock", FALSE)))
+}
+
+.python_lock_path <- function(must_exist = FALSE) {
+  path <- Sys.getenv("DSFLOWER_PYTHON_LOCK", "")
+  if (!nzchar(path)) path <- as.character(.dsf_option("python_lock", ""))[1]
+  if (!nzchar(path)) {
+    if (must_exist && .python_lock_required()) {
+      stop("A hash-locked Python environment is required, but ",
+           "DSFLOWER_PYTHON_LOCK/dsflower.python_lock is unset.", call. = FALSE)
+    }
+    return("")
+  }
+  if (must_exist && (!file.exists(path) || dir.exists(path) || file.access(path, 4L) != 0L)) {
+    stop("Configured dsflower Python lock is not a readable regular file: ",
+         path, call. = FALSE)
+  }
+  normalizePath(path, winslash = "/", mustWork = FALSE)
+}
+
+.python_version_spec <- function() {
+  version <- Sys.getenv("DSFLOWER_PYTHON_VERSION", "")
+  if (!nzchar(version)) {
+    version <- as.character(.dsf_option("python_version", "3.11"))[1]
+  }
+  if (!grepl("^[0-9]+\\.[0-9]+(\\.[0-9]+)?$", version)) {
+    stop("DSFLOWER_PYTHON_VERSION must be major.minor or major.minor.patch.",
+         call. = FALSE)
+  }
+  version
+}
+
+.python_env_spec_hash <- function(framework) {
+  python_spec <- paste0("python=", .python_version_spec())
+  lock <- .python_lock_path()
+  if (!nzchar(lock) && .python_lock_required()) return(NA_character_)
+  if (nzchar(lock)) {
+    if (!file.exists(lock) || dir.exists(lock) || file.access(lock, 4L) != 0L) {
+      return(NA_character_)
+    }
+    return(paste0(python_spec, ";lock-sha256:",
+                  digest::digest(file = lock, algo = "sha256")))
+  }
+  .deps_hash(c(python_spec, .python_deps_for_framework(framework)))
+}
+
+.uv_bootstrap_config <- function() {
+  version <- Sys.getenv("DSFLOWER_UV_VERSION", "")
+  if (!nzchar(version)) version <- as.character(.dsf_option("uv_version", ""))[1]
+  sha256 <- Sys.getenv("DSFLOWER_UV_SHA256", "")
+  if (!nzchar(sha256)) sha256 <- as.character(.dsf_option("uv_sha256", ""))[1]
+  if (!nzchar(version) || !nzchar(sha256)) {
+    stop("uv is not installed and mutable 'latest' bootstrap is disabled. ",
+         "Install uv through the operating system, or configure both ",
+         "DSFLOWER_UV_VERSION and DSFLOWER_UV_SHA256 for an audited release.",
+         call. = FALSE)
+  }
+  if (!grepl("^[0-9]+\\.[0-9]+\\.[0-9]+([.-][0-9A-Za-z.-]+)?$", version)) {
+    stop("DSFLOWER_UV_VERSION is not a valid release tag.", call. = FALSE)
+  }
+  if (!grepl("^[0-9A-Fa-f]{64}$", sha256)) {
+    stop("DSFLOWER_UV_SHA256 must be 64 hexadecimal characters.", call. = FALSE)
+  }
+  list(version = version, sha256 = tolower(sha256))
+}
+
+# Record the exact resolved environment for deployment audit/rebuild evidence.
+# This is metadata only: the dependency-range hash remains the health marker.
+.record_venv_versions <- function(venv_path) {
+  site_dirs <- .venv_site_packages_dirs(venv_path)
+  rows <- character()
+  for (site_dir in site_dirs) {
+    infos <- list.files(site_dir, pattern = "\\.dist-info$", full.names = TRUE)
+    for (info in infos) {
+      lines <- tryCatch(readLines(file.path(info, "METADATA"), warn = FALSE),
+                        error = function(e) character())
+      name <- sub("^Name:\\s*", "", lines[grepl("^Name:\\s*", lines)])
+      version <- sub("^Version:\\s*", "", lines[grepl("^Version:\\s*", lines)])
+      if (length(name) && length(version) && nzchar(name[[1]]) && nzchar(version[[1]])) {
+        rows <- c(rows, paste0(name[[1]], "==", version[[1]]))
+      }
+    }
+  }
+  target <- file.path(venv_path, ".dsflower_versions.txt")
+  tmp <- tempfile(pattern = ".dsflower-versions-", tmpdir = venv_path)
+  on.exit(unlink(tmp), add = TRUE)
+  writeLines(sort(unique(rows), method = "radix"), tmp)
+  if (!file.rename(tmp, target)) return(FALSE)
+  TRUE
+}
+
 #' Check if a Python venv is healthy
 #' @keywords internal
 .venv_is_healthy <- function(venv_path, framework) {
@@ -164,7 +268,7 @@
   if (!file.exists(python)) return(FALSE)
   marker <- file.path(venv_path, ".dsflower_ready")
   if (!file.exists(marker)) return(FALSE)
-  expected_hash <- .deps_hash(.python_deps_for_framework(framework))
+  expected_hash <- .python_env_spec_hash(framework)
   current_hash <- tryCatch(readLines(marker, warn = FALSE, n = 1),
                            error = function(e) "")
   if (!identical(current_hash, expected_hash)) return(FALSE)
@@ -283,7 +387,8 @@
     uv <- .ensure_uv()
     # processx passes args without a shell, so a venv_path containing spaces
     # (e.g. macOS "Application Support") is handled correctly.
-    rc <- processx::run(uv, c("venv", "--python", "3.11", "--quiet", venv_path),
+    rc <- processx::run(uv, c("venv", "--python", .python_version_spec(),
+                              "--quiet", venv_path),
                         error_on_status = FALSE)$status
     if (rc != 0L)
       stop("Failed to create venv at ", venv_path, call. = FALSE)
@@ -292,14 +397,20 @@
     # visible, else CPU; see .torch_backend). CPU avoids the CUDA build's unused
     # ~3.5 GB nvidia/triton libs on GPU-less nodes.
     deps <- .python_deps_for_framework(framework)
+    lock <- .python_lock_path(must_exist = TRUE)
     torch_flag <- if (any(grepl("torch", deps, fixed = TRUE)))
       c("--torch-backend", .torch_backend()) else character(0)
-    message("  Installing: ", paste(deps, collapse = ", "))
+    install_spec <- if (nzchar(lock)) c("--require-hashes", "-r", lock) else deps
+    if (nzchar(lock)) {
+      message("  Installing administrator hash-locked Python requirements")
+    } else {
+      message("  Installing: ", paste(deps, collapse = ", "))
+    }
     venv_python <- file.path(venv_path, "bin", "python")
     result <- processx::run(
       command = uv,
       args = c("pip", "install", "--python", venv_python, "--quiet",
-               torch_flag, deps),
+               torch_flag, install_spec),
       error_on_status = FALSE,
       timeout = timeout_secs
     )
@@ -336,8 +447,14 @@
                              timeout = 120), error = function(e) NULL)
     }
 
-    dep_hash <- .deps_hash(deps)
-    writeLines(dep_hash, file.path(venv_path, ".dsflower_ready"))
+    .record_venv_versions(venv_path)
+    dep_hash <- .python_env_spec_hash(framework)
+    marker_tmp <- tempfile(pattern = ".dsflower-ready-", tmpdir = venv_path)
+    writeLines(dep_hash, marker_tmp)
+    if (!file.rename(marker_tmp, file.path(venv_path, ".dsflower_ready"))) {
+      unlink(marker_tmp)
+      stop("Could not atomically record the Python environment marker.", call. = FALSE)
+    }
     message("  Python environment for '", framework, "' ready.")
 
     list(python = venv_python, flower_supernode = supernode, source = "venv")
@@ -423,6 +540,9 @@
     return(list(
       python_version = "not provisioned",
       flower_version = "not provisioned",
+      torch_version = "not provisioned",
+      opacus_version = "not provisioned",
+      runtime_versions_sha256 = "not recorded",
       python_envs = envs
     ))
   }
@@ -431,6 +551,13 @@
   list(
     python_version = .read_venv_python_version(first),
     flower_version = .read_venv_package_version(first, "flwr"),
+    torch_version = .read_venv_package_version(first, "torch"),
+    opacus_version = .read_venv_package_version(first, "opacus"),
+    runtime_versions_sha256 = {
+      versions <- file.path(first, ".dsflower_versions.txt")
+      if (file.exists(versions)) digest::digest(file = versions, algo = "sha256")
+      else "not recorded"
+    },
     python_envs = envs
   )
 }
@@ -457,7 +584,7 @@
     if (file.exists(p)) { .dsflower_runtime$uv_path <- p; return(p) }
   }
 
-  # Download standalone binary
+  # Download one immutable, administrator-pinned standalone archive.
   tools_dir <- file.path(.venv_root(), ".tools")
   dir.create(tools_dir, recursive = TRUE, showWarnings = FALSE)
   uv_path <- file.path(tools_dir, "uv")
@@ -466,9 +593,10 @@
     return(uv_path)
   }
 
-  message("dsFlower: downloading uv...")
+  bootstrap <- .uv_bootstrap_config()
+  message("dsFlower: downloading pinned uv ", bootstrap$version, "...")
   sysname <- tolower(Sys.info()[["sysname"]])
-  machine <- Sys.info()[["machine"]]
+  machine <- tolower(Sys.info()[["machine"]])
   os <- switch(sysname,
     darwin = "apple-darwin", linux = "unknown-linux-gnu",
     stop("Unsupported OS: ", sysname, ". Install uv: https://docs.astral.sh/uv/",
@@ -478,8 +606,9 @@
     aarch64 = "aarch64", arm64 = "aarch64",
     stop("Unsupported arch: ", machine, call. = FALSE))
 
-  url <- paste0("https://github.com/astral-sh/uv/releases/latest/download/uv-",
-                arch, "-", os, ".tar.gz")
+  triple <- paste(arch, os, sep = "-")
+  url <- paste0("https://github.com/astral-sh/uv/releases/download/",
+                bootstrap$version, "/uv-", triple, ".tar.gz")
   tmp <- tempfile(fileext = ".tar.gz")
   tmp_dir <- tempfile()
   on.exit({ unlink(tmp); unlink(tmp_dir, recursive = TRUE) }, add = TRUE)
@@ -487,16 +616,30 @@
   rc <- tryCatch(utils::download.file(url, tmp, mode = "wb", quiet = TRUE),
                   error = function(e) 1L)
   if (!identical(rc, 0L))
-    stop("Failed to download uv. Install manually: https://docs.astral.sh/uv/",
+    stop("Failed to download pinned uv. Install manually: https://docs.astral.sh/uv/",
          call. = FALSE)
 
-  dir.create(tmp_dir, showWarnings = FALSE)
-  utils::untar(tmp, exdir = tmp_dir)
-  bins <- list.files(tmp_dir, pattern = "^uv$", recursive = TRUE, full.names = TRUE)
-  if (length(bins) == 0) stop("uv binary not found in archive.", call. = FALSE)
+  actual <- digest::digest(file = tmp, algo = "sha256")
+  if (!identical(tolower(actual), bootstrap$sha256)) {
+    stop("Downloaded uv archive SHA-256 mismatch; refusing to extract it.",
+         call. = FALSE)
+  }
 
-  file.copy(bins[1], uv_path, overwrite = TRUE)
-  Sys.chmod(uv_path, "0755")
+  dir.create(tmp_dir, showWarnings = FALSE)
+  member <- paste0("uv-", triple, "/uv")
+  entries <- utils::untar(tmp, list = TRUE)
+  if (!member %in% entries) stop("uv binary not found in verified archive.", call. = FALSE)
+  utils::untar(tmp, files = member, exdir = tmp_dir)
+  source <- file.path(tmp_dir, member)
+  install_tmp <- tempfile(pattern = ".uv-", tmpdir = tools_dir)
+  if (!file.copy(source, install_tmp, overwrite = TRUE)) {
+    stop("Could not stage verified uv binary.", call. = FALSE)
+  }
+  Sys.chmod(install_tmp, "0755")
+  if (!file.rename(install_tmp, uv_path)) {
+    unlink(install_tmp)
+    stop("Could not atomically install verified uv binary.", call. = FALSE)
+  }
   message("dsFlower: uv installed at ", uv_path)
   .dsflower_runtime$uv_path <- uv_path
   uv_path
