@@ -48,12 +48,21 @@ test_that("the trusted Python environment does not inherit injection variables",
     LD_PRELOAD = "/attacker/preload.so",
     DSFLOWER_ATTACKER_VALUE = "present"
   ))
+  staging <- withr::local_tempdir()
   env <- dsFlower:::.build_clean_python_env(
-    tempfile("venv-"), withr::local_tempdir(), extra_pypath = "/trusted/hook")
+    tempfile("venv-"), staging, extra_pypath = "/trusted/hook")
   expect_identical(unname(env[["PYTHONPATH"]]), "/trusted/hook")
   expect_false(any(names(env) %in% c(
     "PYTHONSTARTUP", "PYTHONINSPECT", "LD_PRELOAD", "DSFLOWER_ATTACKER_VALUE")))
   expect_identical(unname(env[["PYTHONNOUSERSITE"]]), "1")
+  expect_identical(
+    unname(env[["FLWR_HOME"]]), file.path(staging, ".flwr"))
+  expect_true(dir.exists(env[["FLWR_HOME"]]))
+  expect_equal(
+    bitwAnd(as.integer(file.info(env[["FLWR_HOME"]])$mode),
+            as.integer(strtoi("77", base = 8))),
+    0L
+  )
   expect_identical(unname(env[["DSF_SAA_SANDBOX_OK"]]), "0")
   expect_identical(
     unname(env[["DSF_HOOK_RESOURCE_ISOLATION_OK"]]), "0")
@@ -66,6 +75,14 @@ test_that("the trusted Python environment does not inherit injection variables",
   expect_identical(unname(attested[["DSF_SAA_SANDBOX_OK"]]), "1")
   expect_identical(
     unname(attested[["DSF_HOOK_RESOURCE_ISOLATION_OK"]]), "1")
+
+  unsafe_staging <- withr::local_tempdir()
+  expect_true(file.symlink(withr::local_tempdir(),
+                           file.path(unsafe_staging, ".flwr")))
+  expect_error(
+    dsFlower:::.build_clean_python_env(tempfile("venv-"), unsafe_staging),
+    "Flower home is unsafe"
+  )
 })
 
 test_that(".supernode_lookup returns NULL for unknown manifest_dir", {

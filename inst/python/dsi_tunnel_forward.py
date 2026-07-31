@@ -62,8 +62,9 @@ def relay_alive(hb_path):
     try:
         return (time.time() - os.path.getmtime(hb_path)) <= RELAY_TTL
     except OSError:
-        # No heartbeat file yet -> assume alive briefly (seeded at flowerTunnelUpDS)
-        return True
+        # flowerTunnelUpDS seeds this file before spawning us. Its absence means
+        # the relay cleaned up or its temporary session disappeared.
+        return False
 
 
 @contextmanager
@@ -171,9 +172,25 @@ def compact_spool(path, acknowledged, lock_path):
     return True
 
 
+def accept_latest(srv):
+    """Accept every queued dial and keep only the newest TCP stream."""
+    latest = None
+    while True:
+        try:
+            candidate, _ = srv.accept()
+        except BlockingIOError:
+            return latest
+        if latest is not None:
+            try:
+                latest.close()
+            except OSError:
+                pass
+        latest = candidate
+
+
 def serve_connection(
     conn, up_path, down_path, gen_path, hb_path, up_ack_path, down_ack_path,
-    lock_path, gen
+    lock_path, gen, srv
 ):
     conn.setblocking(False)
     # The R exchange holds this same advisory lock. A reconnect therefore
@@ -201,7 +218,17 @@ def serve_connection(
                     conn.close()
                 except OSError:
                     pass
-                return False   # relay gone -> stop serving + exit
+                return False, None   # relay gone -> stop serving + exit
+        # A gRPC redial can arrive before the kernel reports the old TCP stream
+        # closed. Promote the newest queued connection immediately instead of
+        # making it wait behind a half-open generation.
+        replacement = accept_latest(srv)
+        if replacement is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return True, replacement
         # socket -> up.bin. Once the bounded spool is full, stop receiving so
         # TCP applies backpressure instead of allowing unbounded disk growth.
         _, up_size, _ = spool_state(up_path)
@@ -258,7 +285,7 @@ def serve_connection(
         conn.close()
     except Exception:
         pass
-    return True   # connection ended normally; keep serving (re-accept)
+    return True, None   # connection ended normally; keep serving (re-accept)
 
 
 def main():
@@ -293,24 +320,28 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(8)
-    srv.settimeout(5.0)   # so we can poll relay liveness while waiting to accept
+    srv.setblocking(False)
     open(os.path.join(a.spool, "ready"), "w").close()
 
     gen = 0
+    pending = None
     while True:
         if not relay_alive(hb_path):
             break   # relay gone -> exit (SuperNode will hit --max-wait-time)
-        try:
-            conn, _ = srv.accept()
-        except socket.timeout:
-            continue
-        except OSError:
-            break
+        if pending is None:
+            try:
+                pending = accept_latest(srv)
+            except OSError:
+                break
+            if pending is None:
+                time.sleep(0.05)
+                continue
+        conn, pending = pending, None
         gen += 1
         open(os.path.join(a.spool, "connected"), "w").close()
-        keep = serve_connection(
+        keep, pending = serve_connection(
             conn, up_path, down_path, gen_path, hb_path, up_ack_path,
-            down_ack_path, lock_path, gen
+            down_ack_path, lock_path, gen, srv
         )
         if not keep:
             break   # relay went away mid-connection -> exit

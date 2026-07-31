@@ -248,7 +248,7 @@ Options use the `dsflower.*` prefix, with the standard
 | `app_spool_max_bytes` | `1073741824` | Global logical-byte cap across all uploaded FABs and unpacked apps. |
 | `app_spool_max_uploads` | `128` | Global cap on simultaneous upload-token directories. |
 | `app_spool_ttl_seconds` | `86400` | Inactive-upload retention; locked operations and staging-referenced apps are skipped by GC. |
-| `tunnel_chunk_bytes` | `1048576` | Maximum decoded payload in one DSI tunnel exchange; constrained to 16 KiB--8 MiB and negotiated with the client. |
+| `tunnel_chunk_bytes` | `524288` | Maximum decoded payload in one DSI tunnel exchange; constrained to 16--512 KiB and negotiated with the client. The upper bound stays below DSI's expression-parser limit; larger streams are carried as multiple exact chunks. |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; at least eight chunks and at most 64 GiB. TCP backpressure applies when full. |
 | `tunnel_request_max_bytes` | `67108864` | Maximum encoded fan-out request accepted before JSON decoding; constrained to 1--256 MiB. |
 | `tunnel_loss_tolerance` | `180` | Seconds without a relay heartbeat before the node forwarder exits; constrained to 5--86400. |

@@ -149,9 +149,11 @@ def _run_trees(grid, cfg):
             break
         time.sleep(2.0)
         waited += 2.0
-    if len(node_ids) < min_nodes:
-        raise RuntimeError("only %d node(s) connected after %ds, need >= %d"
-                           % (len(node_ids), int(waited), min_nodes))
+    if len(node_ids) != min_nodes:
+        raise RuntimeError(
+            "%d node(s) connected after %ds, expected exactly %d; refusing an "
+            "unexpected federation roster"
+            % (len(node_ids), int(waited), min_nodes))
     # Each node trains its FULL curator-side DP-GBDT in one round (the booster's n_trees is
     # the node-internal boosting; one message exchange suffices). No init model.
     empty = RecordDict({"arrays": ArrayRecord(numpy_ndarrays=[np.zeros(1, dtype=np.float64)])})
@@ -169,10 +171,11 @@ def _run_trees(grid, cfg):
 def _collect_trees(replies, n_connected, min_nodes):
     """Bag the successful DP-GBDT boosters and report the TRUE failure count.
 
-    FAIL CLOSED when fewer than ``min_nodes`` boosters come back: the connection gate
-    only guarantees enough nodes DIALLED IN, but a node can still error during training,
-    and silently bagging the survivors would (a) weaken the model and (b) misreport the
-    federation size as fully successful. Returns (bagged_booster, n_failures)."""
+    FAIL CLOSED unless every connected node returns one booster. A node can error
+    after dialling in, and silently bagging the survivors would weaken the model
+    and misreport the federation as fully successful. Returns
+    (bagged_booster, n_failures)."""
+    replies = list(replies)
     boosters = []
     for r in replies:
         try:
@@ -184,11 +187,12 @@ def _collect_trees(replies, n_connected, min_nodes):
         except Exception:
             continue
     n_failures = int(n_connected) - len(boosters)
-    if len(boosters) < min_nodes:
+    if (len(replies) != int(n_connected)
+            or len(boosters) != int(n_connected)):
         raise RuntimeError(
-            "only %d of %d node(s) returned a DP-GBDT booster, need >= %d; refusing to "
-            "bag a degraded federation (check node logs)."
-            % (len(boosters), int(n_connected), min_nodes))
+            "%d of %d node(s) returned a DP-GBDT booster; refusing to bag a "
+            "degraded federation (check node logs)."
+            % (len(boosters), int(n_connected)))
     return _bag_boosters(boosters), n_failures
 
 
@@ -226,9 +230,66 @@ def _initial_arrays(cfg, track):
 # post-processing theorem the per-node (epsilon, delta) guarantee is unchanged.
 # The strategy is pure aggregation, never a privacy knob. FedProx is excluded
 # (it needs a node-side proximal term); the trees track never reaches here.
+
+
+class _RequireCompleteTrain:
+    """Reject a round unless the configured federation replies successfully."""
+
+    def __init__(self, *, expected_train_nodes, **kwargs):
+        self.expected_train_nodes = int(expected_train_nodes)
+        super().__init__(**kwargs)
+
+    def configure_train(self, server_round, arrays, config, grid):
+        messages = list(super().configure_train(
+            server_round, arrays, config, grid))
+        connected = list(grid.get_node_ids())
+        destinations = [message.metadata.dst_node_id for message in messages]
+        if (len(connected) != self.expected_train_nodes
+                or len(messages) != self.expected_train_nodes
+                or set(destinations) != set(connected)):
+            raise RuntimeError(
+                "%d node(s) are connected in round %d, expected exactly %d; "
+                "refusing an unexpected federation roster."
+                % (len(connected), server_round, self.expected_train_nodes))
+        return messages
+
+    def aggregate_train(self, server_round, replies):
+        replies = list(replies)
+        valid_count = sum(not reply.has_error() for reply in replies)
+        if (len(replies) != self.expected_train_nodes
+                or valid_count != self.expected_train_nodes):
+            self._check_and_log_replies(replies, is_train=True)
+            raise RuntimeError(
+                "%d of %d configured node(s) returned a valid update in round %d; "
+                "refusing to aggregate a degraded federation."
+                % (valid_count, self.expected_train_nodes, server_round))
+        return super().aggregate_train(server_round, replies)
+
+
+class _StrictFedAvg(_RequireCompleteTrain, FedAvg):
+    pass
+
+
+class _StrictFedAdam(_RequireCompleteTrain, FedAdam):
+    pass
+
+
+class _StrictFedAdagrad(_RequireCompleteTrain, FedAdagrad):
+    pass
+
+
+class _StrictFedYogi(_RequireCompleteTrain, FedYogi):
+    pass
+
+
+class _StrictFedAvgM(_RequireCompleteTrain, FedAvgM):
+    pass
+
+
 _STRATEGIES = {
-    "fedavg": FedAvg, "fedadam": FedAdam, "fedadagrad": FedAdagrad,
-    "fedyogi": FedYogi, "fedavgm": FedAvgM,
+    "fedavg": _StrictFedAvg, "fedadam": _StrictFedAdam,
+    "fedadagrad": _StrictFedAdagrad, "fedyogi": _StrictFedYogi,
+    "fedavgm": _StrictFedAvgM,
 }
 
 
@@ -269,7 +330,8 @@ def _build_strategy(cfg, min_nodes):
                 "strategy-server-momentum", 0.0, zero=True, unit=True))
     else:
         specific = {}
-    return _STRATEGIES[name](**common, **specific)
+    return _STRATEGIES[name](
+        expected_train_nodes=min_nodes, **common, **specific)
 
 
 def _run_fedavg(grid, cfg, track):

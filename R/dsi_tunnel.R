@@ -45,7 +45,10 @@
 #' @keywords internal
 .tunnel_chunk_bytes <- function() {
   as.integer(.tunnel_limit(
-    "tunnel_chunk_bytes", 1024^2, 16 * 1024, 8 * 1024^2
+    # DSI transports character arguments as R expressions. DSLite's real parser
+    # fails near one million encoded characters; 512 KiB raw stays safely below
+    # that boundary after URL-safe base64 while total streams remain unbounded.
+    "tunnel_chunk_bytes", 512 * 1024, 16 * 1024, 512 * 1024
   ))
 }
 
@@ -400,10 +403,20 @@ flowerTunnelExchangeDS <- function(conn_id, req = "", pa = NULL, pd = "",
       # down: idempotently append one bounded SuperLink->SuperNode chunk
       down_sz <- if (is.character(pd) && length(pd) == 1L &&
                      !is.na(pd) && nzchar(pd)) {
-        .tunnel_append_at(
-          spool, "down.bin", pa, .tunnel_dec(pd, chunk_bytes),
-          max_bytes = spool_max_bytes
-        )
+        payload <- .tunnel_dec(pd, chunk_bytes)
+        current <- .tunnel_spool_state(spool, "down.bin", create = TRUE)
+        if (pa == current$eof &&
+            current$bytes + length(payload) > spool_max_bytes) {
+          # Capacity is ordinary backpressure, not an invalid request. Keep the
+          # exact chunk unacknowledged but still return upstream bytes so a
+          # full-duplex peer cannot deadlock with both bounded spools full.
+          current$eof
+        } else {
+          .tunnel_append_at(
+            spool, "down.bin", pa, payload,
+            max_bytes = spool_max_bytes
+          )
+        }
       } else {
         .tunnel_spool_state(spool, "down.bin", create = TRUE)$eof
       }
@@ -483,7 +496,7 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
   cid <- .tunnel_conn_id(conn_id)
   port <- .tunnel_port(listen_port)
   abi <- suppressWarnings(as.numeric(protocol_abi))
-  if (length(abi) != 1L || is.na(abi) || !is.finite(abi) || abi != 2) {
+  if (length(abi) != 1L || is.na(abi) || !is.finite(abi) || abi != 3) {
     stop("Incompatible dsFlower tunnel protocol ABI; deploy matching server and client versions.",
          call. = FALSE)
   }
@@ -512,7 +525,7 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
         ok = TRUE,
         listen = paste0("127.0.0.1:", port),
         chunk_bytes = chunk_bytes,
-        protocol_abi = 2L
+        protocol_abi = 3L
       ))
     }
     if (!is.null(active_port)) {
@@ -582,7 +595,7 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
     ok = TRUE,
     listen = paste0("127.0.0.1:", port),
     chunk_bytes = chunk_bytes,
-    protocol_abi = 2L
+    protocol_abi = 3L
   )
 }
 

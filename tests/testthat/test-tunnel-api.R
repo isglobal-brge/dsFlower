@@ -116,7 +116,7 @@ test_that("failed forwarder startup kills its process and clears all state", {
   )
 
   expect_error(
-    dsFlower::flowerTunnelUpDS(cid, 18080L, "site", protocol_abi = 2L),
+    dsFlower::flowerTunnelUpDS(cid, 18080L, "site", protocol_abi = 3L),
     "failed to start"
   )
   expect_null(env$tunnel_conn_id)
@@ -273,28 +273,26 @@ test_that("absolute offsets remain idempotent across spool compaction", {
   spool
 }
 
-test_that("large tunnel and outer DataSHIELD payloads round-trip without truncation", {
-  payload <- as.raw((seq_len(1024^2 + 4099L) - 1L) %% 256L)
+test_that("the maximum DSI-safe tunnel chunk round-trips without truncation", {
+  payload <- as.raw((seq_len(512 * 1024L) - 1L) %% 256L)
   encoded_payload <- dsFlower:::.tunnel_enc(payload)
-  expect_gt(nchar(encoded_payload, type = "bytes"), 1000000L)
+  expect_lt(nchar(encoded_payload, type = "bytes"), 1000000L)
   expect_identical(
-    dsFlower:::.tunnel_dec(encoded_payload, max_bytes = 2 * 1024^2),
+    dsFlower:::.tunnel_dec(encoded_payload, max_bytes = 512 * 1024L),
     payload
   )
   expect_identical(
-    dsFlower:::.app_b64_dec(encoded_payload, max_bytes = 2 * 1024^2),
+    dsFlower:::.app_b64_dec(encoded_payload, max_bytes = 512 * 1024L),
     payload
   )
 
   request <- list(pa = 0, pd = encoded_payload, pf = 0, g = 1)
   outer <- .test_tunnel_arg(request)
-  expect_gt(nchar(outer, type = "bytes"), 1000000L)
   decoded <- dsFlower:::.ds_arg(outer)
   expect_identical(decoded$pd, encoded_payload)
 
   cid <- paste0("dsf_", strrep("f", 32))
   spool <- .activate_test_tunnel(cid)
-  withr::local_options(list(dsflower.tunnel_chunk_bytes = 2 * 1024^2))
   result <- dsFlower::flowerTunnelExchangeDS(
     cid, pa = 0, pd = encoded_payload, pf = 0, g = 1
   )
@@ -306,6 +304,66 @@ test_that("large tunnel and outer DataSHIELD payloads round-trip without truncat
     )$data,
     payload
   )
+})
+
+test_that("tunnel chunks cannot exceed the DSI expression-safe maximum", {
+  expect_identical(dsFlower:::.tunnel_chunk_bytes(), 512L * 1024L)
+  withr::local_options(list(dsflower.tunnel_chunk_bytes = 512L * 1024L + 1L))
+  expect_error(dsFlower:::.tunnel_chunk_bytes(), "Invalid.*tunnel_chunk_bytes")
+})
+
+test_that("512 KiB tunnel chunks traverse real DSI and DSLite", {
+  skip_if_not_installed("DSLite")
+  python <- Sys.which("python3")
+  if (!nzchar(python)) python <- Sys.which("python")
+  skip_if(!nzchar(python), "Python is required for the tunnel forwarder")
+  withr::local_options(list(
+    dsflower.tunnel_chunk_bytes = 512 * 1024L,
+    dsflower.tunnel_spool_max_bytes = 4 * 1024^2
+  ))
+
+  server <- DSLite::newDSLiteServer(tables = list())
+  for (method in c(
+    "flowerTunnelUpDS", "flowerTunnelExchangeDS", "flowerTunnelDownDS"
+  )) {
+    server$aggregateMethod(method, paste0("dsFlower::", method))
+  }
+  server_name <- paste0("dsflower_tunnel_dslite_", Sys.getpid())
+  assign(server_name, server, envir = .GlobalEnv)
+  withr::defer(rm(list = server_name, envir = .GlobalEnv))
+  connection <- DSLite::dsConnect(
+    DSLite::DSLite(), name = "site", url = server_name
+  )
+  withr::defer(DSLite::dsDisconnect(connection))
+  conns <- list(site = connection)
+
+  port_result <- processx::run(python, c("-c", paste(
+    "import socket", "s=socket.socket()", "s.bind(('127.0.0.1',0))",
+    "print(s.getsockname()[1])", "s.close()", sep = ";"
+  )))
+  port <- as.integer(trimws(port_result$stdout))
+  cid <- paste0("dsf_", strrep("6", 32))
+  ready <- DSI::datashield.aggregate(conns, call(
+    "flowerTunnelUpDS", cid, port, "site", protocol_abi = 3L
+  ))
+  expect_true(ready$site$ok)
+  expect_equal(ready$site$chunk_bytes, 512 * 1024)
+  withr::defer(tryCatch(
+    DSI::datashield.aggregate(conns, call("flowerTunnelDownDS", cid)),
+    error = function(e) NULL
+  ))
+
+  payload <- as.raw((seq_len(512L * 1024L) - 1L) %% 256L)
+  result <- DSI::datashield.aggregate(conns, call(
+    "flowerTunnelExchangeDS", cid, pa = 0,
+    pd = dsFlower:::.tunnel_enc(payload), pf = 0, g = 0
+  ))
+  expect_true(result$site$ok)
+  expect_equal(result$site$sz, length(payload))
+  expect_identical(dsFlower:::.tunnel_read_at(
+    dsFlower:::.tunnel_spool(cid, create = FALSE), "down.bin", 0,
+    max_bytes = length(payload)
+  )$data, payload)
 })
 
 test_that("generation fencing rejects stale reconnect traffic", {
@@ -339,6 +397,34 @@ test_that("generation fencing rejects stale reconnect traffic", {
     pa = 7, pd = dsFlower:::.tunnel_enc(charToRaw("!")), pf = 0, g = 2
   )))
   expect_identical(dsFlower::flowerTunnelExchangeDS(cid, keyed)$sz, 8)
+})
+
+test_that("downstream backpressure still drains the upstream stream", {
+  cid <- paste0("dsf_", strrep("5", 32))
+  spool <- .activate_test_tunnel(cid, generation = 1)
+  chunk <- 16 * 1024L
+  cap <- 1024^2L
+  withr::local_options(list(
+    dsflower.tunnel_chunk_bytes = chunk,
+    dsflower.tunnel_spool_max_bytes = cap
+  ))
+  dsFlower:::.tunnel_append(spool, "down.bin", as.raw(rep(0x22, cap)))
+  upstream <- charToRaw("upstream-must-progress")
+  dsFlower:::.tunnel_append(spool, "up.bin", upstream)
+
+  result <- dsFlower::flowerTunnelExchangeDS(
+    cid, pa = cap,
+    pd = dsFlower:::.tunnel_enc(as.raw(rep(0x33, chunk))),
+    pf = 0, g = 1
+  )
+
+  expect_identical(result$sz, as.numeric(cap))
+  expect_identical(result$ue, as.numeric(length(upstream)))
+  expect_identical(dsFlower:::.tunnel_dec(result$ud, chunk), upstream)
+  expect_identical(
+    dsFlower:::.tunnel_spool_state(spool, "down.bin")$eof,
+    as.numeric(cap)
+  )
 })
 
 test_that("the forwarder compacts both streams and fences a concurrent reconnect", {
@@ -518,4 +604,32 @@ test_that("the forwarder compacts both streams and fences a concurrent reconnect
   expect_identical(dsFlower:::.tunnel_spool_state(
     spool, "down.bin"
   )$bytes, 0)
+
+  # A SuperNode may redial before its previous TCP socket has visibly closed.
+  # The queued replacement must become a new generation without waiting for the
+  # old half-open stream to time out.
+  fourth <- socketConnection(
+    "127.0.0.1", port, open = "r+b", blocking = TRUE, timeout = 2
+  )
+  withr::defer(tryCatch(close(fourth), error = function(e) NULL))
+  expect_true(wait_for(function() identical(read_gen(), 4)))
+  expect_identical(dsFlower:::.tunnel_spool_state(
+    spool, "up.bin"
+  )$bytes, 0)
+  expect_identical(dsFlower:::.tunnel_spool_state(
+    spool, "down.bin"
+  )$bytes, 0)
+  replacement_payload <- charToRaw("replacement-stream")
+  writeBin(replacement_payload, fourth)
+  flush(fourth)
+  expect_true(wait_for(function() {
+    dsFlower:::.tunnel_spool_state(spool, "up.bin")$bytes ==
+      length(replacement_payload)
+  }))
+  expect_identical(
+    dsFlower:::.tunnel_read_at(
+      spool, "up.bin", 0, max_bytes = length(replacement_payload)
+    )$data,
+    replacement_payload
+  )
 })

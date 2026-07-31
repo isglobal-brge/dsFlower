@@ -10,7 +10,8 @@ from unittest import mock
 
 import numpy as np
 import pandas as pd
-from flwr.common import ArrayRecord, Message, RecordDict
+from flwr.common import (
+    ArrayRecord, ConfigRecord, Error, Message, MetricRecord, RecordDict)
 
 
 FLOWER_APP = os.path.join(
@@ -156,6 +157,78 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(strategy.beta_1, 0.8)
         self.assertEqual(strategy.beta_2, 0.95)
         self.assertEqual(strategy.tau, 1e-4)
+
+    @staticmethod
+    def _train_reply(value, node_id):
+        request = Message(
+            content=RecordDict(), dst_node_id=node_id, message_type="train")
+        return Message(
+            content=RecordDict({
+                "arrays": ArrayRecord(
+                    numpy_ndarrays=[np.asarray([value], dtype=np.float64)]),
+                "metrics": MetricRecord({"num-examples": 1}),
+            }),
+            reply_to=request,
+        )
+
+    @staticmethod
+    def _error_reply(node_id):
+        request = Message(
+            content=RecordDict(), dst_node_id=node_id, message_type="train")
+        return Message(error=Error(1, "client failed"), reply_to=request)
+
+    def test_strategy_requires_every_configured_node_in_every_round(self):
+        strategy = server_app._build_strategy(
+            {"strategy": "fedavg"}, min_nodes=2)
+        valid = [self._train_reply(1.0, 1), self._train_reply(3.0, 2)]
+        arrays, _ = strategy.aggregate_train(1, valid)
+        np.testing.assert_array_equal(
+            arrays.to_numpy_ndarrays()[0], np.asarray([2.0]))
+
+        for name in server_app._STRATEGIES:
+            with self.subTest(strategy=name):
+                candidate = server_app._build_strategy(
+                    {"strategy": name}, min_nodes=2)
+                with self.assertRaisesRegex(
+                        RuntimeError, "1 of 2.*degraded federation"):
+                    candidate.aggregate_train(1, [
+                        self._train_reply(1.0, 1), self._error_reply(2)])
+        with self.assertRaisesRegex(RuntimeError, "1 of 2.*degraded federation"):
+            strategy.aggregate_train(1, valid[:1])
+        with self.assertRaisesRegex(RuntimeError, "3 of 2.*degraded federation"):
+            strategy.aggregate_train(
+                1, valid + [self._train_reply(5.0, 3)])
+
+    def test_strategy_rejects_an_extra_connected_node_before_sending(self):
+        class ChangingGrid:
+            def __init__(self):
+                self.calls = 0
+
+            def get_node_ids(self):
+                self.calls += 1
+                return [] if self.calls == 1 else [11, 22, 33]
+
+        strategy = server_app._build_strategy(
+            {"strategy": "fedavg"}, min_nodes=2)
+        with self.assertRaisesRegex(
+                RuntimeError, "3 node.*expected exactly 2"):
+            strategy.configure_train(
+                1,
+                ArrayRecord(numpy_ndarrays=[np.asarray([0.0])]),
+                ConfigRecord(),
+                ChangingGrid(),
+            )
+
+    def test_tree_aggregation_rejects_any_missing_booster(self):
+        booster = {
+            "model_type": "dp_gbdt", "trees": [], "n_trees": 0,
+        }
+        raw = np.frombuffer(
+            json.dumps(booster).encode("utf-8"), dtype=np.uint8)
+        valid = [self._train_reply(raw, 1), self._train_reply(raw, 2)]
+        with self.assertRaisesRegex(RuntimeError, "2 of 2.*degraded federation"):
+            server_app._collect_trees(
+                valid + [self._error_reply(3)], n_connected=2, min_nodes=2)
 
 
 class ArtifactRuntimeTests(unittest.TestCase):
