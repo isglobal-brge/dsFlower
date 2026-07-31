@@ -14,11 +14,14 @@ flowerAppPushDS(token, chunk_b64 = "", offset = NULL)
 \item{offset}{Numeric; the size the client believes the node file has.}
 }
 \value{
-list(size = new file size), or list(size, error="gap") on a gap.
+A fixed acknowledgement containing \code{ok}, \code{offset},
+  \code{size}, \code{bytes}, and the chunk \code{sha256}; failed geometry also
+  contains a public \code{error} code.
 }
 \description{
-Idempotent at \code{offset}: the client passes the size it believes the node's
-file has, and only the bytes of \code{chunk_b64} not already present are
-appended, so a retried push never duplicates or loses bytes.
+Idempotent at \code{offset}: a new chunk must start exactly at EOF. A replay is
+acknowledged only when its offset, length, and content are byte-identical to
+the one complete chunk already stored, so a lost ACK cannot silently change
+message geometry or content.
 }
 \keyword{internal}

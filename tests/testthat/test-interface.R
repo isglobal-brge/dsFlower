@@ -299,7 +299,7 @@ test_that("prepare reserves before schema access and never refunds failures", {
   withr::defer(dsFlower:::.removeHandle("test_failed_prepare_reservation"))
   expect_error(
     flowerPrepareRunDS("test_failed_prepare_reservation", "target", "f1"),
-    "target columns were not found"
+    "Private data preparation failed on this node"
   )
 
   dsFlower:::.setHandle(
@@ -311,6 +311,94 @@ test_that("prepare reserves before schema access and never refunds failures", {
   state <- dsFlower:::.getHandle("test_next_prepare_reservation")
   manifest <- jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
   expect_equal(manifest[["privacy-allocation-index"]], 2L)
+})
+
+test_that("privacy-tail prepare never opens private sources and remains nonblocking", {
+  local_interface_privacy_state()
+  withr::local_options(list(
+    dsflower.dp_min_release_epsilon = 10,
+    dsflower.dp_unit = "patient",
+    dsflower.patient_column = "subject_id"
+  ))
+
+  private_access <- function(...) {
+    stop("private source was accessed", call. = FALSE)
+  }
+  local_mocked_bindings(
+    .loadTrainingData = private_access,
+    .stageData = private_access,
+    .stageFromDescriptor = private_access,
+    .stage_image_manifest = private_access
+  )
+
+  tree_config <- list(
+    "dp-track" = "trees",
+    "num-server-rounds" = 1L,
+    "num-features" = 2L,
+    "num-classes" = 2L,
+    "target-levels" = c(0, 1),
+    "feature-bounds" = list(lower = c(-1, -2), upper = c(1, 2)),
+    "gbdt-spec" = list(
+      objective = "binary:logistic", max_depth = 2L, n_trees = 3L,
+      learning_rate = 0.1, reg_lambda = 1, n_bins = 8L,
+      feature_ranges = list(c(-1, 1), c(-2, 2))
+    )
+  )
+
+  handles <- list(
+    tail_file = mock_handle(
+      data_path = "/private/must-not-be-opened.csv", data_format = "csv"),
+    tail_table = mock_handle(
+      table_data = data.frame(private = "must-not-be-read")),
+    tail_image = within(mock_handle(), {
+      source <- "descriptor"
+      source_kind <- "image_bundle"
+      descriptor <- structure(
+        list(source_kind = "image_bundle", private = "must-not-be-read"),
+        class = "FlowerDatasetDescriptor")
+      table_data <- NULL
+      data_format <- "descriptor"
+    })
+  )
+  withr::defer(for (handle_name in names(handles)) {
+    try(dsFlower:::.removeHandle(handle_name), silent = TRUE)
+  })
+
+  for (name in names(handles)) {
+    dsFlower:::.setHandle(name, handles[[name]])
+    config <- if (identical(name, "tail_file")) tree_config else list()
+    expect_no_error(flowerPrepareRunDS(name, "target", c("f1", "f2"), config))
+
+    state <- dsFlower:::.getHandle(name)
+    expect_true(state$prepared)
+    expect_false(state$node_ensured)
+    manifest_path <- file.path(state$staging_dir, "manifest.json")
+    expect_true(file.exists(manifest_path))
+    expect_setequal(list.files(state$staging_dir), "manifest.json")
+    manifest <- jsonlite::fromJSON(manifest_path, simplifyVector = FALSE)
+    expect_true(manifest[["privacy-reserved"]])
+    expect_false(manifest[["privacy-release-enabled"]])
+    expect_identical(manifest$n_samples, 0L)
+    expect_identical(manifest$n_units, 0L)
+    expect_identical(manifest$source_kind, "privacy_noop")
+    expect_identical(manifest[["dp-unit"]], "patient")
+    expect_identical(manifest$patient_column, "subject_id")
+    expect_false("data_file" %in% names(manifest))
+    expect_false("samples_file" %in% names(manifest))
+  }
+
+  tree_state <- dsFlower:::.getHandle("tail_file")
+  tree_manifest <- jsonlite::fromJSON(
+    file.path(tree_state$staging_dir, "manifest.json"), simplifyVector = FALSE)
+  expect_identical(tree_manifest[["dp-track"]], "trees")
+  expect_identical(tree_manifest[["num-features"]], 2L)
+  expect_identical(tree_manifest[["gbdt-spec"]]$n_trees, 3L)
+
+  # A new query receives the next public no-op allocation; it is not rejected.
+  old_token <- tree_state$run_token
+  expect_no_error(flowerPrepareRunDS(
+    "tail_file", "target", c("f1", "f2"), tree_config))
+  expect_false(identical(dsFlower:::.getHandle("tail_file")$run_token, old_token))
 })
 
 test_that("run admission is independent of a rare target class", {
@@ -522,21 +610,50 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("opacus_version" %in% names(caps))
   expect_true("runtime_versions_sha256" %in% names(caps))
   expect_true("templates" %in% names(caps))
+  expect_identical(caps$templates, character())
+  expect_true(caps$templates_deprecated)
+  expect_false(caps$allow_custom_config)
+  expect_true(caps$allow_custom_config_deprecated)
+  expect_identical(caps$dp_tracks, c("neural", "trees", "egress"))
+  expect_setequal(
+    caps$declarative_model_ops$layers,
+    c("linear", "relu", "gelu", "tanh", "sigmoid", "elu", "silu",
+      "leaky_relu", "dropout", "layernorm", "softmax", "reshape",
+      "flatten", "conv1d", "conv2d", "maxpool2d",
+      "adaptiveavgpool2d", "upsample", "lstm", "gru")
+  )
+  expect_setequal(
+    caps$declarative_model_ops$graph,
+    c("add", "mul", "sub", "div", "affine", "concat", "matmul",
+      "transpose")
+  )
+  expect_setequal(
+    caps$declarative_losses,
+    c("bce_logits", "cross_entropy", "mse", "poisson_nll",
+      "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll")
+  )
+  expect_identical(caps$tree_objectives, "binary:logistic")
+  expect_setequal(
+    caps$aggregation_strategies,
+    c("fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm")
+  )
   expect_true("max_rounds" %in% names(caps))
   expect_true("min_samples" %in% names(caps))
   expect_false("secure_aggregation_supported" %in% names(caps))
 })
 
-test_that("flowerGetCapabilitiesDS includes is_docker and hostname", {
+test_that("flowerGetCapabilitiesDS omits infrastructure and session state", {
+  withr::local_options(list(
+    dsflower.hook_resource_isolation_attested = TRUE))
   caps <- flowerGetCapabilitiesDS()
-  expect_true("is_docker" %in% names(caps))
-  expect_true("hostname" %in% names(caps))
-  expect_type(caps$is_docker, "logical")
-  expect_type(caps$hostname, "character")
-  expect_true(nchar(caps$hostname) > 0)
+  expect_false(any(c(
+    "python_envs", "hostname", "is_docker", "active_supernodes",
+    "zombie_processes"
+  ) %in% names(caps)))
+  expect_true(caps$hook_resource_isolation_attested)
 })
 
-test_that("handle capabilities expose schema but never a private row count", {
+test_that("capabilities are invariant to existing or missing handle symbols", {
   name <- "test_capabilities_no_rows"
   dsFlower:::.setHandle(name, list(
     data_path = tempfile(), source = "table",
@@ -544,16 +661,44 @@ test_that("handle capabilities expose schema but never a private row count", {
     prepared = FALSE, node_ensured = FALSE))
   withr::defer(dsFlower:::.removeHandle(name))
 
-  caps <- flowerGetCapabilitiesDS(name)
-  expect_false("data_n_rows" %in% names(caps))
-  expect_equal(caps$data_n_cols, 2L)
-  expect_equal(caps$data_columns, c("x", "y"))
+  existing <- flowerGetCapabilitiesDS(name)
+  missing <- flowerGetCapabilitiesDS("definitely_missing_handle")
+  expect_identical(existing, missing)
+  expect_false(any(c(
+    "data_n_rows", "data_n_cols", "data_columns", "data_source",
+    "prepared", "node_ensured", "has_imagedata", "image_assets"
+  ) %in% names(existing)))
 })
 
-test_that(".detect_container_env returns logical", {
-  result <- dsFlower:::.detect_container_env()
-  expect_type(result, "logical")
-  expect_length(result, 1)
+test_that("disabled compatibility egress never looks up private symbols", {
+  existing_data <- data.frame(secret_a = 1:8, secret_b = 9:16)
+  requested <- c("requested_b", "requested_a")
+
+  existing <- flowerFeatureStatsDS("existing_data", requested)
+  missing <- flowerFeatureStatsDS("definitely_missing_data", requested)
+  expect_identical(existing, missing)
+  expect_identical(existing$features, requested)
+  expect_identical(existing$n, c(0, 0))
+  expect_identical(existing$sum, c(0, 0))
+  expect_identical(existing$sumsq, c(0, 0))
+  expect_true(existing$disabled)
+
+  # NULL cannot mean "all server columns" without creating a schema oracle.
+  empty <- flowerFeatureStatsDS("existing_data", NULL)
+  expect_identical(empty$features, character())
+  expect_identical(empty$n, numeric())
+
+  handle_name <- "test_disabled_egress_handle"
+  dsFlower:::.setHandle(handle_name, list(private = "state"))
+  withr::defer(dsFlower:::.removeHandle(handle_name))
+  expect_identical(
+    flowerMetricsDS(handle_name),
+    flowerMetricsDS("definitely_missing_handle")
+  )
+  expect_identical(
+    flowerLogDS(handle_name),
+    flowerLogDS("definitely_missing_handle")
+  )
 })
 
 test_that("flowerCheckConnectivityDS detects unreachable address", {

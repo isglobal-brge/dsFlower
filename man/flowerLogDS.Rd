@@ -7,9 +7,9 @@
 flowerLogDS(handle_symbol, last_n = 50L)
 }
 \arguments{
-\item{handle_symbol}{Character; symbol of the handle.}
+\item{handle_symbol}{Ignored compatibility argument.}
 
-\item{last_n}{Integer; number of lines to return (max 200).}
+\item{last_n}{Ignored compatibility argument.}
 }
 \value{
 Empty character vector.

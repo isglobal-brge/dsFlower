@@ -26,8 +26,8 @@ same federation.}
 TLS verification. The SuperNode uses \code{--root-certificates} to
 verify the SuperLink's identity.}
 
-\item{template_name}{Character or NULL; Flower template name used to resolve
-the server-side runtime and write code-verification artifacts.}
+\item{template_name}{Deprecated compatibility argument. Named executable
+templates are retired; non-NULL values fail before any run-side effect.}
 
 \item{torch_backend}{Character or NULL; requested CPU/GPU backend. The node
 validates availability and applies its own backend policy.}

@@ -70,7 +70,21 @@ test_that("chunked push + install verifies a FAB by sha256 and unpacks it", {
 
   # idempotent: re-pushing the last chunk at the same offset does not grow the file
   r2b <- dsFlower::flowerAppPushDS(token, .enc_b64(raw[(half + 1):length(raw)]), half)
+  expect_true(r2b$ok)
   expect_equal(r2b$size, length(raw))
+  conflict <- raw[(half + 1):length(raw)]
+  conflict[[1L]] <- as.raw(bitwXor(as.integer(conflict[[1L]]), 1L))
+  bad_content <- dsFlower::flowerAppPushDS(
+    token, .enc_b64(conflict), half)
+  expect_false(bad_content$ok)
+  expect_identical(bad_content$error, "conflict")
+  bad_length <- dsFlower::flowerAppPushDS(
+    token, .enc_b64(raw[(half + 1):(length(raw) - 1L)]), half)
+  expect_false(bad_length$ok)
+  expect_identical(bad_length$error, "conflict")
+  expect_equal(file.size(file.path(
+    dsFlower:::.app_spool_dir(token, create = FALSE), "app.fab")),
+    length(raw))
 
   res <- dsFlower::flowerAppInstallDS(token, sha)
   expect_true(res$ok)

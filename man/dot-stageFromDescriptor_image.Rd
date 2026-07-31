@@ -16,5 +16,9 @@
 Handles multi-root image assets from the descriptor. Metadata is staged
 (CSV/Parquet), images remain on disk (zero-copy). The manifest includes
 an \code{assets} key mapping asset names to their validated root paths.
+Private record values are totalized: an invalid/unavailable path becomes a
+fixed zero-image marker, invalid labels become their public target default,
+and no row is removed. Descriptor shape, metadata source, backend, and asset
+roots are global valid-input preconditions and still fail closed.
 }
 \keyword{internal}

@@ -21,6 +21,9 @@ _MAX_SERVER_ROUNDS = 500
 _MAX_LEARNING_RATE = 10.0
 _MAX_GBDT_REG_LAMBDA = 1.0e6
 _MAX_NUMERIC_ABS = 1.0e6
+_MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
+_INVALID_IMAGE = "__dsflower_invalid_image__"
+_ASCII_ID_TRIM = " \t\r\n"
 
 
 def _get_manifest_dir(context=None):
@@ -52,16 +55,6 @@ def _load_target(y_series, manifest):
     """
     task_type = str(manifest.get("task-type", "classification")).lower()
     numeric_task = task_type in ("regression", "count", "continuous")
-    try:
-        numeric = pd.to_numeric(y_series, errors="raise").to_numpy(dtype=np.float64)
-    except Exception as exc:
-        if numeric_task:
-            raise ValueError("regression/count target must be numeric") from exc
-        raise ValueError(
-            "non-numeric classification target requires public target-levels") from exc
-    if not bool(np.all(np.isfinite(numeric))):
-        raise ValueError("target contains non-finite values")
-
     if numeric_task:
         bounds = manifest.get("target-bounds")
         if not isinstance(bounds, dict):
@@ -80,6 +73,11 @@ def _load_target(y_series, manifest):
             raise ValueError("count target-bounds require lower >= 0")
         if loss_name == "gamma_nll" and lower <= 0.0:
             raise ValueError("gamma_nll target-bounds require lower > 0")
+        numeric = pd.to_numeric(y_series, errors="coerce").to_numpy(
+            dtype=np.float64)
+        midpoint = lower + (upper - lower) / 2.0
+        numeric = np.nan_to_num(
+            numeric, nan=midpoint, posinf=upper, neginf=lower)
         return np.clip(numeric, lower, upper).astype(np.float32)
 
     levels = manifest.get("target-levels")
@@ -94,11 +92,62 @@ def _load_target(y_series, manifest):
             "num-classes", 2 if manifest.get("dp-track") == "trees" else 2))
     if n_classes < 2 or n_classes > 1024:
         raise ValueError("manifest has invalid public class count")
-    if not bool(np.all(numeric == np.floor(numeric))):
-        raise ValueError("classification target must contain integer class codes")
-    if not bool(np.all((numeric >= 0) & (numeric < n_classes))):
-        raise ValueError("classification target is outside the public class domain")
-    return numeric.astype(np.float32)
+    numeric = pd.to_numeric(y_series, errors="coerce").to_numpy(
+        dtype=np.float64)
+    valid = (np.isfinite(numeric) & (numeric == np.floor(numeric))
+             & (numeric >= 0) & (numeric < n_classes))
+    # Code zero is a public catch-all. Invalid private values therefore change
+    # one bounded record instead of selecting an exact no-op response.
+    return np.where(valid, numeric, 0.0).astype(np.float32)
+
+
+def _load_features(frame, manifest):
+    """Map every private feature cell to the fixed finite numeric domain."""
+    numeric = frame.apply(pd.to_numeric, errors="coerce").to_numpy(
+        dtype=np.float64)
+    defaults = np.zeros(numeric.shape[1], dtype=np.float64)
+    bounds = manifest.get("feature-bounds")
+    if isinstance(bounds, dict):
+        lower = np.asarray(bounds.get("lower", []), dtype=np.float64)
+        upper = np.asarray(bounds.get("upper", []), dtype=np.float64)
+        if (lower.shape == defaults.shape and upper.shape == defaults.shape
+                and np.all(np.isfinite(lower)) and np.all(np.isfinite(upper))
+                and np.all(lower < upper)
+                and np.all(np.abs(lower) <= _MAX_NUMERIC_ABS)
+                and np.all(np.abs(upper) <= _MAX_NUMERIC_ABS)):
+            defaults = lower + (upper - lower) / 2.0
+    invalid = ~np.isfinite(numeric)
+    if bool(np.any(invalid)):
+        numeric = np.where(invalid, defaults[np.newaxis, :], numeric)
+    return np.clip(
+        numeric, -_MAX_NUMERIC_ABS, _MAX_NUMERIC_ABS).astype(np.float32)
+
+
+def _read_staged_frame(path, manifest):
+    """Read one staged table without lossy CSV inference of identity fields."""
+    if (manifest.get("data_format") == "parquet"
+            or path.lower().endswith(".parquet")):
+        import pyarrow.parquet as pq
+        return pq.read_table(path).to_pandas()
+
+    string_columns = []
+    patient_column = manifest.get("patient_column")
+    if isinstance(patient_column, str) and patient_column:
+        string_columns.append(patient_column)
+    if manifest.get("data_type") == "image":
+        assets = manifest.get("assets", {}) or {}
+        images = assets.get("images", {}) or {}
+        path_column = images.get("path_col", "relative_path")
+        if isinstance(path_column, str) and path_column:
+            string_columns.append(path_column)
+    return pd.read_csv(
+        path,
+        dtype={column: "string" for column in set(string_columns)},
+        keep_default_na=False,
+        na_filter=False,
+        encoding="utf-8",
+        encoding_errors="strict",
+    )
 
 
 def load_data(context=None):
@@ -107,15 +156,24 @@ def load_data(context=None):
     manifest_dir = _get_manifest_dir(context)
     data_file = os.path.join(manifest_dir, manifest["data_file"])
 
-    if manifest.get("data_format", "csv") == "parquet":
-        import pyarrow.parquet as pq
-        df = pq.read_table(data_file).to_pandas()
-    else:
-        df = pd.read_csv(data_file)
+    df = _read_staged_frame(data_file, manifest)
 
     target_col = manifest["target_column"]
-    if not isinstance(target_col, str) or target_col not in df.columns:
-        raise ValueError("manifest must pin one available target column")
+    multilabel = str(manifest.get("loss-name", "")).lower() == "multilabel_bce"
+    if multilabel:
+        num_labels = int(manifest.get("num-labels", 0))
+        if (not isinstance(target_col, list) or len(target_col) != num_labels
+                or num_labels < 2 or num_labels > 1024
+                or len(set(target_col)) != len(target_col)
+                or any(not isinstance(col, str) or col not in df.columns
+                       for col in target_col)):
+            raise ValueError(
+                "multilabel manifest must pin num-labels available target columns")
+        target_cols = target_col
+    else:
+        if not isinstance(target_col, str) or target_col not in df.columns:
+            raise ValueError("manifest must pin one available target column")
+        target_cols = [target_col]
     feat_cols = manifest.get("feature_columns")
     patient_col = manifest.get("patient_column")
     if feat_cols:
@@ -124,15 +182,34 @@ def load_data(context=None):
             raise ValueError("manifest has no non-identifier feature columns")
         feat = df[feat_cols]
     else:
-        excluded = [target_col] + ([patient_col] if patient_col else [])
+        excluded = target_cols + ([patient_col] if patient_col else [])
         feat = df.drop(columns=excluded)
-    X = feat.to_numpy(dtype=np.float32)
-    return X, _load_target(df[target_col], manifest)
+    X = _load_features(feat, manifest)
+    if multilabel:
+        y = np.column_stack([
+            _load_target(df[column], manifest) for column in target_cols
+        ]).astype(np.float32)
+    else:
+        y = _load_target(df[target_col], manifest)
+    return X, y
 
 
 def is_image_run(context=None):
     """True if the staged manifest is an image collection (data_type=='image')."""
     return _load_manifest(context).get("data_type") == "image"
+
+
+def _canonical_patient_id(value):
+    """Apply the exact public trim-utf8-v2 patient-ID mapping."""
+    try:
+        text = ("" if value is None else str(value)).strip(_ASCII_ID_TRIM)
+        text.encode("utf-8", errors="strict")
+    except (TypeError, UnicodeError, ValueError):
+        return _MISSING_PATIENT_UNIT
+    if (not text
+            or text.lower() in ("na", "nan", "null", "<na>", "nat")):
+        return _MISSING_PATIENT_UNIT
+    return text
 
 
 def _load_patient_ids(df, manifest):
@@ -148,20 +225,38 @@ def _load_patient_ids(df, manifest):
     if (not isinstance(explicit, str) or not explicit
             or explicit not in df.columns):
         raise ValueError("manifest-pinned patient column is missing")
-    if manifest.get("patient-id-canonicalization") != "trim-utf8-v1":
+    if manifest.get("patient-id-canonicalization") != "trim-utf8-v2":
         raise ValueError("manifest has an unsupported patient ID canonicalization")
     values = df[explicit]
-    text = values.astype(str).str.strip()
-    invalid = values.isna() | text.eq("") | text.str.lower().isin(
-        ("na", "nan", "null"))
-    if bool(invalid.any()):
-        raise ValueError(
-            "manifest-pinned patient identifiers contain missing values")
-    return text.to_numpy(dtype=str)
+    return np.asarray(
+        [_canonical_patient_id(value) for value in values], dtype=str)
+
+
+def assert_pinned_unit_count(context, n_rows, patient_ids=None):
+    """Fail closed on a structurally changed staged privacy-unit roster."""
+    manifest = _load_manifest(context)
+    if "n_units" not in manifest:
+        return
+    raw = manifest["n_units"]
+    if isinstance(raw, (bool, np.bool_)):
+        raise ValueError("manifest has an invalid pinned privacy-unit count")
+    try:
+        number = float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("manifest has an invalid pinned privacy-unit count") from exc
+    if (not math.isfinite(number) or number != math.floor(number) or number < 1):
+        raise ValueError("manifest has an invalid pinned privacy-unit count")
+    observed = (int(n_rows) if patient_ids is None else int(np.unique(
+        np.asarray([_canonical_patient_id(value) for value in patient_ids],
+                   dtype=str)).size))
+    if observed != int(number):
+        raise RuntimeError("staged privacy-unit roster changed after manifest pinning")
 
 
 def _resolve_image_path(images_root, value):
     """Resolve one portable relative path without allowing root escape."""
+    if isinstance(value, str) and value == _INVALID_IMAGE:
+        return None
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ValueError("image samples contain an unsafe relative path")
     if ("\\" in value or os.path.isabs(value) or ntpath.isabs(value)
@@ -200,11 +295,7 @@ def load_image_collection(context=None):
     samples_file = os.path.join(manifest_dir, manifest["samples_file"])
     if not os.path.isfile(samples_file):
         raise ValueError("image samples file is unavailable")
-    if samples_file.lower().endswith(".parquet"):
-        import pyarrow.parquet as pq
-        df = pq.read_table(samples_file).to_pandas()
-    else:
-        df = pd.read_csv(samples_file)
+    df = _read_staged_frame(samples_file, manifest)
 
     assets = manifest.get("assets", {}) or {}
     images = assets.get("images", {}) or {}
@@ -219,10 +310,17 @@ def load_image_collection(context=None):
     target_col = manifest["target_column"]
     if not isinstance(target_col, str) or target_col not in df.columns:
         raise ValueError("manifest must pin one available target column")
-    if df[target_col].isna().any() or not len(df):
+    if not len(df):
         raise ValueError("staged image collection has an invalid target column")
 
-    paths = [_resolve_image_path(images_root, p) for p in df[path_col]]
+    paths = []
+    for value in df[path_col]:
+        try:
+            paths.append(_resolve_image_path(images_root, value))
+        except (OSError, TypeError, ValueError):
+            # A private bad/missing path is one bounded zero-image record. Never
+            # pass the sentinel to a filesystem API in the vision reader.
+            paths.append(None)
     groups = _load_patient_ids(df, manifest)
     return paths, _load_target(df[target_col], manifest), groups
 
@@ -420,7 +518,7 @@ def load_pinned_run_config(context=None):
     keys = (
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",
-        "gbdt-spec", "feature-bounds", "user-module",
+        "gbdt-spec", "feature-bounds", "backbone", "image-size", "user-module",
     )
     for key in keys:
         if key in manifest:
@@ -544,9 +642,5 @@ def load_tabular_patient_ids(context=None):
         return None
     manifest_dir = _get_manifest_dir(context)
     data_file = os.path.join(manifest_dir, manifest["data_file"])
-    if manifest.get("data_format", "csv") == "parquet":
-        import pyarrow.parquet as pq
-        df = pq.read_table(data_file).to_pandas()
-    else:
-        df = pd.read_csv(data_file)
+    df = _read_staged_frame(data_file, manifest)
     return _load_patient_ids(df, manifest)

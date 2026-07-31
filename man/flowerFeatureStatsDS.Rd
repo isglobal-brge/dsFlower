@@ -7,10 +7,11 @@
 flowerFeatureStatsDS(data_symbol, feature_columns = NULL)
 }
 \arguments{
-\item{data_symbol}{Character; symbol of the assigned data.frame.}
+\item{data_symbol}{Ignored compatibility argument.}
 
 \item{feature_columns}{Character or JSON-encoded character vector; feature
-column names (order is preserved in the returned vectors). NULL = all columns.}
+names supplied by the caller (order is preserved in the returned vectors).
+NULL returns empty vectors because server-side schema is not inspected.}
 }
 \value{
 Named list with the requested \code{features}, zero-valued

@@ -30,9 +30,21 @@ def _node_secret():
     if nofollow is None:
         raise RuntimeError("this platform cannot safely open the dsFlower node secret")
     try:
+        parent = os.path.dirname(path)
+        parent_info = os.lstat(parent)
         path_info = os.lstat(path)
     except OSError as exc:
         raise RuntimeError("trusted dsFlower node-secret path is missing or unsafe") from exc
+    if not stat.S_ISDIR(parent_info.st_mode):
+        raise RuntimeError("dsFlower node-secret parent must be a real directory")
+    if parent_info.st_uid not in (os.geteuid(), 0):
+        raise RuntimeError(
+            "dsFlower node-secret parent must be owned by the node EUID or root"
+        )
+    if stat.S_IMODE(parent_info.st_mode) & 0o022:
+        raise RuntimeError(
+            "dsFlower node-secret parent must not be writable by group or other users"
+        )
     if not stat.S_ISREG(path_info.st_mode):
         raise RuntimeError("dsFlower node secret must be a regular file")
 
@@ -43,6 +55,19 @@ def _node_secret():
         raise RuntimeError("trusted dsFlower node-secret path is missing or unsafe") from exc
     try:
         info = os.fstat(fd)
+        parent_after = os.lstat(parent)
+        if (not stat.S_ISDIR(parent_after.st_mode)
+                or (parent_after.st_dev, parent_after.st_ino)
+                != (parent_info.st_dev, parent_info.st_ino)):
+            raise RuntimeError("dsFlower node-secret parent changed while opening")
+        if parent_after.st_uid not in (os.geteuid(), 0):
+            raise RuntimeError(
+                "dsFlower node-secret parent must be owned by the node EUID or root"
+            )
+        if stat.S_IMODE(parent_after.st_mode) & 0o022:
+            raise RuntimeError(
+                "dsFlower node-secret parent must not be writable by group or other users"
+            )
         if (not stat.S_ISREG(info.st_mode)
                 or (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino)):
             raise RuntimeError("dsFlower node-secret path changed while opening")

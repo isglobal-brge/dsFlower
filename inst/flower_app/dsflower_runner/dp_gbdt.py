@@ -58,6 +58,8 @@ _MAX_TREES = 200
 _MAX_BINS = 64
 _MAX_FEATURES = 65_536
 _MAX_RUN_TOKEN_CHARS = 1024
+_MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
+_ASCII_ID_TRIM = " \t\r\n"
 
 # Objective allowlist: each maps to FINITE per-instance gradient/hessian clip
 # bounds (g*, h*). Only objectives whose gradient AND hessian are provably
@@ -294,6 +296,18 @@ def route_to_leaf(X, feat, thr, depth):
     return node - ((1 << depth) - 1)
 
 
+def _canonical_patient_id(value):
+    try:
+        text = ("" if value is None else str(value)).strip(_ASCII_ID_TRIM)
+        text.encode("utf-8", errors="strict")
+    except (TypeError, UnicodeError, ValueError):
+        return _MISSING_PATIENT_UNIT
+    if (not text
+            or text.lower() in ("na", "nan", "null", "<na>", "nat")):
+        return _MISSING_PATIENT_UNIT
+    return text
+
+
 # --------------------------------------------------------------------------- #
 # Per-patient pooling (DP unit = patient). Mirrors the neural _pool_by_patient.
 # --------------------------------------------------------------------------- #
@@ -304,24 +318,22 @@ def pool_by_patient(X, y, patient_ids):
     contributes one clamped (g, h), bounding its replace-one sensitivity to Δ₂.
     Returns (X_pooled, y_pooled)."""
     X, y = _finite_xy(X, y)
-    pid = np.asarray(patient_ids).ravel()
+    pid = np.asarray(patient_ids, dtype=object).ravel()
     if pid.shape != (X.shape[0],):
         raise ValueError("patient_ids length %d != X rows %d" % (pid.size, X.shape[0]))
+    canonical = []
     for value in pid:
-        if value is None or (isinstance(value, (float, np.floating))
-                             and not math.isfinite(float(value))):
-            raise ValueError("patient_ids must not contain missing values")
-    try:
-        uniq = np.unique(pid)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("patient_ids must have a consistently comparable type") from exc
+        canonical.append(_canonical_patient_id(value))
+    pid = np.asarray(canonical, dtype=str)
+    uniq = np.unique(pid)
     Xp = np.empty((len(uniq), X.shape[1]), dtype=np.float64)
     yp = np.empty(len(uniq), dtype=np.float64)
     for k, u in enumerate(uniq):
         m = pid == u
         Xp[k] = X[m].mean(axis=0)
-        # one outcome per patient: round the mean label (ties → 1) to {0,1}.
-        yp[k] = 1.0 if y[m].mean() >= 0.5 else 0.0
+        # One outcome per patient: majority label, with the same lowest-label
+        # tie break used by the neural track (a binary tie therefore maps to 0).
+        yp[k] = 1.0 if y[m].mean() > 0.5 else 0.0
     return Xp, yp
 
 

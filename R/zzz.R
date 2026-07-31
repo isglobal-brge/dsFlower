@@ -45,9 +45,41 @@
   path
 }
 
+#' Validate the parent directory of a dsFlower node secret
+#' @keywords internal
+.validate_node_secret_parent <- function(path, euid = NULL) {
+  parent <- dirname(path)
+  if (.path_is_symlink(parent)) {
+    stop("The dsFlower node-secret parent must be a real directory.",
+         call. = FALSE)
+  }
+  info <- file.info(parent)
+  if (nrow(info) != 1L || is.na(info$isdir[[1]]) || !isTRUE(info$isdir[[1]])) {
+    stop("The dsFlower node-secret parent must be a real directory.",
+         call. = FALSE)
+  }
+  if (.Platform$OS.type == "unix") {
+    if (is.null(euid)) euid <- .privacy_effective_uid()
+    owner <- suppressWarnings(as.integer(info$uid[[1]]))
+    if (is.na(owner) || !owner %in% c(as.integer(euid), 0L)) {
+      stop("The dsFlower node-secret parent must be owned by the node EUID or root.",
+           call. = FALSE)
+    }
+    mode <- suppressWarnings(as.integer(info$mode[[1]]))
+    unsafe_write <- as.integer(strtoi("22", base = 8))
+    if (is.na(mode) || bitwAnd(mode, unsafe_write) != 0L) {
+      stop("The dsFlower node-secret parent must not be writable by group or other users.",
+           call. = FALSE)
+    }
+  }
+  normalizePath(parent, winslash = "/", mustWork = TRUE)
+}
+
 #' Validate a dedicated 256-bit dsFlower node secret
 #' @keywords internal
 .validate_node_secret <- function(path) {
+  euid <- if (.Platform$OS.type == "unix") .privacy_effective_uid() else NULL
+  parent_before <- .validate_node_secret_parent(path, euid)
   if (!file.exists(path) || .path_is_symlink(path)) {
     stop("The dsFlower node secret is missing or is a symbolic link: ", path,
          call. = FALSE)
@@ -90,6 +122,11 @@
            call. = FALSE)
     }
   }
+  parent_after <- .validate_node_secret_parent(path, euid)
+  if (!identical(parent_after, parent_before)) {
+    stop("The dsFlower node-secret parent changed while validating the key.",
+         call. = FALSE)
+  }
   invisible(path)
 }
 
@@ -106,11 +143,25 @@
     stop("/dev/urandom is unavailable; refusing to create a DP node secret.",
          call. = FALSE)
   }
-  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
-  if (!dir.exists(dirname(path))) {
-    stop("Could not create the dsFlower secret directory: ", dirname(path),
+  parent <- dirname(path)
+  parent_existed <- dir.exists(parent)
+  old_umask <- if (.Platform$OS.type == "unix") Sys.umask("0077") else NULL
+  umask_restored <- FALSE
+  on.exit({
+    if (!umask_restored && !is.null(old_umask)) Sys.umask(old_umask)
+  }, add = TRUE)
+  dir.create(parent, recursive = TRUE, mode = "0700", showWarnings = FALSE)
+  if (!is.null(old_umask)) Sys.umask(old_umask)
+  umask_restored <- TRUE
+  if (!dir.exists(parent)) {
+    stop("Could not create the dsFlower secret directory: ", parent,
          call. = FALSE)
   }
+  if (.Platform$OS.type == "unix" && !parent_existed) {
+    Sys.chmod(parent, "0700")
+  }
+  euid <- if (.Platform$OS.type == "unix") .privacy_effective_uid() else NULL
+  parent_before <- .validate_node_secret_parent(path, euid)
 
   lock <- filelock::lock(paste0(path, ".lock"), timeout = 10000)
   if (is.null(lock)) stop("Timed out creating the dsFlower node secret.", call. = FALSE)
@@ -123,7 +174,7 @@
            call. = FALSE)
     }
     value <- paste(sprintf("%02x", as.integer(entropy)), collapse = "")
-    tmp <- tempfile(pattern = ".node-secret-", tmpdir = dirname(path))
+    tmp <- tempfile(pattern = ".node-secret-", tmpdir = parent)
     on.exit(unlink(tmp), add = TRUE)
     # base::file.create() has no `mode` formal: passing mode="0600" is
     # interpreted through `...` as a second filename. Use a restrictive umask
@@ -142,6 +193,11 @@
     if (!file.rename(tmp, path)) {
       stop("Could not atomically install the dsFlower node secret.", call. = FALSE)
     }
+  }
+  parent_after <- .validate_node_secret_parent(path, euid)
+  if (!identical(parent_after, parent_before)) {
+    stop("The dsFlower node-secret parent changed while creating the key.",
+         call. = FALSE)
   }
   .validate_node_secret(path)
 }

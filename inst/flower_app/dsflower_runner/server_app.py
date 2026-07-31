@@ -12,11 +12,13 @@ re-checks its OWN manifest-pinned track, so a mismatch fails closed node-side):
     already-noised DP-GBDT booster and BAG them (concatenate trees, scale weights
     by 1/M). Never FedAvg (it would average mismatched boosters).
 
-Final artifacts go to results-dir for the R relay's watchdog: model.pt + history
-(neural/egress), or booster.json + history (trees).
+Final artifacts go to results-dir for the R relay's watchdog: a native model,
+a bounded portable weight record, and history (neural/egress), or booster.json
+and history (trees).
 """
 
 import json
+import math
 import os
 
 import numpy as np
@@ -30,6 +32,48 @@ from flwr.common import ArrayRecord, Context, Message, RecordDict
 from .params import get_torch_params, set_torch_params
 
 app = ServerApp()
+
+# JSON is only the small-model interchange format used by the R client. Native
+# model.pt/model.npz remains authoritative for larger models. The conservative
+# per-element estimate prevents list conversion from multiplying memory use and
+# keeps the generated JSON below the client's default 50 MiB read ceiling.
+_PORTABLE_JSON_MAX_BYTES = 50 * 1024**2
+_PORTABLE_JSON_BYTES_PER_ELEMENT = 32
+
+
+def _save_portable_arrays(results_dir, arrays, round_number):
+    arrays = [np.asarray(value) for value in arrays]
+    if any(not np.issubdtype(value.dtype, np.number)
+           or not bool(np.all(np.isfinite(value))) for value in arrays):
+        raise RuntimeError("aggregated model contains non-finite parameters")
+
+    estimated_bytes = sum(
+        int(value.size) * _PORTABLE_JSON_BYTES_PER_ELEMENT
+        + int(value.ndim) * 24 + 64
+        for value in arrays
+    )
+    model_path = os.path.join(results_dir, "global_model.json")
+    skipped_path = os.path.join(results_dir, "global_model.skipped.json")
+    if estimated_bytes > _PORTABLE_JSON_MAX_BYTES:
+        if os.path.exists(model_path):
+            os.unlink(model_path)
+        with open(skipped_path, "w", encoding="utf-8") as handle:
+            json.dump({"reason": "weights_exceed_json_limit"}, handle)
+        return
+
+    payload = {str(i): value.tolist() for i, value in enumerate(arrays)}
+    payload["__shapes__"] = [list(value.shape) for value in arrays]
+    payload["__round__"] = int(round_number)
+    temporary = model_path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, allow_nan=False, separators=(",", ":"))
+        os.replace(temporary, model_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    if os.path.exists(skipped_path):
+        os.unlink(skipped_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -190,11 +234,42 @@ _STRATEGIES = {
 
 def _build_strategy(cfg, min_nodes):
     name = str(cfg.get("strategy", "fedavg")).lower()
-    cls = _STRATEGIES.get(name, FedAvg)
-    return cls(
+    if name not in _STRATEGIES:
+        raise ValueError(f"Unsupported aggregation strategy: {name}")
+    common = dict(
         fraction_train=1.0, fraction_evaluate=0.0,
         min_train_nodes=min_nodes, min_evaluate_nodes=0,
-        min_available_nodes=min_nodes)
+        min_available_nodes=min_nodes, weighted_by_key="num-examples")
+
+    def number(key, default, *, zero=False, unit=False):
+        value = float(cfg.get(key, default))
+        if (not math.isfinite(value) or (value < 0.0 if zero else value <= 0.0)
+                or (unit and value >= 1.0)):
+            raise ValueError(f"Invalid public strategy parameter: {key}")
+        return value
+
+    if name in ("fedadam", "fedyogi"):
+        defaults = ((0.1, 0.1) if name == "fedadam" else (0.01, 0.0316))
+        specific = dict(
+            eta=number("strategy-eta", defaults[0]),
+            eta_l=number("strategy-eta-l", defaults[1]),
+            beta_1=number("strategy-beta-1", 0.9, zero=True, unit=True),
+            beta_2=number("strategy-beta-2", 0.99, zero=True, unit=True),
+            tau=number("strategy-tau", 1e-3))
+    elif name == "fedadagrad":
+        specific = dict(
+            eta=number("strategy-eta", 0.1),
+            eta_l=number("strategy-eta-l", 0.1),
+            tau=number("strategy-tau", 1e-3))
+    elif name == "fedavgm":
+        specific = dict(
+            server_learning_rate=number(
+                "strategy-server-learning-rate", 1.0),
+            server_momentum=number(
+                "strategy-server-momentum", 0.0, zero=True, unit=True))
+    else:
+        specific = {}
+    return _STRATEGIES[name](**common, **specific)
 
 
 def _run_fedavg(grid, cfg, track):
@@ -216,13 +291,14 @@ def _save_results(cfg, model, result):
         raise RuntimeError(
             "No client updates were aggregated (all ClientApps failed); nothing to "
             "save. Check the node-side ClientApp logs.")
+    num_rounds = int(cfg.get("num-server-rounds", 1))
     if model is not None:
         set_torch_params(model, final_arrays)
         torch.save(model.state_dict(), os.path.join(results_dir, "model.pt"))
     else:  # egress: no torch model, save raw arrays
         np.savez(os.path.join(results_dir, "model.npz"), *final_arrays)
+    _save_portable_arrays(results_dir, final_arrays, num_rounds)
 
-    num_rounds = int(cfg.get("num-server-rounds", 1))
     per_round = dict(result.train_metrics_clientapp or {})
     history = []
     for rnd in range(1, num_rounds + 1):

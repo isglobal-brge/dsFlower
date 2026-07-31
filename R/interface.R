@@ -170,7 +170,6 @@
   list(
     source             = "table",
     data_symbol        = data_symbol %||% "table",
-    table_fingerprint  = digest::digest(df, algo = "xxhash64"),
     resource_client    = NULL,
     data_path          = NULL,
     data_format        = "table",
@@ -468,10 +467,10 @@ flowerInitDS <- function(data_symbol) {
                                                 .dsf_option("dp_sample_aggregate", FALSE))))
   run_config[["privacy-sa_blocks"]] <- .bounded_server_number(
     "dp_sa_blocks", 8L, 2L, 64L, integer = TRUE)
-  # Constant-time padding for the egress sandbox (seconds; 0 = off). Set this ABOVE the
-  # egress timeout (timeout + a few seconds of kill/cleanup guard) to close the timing
-  # side-channel where uploaded code could sleep on a data predicate and leak it via round
-  # duration. Off by default (it adds latency).
+  # Minimum-duration padding for the egress sandbox (seconds; 0 = off). Set this ABOVE
+  # the egress timeout (timeout + a few seconds of kill/cleanup guard). This reduces
+  # direct sleep/fast-return channels but is not a formal constant-time guarantee:
+  # cleanup and availability remain deployment concerns. Off by default (it adds latency).
   egress_timeout <- .bounded_server_number(
     "dp_egress_timeout", 900L, 1L, 3600L, integer = TRUE)
   egress_time_pad <- .bounded_server_number(
@@ -525,8 +524,10 @@ flowerInitDS <- function(data_symbol) {
 #' Prepare a Training Run
 #'
 #' DataSHIELD ASSIGN method. Reserves the server-owned lifetime allocation,
-#' loads training data, applies total public preprocessing, and stages data with
-#' a JSON manifest. No minimum-size or private-value admission bit is returned.
+#' and, when that allocation is numerically viable, applies total public
+#' preprocessing and stages the training data. A non-viable geometric-tail
+#' allocation stages only a public no-op manifest and never opens the private
+#' source. No minimum-size or private-value admission bit is returned.
 #'
 #' @param handle_symbol Character; symbol of the initialized handle.
 #' @param target_column Character; name of the target column.
@@ -562,10 +563,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   # labels, completeness or patient identifiers are inspected. Failed attempts
   # are intentionally never refunded; the lifetime schedule remains
   # non-blocking and simply assigns the next geometrically smaller allocation.
-  descriptor_data_type <- if (
-    identical(handle$source, "descriptor") && !is.null(handle$descriptor)) {
-    if (identical(handle$descriptor$source_kind, "image_bundle"))
-      "image" else "tabular"
+  descriptor_data_type <- if (identical(handle$source, "descriptor")) {
+    # source_kind is copied into the handle at initialization.  Do not inspect
+    # the descriptor merely to route a data-free privacy-tail allocation.
+    if (identical(handle$source_kind, "image_bundle")) "image" else "tabular"
   } else {
     NULL
   }
@@ -573,6 +574,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   routed <- .takeRunDataType(run_config, expected = descriptor_data_type)
   run_config <- routed$run_config
   data_type <- routed$data_type
+  columns <- .normalizePublicColumnSelection(
+    target_column, feature_columns, run_config)
+  target_column <- columns$target_column
+  feature_columns <- columns$feature_columns
   template_name <- run_config[["template_name"]] %||% NULL
   run_token <- .generate_run_token()
   .ensure_node_secret()
@@ -581,57 +586,131 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   admitted <- FALSE
   on.exit(if (!admitted) .cleanupStaging(run_token), add = TRUE)
 
-  # Load data: from descriptor, in-memory table, or file
-  if (identical(handle$source, "descriptor") && !is.null(handle$descriptor)) {
-    # Descriptor path: delegate staging entirely to .stageFromDescriptor
-    # which handles in_memory_df, staged_parquet, and image_bundle
-    desc <- handle$descriptor
-    staging_dir <- .stageFromDescriptor(desc, run_token, target_column,
-                                         feature_columns, run_config)
+  if (!isTRUE(reservation$release_enabled)) {
+    staging_dir <- .stagePublicNoopManifest(
+      run_token, target_column, feature_columns, data_type,
+      run_config, reservation)
+    .apply_privacy_reservation(staging_dir, reservation)
 
-    # Read the server-authored structural counts from the staged manifest.
-    manifest_path <- file.path(staging_dir, "manifest.json")
-    staged_manifest <- jsonlite::fromJSON(manifest_path, simplifyVector = TRUE)
+    handle$run_token       <- run_token
+    handle$staging_dir     <- staging_dir
+    handle$target_column   <- target_column
+    handle$feature_columns <- feature_columns
+    handle$template_name   <- template_name
+    handle$runtime_desc    <- NULL
+    handle$prepared        <- TRUE
+    admitted <- TRUE
+    return(.storeHandle(handle_symbol, handle))
+  }
 
-    data_type <- staged_manifest$data_type %||% "tabular"
-    .enforceDisclosureAndDp(handle, target_column, template_name,
-                            staged_manifest$n_samples, NULL, run_config,
-                            data_type = data_type,
-                            n_units = staged_manifest$n_units)
+  # From this point onward errors can be caused by private storage/content or
+  # third-party decoders. Keep their text inside the node: the exterior DSI
+  # response carries one constant diagnostic while on.exit still removes any
+  # partial staging. Success/error and timing remain operational signals outside
+  # the numeric DP transcript, as documented in ARCHITECTURE.md.
+  tryCatch({
+    # Load data: from descriptor, in-memory table, or file
+    if (identical(handle$source, "descriptor") && !is.null(handle$descriptor)) {
+      # Descriptor path: delegate staging entirely to .stageFromDescriptor,
+      # which handles in_memory_df, staged_parquet, and image_bundle.
+      desc <- handle$descriptor
+      staging_dir <- .stageFromDescriptor(
+        desc, run_token, target_column, feature_columns, run_config)
 
-    # Inject validated mask paths from dsImaging (segmentation tasks)
-    seg_generation_id <- run_config[["segmentation_generation_id"]] %||% NULL
-    if (!is.null(seg_generation_id) && requireNamespace("dsImaging", quietly = TRUE)) {
-      mask_paths <- dsImaging::imagingSegmentationGetMaskPaths(seg_generation_id)
-      if (length(mask_paths) > 0) {
-        # Create a mask root directory with symlinks to actual artifacts
-        mask_root <- file.path(staging_dir, "masks")
-        dir.create(mask_root, showWarnings = FALSE)
-        for (sid in names(mask_paths)) {
-          src <- mask_paths[[sid]]
-          dst <- file.path(mask_root, basename(src))
-          if (file.exists(src) && !file.exists(dst)) file.symlink(src, dst)
+      # Read the server-authored structural counts from the staged manifest.
+      manifest_path <- file.path(staging_dir, "manifest.json")
+      staged_manifest <- jsonlite::fromJSON(
+        manifest_path, simplifyVector = TRUE)
+
+      data_type <- staged_manifest$data_type %||% "tabular"
+      .enforceDisclosureAndDp(
+        handle, target_column, template_name, staged_manifest$n_samples,
+        NULL, run_config, data_type = data_type,
+        n_units = staged_manifest$n_units)
+
+      # Inject validated mask paths from dsImaging (segmentation tasks)
+      seg_generation_id <-
+        run_config[["segmentation_generation_id"]] %||% NULL
+      if (!is.null(seg_generation_id) &&
+          requireNamespace("dsImaging", quietly = TRUE)) {
+        mask_paths <-
+          dsImaging::imagingSegmentationGetMaskPaths(seg_generation_id)
+        if (length(mask_paths) > 0) {
+          # Create a mask root directory with symlinks to actual artifacts
+          mask_root <- file.path(staging_dir, "masks")
+          dir.create(mask_root, showWarnings = FALSE)
+          for (sid in names(mask_paths)) {
+            src <- mask_paths[[sid]]
+            dst <- file.path(mask_root, basename(src))
+            if (file.exists(src) && !file.exists(dst)) file.symlink(src, dst)
+          }
+          # Update manifest with masks asset
+          staged_manifest$assets$masks <- list(
+            type = "image_root",
+            root = normalizePath(mask_root),
+            path_col = "mask_path"
+          )
+          staged_manifest$segmentation_generation_id <- seg_generation_id
+          .write_manifest_atomic(staged_manifest, manifest_path)
         }
-        # Update manifest with masks asset
-        staged_manifest$assets$masks <- list(
-          type = "image_root",
-          root = normalizePath(mask_root),
-          path_col = "mask_path"
-        )
-        staged_manifest$segmentation_generation_id <- seg_generation_id
-        .write_manifest_atomic(staged_manifest, manifest_path)
       }
+
+      # Resolve runtime descriptor: template -> framework -> venv -> paths
+      runtime_desc <- NULL
+      if (!is.null(template_name)) {
+        runtime_desc <- .resolve_template_runtime(template_name)
+        writeLines(
+          jsonlite::toJSON(runtime_desc, auto_unbox = TRUE, pretty = TRUE),
+          file.path(staging_dir, "runtime.json"))
+      }
+      .apply_privacy_reservation(staging_dir, reservation)
+
+      handle$run_token       <- run_token
+      handle$staging_dir     <- staging_dir
+      handle$target_column   <- target_column
+      handle$feature_columns <- feature_columns
+      handle$template_name   <- template_name
+      handle$runtime_desc    <- runtime_desc
+      handle$prepared        <- TRUE
+      admitted <- TRUE
+      return(.storeHandle(handle_symbol, handle))
     }
 
-    # Resolve runtime descriptor: template -> framework -> venv -> absolute paths
+    if (identical(handle$source, "table") && !is.null(handle$table_data)) {
+      data <- handle$table_data
+    } else {
+      data <- .loadTrainingData(handle$data_path, handle$data_format)
+    }
+    .validateDataSchema(data, target_column, feature_columns)
+
+    # Stage the total, row-preserving preprocessing selected by public config.
+    staging_dir <- if (identical(data_type, "image")) {
+      # Image pipeline: the data.frame is sample metadata; pixels stay on disk.
+      if (!("relative_path" %in% names(data))) {
+        stop("Image data requires a 'relative_path' column in the data. ",
+             "The data.frame should contain sample metadata, not pixel data.",
+             call. = FALSE)
+      }
+      .stage_image_manifest(run_token, target_column, data, run_config)
+    } else {
+      .stageData(data, run_token, target_column, feature_columns, run_config)
+    }
+
+    staged_manifest <- jsonlite::fromJSON(
+      file.path(staging_dir, "manifest.json"), simplifyVector = TRUE)
+    .enforceDisclosureAndDp(
+      handle, target_column, template_name, staged_manifest$n_samples,
+      NULL, run_config, data_type = data_type,
+      n_units = staged_manifest$n_units)
+    .apply_privacy_reservation(staging_dir, reservation)
+
+    # Resolve runtime descriptor
     runtime_desc <- NULL
     if (!is.null(template_name)) {
       runtime_desc <- .resolve_template_runtime(template_name)
-      # Persist to staging dir for flowerEnsureSuperNodeDS to read
       writeLines(jsonlite::toJSON(runtime_desc, auto_unbox = TRUE, pretty = TRUE),
                  file.path(staging_dir, "runtime.json"))
     }
-    .apply_privacy_reservation(staging_dir, reservation)
 
     handle$run_token       <- run_token
     handle$staging_dir     <- staging_dir
@@ -640,57 +719,13 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     handle$template_name   <- template_name
     handle$runtime_desc    <- runtime_desc
     handle$prepared        <- TRUE
+
     admitted <- TRUE
-    return(.storeHandle(handle_symbol, handle))
-  }
-
-  if (identical(handle$source, "table") && !is.null(handle$table_data)) {
-    data <- handle$table_data
-  } else {
-    data <- .loadTrainingData(handle$data_path, handle$data_format)
-  }
-  .validateDataSchema(data, target_column, feature_columns)
-
-  # Stage the total, row-preserving preprocessing selected by public config.
-  staging_dir <- if (identical(data_type, "image")) {
-    # Image pipeline: the handle's data.frame is the samples metadata
-    # (sample_id, relative_path, label). Images stay on disk (zero-copy).
-    if (!("relative_path" %in% names(data))) {
-      stop("Image data requires a 'relative_path' column in the data. ",
-           "The data.frame should contain sample metadata, not pixel data.",
-           call. = FALSE)
-    }
-    .stage_image_manifest(run_token, target_column, data, run_config)
-  } else {
-    .stageData(data, run_token, target_column, feature_columns, run_config)
-  }
-
-  staged_manifest <- jsonlite::fromJSON(
-    file.path(staging_dir, "manifest.json"), simplifyVector = TRUE)
-  .enforceDisclosureAndDp(
-    handle, target_column, template_name, staged_manifest$n_samples,
-    NULL, run_config, data_type = data_type,
-    n_units = staged_manifest$n_units)
-  .apply_privacy_reservation(staging_dir, reservation)
-
-  # Resolve runtime descriptor
-  runtime_desc <- NULL
-  if (!is.null(template_name)) {
-    runtime_desc <- .resolve_template_runtime(template_name)
-    writeLines(jsonlite::toJSON(runtime_desc, auto_unbox = TRUE, pretty = TRUE),
-               file.path(staging_dir, "runtime.json"))
-  }
-
-  handle$run_token       <- run_token
-  handle$staging_dir     <- staging_dir
-  handle$target_column   <- target_column
-  handle$feature_columns <- feature_columns
-  handle$template_name   <- template_name
-  handle$runtime_desc    <- runtime_desc
-  handle$prepared        <- TRUE
-
-  admitted <- TRUE
-  .storeHandle(handle_symbol, handle)
+    .storeHandle(handle_symbol, handle)
+  }, error = function(e) {
+    stop("Private data preparation failed on this node; contact the node ",
+         "administrator.", call. = FALSE)
+  })
 }
 
 #' Ensure SuperNode is Running
@@ -709,8 +744,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #' @param ca_cert_pem Character or NULL; B64-encoded CA certificate PEM for
 #'   TLS verification. The SuperNode uses \code{--root-certificates} to
 #'   verify the SuperLink's identity.
-#' @param template_name Character or NULL; Flower template name used to resolve
-#'   the server-side runtime and write code-verification artifacts.
+#' @param template_name Deprecated compatibility argument. Named executable
+#'   templates are retired; non-NULL values fail before any run-side effect.
 #' @param torch_backend Character or NULL; requested CPU/GPU backend. The node
 #'   validates availability and applies its own backend policy.
 #' @return Updated handle with SuperNode information.
@@ -720,6 +755,10 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
                                      ca_cert_pem = NULL,
                                      template_name = NULL,
                                      torch_backend = NULL) {
+  if (!is.null(template_name)) {
+    stop("Named executable templates are retired. The prepared declarative DP ",
+         "track selects the trusted runtime.", call. = FALSE)
+  }
   handle <- .getHandle(handle_symbol)
 
   # Per-run torch backend the researcher requested (cpu/gpu/auto). Recorded so
@@ -743,8 +782,10 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 
   # DSI tunnel transport: the node-local tunnel forwarder (flowerTunnelUpDS)
   # carries the SuperNode<->SuperLink bytes over DataSHIELD, so the SuperNode
-  # dials its own loopback forwarder and runs insecure (the DSI channel already
-  # provides TLS). This is the only transport -- no Tor, no tailnet.
+  # dials its own loopback forwarder and runs insecure. The outer DSI connector
+  # is the transport-security boundary; dsFlowerClient requires HTTPS by default
+  # and makes any plaintext exception explicit. This is the only transport -- no
+  # Tor or tailnet is assumed by the protocol.
   # A cached port is not authorization. The exact capability-bound forwarder
   # must still be alive and must have published readiness after binding.
   tunnel_port <- .active_tunnel_port()
@@ -760,9 +801,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
                              Sys.getenv("DSFLOWER_COORDINATOR_ADDRESS", ""))
   if (!is.null(pinned_addr) && nzchar(pinned_addr) &&
       !identical(superlink_address, pinned_addr)) {
-    stop("Refusing SuperNode: client requested SuperLink '", superlink_address,
-         "' but this node is pinned to coordinator '", pinned_addr,
-         "'. Redirecting a pinned node is not allowed.", call. = FALSE)
+    stop("Refusing SuperNode: the requested coordinator does not match the ",
+         "node-pinned coordinator.", call. = FALSE)
   }
 
   # Coordinator-trust gate: the current runner applies node-side central DP but does not
@@ -774,8 +814,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
        identical(superlink_address, pinned_addr))
   if (!operator_authorized &&
       !isTRUE(as.logical(.dsf_option("allow_untrusted_coordinator", FALSE)))) {
-    stop("Refusing SuperNode: coordinator '", superlink_address, "' is not ",
-         "operator-authorized and this runner has no Secure Aggregation. It could ",
+    stop("Refusing SuperNode: the coordinator is not operator-authorized and ",
+         "this runner has no Secure Aggregation. It could ",
          "observe each already-DP node update. Set the server-only option ",
          "dsflower.allow_untrusted_coordinator=TRUE only after accepting that ",
          "threat model.", call. = FALSE)
@@ -830,9 +870,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     conn_check <- flowerCheckConnectivityDS(superlink_address)
   }
   if (!isTRUE(conn_check$reachable)) {
-    stop("This node has no outbound egress to the SuperLink at '",
-         superlink_address, "' (", conn_check$error %||% "unreachable", "). ",
-         "Open outbound access from this server to that host:port (v2 transport ",
+    stop("This node cannot reach the configured SuperLink. ",
+         "Open outbound access from this server (v2 transport ",
          "is the DataSHIELD tunnel, so this path is normally unused).",
          call. = FALSE)
   }
@@ -844,8 +883,8 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   manifest_path <- file.path(handle$staging_dir, "manifest.json")
   manifest <- tryCatch(
     jsonlite::fromJSON(manifest_path, simplifyVector = FALSE),
-    error = function(e) stop("Could not read the prepared privacy manifest: ",
-                             conditionMessage(e), call. = FALSE))
+    error = function(e) stop("Could not read the prepared privacy manifest.",
+                             call. = FALSE))
   max_releases <- suppressWarnings(as.integer(
     manifest[["privacy-max-releases"]] %||% NA_integer_))
   reservation <- .reserve_privacy_run(handle$run_token, max_releases)
@@ -946,10 +985,13 @@ flowerPingDS <- function() {
 #' Get Server Capabilities
 #'
 #' DataSHIELD AGGREGATE method. Returns information about the server's
-#' Flower capabilities including Python version, available templates,
-#' and disclosure settings.
+#' Flower capabilities including Python version, the hash-pinned declarative
+#' runner vocabulary, and disclosure settings. The response is independent of
+#' cohort contents, handle state, filesystem paths, and other sessions. The
+#' legacy template catalogue is retained as an explicitly deprecated empty
+#' field.
 #'
-#' @param handle_symbol Character; symbol of the handle (optional).
+#' @param handle_symbol Ignored compatibility argument.
 #' @return Named list of capabilities.
 #' @export
 flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
@@ -958,12 +1000,8 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
   # Disclosure settings
   settings <- .flowerDisclosureSettings()
 
-  # SuperNode status
-  node_list <- .supernode_list()
-
-  # Environment detection for SuperLink auto-discovery
-  is_docker <- .detect_container_env()
   privacy_policy <- .privacy_policy()
+  runner_caps <- .RUNNER_PUBLIC_CAPABILITIES
 
   caps <- list(
     dsflower_version    = as.character(utils::packageVersion("dsFlower")),
@@ -972,10 +1010,16 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     torch_version       = runtime$torch_version,
     opacus_version      = runtime$opacus_version,
     runtime_versions_sha256 = runtime$runtime_versions_sha256,
-    python_envs         = runtime$python_envs,
     templates           = settings$allowed_templates,
+    templates_deprecated = settings$allowed_templates_deprecated,
+    dp_tracks           = runner_caps$dp_tracks,
+    declarative_model_ops = runner_caps$declarative_model_ops,
+    declarative_losses  = runner_caps$declarative_losses,
+    tree_objectives     = runner_caps$tree_objectives,
+    aggregation_strategies = runner_caps$aggregation_strategies,
     max_rounds          = settings$max_rounds,
     allow_custom_config = settings$allow_custom_config,
+    allow_custom_config_deprecated = settings$allow_custom_config_deprecated,
     min_samples         = 0L,
     min_clients_per_round = 1L,
     dp_required         = TRUE,
@@ -992,45 +1036,9 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     hook_enabled        = isTRUE(as.logical(.dsf_option("hook_enabled", FALSE))),
     hook_sandbox_attested = isTRUE(as.logical(
       .dsf_option("hook_sandbox_attested", FALSE))),
-    active_supernodes   = nrow(node_list[node_list$alive, , drop = FALSE]),
-    is_docker           = is_docker,
-    # Zombie-process monitor: the subreaper wrapper prevents FL descendants from
-    # leaking to a non-reaping PID 1, so this should stay ~0. A rising count means
-    # leaked defunct processes (e.g. pre-fix, parented to the JVM) that only a
-    # container restart can clear -- poll this for a periodic health check.
-    zombie_processes    = .count_zombies(),
-    hostname            = Sys.info()[["nodename"]]
+    hook_resource_isolation_attested = isTRUE(as.logical(
+      .dsf_option("hook_resource_isolation_attested", FALSE)))
   )
-
-  # Add handle-specific info if symbol provided
-  if (!is.null(handle_symbol)) {
-    tryCatch({
-      handle <- .getHandle(handle_symbol)
-      if (identical(handle$source, "table") && !is.null(handle$table_data)) {
-        caps$data_n_cols <- ncol(handle$table_data)
-        caps$data_columns <- names(handle$table_data)
-      } else {
-        data_summary <- .getDataSummary(handle$data_path, handle$data_format)
-        caps$data_n_cols <- data_summary$n_cols
-        caps$data_columns <- data_summary$columns
-      }
-      caps$data_source <- handle$source %||% "resource"
-      caps$prepared <- handle$prepared
-      caps$node_ensured <- handle$node_ensured
-
-      # Detect imaging data
-      if (identical(handle$source, "descriptor") && !is.null(handle$descriptor)) {
-        sk <- handle$descriptor$source_kind
-        if (sk %in% c("image_bundle", "imaging_resource")) {
-          caps$has_imagedata <- TRUE
-          assets <- handle$descriptor$assets
-          if (!is.null(assets)) {
-            caps$image_assets <- names(assets)
-          }
-        }
-      }
-    }, error = function(e) NULL)
-  }
 
   caps
 }
@@ -1069,15 +1077,14 @@ flowerStatusDS <- function(handle_symbol) {
 #' are outside the model mechanism's DP proof. This DataSHIELD AGGREGATE symbol
 #' is retained for protocol compatibility and always returns an empty data frame.
 #'
-#' @param handle_symbol Character; symbol of the handle.
-#' @param since_round Integer; return only metrics from this round onward.
+#' @param handle_symbol Ignored compatibility argument.
+#' @param since_round Ignored compatibility argument.
 #' @return Empty data.frame with columns: round, metric, value.
 #' @export
 flowerMetricsDS <- function(handle_symbol, since_round = 0L) {
   # A log-derived metric can encode a data-dependent failure, duration, count,
   # or loss and is not covered by the model mechanism's DP proof. Keep this
   # aggregate for protocol compatibility, but expose no node-side metrics.
-  .getHandle(handle_symbol)
   data.frame(round = integer(0), metric = character(0),
              value = numeric(0), stringsAsFactors = FALSE)
 }
@@ -1088,14 +1095,13 @@ flowerMetricsDS <- function(handle_symbol, since_round = 0L) {
 #' mechanism. This DataSHIELD AGGREGATE symbol is retained for protocol
 #' compatibility and always returns an empty character vector.
 #'
-#' @param handle_symbol Character; symbol of the handle.
-#' @param last_n Integer; number of lines to return (max 200).
+#' @param handle_symbol Ignored compatibility argument.
+#' @param last_n Ignored compatibility argument.
 #' @return Empty character vector.
 #' @export
 flowerLogDS <- function(handle_symbol, last_n = 50L) {
   # Logs contain data-dependent failures/timing and are not a DP mechanism.
   # Keep the aggregate for wire compatibility, but never release raw lines.
-  .getHandle(handle_symbol)
   character(0)
 }
 
@@ -1106,28 +1112,18 @@ flowerLogDS <- function(handle_symbol, last_n = 50L) {
 #' data-independent identity transform (n/sum/sumsq all zero).  New clients use
 #' public, analyst-supplied feature bounds instead.
 #'
-#' @param data_symbol Character; symbol of the assigned data.frame.
+#' @param data_symbol Ignored compatibility argument.
 #' @param feature_columns Character or JSON-encoded character vector; feature
-#'   column names (order is preserved in the returned vectors). NULL = all columns.
+#'   names supplied by the caller (order is preserved in the returned vectors).
+#'   NULL returns empty vectors because server-side schema is not inspected.
 #' @return Named list with the requested \code{features}, zero-valued
 #'   \code{n}/\code{sum}/\code{sumsq} vectors, \code{disabled = TRUE}, and a
 #'   reason. No statistic computed from feature values is returned.
 #' @export
 flowerFeatureStatsDS <- function(data_symbol, feature_columns = NULL) {
-  obj <- get(data_symbol, envir = parent.frame(), inherits = FALSE)
-  if (is.matrix(obj)) obj <- as.data.frame(obj)
-  if (!is.data.frame(obj)) {
-    stop("flowerFeatureStatsDS: '", data_symbol, "' is not a data.frame.",
-         call. = FALSE)
-  }
   feats <- .ds_arg(feature_columns)
-  if (is.null(feats) || length(feats) == 0L) feats <- names(obj)
-  feats <- as.character(unlist(feats))
-  feats <- feats[feats %in% names(obj)]
-  if (length(feats) == 0L) {
-    stop("flowerFeatureStatsDS: none of the requested feature columns are present.",
-         call. = FALSE)
-  }
+  if (is.null(feats) || length(feats) == 0L) feats <- character()
+  feats <- as.character(unlist(feats, use.names = FALSE))
   zero <- numeric(length(feats))
   list(features = feats, n = zero, sum = zero, sumsq = zero,
        disabled = TRUE, reason = "exact-feature-statistics-disabled")
@@ -1235,53 +1231,6 @@ flowerPrivacyBudgetDS <- function(handle_symbol = NULL, target_column = NULL) {
   result
 }
 
-# --- Container/environment detection ---
-
-#' Detect whether the current process runs inside a container
-#'
-#' Checks multiple signals: \code{/.dockerenv}, \code{/run/.containerenv}
-#' (Podman), cgroup v1/v2, and the \code{container} environment variable
-#' (set by systemd-nspawn, Kubernetes, etc.).
-#'
-#' @return Logical; TRUE if a container environment is detected.
-#' @keywords internal
-.detect_container_env <- function() {
-  # Signal 1: Docker creates this file
-  if (file.exists("/.dockerenv")) return(TRUE)
-
-  # Signal 2: Podman creates this file
-  if (file.exists("/run/.containerenv")) return(TRUE)
-
-  # Signal 3: $container env var (systemd-nspawn, some K8s setups)
-  ctr_env <- Sys.getenv("container", unset = "")
-  if (nzchar(ctr_env)) return(TRUE)
-
-  # Signal 4: cgroup v1 — /proc/1/cgroup mentions docker/containerd/kubepods
-  cg <- tryCatch(
-    readLines("/proc/1/cgroup", warn = FALSE),
-    warning = function(w) character(0),
-    error   = function(e) character(0)
-  )
-  if (length(cg) > 0 &&
-      any(grepl("docker|containerd|kubepods|lxc|podman", cg,
-                ignore.case = TRUE))) {
-    return(TRUE)
-  }
-
-  # Signal 5: cgroup v2 — /proc/self/mountinfo with overlay/cgroup hints
-  mi <- tryCatch(
-    readLines("/proc/self/mountinfo", warn = FALSE),
-    warning = function(w) character(0),
-    error   = function(e) character(0)
-  )
-  if (length(mi) > 0 &&
-      any(grepl("/docker/|/kubepods/|/containerd/", mi))) {
-    return(TRUE)
-  }
-
-  FALSE
-}
-
 #' Check TCP connectivity from this node to a given address
 #'
 #' DataSHIELD AGGREGATE method. Attempts a TCP connection to the specified
@@ -1359,9 +1308,9 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
     close(con)
     list(reachable = TRUE, error = NULL)
   }, warning = function(w) {
-    list(reachable = FALSE, error = conditionMessage(w))
+    list(reachable = FALSE, error = "TCP connection failed.")
   }, error = function(e) {
-    list(reachable = FALSE, error = conditionMessage(e))
+    list(reachable = FALSE, error = "TCP connection failed.")
   })
 }
 

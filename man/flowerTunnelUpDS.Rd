@@ -4,7 +4,7 @@
 \alias{flowerTunnelUpDS}
 \title{Start the node-side tunnel forwarder (DataSHIELD AGGREGATE)}
 \usage{
-flowerTunnelUpDS(conn_id, listen_port, node_name = "")
+flowerTunnelUpDS(conn_id, listen_port, node_name = "", protocol_abi = NULL)
 }
 \arguments{
 \item{conn_id}{Character; tunnel connection id.}
@@ -12,9 +12,12 @@ flowerTunnelUpDS(conn_id, listen_port, node_name = "")
 \item{listen_port}{Integer; local port the SuperNode will dial.}
 
 \item{node_name}{Character; this node's federation name.}
+
+\item{protocol_abi}{Numeric; exact tunnel protocol ABI expected by the client.}
 }
 \value{
-list(ok, listen, chunk_bytes).
+list(ok, listen, chunk_bytes, protocol_abi). The ABI marker makes a
+  mixed client/server deployment fail before exchanging stream bytes.
 }
 \description{
 Spawns dsi_tunnel_forward.py listening on 127.0.0.1:listen_port; the Flower

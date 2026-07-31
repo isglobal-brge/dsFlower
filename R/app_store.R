@@ -439,7 +439,7 @@
   if (!is.character(s) || length(s) != 1 || !nzchar(s) || !startsWith(s, "B64:")) {
     return(raw(0))
   }
-  b64 <- substring(s, 5)
+  b64 <- substring(s, first = 5L, last = nchar(s, type = "chars"))
   if (!grepl("^[A-Za-z0-9_-]+={0,2}$", b64)) {
     stop("Invalid base64 app chunk.", call. = FALSE)
   }
@@ -460,13 +460,16 @@
 
 #' Push a chunk of an uploaded FAB (DataSHIELD AGGREGATE)
 #'
-#' Idempotent at \code{offset}: the client passes the size it believes the node's
-#' file has, and only the bytes of \code{chunk_b64} not already present are
-#' appended, so a retried push never duplicates or loses bytes.
+#' Idempotent at \code{offset}: a new chunk must start exactly at EOF. A replay is
+#' acknowledged only when its offset, length, and content are byte-identical to
+#' the one complete chunk already stored, so a lost ACK cannot silently change
+#' message geometry or content.
 #' @param token Character; upload token (per-run).
 #' @param chunk_b64 Character; \code{B64:} url-safe payload, or "".
 #' @param offset Numeric; the size the client believes the node file has.
-#' @return list(size = new file size), or list(size, error="gap") on a gap.
+#' @return A fixed acknowledgement containing \code{ok}, \code{offset},
+#'   \code{size}, \code{bytes}, and the chunk \code{sha256}; failed geometry also
+#'   contains a public \code{error} code.
 #' @keywords internal
 #' @export
 flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
@@ -496,16 +499,42 @@ flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
              call. = FALSE)
       }
       off <- suppressWarnings(as.numeric(offset))
-      if (length(off) == 0L || is.na(off)) off <- sz
       if (length(off) != 1L || !is.finite(off) || off < 0 || off != floor(off)) {
         stop("Invalid app upload offset.", call. = FALSE)
       }
-      already <- sz - off                   # bytes of 'raw' already on disk
-      if (already < 0) {
+      if (length(raw) < 1L || off + length(raw) > 2^53) {
+        stop("Invalid app upload chunk geometry.", call. = FALSE)
+      }
+      chunk_hash <- digest::digest(raw, algo = "sha256", serialize = FALSE)
+      ack <- function(ok, error = NULL) {
+        value <- list(
+          ok = isTRUE(ok), offset = off, size = sz,
+          bytes = length(raw), sha256 = chunk_hash
+        )
+        if (!is.null(error)) value$error <- error
+        value
+      }
+      if (off > sz) {
         if (!is_new) .touch_app_activity(spool)
-        list(size = sz, error = "gap")
+        ack(FALSE, "gap")
       } else {
-        append_n <- max(0, length(raw) - already)
+        replay <- off < sz
+        if (replay && off + length(raw) != sz) {
+          if (!is_new) .touch_app_activity(spool)
+          return(ack(FALSE, "conflict"))
+        }
+        if (replay) {
+          con <- file(bin, "rb")
+          existing <- tryCatch({
+            seek(con, where = off, origin = "start")
+            readBin(con, "raw", n = length(raw))
+          }, finally = close(con))
+          if (!identical(existing, raw)) {
+            .touch_app_activity(spool)
+            return(ack(FALSE, "conflict"))
+          }
+        }
+        append_n <- if (replay) 0 else length(raw)
         if (sz + append_n > cap) {
           if (dir.exists(spool)) unlink(spool, recursive = TRUE)
           stop("Uploaded app exceeds dsflower.max_fab_bytes (", cap, " bytes).",
@@ -517,7 +546,7 @@ flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
         if (append_n > 0) {
           con <- file(bin, "ab")
           tryCatch(
-            writeBin(raw[(already + 1):length(raw)], con),
+            writeBin(raw, con),
             finally = close(con)
           )
           Sys.chmod(bin, "0600")
@@ -530,7 +559,8 @@ flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
                call. = FALSE)
         }
         .assert_app_spool_quota(root, policy)
-        list(size = new_size)
+        sz <- new_size
+        ack(TRUE)
       }
     })
   })

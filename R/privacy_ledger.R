@@ -57,7 +57,7 @@
          call. = FALSE)
   }
 
-  policy_text <- paste(
+  policy_text <- function(canonicalization) paste(
     "dsflower-privacy-v5", domain,
     format(total_epsilon, digits = 17, scientific = TRUE),
     format(total_delta, digits = 17, scientific = TRUE),
@@ -66,7 +66,7 @@
     format(min_release_delta, digits = 17, scientific = TRUE),
     unit_policy$dp_unit,
     unit_policy$patient_column %||% "<none>",
-    unit_policy$canonicalization,
+    canonicalization,
     adjacency,
     format(.privacy_allocation_slack, digits = 17, scientific = TRUE),
     sep = "|")
@@ -81,7 +81,11 @@
     patient_column = unit_policy$patient_column,
     unit_canonicalization = unit_policy$canonicalization,
     adjacency = adjacency,
-    policy_hash = digest::digest(policy_text, algo = "sha256", serialize = FALSE)
+    policy_hash = digest::digest(
+      policy_text(unit_policy$canonicalization),
+      algo = "sha256", serialize = FALSE),
+    legacy_v1_policy_hash = digest::digest(
+      policy_text("trim-utf8-v1"), algo = "sha256", serialize = FALSE)
   )
 }
 
@@ -135,11 +139,16 @@
 }
 
 .privacy_dir_writable <- function(path) {
+  existed <- dir.exists(path)
   ok <- tryCatch({
     dir.create(path, recursive = TRUE, showWarnings = FALSE)
     dir.exists(path)
   }, error = function(e) FALSE)
   if (!isTRUE(ok)) return(FALSE)
+  if (!existed && .Platform$OS.type == "unix") {
+    chmod_ok <- suppressWarnings(Sys.chmod(path, "0700"))
+    if (length(chmod_ok) != 1L || !isTRUE(chmod_ok)) return(FALSE)
+  }
   probe <- file.path(path, paste0(".dsflower-write-probe-", Sys.getpid()))
   tryCatch({
     con <- file(probe, open = "wx")
@@ -216,16 +225,107 @@
        call. = FALSE)
 }
 
-.privacy_db_connect <- function(path = .privacy_ledger_path()) {
-  if (.path_is_symlink(path)) {
-    stop("Privacy ledger must not be a symbolic link.", call. = FALSE)
+.privacy_effective_uid <- function() {
+  probe <- tempfile(pattern = ".dsflower-euid-")
+  on.exit(unlink(probe), add = TRUE)
+  if (!isTRUE(file.create(probe))) {
+    stop("Could not establish the node process owner.", call. = FALSE)
   }
+  uid <- suppressWarnings(as.integer(file.info(probe)$uid[[1]]))
+  if (is.na(uid)) {
+    stop("Could not establish the node process owner.", call. = FALSE)
+  }
+  uid
+}
+
+.privacy_validate_ledger_parent <- function(path, euid) {
+  parent <- dirname(path)
+  if (.path_is_symlink(parent)) {
+    stop("Privacy ledger parent must be a real directory.", call. = FALSE)
+  }
+  info <- file.info(parent)
+  if (nrow(info) != 1L || is.na(info$isdir[[1]]) || !isTRUE(info$isdir[[1]])) {
+    stop("Privacy ledger parent must be a real directory.", call. = FALSE)
+  }
+  if (.Platform$OS.type == "unix") {
+    owner <- suppressWarnings(as.integer(info$uid[[1]]))
+    if (is.na(owner) || !identical(owner, as.integer(euid))) {
+      stop("Privacy ledger parent must be owned by the node EUID.",
+           call. = FALSE)
+    }
+    mode <- suppressWarnings(as.integer(info$mode[[1]]))
+    unsafe_write <- as.integer(strtoi("22", base = 8))
+    if (is.na(mode) || bitwAnd(mode, unsafe_write) != 0L) {
+      stop("Privacy ledger parent must not be writable by group or other users.",
+           call. = FALSE)
+    }
+  }
+  normalizePath(parent, winslash = "/", mustWork = TRUE)
+}
+
+.privacy_validate_ledger_file <- function(path, euid, repair_mode = FALSE) {
+  if (!file.exists(path) || .path_is_symlink(path) ||
+      !utils::file_test("-f", path)) {
+    stop("Privacy ledger must be a regular file, not a symbolic link.",
+         call. = FALSE)
+  }
+  if (.Platform$OS.type == "unix") {
+    info <- file.info(path)
+    owner <- suppressWarnings(as.integer(info$uid[[1]]))
+    if (is.na(owner) || !identical(owner, as.integer(euid))) {
+      stop("Privacy ledger must be owned by the node EUID.", call. = FALSE)
+    }
+    expected_mode <- as.integer(strtoi("600", base = 8))
+    mode <- suppressWarnings(as.integer(info$mode[[1]]))
+    if (!identical(mode, expected_mode) && isTRUE(repair_mode)) {
+      chmod_ok <- suppressWarnings(Sys.chmod(path, "0600"))
+      if (length(chmod_ok) != 1L || !isTRUE(chmod_ok)) {
+        stop("Could not set privacy ledger permissions to 0600.", call. = FALSE)
+      }
+      mode <- suppressWarnings(as.integer(file.info(path)$mode[[1]]))
+    }
+    if (is.na(mode) || !identical(mode, expected_mode)) {
+      stop("Privacy ledger must have Unix mode exactly 0600.", call. = FALSE)
+    }
+  }
+  normalizePath(path, winslash = "/", mustWork = TRUE)
+}
+
+.privacy_db_connect <- function(path = .privacy_ledger_path()) {
+  euid <- if (.Platform$OS.type == "unix") .privacy_effective_uid() else NA_integer_
+  parent_before <- .privacy_validate_ledger_parent(path, euid)
+  if (file.exists(path) || .path_is_symlink(path)) {
+    .privacy_validate_ledger_file(path, euid, repair_mode = TRUE)
+  }
+
+  # A restrictive umask avoids a group/world-readable creation window.  DBI
+  # does not expose SQLite's file descriptor, so path security is revalidated
+  # after opening; the Python release guard performs the stronger inode check.
+  old_umask <- if (.Platform$OS.type == "unix") Sys.umask("0077") else NULL
+  umask_restored <- FALSE
+  on.exit({
+    if (!umask_restored && !is.null(old_umask)) Sys.umask(old_umask)
+  }, add = TRUE)
   con <- tryCatch(
     DBI::dbConnect(RSQLite::SQLite(), dbname = path),
     error = function(e) stop("Could not open the privacy ledger: ",
                              conditionMessage(e), call. = FALSE))
+  if (!is.null(old_umask)) Sys.umask(old_umask)
+  umask_restored <- TRUE
   ok <- FALSE
   on.exit(if (!ok) try(DBI::dbDisconnect(con), silent = TRUE), add = TRUE)
+  parent_after <- .privacy_validate_ledger_parent(path, euid)
+  if (!identical(parent_after, parent_before)) {
+    stop("Privacy ledger parent changed while opening.", call. = FALSE)
+  }
+  expected_path <- .privacy_validate_ledger_file(path, euid)
+  opened <- DBI::dbGetQuery(con, "PRAGMA database_list")
+  main <- opened$file[opened$name == "main"]
+  if (length(main) != 1L || !nzchar(main[[1]]) ||
+      !identical(normalizePath(main[[1]], winslash = "/", mustWork = TRUE),
+                 expected_path)) {
+    stop("SQLite opened an unexpected privacy ledger path.", call. = FALSE)
+  }
   DBI::dbExecute(con, "PRAGMA busy_timeout = 10000")
   DBI::dbExecute(con, "PRAGMA journal_mode = WAL")
   DBI::dbExecute(con, "PRAGMA synchronous = FULL")
@@ -259,7 +359,6 @@
     "PRIMARY KEY(run_token, message_id),",
     "UNIQUE(run_token, release_index),",
     "FOREIGN KEY(run_token) REFERENCES privacy_reservations(run_token))"))
-  Sys.chmod(path, "0600")
   ok <- TRUE
   con
 }
@@ -270,6 +369,54 @@
 
 .privacy_db_rollback <- function(con) {
   try(DBI::dbExecute(con, "ROLLBACK"), silent = TRUE)
+}
+
+# One-way compatibility migration for the corrected patient-ID contract. Row
+# adjacency never uses identifier canonicalisation, so preserving the allocation
+# counter is always safe. Patient mode is migrated automatically only when the
+# ledger proves that no v1 release was ever claimed; otherwise the two possible
+# equivalence-class partitions must not be mixed without an offline roster audit.
+.migrate_v1_policy_hash <- function(con, policy, stored_hash) {
+  if (identical(as.character(stored_hash), policy$policy_hash)) return(TRUE)
+  if (!identical(as.character(stored_hash), policy$legacy_v1_policy_hash) ||
+      !identical(policy$unit_canonicalization, "trim-utf8-v2")) {
+    return(FALSE)
+  }
+
+  safe <- identical(policy$dp_unit, "row")
+  if (identical(policy$dp_unit, "patient")) {
+    counts <- DBI::dbGetQuery(
+      con,
+      paste(
+        "SELECT COALESCE(SUM(r.claimed_releases), 0) AS claimed,",
+        "COUNT(c.message_id) AS claim_rows",
+        "FROM privacy_reservations r",
+        "LEFT JOIN privacy_release_claims c ON c.run_token = r.run_token",
+        "WHERE r.domain = ?"),
+      params = list(policy$domain))
+    safe <- nrow(counts) == 1L &&
+      identical(as.numeric(counts$claimed[[1]]), 0) &&
+      identical(as.numeric(counts$claim_rows[[1]]), 0)
+  }
+  if (!isTRUE(safe)) return(FALSE)
+
+  if (identical(policy$dp_unit, "patient")) {
+    DBI::dbExecute(
+      con,
+      paste(
+        "UPDATE privacy_reservations",
+        "SET claimed_releases = max_releases",
+        "WHERE domain = ?"),
+      params = list(policy$domain))
+  }
+
+  updated <- DBI::dbExecute(
+    con,
+    paste("UPDATE privacy_policy SET policy_hash = ?",
+          "WHERE domain = ? AND policy_hash = ?"),
+    params = list(
+      policy$policy_hash, policy$domain, policy$legacy_v1_policy_hash))
+  identical(as.integer(updated), 1L)
 }
 
 .privacy_release_is_viable <- function(policy, epsilon, delta, max_releases = 1L) {
@@ -338,19 +485,24 @@
       "provably disjoint populations.", call. = FALSE)
   }
 
+  bound <- DBI::dbGetQuery(
+    con, "SELECT policy_hash FROM privacy_policy WHERE domain = ?",
+    params = list(policy$domain))
+  if (nrow(bound) == 1L && !.migrate_v1_policy_hash(
+      con, policy, bound$policy_hash[[1]])) {
+    stop("The configured dsFlower privacy policy differs from the policy already ",
+         "bound to this ledger/domain.", call. = FALSE)
+  }
+
   existing <- DBI::dbGetQuery(
     con,
-    paste("SELECT allocation_index, epsilon, delta, max_releases",
+    paste("SELECT domain, allocation_index, epsilon, delta, max_releases",
           "FROM privacy_reservations WHERE run_token = ?"),
     params = list(run_token))
   if (nrow(existing) == 1L) {
-    bound <- DBI::dbGetQuery(
-      con, "SELECT policy_hash FROM privacy_policy WHERE domain = ?",
-      params = list(policy$domain))
-    if (nrow(bound) != 1L ||
-        !identical(as.character(bound$policy_hash[[1]]), policy$policy_hash)) {
-      stop("The configured dsFlower privacy policy differs from the policy already ",
-           "bound to this ledger/domain.", call. = FALSE)
+    if (!identical(as.character(existing$domain[[1]]), policy$domain)) {
+      stop("Existing privacy reservation belongs to a different domain.",
+           call. = FALSE)
     }
     if (as.integer(existing$max_releases[[1]]) != max_releases) {
       stop("Existing privacy reservation has a different release horizon.",

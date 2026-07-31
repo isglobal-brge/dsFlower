@@ -23,8 +23,9 @@ FLOWER_APP = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "flower_app")
 sys.path.insert(0, FLOWER_APP)
 
-from dsflower_runner import (client_app, dp_harness, egress_child, model_spec,
-                             params, seeding, task, tier2_lib)  # noqa: E402
+from dsflower_runner import (client_app, dp_gbdt, dp_harness, egress_child,
+                             model_spec, params, seeding, task, tier2_lib,
+                             vision)  # noqa: E402
 
 
 def _package_hash(package_dir):
@@ -116,6 +117,68 @@ class ManifestPrivacyContractTests(unittest.TestCase):
         self.assertEqual(captured["env"]["DSF_RLIMIT_FSIZE"], str(256 * 1024 * 1024))
         self.assertEqual(captured["env"]["DSF_RLIMIT_NPROC"], "16")
         self.assertEqual(captured["env"]["DSF_RLIMIT_CPU"], "7")
+
+    def test_hook_requires_independent_resource_isolation_attestation(self):
+        pcfg = {
+            "hook_enabled": True, "egress_timeout": 30,
+            "egress_time_pad": 35,
+        }
+        caps = {
+            "subprocess": True, "net_lock": True,
+            "fs_isolation": True,
+        }
+        with mock.patch.dict(os.environ, {
+                "DSF_SAA_SANDBOX_OK": "1",
+        }, clear=True):
+            self.assertIsNone(tier2_lib.hook_execution_caps(pcfg, caps))
+        with mock.patch.dict(os.environ, {
+                "DSF_SAA_SANDBOX_OK": "1",
+                "DSF_HOOK_RESOURCE_ISOLATION_OK": "1",
+        }, clear=True):
+            self.assertIs(tier2_lib.hook_execution_caps(pcfg, caps), caps)
+
+    def test_sample_aggregate_padding_wraps_the_release_once(self):
+        old = [np.zeros(2, dtype=np.float64)]
+        pcfg = {
+            "hook_enabled": True, "sample_aggregate": True, "sa_blocks": 3,
+            "egress_timeout": 1, "egress_time_pad": 10,
+            "clipping_norm": 1.0, "epsilon": 1.0, "delta": 1e-5,
+        }
+        caps = {"subprocess": True, "net_lock": True, "fs_isolation": True}
+        with mock.patch.object(
+                tier2_lib, "hook_execution_caps", return_value=caps), \
+                mock.patch.object(
+                    tier2_lib, "_pinned_user_package", return_value="/hook/__init__.py"), \
+                mock.patch.object(
+                    tier2_lib, "_run_isolated",
+                    side_effect=lambda *args: [array.copy() for array in old]) as run, \
+                mock.patch.object(
+                    tier2_lib.time, "monotonic", side_effect=[100.0, 101.0]), \
+                mock.patch.object(tier2_lib.time, "sleep") as sleep:
+            result = tier2_lib.gated_local_update(
+                "hookpkg", old, np.zeros((6, 1)), np.zeros(6), {}, pcfg,
+                seed=b"s" * 32, hook_caps=caps)
+
+        self.assertEqual(run.call_count, 3)
+        self.assertTrue(all(call.args[-1] == 1 for call in run.call_args_list))
+        sleep.assert_called_once_with(9.0)
+        self.assertEqual(result[0].shape, old[0].shape)
+
+    def test_hostile_npy_shape_is_rejected_before_np_load(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "hostile.npy")
+            with open(path, "wb") as handle:
+                np.lib.format.write_array_header_1_0(handle, {
+                    "descr": np.lib.format.dtype_to_descr(np.dtype(np.float64)),
+                    "fortran_order": False,
+                    "shape": (10**12,),
+                })
+            with mock.patch.object(
+                    tier2_lib.np, "load",
+                    side_effect=AssertionError("np.load must not run")) as load:
+                with self.assertRaises(ValueError):
+                    tier2_lib._load_expected_f64_npy(path, (1,))
+            load.assert_not_called()
 
 
 class DpSgdAccountingTests(unittest.TestCase):
@@ -683,6 +746,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
               mock.patch.object(client_app, "load_tabular_patient_ids",
                                 return_value=None),
+              mock.patch.object(client_app.task_module,
+                                "assert_pinned_unit_count"),
               mock.patch.object(
                   client_app.dp_harness, "per_sample_independence_probe",
                   side_effect=AssertionError("private architecture probe")) as probe,
@@ -711,6 +776,8 @@ class SecureGbdtRngTests(unittest.TestCase):
               mock.patch.object(client_app, "load_data", return_value=(X, y)),
               mock.patch.object(client_app, "load_tabular_patient_ids",
                                 return_value=None),
+              mock.patch.object(client_app.task_module,
+                                "assert_pinned_unit_count"),
               mock.patch.object(client_app.seeding, "master_seed",
                                 return_value=b"m" * 32),
               mock.patch.object(client_app.dp_gbdt, "fit_dp_gbdt",
@@ -791,6 +858,18 @@ class RunPinBoundsTests(unittest.TestCase):
                 node_config={"manifest-dir": manifest_dir}, run_config={})
             with self.assertRaisesRegex(RuntimeError, "learning_rate"):
                 task.load_gbdt_spec(context)
+
+    def test_image_config_is_frozen_from_the_node_manifest(self):
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({"image-size": 224, "backbone": "resnet18"}, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir},
+                run_config={"image-size": 10**9, "backbone": "other"})
+            cfg = task.load_pinned_run_config(context)
+            self.assertEqual(cfg["image-size"], 224)
+            self.assertEqual(cfg["backbone"], "resnet18")
 
 
 class Tier2PinTests(unittest.TestCase):
@@ -996,15 +1075,58 @@ class PatientIdGateTests(unittest.TestCase):
         return {
             "dp-unit": "patient",
             "patient_column": "patient_id",
-            "patient-id-canonicalization": "trim-utf8-v1",
+            "patient-id-canonicalization": "trim-utf8-v2",
         }
 
-    def test_pinned_patient_ids_reject_missing_empty_and_nan_strings(self):
+    def test_pinned_patient_ids_totalize_missing_empty_and_nan_strings(self):
         manifest = self._patient_manifest()
-        for invalid in (None, "", "  ", "nan", "NaN"):
+        for invalid in (None, "", "  ", "na", "nan", "NaN", "NULL",
+                        "<NA>", "NaT"):
             frame = pd.DataFrame({"patient_id": ["p1", invalid]})
-            with self.assertRaises(ValueError):
-                task._load_patient_ids(frame, manifest)
+            self.assertEqual(
+                task._load_patient_ids(frame, manifest).tolist(),
+                ["p1", task._MISSING_PATIENT_UNIT],
+            )
+
+    def test_v2_patient_id_fixture_matches_every_runner_component(self):
+        em_space_id = "\u2003patient\u2003"
+        values = [" \tpatient\r\n", em_space_id, "N/A",
+                  task._MISSING_PATIENT_UNIT, None, "<NA>", "NaT"]
+        expected = ["patient", em_space_id, "N/A",
+                    task._MISSING_PATIENT_UNIT,
+                    task._MISSING_PATIENT_UNIT,
+                    task._MISSING_PATIENT_UNIT,
+                    task._MISSING_PATIENT_UNIT]
+        loaded = task._load_patient_ids(
+            pd.DataFrame({"patient_id": values}), self._patient_manifest())
+        self.assertEqual(loaded.tolist(), expected)
+        self.assertEqual(
+            [dp_gbdt._canonical_patient_id(value) for value in values], expected)
+        self.assertEqual(
+            [tier2_lib._canonical_patient_id(value) for value in values], expected)
+
+        legacy = self._patient_manifest()
+        legacy["patient-id-canonicalization"] = "trim-utf8-v1"
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            task._load_patient_ids(
+                pd.DataFrame({"patient_id": ["p1"]}), legacy)
+
+    def test_missing_and_literal_sentinel_merge_conservatively(self):
+        groups = [task._MISSING_PATIENT_UNIT, None]
+        Xp, yp = client_app._pool_by_patient(
+            np.asarray([[1.0], [3.0]], np.float32),
+            np.asarray([0.0, 1.0], np.float32), groups, "mse")
+        self.assertEqual(Xp.shape, (1, 1))
+        self.assertEqual(yp.shape, (1,))
+        blocks, n_units = tier2_lib._patient_row_blocks(
+            groups, 2, 2, b"p" * 32)
+        self.assertEqual(n_units, 1)
+        self.assertEqual(sorted(np.concatenate(blocks).tolist()), [0, 1])
+        tree_X, tree_y = dp_gbdt.pool_by_patient(
+            np.asarray([[1.0], [3.0]]), np.asarray([0.0, 1.0]), groups)
+        self.assertEqual(tree_X.shape, (1, 1))
+        self.assertEqual(tree_y.shape, (1,))
+        self.assertEqual(tree_y.tolist(), [0.0])
 
     def test_valid_pinned_patient_ids_are_returned(self):
         frame = pd.DataFrame({"patient_id": ["p1", "p2"]})
@@ -1017,10 +1139,10 @@ class PatientIdGateTests(unittest.TestCase):
         frame = pd.DataFrame({"patient_id": ["p1", "p2"]})
         self.assertIsNone(task._load_patient_ids(frame, {
             "dp-unit": "row", "patient_column": None,
-            "patient-id-canonicalization": "trim-utf8-v1",
+            "patient-id-canonicalization": "trim-utf8-v2",
         }))
 
-    def test_tabular_and_image_loaders_both_enforce_the_patient_gate(self):
+    def test_tabular_and_image_loaders_both_totalize_patient_ids(self):
         with tempfile.TemporaryDirectory() as manifest_dir:
             context = SimpleNamespace(node_config={"manifest-dir": manifest_dir})
 
@@ -1033,10 +1155,12 @@ class PatientIdGateTests(unittest.TestCase):
                     "data_type": "tabular", "data_file": "data.csv",
                     "data_format": "csv", "patient_column": "patient_id",
                     "dp-unit": "patient",
-                    "patient-id-canonicalization": "trim-utf8-v1",
+                    "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
-            with self.assertRaises(ValueError):
-                task.load_tabular_patient_ids(context)
+            self.assertEqual(
+                task.load_tabular_patient_ids(context).tolist(),
+                ["p1", task._MISSING_PATIENT_UNIT],
+            )
 
             pd.DataFrame({
                 "patient_id": ["p1", "nan"], "relative_path": ["a.png", "b.png"],
@@ -1052,10 +1176,44 @@ class PatientIdGateTests(unittest.TestCase):
                     "data_root": manifest_dir, "target_column": "label",
                     "patient_column": "patient_id",
                     "dp-unit": "patient",
-                    "patient-id-canonicalization": "trim-utf8-v1",
+                    "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
-            with self.assertRaises(ValueError):
-                task.load_image_collection(context)
+            _, _, groups = task.load_image_collection(context)
+            self.assertEqual(
+                groups.tolist(), ["p1", task._MISSING_PATIENT_UNIT])
+
+    def test_csv_patient_ids_are_lossless_and_match_pinned_roster(self):
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            pd.DataFrame({
+                "patient_id": ["001", "1", "N/A"],
+                "x": [1.0, 2.0, 3.0], "y": [0, 1, 0],
+            }).to_csv(os.path.join(manifest_dir, "data.csv"), index=False)
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({
+                    "data_type": "tabular", "data_file": "data.csv",
+                    "data_format": "csv", "target_column": "y",
+                    "feature_columns": ["x"], "task-type": "classification",
+                    "num-classes": 2, "dp-unit": "patient",
+                    "patient_column": "patient_id",
+                    "patient-id-canonicalization": "trim-utf8-v2",
+                    "n_units": 3,
+                }, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir})
+            ids = task.load_tabular_patient_ids(context)
+            self.assertEqual(ids.tolist(), ["001", "1", "N/A"])
+            task.assert_pinned_unit_count(context, 3, ids)
+
+    def test_pinned_roster_mismatch_is_structural_failure(self):
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({"n_units": 2}, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir})
+            with self.assertRaisesRegex(RuntimeError, "roster changed"):
+                task.assert_pinned_unit_count(context, 1)
 
     def test_image_paths_are_regular_files_contained_by_the_image_root(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
@@ -1068,6 +1226,8 @@ class PatientIdGateTests(unittest.TestCase):
                 task._resolve_image_path(root, "nested/scan.png"),
                 os.path.realpath(valid),
             )
+            self.assertIsNone(
+                task._resolve_image_path(root, task._INVALID_IMAGE))
 
             for bad in ("../secret", "/absolute", "a/../../secret",
                         r"a\..\secret", "C:/secret", "a//secret", "./secret"):
@@ -1085,6 +1245,250 @@ class PatientIdGateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 task._resolve_image_path(root, "link.png")
 
+    def test_private_bad_image_paths_and_bytes_become_fixed_zero_records(self):
+        with tempfile.TemporaryDirectory() as root:
+            corrupt = os.path.join(root, "corrupt.png")
+            with open(corrupt, "wb") as handle:
+                handle.write(b"not an image")
+            pd.DataFrame({
+                "relative_path": ["../escape.png", "corrupt.png"],
+                "label": ["bad", 1],
+            }).to_csv(os.path.join(root, "samples.csv"), index=False)
+            with open(os.path.join(root, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({
+                    "data_type": "image", "samples_file": "samples.csv",
+                    "data_root": root, "target_column": "label",
+                    "task-type": "classification", "num-classes": 2,
+                    "dp-unit": "row", "patient_column": None,
+                    "patient-id-canonicalization": "trim-utf8-v2",
+                }, handle)
+            context = SimpleNamespace(node_config={"manifest-dir": root})
+            paths, labels, groups = task.load_image_collection(context)
+            self.assertEqual(paths, [None, os.path.realpath(corrupt)])
+            np.testing.assert_array_equal(labels, np.asarray([0, 1], np.float32))
+            self.assertIsNone(groups)
+
+            with mock.patch.object(
+                    vision, "_read_array",
+                    side_effect=AssertionError("sentinel must not be opened")):
+                zero = vision.read_image_2d(None, 8)
+                named_zero = vision.read_image_2d(task._INVALID_IMAGE, 8)
+            self.assertEqual(zero.shape, (3, 8, 8))
+            self.assertFalse(bool(np.any(zero)))
+            np.testing.assert_array_equal(named_zero, zero)
+            corrupt_zero = vision.read_image_2d(corrupt, 8)
+            self.assertEqual(corrupt_zero.shape, (3, 8, 8))
+            self.assertFalse(bool(np.any(corrupt_zero)))
+            volume_zero = vision.read_image_3d(None, 16)
+            self.assertEqual(volume_zero.shape, (1, 16, 16, 16))
+            self.assertFalse(bool(np.any(volume_zero)))
+
+    def test_invalid_image_size_never_reaches_zero_allocation(self):
+        invalid = (-1, True, np.bool_(False),
+                   vision._MAX_IMAGE_SIZE + 1, 8.0, "8")
+        with mock.patch.object(
+                vision.np, "zeros",
+                side_effect=AssertionError("np.zeros must not run")) as zeros:
+            for reader in (vision.read_image_2d, vision.read_image_3d):
+                for value in invalid:
+                    with self.subTest(reader=reader.__name__, value=value):
+                        with self.assertRaises(ValueError):
+                            reader(None, value)
+        zeros.assert_not_called()
+
+    def test_oversized_source_is_rejected_before_raster_open(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "oversized.png")
+            with open(path, "wb") as handle:
+                handle.truncate(vision._MAX_IMAGE_SOURCE_BYTES + 1)
+            image_api = SimpleNamespace(open=mock.Mock(
+                side_effect=AssertionError("raster decoder must not run")))
+            pil = SimpleNamespace(Image=image_api)
+            with mock.patch.dict(sys.modules, {"PIL": pil, "PIL.Image": image_api}):
+                with self.assertRaises(ValueError):
+                    vision._read_array(path)
+            image_api.open.assert_not_called()
+
+    def test_symlink_source_is_rejected_before_raster_open(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "target.png")
+            path = os.path.join(root, "link.png")
+            with open(target, "wb") as handle:
+                handle.write(b"small header stub")
+            try:
+                os.symlink(target, path)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are unavailable")
+            image_api = SimpleNamespace(open=mock.Mock(
+                side_effect=AssertionError("raster decoder must not run")))
+            pil = SimpleNamespace(Image=image_api)
+            with mock.patch.dict(sys.modules, {"PIL": pil, "PIL.Image": image_api}):
+                with self.assertRaises(ValueError):
+                    vision._read_array(path)
+            image_api.open.assert_not_called()
+
+    def test_raster_header_limit_precedes_pixel_decode(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "huge.png")
+            with open(path, "wb") as handle:
+                handle.write(b"small header stub")
+            image = mock.MagicMock()
+            image.__enter__.return_value = image
+            image.height = vision._MAX_IMAGE_AXIS
+            image.width = vision._MAX_IMAGE_AXIS
+            image.getbands.return_value = ("R", "G", "B")
+            image_api = SimpleNamespace(open=mock.Mock(return_value=image))
+            pil = SimpleNamespace(Image=image_api)
+            with mock.patch.dict(sys.modules, {"PIL": pil, "PIL.Image": image_api}):
+                with self.assertRaises(ValueError):
+                    vision._read_array(path)
+            image.convert.assert_not_called()
+
+    def test_nifti_header_limit_precedes_voxel_decode(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "huge.nii")
+            with open(path, "wb") as handle:
+                handle.write(b"small header stub")
+            image = SimpleNamespace(
+                shape=(vision._MAX_IMAGE_AXIS, vision._MAX_IMAGE_AXIS, 2),
+                get_data_dtype=mock.Mock(return_value=np.dtype("f4")),
+                get_fdata=mock.Mock(
+                    side_effect=AssertionError("voxel decoder must not run")),
+            )
+            nib = SimpleNamespace(load=mock.Mock(return_value=image))
+            with mock.patch.dict(sys.modules, {"nibabel": nib}):
+                with self.assertRaises(ValueError):
+                    vision._read_array(path)
+            image.get_fdata.assert_not_called()
+
+    def test_nrrd_header_limit_precedes_voxel_decode(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "huge.nrrd")
+            with open(path, "wb") as handle:
+                handle.write(b"NRRD0005\ntype: float\n\n")
+            nrrd = SimpleNamespace(
+                read_header=mock.Mock(return_value={
+                    "type": "float",
+                    "sizes": (vision._MAX_IMAGE_AXIS,
+                              vision._MAX_IMAGE_AXIS, 2),
+                }),
+                read=mock.Mock(
+                    side_effect=AssertionError("voxel decoder must not run")),
+            )
+            with mock.patch.dict(sys.modules, {"nrrd": nrrd}):
+                with self.assertRaises(ValueError):
+                    vision._read_array(path)
+            nrrd.read.assert_not_called()
+
+    def test_detached_nrrd_is_totalized_without_reading_sidecar(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "detached.nrrd")
+            with open(path, "wb") as handle:
+                handle.write(b"NRRD0005\ntype: float\n\n")
+            nrrd = SimpleNamespace(
+                read_header=mock.Mock(return_value={
+                    "type": "float", "sizes": (4, 4, 4),
+                    "data file": "private.raw",
+                }),
+                read=mock.Mock(
+                    side_effect=AssertionError("sidecar must not be read")),
+            )
+            with mock.patch.dict(sys.modules, {"nrrd": nrrd}):
+                zero = vision.read_image_3d(path, 16)
+            nrrd.read.assert_not_called()
+            self.assertEqual(zero.shape, (1, 16, 16, 16))
+            self.assertFalse(bool(np.any(zero)))
+
+    def test_detached_mhd_is_totalized_without_starting_decoder(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "detached.mhd")
+            with open(path, "wb") as handle:
+                handle.write(b"ObjectType = Image\nElementDataFile = private.raw\n")
+            sitk = SimpleNamespace(ImageFileReader=mock.Mock(
+                side_effect=AssertionError("MHD decoder must not run")))
+            with mock.patch.dict(sys.modules, {"SimpleITK": sitk}):
+                zero = vision.read_image_3d(path, 16)
+            sitk.ImageFileReader.assert_not_called()
+            self.assertEqual(zero.shape, (1, 16, 16, 16))
+            self.assertFalse(bool(np.any(zero)))
+
+    def test_mha_must_embed_its_payload(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "detached.mha")
+            with open(path, "wb") as handle:
+                handle.write(b"ObjectType = Image\nElementDataFile = private.raw\n")
+            sitk = SimpleNamespace(ImageFileReader=mock.Mock(
+                side_effect=AssertionError("MHA decoder must not run")))
+            with mock.patch.dict(sys.modules, {"SimpleITK": sitk}):
+                zero = vision.read_image_3d(path, 16)
+            sitk.ImageFileReader.assert_not_called()
+            self.assertEqual(zero.shape, (1, 16, 16, 16))
+            self.assertFalse(bool(np.any(zero)))
+
+    def test_simpleitk_header_limit_precedes_voxel_decode(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "huge.mha")
+            with open(path, "wb") as handle:
+                handle.write(b"small header stub")
+            reader = mock.MagicMock()
+            reader.GetPixelID.return_value = 1
+            reader.GetSize.return_value = (
+                vision._MAX_IMAGE_AXIS, vision._MAX_IMAGE_AXIS, 2)
+            reader.GetNumberOfComponents.return_value = 1
+            sitk = SimpleNamespace(
+                ImageFileReader=mock.Mock(return_value=reader),
+                GetPixelIDValueAsString=mock.Mock(return_value="32-bit float"),
+                GetArrayFromImage=mock.Mock(
+                    side_effect=AssertionError("voxel decoder must not run")),
+            )
+            with mock.patch.dict(sys.modules, {"SimpleITK": sitk}):
+                with self.assertRaises(ValueError):
+                    vision._read_array(path)
+            reader.Execute.assert_not_called()
+            sitk.GetArrayFromImage.assert_not_called()
+
+    def test_3d_features_stream_in_byte_bounded_batches(self):
+        shape = vision._image_record_shape(16, True)
+        record_bytes = int(np.prod(shape)) * 4
+        observed = []
+
+        class RecordingBackbone(torch.nn.Module):
+            def forward(self, batch):
+                observed.append((int(batch.shape[0]),
+                                 int(batch.numel() * batch.element_size())))
+                return batch.mean(dim=(2, 3, 4))
+
+        def read(path, image_size):
+            self.assertEqual(image_size, 16)
+            return np.full(shape, float(path), dtype=np.float32)
+
+        with mock.patch.object(
+                vision, "_MAX_IMAGE_BATCH_BYTES", 2 * record_bytes), \
+                mock.patch.object(vision, "read_image_3d", side_effect=read):
+            features = vision.extract_features_from_paths(
+                RecordingBackbone(), list(range(5)), 16, True,
+                device=torch.device("cpu"))
+
+        self.assertEqual([count for count, _ in observed], [2, 2, 1])
+        self.assertTrue(all(size <= 2 * record_bytes for _, size in observed))
+        np.testing.assert_array_equal(
+            features[:, 0], np.arange(5, dtype=np.float32))
+
+    def test_image_larger_than_batch_cap_fails_before_decode(self):
+        shape = vision._image_record_shape(16, True)
+        record_bytes = int(np.prod(shape)) * 4
+        with mock.patch.object(
+                vision, "_MAX_IMAGE_BATCH_BYTES", record_bytes - 1), \
+                mock.patch.object(
+                    vision, "read_image_3d",
+                    side_effect=AssertionError("image must not be decoded")) as read:
+            with self.assertRaises(ValueError):
+                vision.extract_features_from_paths(
+                    object(), ["private.mha"], 16, True,
+                    device=torch.device("cpu"))
+        read.assert_not_called()
+
 
 class PublicTargetTests(unittest.TestCase):
     def test_staged_public_codes_do_not_depend_on_observed_categories(self):
@@ -1099,11 +1503,12 @@ class PublicTargetTests(unittest.TestCase):
         np.testing.assert_array_equal(first, np.asarray([0, 1, 2], np.float32))
         np.testing.assert_array_equal(second, np.asarray([1, 2, 1], np.float32))
 
-    def test_non_numeric_labels_are_never_inferred(self):
-        with self.assertRaises(ValueError):
-            task._load_target(
-                pd.Series(["private-a", "private-b"]),
-                {"task-type": "classification", "num-classes": 2})
+    def test_invalid_classification_values_map_to_public_code_zero(self):
+        target = task._load_target(
+            pd.Series(["private-a", np.nan, np.inf, 1.5, -1, 2, 1]),
+            {"task-type": "classification", "num-classes": 2})
+        np.testing.assert_array_equal(
+            target, np.asarray([0, 0, 0, 0, 0, 0, 1], np.float32))
 
     def test_public_bounds_clip_regression_target(self):
         target = task._load_target(pd.Series([-5.0, 5.0, 20.0]), {
@@ -1111,6 +1516,27 @@ class PublicTargetTests(unittest.TestCase):
             "target-bounds": {"lower": 0.0, "upper": 10.0},
         })
         np.testing.assert_array_equal(target, np.asarray([0, 5, 10], np.float32))
+
+    def test_invalid_regression_values_map_to_public_bounds_midpoint(self):
+        target = task._load_target(
+            pd.Series(["bad", np.nan, np.inf, -np.inf, 4.0]), {
+                "task-type": "regression",
+                "target-bounds": {"lower": 0.0, "upper": 10.0},
+            })
+        np.testing.assert_array_equal(
+            target, np.asarray([5, 5, 10, 0, 4], np.float32))
+
+    def test_private_feature_values_use_public_defaults_and_finite_clip(self):
+        frame = pd.DataFrame({
+            "a": ["bad", np.inf, 1.0e20],
+            "b": [np.nan, -np.inf, -1.0e20],
+        })
+        values = task._load_features(frame, {
+            "feature-bounds": {"lower": [2.0, -4.0], "upper": [6.0, 2.0]},
+        })
+        np.testing.assert_array_equal(values, np.asarray([
+            [4.0, -1.0], [4.0, -1.0], [1.0e6, -1.0e6],
+        ], np.float32))
 
     def test_python_target_boundary_repeats_server_numeric_contract(self):
         invalid = (
@@ -1138,7 +1564,7 @@ class PublicTargetTests(unittest.TestCase):
                     "feature_columns": ["patient_id", "x"],
                     "task-type": "classification", "num-classes": 2,
                     "dp-unit": "patient", "patient_column": "patient_id",
-                    "patient-id-canonicalization": "trim-utf8-v1",
+                    "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
             context = SimpleNamespace(
                 node_config={"manifest-dir": manifest_dir})
@@ -1220,11 +1646,19 @@ class PatientPartitionTests(unittest.TestCase):
         # At k=2 the conservative bound is the same 2C as the plain floor.
         self.assertEqual(min(2.0, 4.0 / 2), 2.0)
 
-    def test_patient_partition_rejects_invalid_or_misaligned_ids(self):
-        with self.assertRaises(RuntimeError):
-            tier2_lib._patient_row_blocks(["p1", np.nan], 2, 2, b"p" * 32)
+    def test_patient_partition_totalizes_invalid_but_rejects_misaligned_ids(self):
+        blocks, n_units = tier2_lib._patient_row_blocks(
+            ["p1", np.nan], 2, 2, b"p" * 32)
+        self.assertEqual(n_units, 2)
+        self.assertEqual(sorted(np.concatenate(blocks).tolist()), [0, 1])
         with self.assertRaises(RuntimeError):
             tier2_lib._patient_row_blocks(["p1"], 2, 2, b"p" * 32)
+
+        X, y = dp_gbdt.pool_by_patient(
+            np.asarray([[1.0], [2.0]]), np.asarray([0.0, 1.0]),
+            ["p1", None])
+        self.assertEqual(X.shape, (2, 1))
+        self.assertEqual(y.shape, (2,))
 
 
 if __name__ == "__main__":

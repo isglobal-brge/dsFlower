@@ -8,6 +8,12 @@
 # numerically total (activations/losses remain part of the valid-input contract).
 .DSFLOWER_FLOAT32_SAFE_MAX <- 1e6
 
+# Reserved record-local marker.  It is never interpreted as a real asset path:
+# the trusted runner maps it directly to a fixed zero image before filesystem
+# resolution.  Keeping this value public and constant avoids a success/error bit
+# for missing, malformed, or inaccessible private image records.
+.DSFLOWER_INVALID_IMAGE_PATH <- "__dsflower_invalid_image__"
+
 #' Generate a unique run token
 #'
 #' Creates a token in the format \code{run_<32 hex digits>} from 128 bits of
@@ -48,8 +54,7 @@
   fmt <- tolower(data_format %||% "csv")
 
   if (is.null(data_path) || !file.exists(data_path)) {
-    stop("Training data file not found: ", data_path %||% "(not configured)",
-         call. = FALSE)
+    stop("The configured training data source is unavailable.", call. = FALSE)
   }
 
   if (fmt == "csv") {
@@ -104,6 +109,49 @@
   }
 
   invisible(TRUE)
+}
+
+# Validate analyst-supplied column names without inspecting a private schema.
+# This runs before the lifetime reservation and is also the complete column
+# contract available to a data-free privacy-tail manifest.
+.normalizePublicColumnSelection <- function(target_column, feature_columns,
+                                            run_config) {
+  target_column <- as.character(unlist(target_column, use.names = FALSE))
+  if (!length(target_column) || anyNA(target_column) ||
+      any(!nzchar(target_column)) || anyDuplicated(target_column)) {
+    stop("target_column must contain unique, non-empty column names.",
+         call. = FALSE)
+  }
+
+  multilabel <- identical(tolower(as.character(unlist(
+    run_config[["loss-name"]] %||% "", use.names = FALSE))),
+    "multilabel_bce")
+  expected_targets <- if (multilabel) {
+    as.integer(run_config[["num-labels"]])
+  } else {
+    1L
+  }
+  if (length(target_column) != expected_targets) {
+    stop(if (multilabel) {
+      "target_column length must equal the public num-labels value."
+    } else {
+      "The enforced-DP runner requires exactly one target column."
+    }, call. = FALSE)
+  }
+
+  if (is.null(feature_columns)) {
+    return(list(target_column = target_column, feature_columns = NULL))
+  }
+  feature_columns <- as.character(unlist(feature_columns, use.names = FALSE))
+  if (!length(feature_columns) || anyNA(feature_columns) ||
+      any(!nzchar(feature_columns)) || anyDuplicated(feature_columns)) {
+    stop("feature_columns must contain unique, non-empty column names.",
+         call. = FALSE)
+  }
+  if (length(intersect(target_column, feature_columns))) {
+    stop("Target columns cannot also be model feature columns.", call. = FALSE)
+  }
+  list(target_column = target_column, feature_columns = feature_columns)
 }
 
 .trainingColumns <- function(data, target_column, feature_columns = NULL,
@@ -217,10 +265,8 @@
   patient_column <- .detectPatientColumn(data, run_config)
   if (!is.null(patient_column)) {
     values <- data[[patient_column]]
-    missing <- is.na(values)
-    ids <- trimws(enc2utf8(as.character(values)))
-    invalid <- missing | !nzchar(ids) |
-      tolower(ids) %in% c("na", "nan", "null")
+    ids <- .canonicalPatientIdText(values)
+    invalid <- .invalidPatientIds(ids)
     # A single fixed unit is conservative: every row without a usable stable
     # identifier is protected together, rather than falling back to row-level
     # DP or exposing an error bit. A real identifier equal to the sentinel is
@@ -296,7 +342,33 @@
 #' @keywords internal
 .transformPublicTarget <- function(data, target_column, run_config) {
   target_column <- as.character(unlist(target_column, use.names = FALSE))
-  if (length(target_column) != 1L || !target_column %in% names(data)) {
+  if (!length(target_column) || anyNA(target_column) ||
+      any(!nzchar(target_column)) || anyDuplicated(target_column) ||
+      any(!target_column %in% names(data))) {
+    stop("Target columns must be unique, non-empty, and present in the data.",
+         call. = FALSE)
+  }
+  loss_name <- tolower(as.character(unlist(
+    run_config[["loss-name"]] %||% "", use.names = FALSE)))
+  if (identical(loss_name, "multilabel_bce")) {
+    num_labels <- suppressWarnings(as.integer(unlist(
+      run_config[["num-labels"]] %||% NA_integer_, use.names = FALSE)))
+    if (length(num_labels) != 1L || is.na(num_labels) ||
+        num_labels < 2L || num_labels > 1024L ||
+        length(target_column) != num_labels) {
+      stop("Multilabel staging requires exactly num-labels=", num_labels,
+           " target columns.", call. = FALSE)
+    }
+    scalar_config <- run_config
+    scalar_config[["loss-name"]] <- "bce_logits"
+    scalar_config[["num-classes"]] <- 2L
+    scalar_config[["num-labels"]] <- NULL
+    for (column in target_column) {
+      data <- .transformPublicTarget(data, column, scalar_config)
+    }
+    return(data)
+  }
+  if (length(target_column) != 1L) {
     stop("The enforced-DP runner requires exactly one target column.",
          call. = FALSE)
   }
@@ -419,15 +491,11 @@
   for (root in candidates) {
     free <- .filesystemFreeBytes(root)
     if (is.na(free) || free >= needed) return(root)
-    message("  Skipping staging root ", root, " (free ",
-            round(free / 1024^2, 1), " MiB; need ",
-            round(needed / 1024^2, 1), " MiB)")
+    message("  Skipping an unavailable staging root.")
   }
 
-  stop("No dsFlower staging root has enough free space. Required: ",
-       round(needed / 1024^2, 1), " MiB. Configure ",
-       "options(dsflower.staging_root='/path/with/space') or ",
-       "DSFLOWER_STAGING_ROOT.", call. = FALSE)
+  stop("No configured dsFlower staging root has sufficient capacity. ",
+       "Contact the node administrator.", call. = FALSE)
 }
 
 .expectedStagingDirs <- function(run_token, create_roots = FALSE) {
@@ -563,6 +631,18 @@
   levels <- run_config[["target-levels"]] %||% NULL
   bounds <- run_config[["target-bounds"]] %||% NULL
   numeric_task <- task_type %in% c("regression", "count", "continuous")
+  loss_name <- tolower(as.character(unlist(
+    run_config[["loss-name"]] %||% "", use.names = FALSE)))
+  if (identical(loss_name, "multilabel_bce")) {
+    num_labels <- suppressWarnings(as.integer(unlist(
+      run_config[["num-labels"]] %||% NA_integer_, use.names = FALSE)))
+    if (length(num_labels) != 1L || is.na(num_labels) ||
+        num_labels < 2L || num_labels > 1024L) {
+      stop("multilabel_bce requires public num-labels in [2, 1024].",
+           call. = FALSE)
+    }
+    run_config[["num-labels"]] <- num_labels
+  }
 
   if (isTRUE(numeric_task)) {
     if (!is.null(levels)) {
@@ -583,8 +663,6 @@
            "the declared [-1e6, 1e6] numeric domain.",
            call. = FALSE)
     }
-    loss_name <- tolower(as.character(unlist(
-      run_config[["loss-name"]] %||% "", use.names = FALSE)))
     if (identical(task_type, "count") && lower < 0) {
       stop("Count target bounds require lower >= 0.", call. = FALSE)
     }
@@ -696,6 +774,11 @@
     stop("run_config cannot set server-owned manifest field(s): ",
          paste(conflicts, collapse = ", "), ".", call. = FALSE)
   }
+  retired <- intersect(keys, c("template_name", "template-name"))
+  if (length(retired)) {
+    stop("Named executable templates are retired. Submit a declarative model ",
+         "specification and dp-track instead.", call. = FALSE)
+  }
   run_config
 }
 
@@ -751,8 +834,8 @@
   }
   manifest <- tryCatch(
     jsonlite::fromJSON(manifest_path, simplifyVector = FALSE),
-    error = function(e) stop("Prepared run manifest is unreadable: ",
-                             conditionMessage(e), call. = FALSE))
+    error = function(e) stop("Prepared run manifest is unreadable.",
+                             call. = FALSE))
   if (length(manifest[["run_token"]]) != 1L ||
       !identical(as.character(manifest[["run_token"]]),
                  as.character(reservation$run_token))) {
@@ -790,6 +873,36 @@
   manifest[["privacy-epsilon"]] <- reservation$epsilon
   manifest[["privacy-delta"]] <- reservation$delta
   .write_manifest_atomic(manifest, manifest_path)
+}
+
+# Stage the numerically-impractical tail of the lifetime schedule without
+# opening a descriptor, table, metadata file, or image.  Every value here is a
+# public request, a server policy value, or a fixed data-independent constant.
+.stagePublicNoopManifest <- function(run_token, target_column, feature_columns,
+                                     data_type, run_config, reservation) {
+  extra_config <- .validate_manifest_extra_config(run_config)
+  staging_dir <- .ensureStagingDir(run_token)
+  manifest <- list(
+    run_token       = run_token,
+    data_type       = data_type,
+    data_format     = "none",
+    n_samples       = 0L,
+    n_units         = 0L,
+    n_input_samples = 0L,
+    dropped_missing = 0L,
+    target_column   = target_column,
+    feature_columns = feature_columns,
+    "dp-unit"       = reservation$dp_unit,
+    patient_column  = reservation$patient_column,
+    "patient-id-canonicalization" = reservation$unit_canonicalization,
+    "target-preencoded" = TRUE,
+    source_kind     = "privacy_noop",
+    staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
+  )
+  manifest <- .merge_manifest_config(manifest, extra_config)
+  manifest <- .normalize_dp_manifest(manifest)
+  .write_manifest_atomic(manifest, file.path(staging_dir, "manifest.json"))
+  staging_dir
 }
 
 #' Stage a validated tabular training frame
@@ -910,7 +1023,7 @@
          "Contact your server administrator.", call. = FALSE)
   }
   if (!dir.exists(data_root)) {
-    stop("Image data root does not exist: ", data_root, call. = FALSE)
+    stop("The configured image data root is unavailable.", call. = FALSE)
   }
   normalizePath(data_root, mustWork = TRUE)
 }
@@ -1066,7 +1179,7 @@
     # Local file: copy or symlink to staging dir
     src <- asset_info$uri
     if (!file.exists(src))
-      stop("Asset file not found: ", src, call. = FALSE)
+      stop("The configured asset file is unavailable.", call. = FALSE)
     file.copy(src, local_parquet, overwrite = TRUE)
   }
 
@@ -1113,7 +1226,7 @@
 
   src_path <- meta$file
   if (!file.exists(src_path)) {
-    stop("Parquet file not found: ", src_path, call. = FALSE)
+    stop("The configured Parquet source is unavailable.", call. = FALSE)
   }
 
   # Determine columns to select
@@ -1241,6 +1354,48 @@
   paste(parts, collapse = "/")
 }
 
+#' Map one private image path into the staged record domain
+#'
+#' Invalid values are record-local data, not descriptor errors.  Return a fixed
+#' marker so one bad record neither changes cardinality nor aborts preparation.
+#' The strict validator above remains available for public descriptor paths.
+#' @keywords internal
+.totalizeImageRecordPath <- function(path) {
+  tryCatch(
+    .safeRelativeAssetPath(path),
+    error = function(e) .DSFLOWER_INVALID_IMAGE_PATH
+  )
+}
+
+#' Keep a staged image path only when it resolves to a regular file in root
+#' @keywords internal
+.totalizeImageRecordAtRoot <- function(path, image_root) {
+  path <- .totalizeImageRecordPath(path)
+  if (identical(path, .DSFLOWER_INVALID_IMAGE_PATH)) return(path)
+  if (is.null(image_root)) return(path)
+  if (!is.character(image_root) || length(image_root) != 1L ||
+      is.na(image_root) || !dir.exists(image_root)) {
+    stop("The configured image asset root is unavailable.", call. = FALSE)
+  }
+
+  root <- normalizePath(image_root, winslash = "/", mustWork = TRUE)
+  candidate <- file.path(root, path)
+  if (.path_is_symlink(candidate)) {
+    return(.DSFLOWER_INVALID_IMAGE_PATH)
+  }
+  resolved <- tryCatch(
+    normalizePath(candidate, winslash = "/", mustWork = TRUE),
+    error = function(e) NA_character_
+  )
+  root_prefix <- paste0(sub("/+$", "", root), "/")
+  if (is.na(resolved) ||
+      !startsWith(resolved, root_prefix) ||
+      !utils::file_test("-f", resolved)) {
+    return(.DSFLOWER_INVALID_IMAGE_PATH)
+  }
+  path
+}
+
 .s3RelativePath <- function(uri, prefix) {
   if (!is.character(uri) || length(uri) != 1L || is.na(uri) ||
       !grepl("^s3://[^/]+/", uri) ||
@@ -1289,7 +1444,13 @@
   local_root <- normalizePath(local_root, winslash = "/", mustWork = TRUE)
   rel_paths <- character(0)
   for (f in files) {
-    rel <- .s3RelativePath(f, s3_uri)
+    # One malformed object key is a record-local asset failure. Skip it here;
+    # its metadata row is retained later with the fixed zero-image marker.
+    rel <- tryCatch(
+      .s3RelativePath(f, s3_uri),
+      error = function(e) NA_character_
+    )
+    if (is.na(rel)) next
     if (!nzchar(rel) || .isDirectoryLikeObject(rel)) next
     local_path <- file.path(local_root, rel)
     dir.create(dirname(local_path), recursive = TRUE, showWarnings = FALSE)
@@ -1347,8 +1508,43 @@
   .readStagedSamples(sm_file)
 }
 
+#' Left-join private image labels without changing the sample roster
+#'
+#' Missing, blank, or duplicate label identifiers are record-local failures:
+#' they produce missing label cells which the public target contract totalizes.
+#' Missing join columns remain a descriptor-schema error.
+#' @keywords internal
+.leftJoinImageLabels <- function(samples_df, labels_df) {
+  if (!is.data.frame(samples_df) || !is.data.frame(labels_df) ||
+      !("sample_id" %in% names(samples_df)) ||
+      !("sample_id" %in% names(labels_df))) {
+    stop("Image sample and label metadata must contain a sample_id column.",
+         call. = FALSE)
+  }
+  label_columns <- setdiff(names(labels_df), "sample_id")
+  if (!length(label_columns)) {
+    stop("Image label metadata must contain at least one label column.",
+         call. = FALSE)
+  }
+
+  sample_ids <- .canonicalPatientIdText(samples_df$sample_id)
+  label_ids <- .canonicalPatientIdText(labels_df$sample_id)
+  sample_invalid <- .invalidPatientIds(sample_ids)
+  label_invalid <- .invalidPatientIds(label_ids)
+  label_duplicate <- duplicated(label_ids) | duplicated(label_ids, fromLast = TRUE)
+  label_ids[label_invalid | label_duplicate] <- NA_character_
+
+  match_index <- match(sample_ids, label_ids)
+  match_index[sample_invalid] <- NA_integer_
+  for (column in label_columns) {
+    samples_df[[column]] <- labels_df[[column]][match_index]
+  }
+  samples_df
+}
+
 .primaryFromFilesJson <- function(files_json) {
-  if (is.null(files_json) || is.na(files_json) || !nzchar(files_json)) {
+  if (is.null(files_json) || length(files_json) != 1L || is.na(files_json) ||
+      !is.character(files_json) || !nzchar(files_json)) {
     return(NA_character_)
   }
   parsed <- tryCatch(
@@ -1356,10 +1552,18 @@
     error = function(e) NULL
   )
   if (!is.list(parsed) || length(parsed) == 0L) return(NA_character_)
-  roles <- vapply(parsed, function(x) as.character(x$role %||% ""), character(1))
+  roles <- vapply(parsed, function(x) {
+    if (!is.list(x)) return("")
+    role <- x$role %||% ""
+    if (length(role) != 1L || is.na(role)) return("")
+    as.character(role)
+  }, character(1))
   idx <- which(roles %in% c("image", "primary"))
   item <- parsed[[if (length(idx) > 0L) idx[[1]] else 1L]]
-  as.character(item$path %||% item$uri %||% item$file %||% NA_character_)
+  if (!is.list(item)) return(NA_character_)
+  value <- item$path %||% item$uri %||% item$file %||% NA_character_
+  if (length(value) != 1L || is.na(value)) return(NA_character_)
+  as.character(value)
 }
 
 .normalisePrimaryPath <- function(primary, image_uri) {
@@ -1387,24 +1591,39 @@
                                    image_root = NULL,
                                    image_uri = NULL,
                                    downloaded_rels = character(0)) {
-  if (path_col %in% names(samples_df)) {
-    current <- as.character(samples_df[[path_col]])
-    if (all(!is.na(current) & nzchar(current))) {
-      samples_df[[path_col]] <- vapply(
-        current, .safeRelativeAssetPath, character(1))
-      return(samples_df)
-    }
+  if (!is.character(path_col) || length(path_col) != 1L || is.na(path_col) ||
+      !nzchar(path_col)) {
+    stop("Image descriptors require one non-empty path column name.",
+         call. = FALSE)
   }
-
-  if (!("sample_id" %in% names(samples_df))) {
+  has_path <- path_col %in% names(samples_df)
+  has_sample_id <- "sample_id" %in% names(samples_df)
+  if (!has_path && !has_sample_id) {
     stop("Image metadata requires either '", path_col, "' or 'sample_id'.",
          call. = FALSE)
   }
 
-  sample_ids <- as.character(samples_df$sample_id)
-  rel_paths <- rep(NA_character_, length(sample_ids))
+  rel_paths <- rep(NA_character_, nrow(samples_df))
+  if (has_path) {
+    current <- as.character(samples_df[[path_col]])
+    rel_paths <- vapply(
+      current,
+      function(path) {
+        value <- .totalizeImageRecordPath(path)
+        if (identical(value, .DSFLOWER_INVALID_IMAGE_PATH)) NA_character_ else value
+      },
+      character(1)
+    )
+  }
+  sample_ids <- if (has_sample_id) {
+    as.character(samples_df$sample_id)
+  } else {
+    rep(NA_character_, nrow(samples_df))
+  }
 
-  if (!is.null(sample_manifests) && "sample_id" %in% names(sample_manifests)) {
+  missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
+  if (any(missing_rel) && has_sample_id && !is.null(sample_manifests) &&
+      "sample_id" %in% names(sample_manifests)) {
     sm_ids <- as.character(sample_manifests$sample_id)
     primary <- rep(NA_character_, nrow(sample_manifests))
     if ("primary_uri" %in% names(sample_manifests)) {
@@ -1418,15 +1637,22 @@
         character(1)
       )
     }
-    primary <- vapply(primary, .normalisePrimaryPath, character(1),
-                      image_uri = image_uri)
-    rel_paths <- primary[match(sample_ids, sm_ids)]
+    primary <- vapply(primary, function(path) {
+      tryCatch(
+        .normalisePrimaryPath(path, image_uri),
+        error = function(e) NA_character_
+      )
+    }, character(1))
+    matched <- primary[match(sample_ids, sm_ids)]
+    rel_paths[missing_rel] <- matched[missing_rel]
   }
 
   missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
-  if (any(missing_rel) && length(downloaded_rels) > 0L) {
+  if (any(missing_rel) && has_sample_id && length(downloaded_rels) > 0L) {
     downloaded_rels <- vapply(
-      downloaded_rels, .safeRelativeAssetPath, character(1))
+      downloaded_rels, .totalizeImageRecordPath, character(1))
+    downloaded_rels <- downloaded_rels[
+      downloaded_rels != .DSFLOWER_INVALID_IMAGE_PATH]
     rel_by_stem <- downloaded_rels
     names(rel_by_stem) <- .stripKnownImageExtension(downloaded_rels)
     rel_paths[missing_rel] <- rel_by_stem[sample_ids[missing_rel]]
@@ -1449,15 +1675,9 @@
     }
   }
 
-  missing_rel <- is.na(rel_paths) | !nzchar(rel_paths)
-  if (any(missing_rel)) {
-    stop("Could not resolve one or more image paths. Provide a relative path ",
-         "column or a dsImaging sample_manifests table.",
-         call. = FALSE)
-  }
-
-  samples_df[[path_col]] <- unname(vapply(
-    rel_paths, .safeRelativeAssetPath, character(1)))
+  samples_df[[path_col]] <- unname(vapply(rel_paths, function(path) {
+    .totalizeImageRecordAtRoot(path, image_root)
+  }, character(1)))
   samples_df
 }
 
@@ -1477,6 +1697,10 @@
 #' Handles multi-root image assets from the descriptor. Metadata is staged
 #' (CSV/Parquet), images remain on disk (zero-copy). The manifest includes
 #' an \code{assets} key mapping asset names to their validated root paths.
+#' Private record values are totalized: an invalid/unavailable path becomes a
+#' fixed zero-image marker, invalid labels become their public target default,
+#' and no row is removed. Descriptor shape, metadata source, backend, and asset
+#' roots are global valid-input preconditions and still fail closed.
 #'
 #' @keywords internal
 .stageFromDescriptor_image <- function(desc, run_token, target_column,
@@ -1563,8 +1787,8 @@
 
     if (requireNamespace("arrow", quietly = TRUE)) {
       samples_df <- .readStagedSamples(staged_samples)
-      labels_df <- arrow::read_parquet(label_file)
-      merged <- merge(samples_df, labels_df, by = "sample_id", all.x = TRUE)
+      labels_df <- as.data.frame(arrow::read_parquet(label_file))
+      merged <- .leftJoinImageLabels(samples_df, labels_df)
       .writeStagedSamples(merged, staged_samples)
       message("  Joined label set '", label_set_name, "' (",
               ncol(labels_df) - 1, " label columns)")
@@ -1611,7 +1835,7 @@
                                           plan$files)
         downloaded_rels[[asset_name]] <- rels
         root <- local_root
-        message("  Downloaded ", length(rels), " files to staging")
+        message("  Asset staging complete")
       }
 
       if (is.null(root) && !.imageAssetNeedsStaging(asset_name, asset_type,
@@ -1619,8 +1843,7 @@
         next
       }
       if (is.null(root) || !dir.exists(root)) {
-        stop("Asset '", asset_name, "' root directory does not exist: ",
-             root %||% "(NULL)", call. = FALSE)
+        stop("A configured image asset root is unavailable.", call. = FALSE)
       }
       resolved_root <- normalizePath(root, mustWork = TRUE)
       va <- list(
@@ -1639,8 +1862,7 @@
     } else if (asset_type %in% file_asset_types) {
       feat_file <- asset$file
       if (is.null(feat_file) || !file.exists(feat_file)) {
-        stop("Asset '", asset_name, "' file does not exist: ",
-             feat_file %||% "(NULL)", call. = FALSE)
+        stop("A configured feature asset is unavailable.", call. = FALSE)
       }
       validated_assets[[asset_name]] <- list(
         type     = asset_type,
@@ -1651,8 +1873,7 @@
     } else if (identical(asset_type, "multimodal_ref")) {
       mpath <- asset$manifest
       if (is.null(mpath) || !file.exists(mpath)) {
-        stop("Asset '", asset_name, "' manifest does not exist: ",
-             mpath %||% "(NULL)", call. = FALSE)
+        stop("A configured multimodal manifest is unavailable.", call. = FALSE)
       }
       validated_assets[[asset_name]] <- list(
         type     = asset_type,

@@ -2,7 +2,7 @@
 % Please edit documentation in R/policy.R
 \name{.validateTemplate}
 \alias{.validateTemplate}
-\title{Validate that a template is in the allowed list}
+\title{Reject retired named-template inputs}
 \usage{
 .validateTemplate(app_template)
 }
@@ -13,7 +13,8 @@
 TRUE invisibly, or stops with an error
 }
 \description{
-When \code{dsflower.allow_custom_config} is FALSE (default), only
-pre-approved app templates bundled with dsFlower can be used.
+Models are data-only declarative specifications in the current runner. Named
+executable templates are retained only as a legacy argument shape and are not
+an authorization mechanism.
 }
 \keyword{internal}

@@ -20,6 +20,9 @@ FedAvg over heads is valid.
 """
 
 import os
+import re
+import stat
+import warnings
 
 import numpy as np
 
@@ -35,6 +38,32 @@ _BACKBONES = {
 DEFAULT_BACKBONE = "resnet18"
 
 _VOLUME_EXTS = (".nii.gz", ".nii", ".nrrd", ".mha", ".mhd", ".dcm")
+_INVALID_IMAGE = "__dsflower_invalid_image__"
+_MAX_IMAGE_SIZE = 512
+_MAX_IMAGE_AXIS = 16_384
+_MAX_IMAGE_ELEMENTS = 32 * 1024 * 1024
+_MAX_IMAGE_SOURCE_BYTES = 256 * 1024 * 1024
+_MAX_IMAGE_DECODED_BYTES = 256 * 1024 * 1024
+_MAX_MEDICAL_HEADER_BYTES = 1024 * 1024
+_MAX_IMAGE_BATCH_BYTES = 128 * 1024 * 1024
+_MAX_IMAGE_BATCH_RECORDS = 32
+
+_NRRD_DTYPES = {
+    "signed char": "i1", "int8": "i1", "int8_t": "i1",
+    "uchar": "u1", "unsigned char": "u1", "uint8": "u1", "uint8_t": "u1",
+    "short": "i2", "short int": "i2", "signed short": "i2",
+    "signed short int": "i2", "int16": "i2", "int16_t": "i2",
+    "ushort": "u2", "unsigned short": "u2", "unsigned short int": "u2",
+    "uint16": "u2", "uint16_t": "u2",
+    "int": "i4", "signed int": "i4", "int32": "i4", "int32_t": "i4",
+    "uint": "u4", "unsigned int": "u4", "uint32": "u4", "uint32_t": "u4",
+    "longlong": "i8", "long long": "i8", "long long int": "i8",
+    "signed long long": "i8", "signed long long int": "i8",
+    "int64": "i8", "int64_t": "i8",
+    "ulonglong": "u8", "unsigned long long": "u8",
+    "unsigned long long int": "u8", "uint64": "u8", "uint64_t": "u8",
+    "float": "f4", "double": "f8",
+}
 
 
 def normalize_backbone(name):
@@ -64,23 +93,130 @@ def is_3d_backbone(backbone):
 # Image reading (format-dispatched) + 3D->2D for 2D backbones
 # --------------------------------------------------------------------------- #
 
+def _validate_image_size(image_size):
+    if (isinstance(image_size, (bool, np.bool_))
+            or not isinstance(image_size, (int, np.integer))):
+        raise ValueError("image-size must be an integer")
+    size = int(image_size)
+    if not 1 <= size <= _MAX_IMAGE_SIZE:
+        raise ValueError(
+            "image-size must be in [1, %d]" % _MAX_IMAGE_SIZE)
+    return size
+
+
+def _validate_source_file(path):
+    path = os.fsdecode(os.fspath(path))
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("image source must be a regular file")
+    if info.st_size > _MAX_IMAGE_SOURCE_BYTES:
+        raise ValueError("image source exceeds the node decode limit")
+    return path
+
+
+def _validate_decoded_shape(shape, dtype, components=1):
+    dims = tuple(shape)
+    if not 2 <= len(dims) <= 4:
+        raise ValueError("image header has an unsupported dimension count")
+    if (isinstance(components, (bool, np.bool_))
+            or not isinstance(components, (int, np.integer))
+            or not 1 <= int(components) <= 1024):
+        raise ValueError("image header has an invalid component count")
+    total = int(components)
+    for raw in dims:
+        if isinstance(raw, (bool, np.bool_)):
+            raise ValueError("image header has an invalid shape")
+        try:
+            dim = int(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("image header has an invalid shape") from exc
+        if dim != raw or not 1 <= dim <= _MAX_IMAGE_AXIS:
+            raise ValueError("image header has an invalid shape")
+        if total > _MAX_IMAGE_ELEMENTS // dim:
+            raise ValueError("image header exceeds the node element limit")
+        total *= dim
+    dtype = np.dtype(dtype)
+    if dtype.hasobject or dtype.kind not in "buif" or dtype.itemsize < 1:
+        raise ValueError("image header has an unsupported dtype")
+    if total > _MAX_IMAGE_DECODED_BYTES // int(dtype.itemsize):
+        raise ValueError("image header exceeds the node decode limit")
+    return total
+
+
+def _require_bounded_nrrd_header(path):
+    with open(path, "rb") as handle:
+        prefix = handle.read(_MAX_MEDICAL_HEADER_BYTES + 1)
+    header_end = prefix.find(b"\n\n")
+    windows_end = prefix.find(b"\r\n\r\n")
+    if header_end < 0 and windows_end < 0:
+        raise ValueError("NRRD header exceeds the node header limit")
+
+
+def _require_inline_mha(path):
+    with open(path, "rb") as handle:
+        prefix = handle.read(_MAX_MEDICAL_HEADER_BYTES + 1)
+    for line in prefix.splitlines():
+        key, separator, value = line.partition(b"=")
+        if separator and key.strip().lower() == b"elementdatafile":
+            if value.strip().lower() != b"local":
+                raise ValueError("detached MetaImage payloads are not supported")
+            return
+    raise ValueError("MHA header exceeds the node header limit")
+
+
+def _simpleitk_dtype(pixel_name):
+    name = str(pixel_name).lower()
+    match = re.search(r"(8|16|32|64)-bit", name)
+    if match is None:
+        raise ValueError("medical image header has an unsupported pixel type")
+    itemsize = int(match.group(1)) // 8
+    return np.dtype("u%d" % itemsize), (2 if "complex" in name else 1)
+
+
 def _read_array(path):
     """Read any supported image/volume into a numpy array (no resize)."""
+    path = _validate_source_file(path)
     p = path.lower()
     if p.endswith((".nii", ".nii.gz")):
         import nibabel as nib
-        return np.asarray(nib.load(path).get_fdata(), dtype=np.float32)
+        image = nib.load(path)
+        _validate_decoded_shape(image.shape, image.get_data_dtype())
+        return np.asarray(image.get_fdata(dtype=np.float32), dtype=np.float32)
     if p.endswith(".nrrd"):
         import nrrd
+        _require_bounded_nrrd_header(path)
+        header = nrrd.read_header(path)
+        if any(str(key).strip().lower() in ("data file", "datafile")
+               for key in header):
+            raise ValueError("detached NRRD payloads are not supported")
+        dtype = _NRRD_DTYPES.get(str(header.get("type", "")).strip().lower())
+        if dtype is None:
+            raise ValueError("NRRD header has an unsupported dtype")
+        _validate_decoded_shape(header.get("sizes", ()), np.dtype(dtype))
         data, _ = nrrd.read(path)
         return np.asarray(data, dtype=np.float32)
-    if p.endswith((".mha", ".mhd", ".dcm")):
+    if p.endswith(".mhd"):
+        raise ValueError("detached MHD payloads are not supported")
+    if p.endswith((".mha", ".dcm")):
         import SimpleITK as sitk
-        return np.asarray(sitk.GetArrayFromImage(sitk.ReadImage(path)),
-                          dtype=np.float32)
+        if p.endswith(".mha"):
+            _require_inline_mha(path)
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(path)
+        reader.ReadImageInformation()
+        dtype, component_multiplier = _simpleitk_dtype(
+            sitk.GetPixelIDValueAsString(reader.GetPixelID()))
+        _validate_decoded_shape(
+            reader.GetSize(), dtype,
+            int(reader.GetNumberOfComponents()) * component_multiplier)
+        return np.asarray(sitk.GetArrayFromImage(reader.Execute()), dtype=np.float32)
     # 2D raster
     from PIL import Image
-    return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+    with Image.open(path) as image:
+        bands = max(3, len(image.getbands()))
+        _validate_decoded_shape(
+            (image.height, image.width), np.dtype("u1"), bands)
+        return np.asarray(image.convert("RGB"), dtype=np.float32)
 
 
 def _to_2d_slice(arr):
@@ -100,42 +236,90 @@ def _to_2d_slice(arr):
 
 
 def _normalize01(arr):
+    with np.errstate(over="ignore", invalid="ignore"):
+        arr = np.asarray(arr, dtype=np.float32)
+    if not arr.size:
+        raise ValueError("empty image array")
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     lo, hi = float(np.min(arr)), float(np.max(arr))
     if hi - lo < 1e-8:
         return np.zeros_like(arr, dtype=np.float32)
-    return ((arr - lo) / (hi - lo)).astype(np.float32)
+    return ((arr.astype(np.float64) - lo) / (hi - lo)).astype(np.float32)
 
 
 def read_image_2d(path, image_size):
-    """Return a 3xHxW float32 tensor-ready array for a 2D backbone."""
+    """Return one totalized 3xHxW float32 record for a 2D backbone."""
+    size = _validate_image_size(image_size)
     import torch.nn.functional as F
     import torch
 
-    arr = _to_2d_slice(_read_array(path))
-    arr = _normalize01(arr)
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=0)            # gray -> 3ch
-    elif arr.ndim == 3:
-        arr = np.transpose(arr[..., :3], (2, 0, 1))        # HWC -> CHW
-    t = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)
-    t = F.interpolate(t, size=(image_size, image_size),
-                      mode="bilinear", align_corners=False)
-    return t.squeeze(0).numpy()
+    output_shape = (3, size, size)
+    if path is None or (isinstance(path, str) and path == _INVALID_IMAGE):
+        return np.zeros(output_shape, dtype=np.float32)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            raw = _read_array(path)
+        arr = _normalize01(_to_2d_slice(raw))
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=0)        # gray -> 3ch
+        elif arr.ndim == 3:
+            channels = int(arr.shape[-1])
+            if channels == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            elif channels == 2:
+                arr = np.concatenate(
+                    [arr, np.zeros_like(arr[..., :1])], axis=-1)
+            elif channels >= 3:
+                arr = arr[..., :3]
+            else:
+                return np.zeros(output_shape, dtype=np.float32)
+            arr = np.transpose(arr, (2, 0, 1))             # HWC -> CHW
+        else:
+            return np.zeros(output_shape, dtype=np.float32)
+        t = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)
+        t = F.interpolate(t, size=(size, size),
+                          mode="bilinear", align_corners=False)
+        result = t.squeeze(0).numpy().astype(np.float32, copy=False)
+        if result.shape != output_shape or not bool(np.all(np.isfinite(result))):
+            return np.zeros(output_shape, dtype=np.float32)
+        return result
+    except Exception:
+        # A corrupt private image is one fixed zero record, never a release-level
+        # success/failure predicate. Public import/config errors occur above.
+        return np.zeros(output_shape, dtype=np.float32)
 
 
 def read_image_3d(path, image_size):
-    """Return a 1xDxHxW float32 array for a 3D backbone (single-channel volume)."""
+    """Return one totalized 1xDxHxW float32 record for a 3D backbone."""
+    size = _validate_image_size(image_size)
     import torch.nn.functional as F
     import torch
 
-    arr = _normalize01(_read_array(path))
-    if arr.ndim == 4:
-        arr = arr[..., 0]
-    t = torch.from_numpy(np.ascontiguousarray(arr))[None, None]
-    d = max(16, image_size // 4)
-    t = F.interpolate(t, size=(d, image_size, image_size),
-                      mode="trilinear", align_corners=False)
-    return t.squeeze(0).numpy()
+    depth = max(16, size // 4)
+    output_shape = (1, depth, size, size)
+    if path is None or (isinstance(path, str) and path == _INVALID_IMAGE):
+        return np.zeros(output_shape, dtype=np.float32)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            raw = _read_array(path)
+        arr = _normalize01(raw)
+        if arr.ndim == 2:
+            arr = arr[np.newaxis, ...]
+        elif arr.ndim == 4:
+            arr = arr[..., 0]
+        if arr.ndim != 3:
+            return np.zeros(output_shape, dtype=np.float32)
+        t = torch.from_numpy(np.ascontiguousarray(arr))[None, None]
+        t = F.interpolate(t, size=(depth, size, size),
+                          mode="trilinear", align_corners=False)
+        result = t.squeeze(0).numpy().astype(np.float32, copy=False)
+        if result.shape != output_shape or not bool(np.all(np.isfinite(result))):
+            return np.zeros(output_shape, dtype=np.float32)
+        return result
+    except Exception:
+        return np.zeros(output_shape, dtype=np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -220,17 +404,42 @@ def pick_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def extract_features(backbone, images_np, device=None, batch=32):
-    """Run the frozen backbone over a stack of images (no grad) -> feature matrix.
-    device=None auto-selects GPU when available; features come back on CPU (numpy)."""
+def _image_record_shape(image_size, is_3d):
+    size = _validate_image_size(image_size)
+    if is_3d:
+        return (1, max(16, size // 4), size, size)
+    return (3, size, size)
+
+
+def extract_features_from_paths(backbone, paths, image_size, is_3d,
+                                device=None):
+    """Decode and embed a path stream in node-bounded image batches.
+
+    Only the compact feature matrix spans the whole cohort. At most one bounded
+    float32 image batch plus the record currently being decoded is resident.
+    """
     import torch
+    shape = _image_record_shape(image_size, is_3d)
+    record_bytes = int(np.prod(shape, dtype=np.int64)) * 4
+    batch_records = min(
+        _MAX_IMAGE_BATCH_RECORDS, _MAX_IMAGE_BATCH_BYTES // record_bytes)
+    if batch_records < 1:
+        raise ValueError("one resized image exceeds the node batch limit")
+    if not paths:
+        raise ValueError("image collection is empty")
     if device is None:
         device = pick_device()
     backbone = backbone.to(device)
+    reader = read_image_3d if is_3d else read_image_2d
     feats = []
     with torch.no_grad():
-        for i in range(0, len(images_np), batch):
-            xb = torch.from_numpy(np.stack(images_np[i:i + batch])).float().to(device)
+        for start in range(0, len(paths), batch_records):
+            count = min(batch_records, len(paths) - start)
+            images = np.empty((count, *shape), dtype=np.float32)
+            for offset, path in enumerate(paths[start:start + count]):
+                images[offset] = reader(path, image_size)
+            xb = torch.from_numpy(images).to(device)
             f = backbone(xb)
             feats.append(f.reshape(f.shape[0], -1).cpu().numpy())
+            del f, xb, images
     return np.concatenate(feats, axis=0).astype(np.float32)
