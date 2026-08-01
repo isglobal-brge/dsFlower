@@ -15,6 +15,7 @@ local_test_privacy_ledger <- function(path = tempfile(fileext = ".sqlite"),
     dsflower.dp_allow_multiple_domains = FALSE
   ), .local_envir = .local_envir)
   withr::local_envvar(c(
+    DSFLOWER_PRIVACY_LEDGER_PATH = NA_character_,
     DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
   ), .local_envir = .local_envir)
   path
@@ -141,6 +142,16 @@ test_that("privacy ledger is a private regular file and unsafe paths fail closed
       dsFlower:::.privacy_db_connect(link),
       "symbolic link"
     )
+
+    mkfifo <- Sys.which("mkfifo")
+    if (nzchar(mkfifo)) {
+      fifo <- tempfile(fileext = ".sqlite")
+      expect_identical(system2(mkfifo, shQuote(fifo)), 0L)
+      expect_error(
+        dsFlower:::.privacy_db_connect(fifo),
+        "regular file"
+      )
+    }
   }
 })
 
@@ -538,6 +549,18 @@ test_that("node-secret parent is private, owned and stable", {
   })
 })
 
+test_that("node-secret validation rejects non-regular filesystem objects", {
+  skip_on_os("windows")
+  mkfifo <- Sys.which("mkfifo")
+  skip_if(!nzchar(mkfifo), "mkfifo is required")
+  withr::with_tempdir({
+    fifo <- file.path(getwd(), "node-secret-fifo")
+    expect_identical(system2(mkfifo, shQuote(fifo)), 0L)
+    Sys.chmod(fifo, "0600")
+    expect_error(dsFlower:::.validate_node_secret(fifo), "regular file")
+  })
+})
+
 test_that("ephemeral node-secret paths require the explicit test escape hatch", {
   secret <- file.path(tempdir(), "dsflower-ephemeral-secret")
   withr::local_envvar(c(
@@ -545,4 +568,273 @@ test_that("ephemeral node-secret paths require the explicit test escape hatch", 
     DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = ""
   ))
   expect_error(dsFlower:::.node_secret_path(), "must be persistent")
+})
+
+test_that("loading the package never materializes runtime privacy state", {
+  withr::with_tempdir({
+    secret <- file.path(getwd(), "privacy", "noise_root")
+    ledger <- file.path(getwd(), "privacy", "ledger.sqlite")
+    venv <- file.path(getwd(), "venvs")
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
+      DSFLOWER_VENV_ROOT = venv,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    ))
+
+    dsFlower:::.onLoad("", "dsFlower")
+
+    expect_true(dir.exists(venv))
+    expect_false(file.exists(secret) || dsFlower:::.path_is_symlink(secret))
+    expect_false(file.exists(ledger) || dsFlower:::.path_is_symlink(ledger))
+  })
+})
+
+test_that("runtime bootstrap creates no allocation and rotates unusable secrets", {
+  withr::with_tempdir({
+    state <- file.path(getwd(), "privacy")
+    secret <- file.path(state, "noise_root")
+    ledger <- file.path(state, "ledger.sqlite")
+    withr::local_options(list(dsflower.privacy_ledger_path = ledger))
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    ))
+
+    initialized <- flowerPrivacyBootstrap()
+    first_secret <- readLines(secret, warn = FALSE)
+    expect_identical(initialized$key_epoch, 1L)
+    expect_identical(initialized$key_action, "initialized")
+    expect_match(first_secret, "^[0-9a-f]{64}$")
+
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    expect_equal(DBI::dbGetQuery(
+      con, "SELECT COUNT(*) AS n FROM privacy_policy")$n, 0L)
+    expect_equal(DBI::dbGetQuery(
+      con, "SELECT COUNT(*) AS n FROM privacy_reservations")$n, 0L)
+    DBI::dbDisconnect(con)
+
+    reused <- flowerPrivacyBootstrap()
+    expect_identical(reused$key_epoch, 1L)
+    expect_identical(reused$key_action, "reused")
+    expect_identical(readLines(secret, warn = FALSE), first_secret)
+
+    writeLines("corrupt", secret, useBytes = TRUE)
+    Sys.chmod(secret, "0600")
+    repaired <- flowerPrivacyBootstrap()
+    second_secret <- readLines(secret, warn = FALSE)
+    expect_identical(repaired$key_epoch, 2L)
+    expect_identical(repaired$key_action, "rotated")
+    expect_match(second_secret, "^[0-9a-f]{64}$")
+    expect_false(identical(second_secret, first_secret))
+
+    unlink(secret)
+    regenerated <- flowerPrivacyBootstrap()
+    expect_identical(regenerated$key_epoch, 3L)
+    expect_identical(regenerated$key_action, "rotated")
+    expect_match(readLines(secret, warn = FALSE), "^[0-9a-f]{64}$")
+
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    on.exit(DBI::dbDisconnect(con), add = TRUE)
+    epochs <- DBI::dbGetQuery(
+      con,
+      paste("SELECT key_epoch, key_fingerprint",
+            "FROM privacy_key_epochs ORDER BY key_epoch"))
+    expect_identical(epochs$key_epoch, 1:3)
+    expect_true(all(grepl("^[0-9a-f]{64}$", epochs$key_fingerprint)))
+    expect_equal(DBI::dbGetQuery(
+      con, "SELECT COUNT(*) AS n FROM privacy_policy")$n, 0L)
+  })
+})
+
+test_that("ledger quick-check runs once per process and path", {
+  withr::with_tempdir({
+    secret <- file.path(getwd(), "privacy", "noise_root")
+    ledger <- file.path(getwd(), "privacy", "ledger.sqlite")
+    withr::local_options(list(dsflower.privacy_ledger_path = ledger))
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    ))
+    checks <- 0L
+    local_mocked_bindings(
+      .privacy_db_quick_check = function(con) {
+        checks <<- checks + 1L
+        invisible(TRUE)
+      }
+    )
+
+    flowerPrivacyBootstrap()
+    flowerPrivacyBootstrap()
+    expect_identical(checks, 1L)
+  })
+})
+
+test_that("runtime bootstrap rotates an exposed key but never follows a symlink", {
+  skip_on_os("windows")
+  withr::with_tempdir({
+    state <- file.path(getwd(), "privacy")
+    secret <- file.path(state, "noise_root")
+    ledger <- file.path(state, "ledger.sqlite")
+    withr::local_options(list(dsflower.privacy_ledger_path = ledger))
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    ))
+
+    flowerPrivacyBootstrap()
+    original <- readLines(secret, warn = FALSE)
+    Sys.chmod(secret, "0644")
+    rotated <- flowerPrivacyBootstrap()
+    expect_identical(rotated$key_epoch, 2L)
+    expect_false(identical(readLines(secret, warn = FALSE), original))
+    expect_identical(
+      as.integer(file.info(secret)$mode[[1]]),
+      as.integer(strtoi("600", base = 8))
+    )
+
+    target <- file.path(getwd(), "attacker-target")
+    writeLines(strrep("a", 64), target, useBytes = TRUE)
+    unlink(secret)
+    expect_true(file.symlink(target, secret))
+    expect_error(flowerPrivacyBootstrap(), "symbolic link")
+    expect_true(dsFlower:::.path_is_symlink(secret))
+    expect_identical(readLines(target, warn = FALSE), strrep("a", 64))
+
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    on.exit(DBI::dbDisconnect(con), add = TRUE)
+    expect_equal(DBI::dbGetQuery(
+      con, "SELECT MAX(key_epoch) AS epoch FROM privacy_key_epochs")$epoch, 2L)
+  })
+})
+
+test_that("conflicting ledger environment and R options fail closed", {
+  withr::with_tempdir({
+    from_env <- file.path(getwd(), "env", "ledger.sqlite")
+    from_option <- file.path(getwd(), "option", "ledger.sqlite")
+    withr::local_envvar(c(
+      DSFLOWER_PRIVACY_LEDGER_PATH = from_env,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    ))
+    withr::local_options(list(dsflower.privacy_ledger_path = from_option))
+    expect_error(dsFlower:::.privacy_ledger_path(), "conflicts")
+
+    withr::local_options(list(dsflower.privacy_ledger_path = from_env))
+    expect_identical(dsFlower:::.privacy_ledger_path(), from_env)
+  })
+})
+
+test_that("bootstrap preserves an existing accountant when regenerating its key", {
+  withr::with_tempdir({
+    secret <- file.path(getwd(), "privacy", "noise_root")
+    ledger <- file.path(getwd(), "privacy", "ledger.sqlite")
+    withr::local_options(list(dsflower.privacy_ledger_path = ledger))
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    ))
+    token <- paste0("run_", strrep("7", 32))
+    reservation <- dsFlower:::.reserve_privacy_run(token, 3L)
+
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    before_policy <- DBI::dbGetQuery(con, "SELECT * FROM privacy_policy")
+    before_reservations <- DBI::dbGetQuery(
+      con, "SELECT * FROM privacy_reservations")
+    DBI::dbDisconnect(con)
+
+    expect_false(file.exists(secret))
+    state <- flowerPrivacyBootstrap()
+    expect_identical(state$key_epoch, 1L)
+    expect_identical(state$key_action, "initialized")
+
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    expect_equal(DBI::dbGetQuery(con, "SELECT * FROM privacy_policy"),
+                 before_policy)
+    expect_equal(DBI::dbGetQuery(con, "SELECT * FROM privacy_reservations"),
+                 before_reservations)
+    DBI::dbDisconnect(con)
+
+    writeLines("invalid", secret, useBytes = TRUE)
+    Sys.chmod(secret, "0600")
+    state <- flowerPrivacyBootstrap()
+    expect_identical(state$key_epoch, 2L)
+    expect_identical(state$key_action, "rotated")
+    expect_identical(
+      dsFlower:::.reserve_privacy_run(token, 3L)$allocation_index,
+      reservation$allocation_index
+    )
+
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    on.exit(DBI::dbDisconnect(con), add = TRUE)
+    expect_equal(DBI::dbGetQuery(con, "SELECT * FROM privacy_policy"),
+                 before_policy)
+    expect_equal(DBI::dbGetQuery(con, "SELECT * FROM privacy_reservations"),
+                 before_reservations)
+  })
+})
+
+test_that("concurrent runtime bootstraps install one key epoch", {
+  skip_on_os("windows")
+  source_root <- normalizePath(testthat::test_path("..", ".."))
+  withr::with_tempdir({
+    secret <- file.path(getwd(), "privacy", "noise_root")
+    ledger <- file.path(getwd(), "privacy", "ledger.sqlite")
+    command <- file.path(R.home("bin"), "Rscript")
+    expression <- paste(
+      "loadNamespace('dsFlower');",
+      "if (exists('.privacy_runtime_bootstrap', asNamespace('dsFlower'),",
+      "inherits=FALSE)) {",
+      "getFromNamespace('.privacy_runtime_bootstrap', 'dsFlower')()",
+      "} else {",
+      "root <- Sys.getenv('DSFLOWER_TEST_SOURCE_ROOT');",
+      "for (f in list.files(file.path(root, 'R'), pattern='[.]R$',",
+      "full.names=TRUE)) sys.source(f, envir=.GlobalEnv);",
+      ".privacy_runtime_bootstrap()",
+      "}"
+    )
+    workers <- lapply(seq_len(8L), function(...) {
+      processx::process$new(
+        command, c("-e", expression),
+        env = c(
+          "current",
+          DSFLOWER_TEST_SOURCE_ROOT = source_root,
+          DSFLOWER_NODE_SECRET_FILE = secret,
+          DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
+          DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+          DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+        ),
+        stdout = "|", stderr = "|", cleanup = TRUE
+      )
+    })
+    withr::defer(lapply(workers, function(worker) {
+      if (worker$is_alive()) worker$kill_tree()
+    }))
+    lapply(workers, function(worker) worker$wait(timeout = 15000))
+    expect_true(all(vapply(
+      workers, function(worker) identical(worker$get_exit_status(), 0L),
+      logical(1)
+    )), info = paste(vapply(workers, function(worker) {
+      paste(worker$read_all_error(), collapse = "\n")
+    }, character(1)), collapse = "\n"))
+
+    expect_identical(dsFlower:::.validate_node_secret(secret), secret)
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    on.exit(DBI::dbDisconnect(con), add = TRUE)
+    expect_equal(DBI::dbGetQuery(
+      con, "SELECT COUNT(*) AS n FROM privacy_key_epochs")$n, 1L)
+    expect_equal(DBI::dbGetQuery(
+      con, "SELECT MAX(key_epoch) AS epoch FROM privacy_key_epochs")$epoch, 1L)
+    expect_false(any(grepl(
+      "^\\.node-secret-", list.files(dirname(secret), all.files = TRUE)
+    )))
+  })
 })

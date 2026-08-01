@@ -99,6 +99,23 @@
   length(link) == 1L && !is.na(link) && nzchar(link)
 }
 
+# utils::file_test("-f") means "exists and is not a directory" in R and
+# therefore accepts FIFOs. Privacy state must use the POSIX regular-file test so
+# a crafted pipe cannot block key reads or SQLite open indefinitely.
+.path_is_regular_file <- function(path) {
+  if (.Platform$OS.type != "unix") {
+    return(utils::file_test("-f", path))
+  }
+  test_bin <- c("/usr/bin/test", "/bin/test")
+  test_bin <- test_bin[file.exists(test_bin)][1L]
+  if (length(test_bin) != 1L || is.na(test_bin) || !nzchar(test_bin)) {
+    stop("No trusted POSIX regular-file test is available.", call. = FALSE)
+  }
+  status <- suppressWarnings(system2(
+    test_bin, c("-f", shQuote(path)), stdout = FALSE, stderr = FALSE))
+  identical(as.integer(status), 0L)
+}
+
 # normalizePath() deliberately leaves '..' components untouched when part of
 # the path does not exist.  That would let an apparent /var path resolve into
 # /tmp only after dir.create().  Collapse those components first, then resolve
@@ -169,9 +186,29 @@
 #' Resolve the persistent SQLite privacy ledger
 #' @keywords internal
 .privacy_ledger_path <- function() {
-  explicit <- .dsf_option(
-    "privacy_ledger_path",
-    Sys.getenv("DSFLOWER_PRIVACY_LEDGER_PATH", ""))
+  from_env <- Sys.getenv("DSFLOWER_PRIVACY_LEDGER_PATH", "")
+  configured <- .dsf_option("privacy_ledger_path", "")
+  configured_supplied <- !(is.null(configured) || length(configured) == 0L ||
+    (length(configured) == 1L && !is.na(configured) &&
+       !nzchar(as.character(configured))))
+  if (nzchar(from_env) && configured_supplied) {
+    if (length(configured) != 1L || is.na(configured) ||
+        !nzchar(as.character(configured)) ||
+        !.path_is_absolute(as.character(configured)) ||
+        !.path_is_absolute(from_env)) {
+      stop("dsflower.privacy_ledger_path must be one absolute path.",
+           call. = FALSE)
+    }
+    if (!identical(.canonical_state_path(from_env),
+                   .canonical_state_path(as.character(configured)))) {
+      stop("DSFLOWER_PRIVACY_LEDGER_PATH conflicts with the configured R option; ",
+           "refusing to select a different privacy ledger.", call. = FALSE)
+    }
+  }
+  # Preserve the historical R-option precedence. A simultaneous ENV is accepted
+  # only when it resolves to the same ledger, so upgrades cannot silently reset
+  # accounting by selecting a different empty database.
+  explicit <- if (configured_supplied) configured else from_env
   allow_test_tmp <- identical(
     Sys.getenv("DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER", ""), "1")
 
@@ -265,7 +302,7 @@
 
 .privacy_validate_ledger_file <- function(path, euid, repair_mode = FALSE) {
   if (!file.exists(path) || .path_is_symlink(path) ||
-      !utils::file_test("-f", path)) {
+      !.path_is_regular_file(path)) {
     stop("Privacy ledger must be a regular file, not a symbolic link.",
          call. = FALSE)
   }
@@ -359,6 +396,13 @@
     "PRIMARY KEY(run_token, message_id),",
     "UNIQUE(run_token, release_index),",
     "FOREIGN KEY(run_token) REFERENCES privacy_reservations(run_token))"))
+  DBI::dbExecute(con, paste(
+    "CREATE TABLE IF NOT EXISTS privacy_key_epochs (",
+    "key_epoch INTEGER PRIMARY KEY CHECK(key_epoch >= 1),",
+    "key_fingerprint TEXT NOT NULL",
+    "CHECK(length(key_fingerprint) = 64 AND",
+    "key_fingerprint NOT GLOB '*[^0-9a-f]*'),",
+    "created_at TEXT NOT NULL)"))
   ok <- TRUE
   con
 }
@@ -369,6 +413,119 @@
 
 .privacy_db_rollback <- function(con) {
   try(DBI::dbExecute(con, "ROLLBACK"), silent = TRUE)
+}
+
+.privacy_db_quick_check <- function(con) {
+  result <- tryCatch(
+    DBI::dbGetQuery(con, "PRAGMA quick_check"),
+    error = function(e) NULL
+  )
+  healthy <- !is.null(result) && ncol(result) == 1L && nrow(result) == 1L &&
+    identical(tolower(as.character(result[[1L]][[1L]])), "ok")
+  if (!healthy) {
+    stop("The dsFlower privacy ledger failed SQLite quick_check.",
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+.read_node_secret_raw <- function(path = .node_secret_path()) {
+  .validate_node_secret(path)
+  bytes <- .read_node_secret_bytes(path)
+  if (length(bytes) && identical(bytes[[length(bytes)]], as.raw(0x0a))) {
+    bytes <- bytes[-length(bytes)]
+    if (length(bytes) && identical(bytes[[length(bytes)]], as.raw(0x0d))) {
+      bytes <- bytes[-length(bytes)]
+    }
+  }
+  value <- tryCatch(rawToChar(bytes), error = function(e) "")
+  decoded <- suppressWarnings(strtoi(
+    substring(value, seq(1L, 63L, 2L), seq(2L, 64L, 2L)), base = 16L))
+  if (length(bytes) != 64L || length(decoded) != 32L || anyNA(decoded)) {
+    stop("The dsFlower node secret changed while it was being read.",
+         call. = FALSE)
+  }
+  .validate_node_secret(path)
+  as.raw(decoded)
+}
+
+.node_secret_fingerprint <- function(path = .node_secret_path()) {
+  digest::digest(.read_node_secret_raw(path), algo = "sha256", serialize = FALSE)
+}
+
+#' Bootstrap persistent differential-privacy state at service runtime
+#'
+#' Creates or validates the SQLite accountant and the per-node CSPRNG secret,
+#' records key rotations for audit, and performs no privacy allocation. Package
+#' installation and loading deliberately never call this function, so a secret
+#' cannot be baked into a reusable image.
+#'
+#' @return Invisibly, an operational status list containing `ok`, `key_epoch`
+#'   and `key_action`. No secret, fingerprint, or filesystem path is returned.
+#' @export
+flowerPrivacyBootstrap <- function() {
+  state <- .privacy_runtime_bootstrap()
+  invisible(list(
+    ok = TRUE,
+    key_epoch = state$key_epoch,
+    key_action = state$key_action
+  ))
+}
+
+.privacy_runtime_bootstrap <- function() {
+  ledger_path <- .privacy_ledger_path()
+  con <- .privacy_db_connect(ledger_path)
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+  checked <- .dsflower_env$privacy_quick_checked %||% character(0)
+  if (!ledger_path %in% checked) {
+    .privacy_db_quick_check(con)
+    .dsflower_env$privacy_quick_checked <- unique(c(checked, ledger_path))
+  }
+  .privacy_db_begin(con)
+  committed <- FALSE
+  on.exit(if (!committed) .privacy_db_rollback(con), add = TRUE)
+
+  secret_path <- .ensure_node_secret()
+  fingerprint <- .node_secret_fingerprint(secret_path)
+  latest <- DBI::dbGetQuery(
+    con,
+    paste("SELECT key_epoch, key_fingerprint FROM privacy_key_epochs",
+          "ORDER BY key_epoch DESC LIMIT 1"))
+  if (nrow(latest) == 0L) {
+    key_epoch <- 1L
+    key_action <- "initialized"
+  } else if (identical(as.character(latest$key_fingerprint[[1L]]),
+                       fingerprint)) {
+    key_epoch <- as.integer(latest$key_epoch[[1L]])
+    key_action <- "reused"
+  } else {
+    previous_epoch <- suppressWarnings(as.numeric(latest$key_epoch[[1L]]))
+    if (length(previous_epoch) != 1L || !is.finite(previous_epoch) ||
+        previous_epoch < 1 || previous_epoch != floor(previous_epoch) ||
+        previous_epoch >= 2^53 - 1) {
+      stop("The dsFlower privacy key epoch is invalid.", call. = FALSE)
+    }
+    key_epoch <- previous_epoch + 1
+    key_action <- "rotated"
+  }
+
+  if (!identical(key_action, "reused")) {
+    DBI::dbExecute(
+      con,
+      paste("INSERT INTO privacy_key_epochs",
+            "(key_epoch,key_fingerprint,created_at) VALUES (?,?,?)"),
+      params = list(
+        key_epoch, fingerprint,
+        format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")))
+  }
+  DBI::dbExecute(con, "COMMIT")
+  committed <- TRUE
+  list(
+    key_epoch = as.integer(key_epoch),
+    key_action = key_action,
+    secret_path = secret_path,
+    ledger_path = ledger_path
+  )
 }
 
 # One-way compatibility migration for the corrected patient-ID contract. Row

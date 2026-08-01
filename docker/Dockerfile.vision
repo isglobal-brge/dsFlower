@@ -39,6 +39,12 @@ RUN R -e 'p<-c("DBI","RSQLite","filelock","arrow","uuid","yaml","aws.s3","resour
  && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsHPC.tar.gz \
  && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsImaging.tar.gz \
  && (chown -R rock:rock /var/lib/rock/R/library/dsImaging /var/lib/rock/R/library/dsHPC /var/lib/dsimaging 2>/dev/null || true) \
- && rm -rf /tmp/dsHPC.tar.gz /tmp/dsImaging.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv
+ && rm -rf /tmp/dsHPC.tar.gz /tmp/dsImaging.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv \
+ && test ! -e /var/lib/dsflower/privacy/noise_root \
+ && test ! -L /var/lib/dsflower/privacy/noise_root \
+ && test ! -e /var/lib/dsflower/node_secret \
+ && test ! -L /var/lib/dsflower/node_secret \
+ && test ! -e /var/lib/dsflower/privacy/ledger.sqlite \
+ && test ! -L /var/lib/dsflower/privacy/ledger.sqlite
 
 # ENTRYPOINT / CMD / port inherited from dsflower-rock (-> datashield/rock-base).

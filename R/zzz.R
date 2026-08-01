@@ -24,7 +24,7 @@
 #' @keywords internal
 .node_secret_path <- function() {
   configured <- .dsf_option(
-    "node_secret_path", "/var/lib/dsflower/node_secret")
+    "node_secret_path", "/var/lib/dsflower/privacy/noise_root")
   from_env <- Sys.getenv("DSFLOWER_NODE_SECRET_FILE", unset = "")
   path <- if (nzchar(from_env)) from_env else configured
   if (length(path) != 1L || is.na(path) || !nzchar(as.character(path)) ||
@@ -75,6 +75,22 @@
   normalizePath(parent, winslash = "/", mustWork = TRUE)
 }
 
+.read_node_secret_bytes <- function(path) {
+  con <- tryCatch(
+    file(path, open = "rb"),
+    warning = function(w) {
+      stop("The dsFlower node secret must be a readable regular file.",
+           call. = FALSE)
+    },
+    error = function(e) {
+      stop("The dsFlower node secret must be a readable regular file.",
+           call. = FALSE)
+    }
+  )
+  on.exit(close(con), add = TRUE)
+  tryCatch(readBin(con, "raw", n = 67L), error = function(e) raw(0))
+}
+
 #' Validate a dedicated 256-bit dsFlower node secret
 #' @keywords internal
 .validate_node_secret <- function(path) {
@@ -85,14 +101,27 @@
          call. = FALSE)
   }
   info <- file.info(path)
-  if (isTRUE(info$isdir[[1]])) {
+  if (nrow(info) != 1L || is.na(info$isdir[[1]]) ||
+      isTRUE(info$isdir[[1]]) || !.path_is_regular_file(path)) {
     stop("The dsFlower node secret must be a regular file.", call. = FALSE)
+  }
+  if (.Platform$OS.type == "unix") {
+    mode <- suppressWarnings(as.integer(info$mode[[1]]))
+    expected_mode <- as.integer(strtoi("600", base = 8))
+    if (is.na(mode) || !identical(mode, expected_mode)) {
+      stop("The dsFlower node secret must have Unix mode exactly 0600.",
+           call. = FALSE)
+    }
+    owner <- suppressWarnings(as.integer(info$uid[[1]]))
+    if (is.na(owner) || !identical(owner, as.integer(euid))) {
+      stop("The dsFlower node secret is not owned by the current service user.",
+           call. = FALSE)
+    }
   }
   # Accept 64 hex bytes with no terminator, LF, or CRLF. Read one byte beyond
   # the largest valid representation so a valid first line plus hidden trailing
   # content cannot pass validation.
-  bytes <- tryCatch(readBin(path, "raw", n = 67L),
-                    error = function(e) raw(0))
+  bytes <- .read_node_secret_bytes(path)
   if (length(bytes) && identical(bytes[[length(bytes)]], as.raw(0x0a))) {
     bytes <- bytes[-length(bytes)]
     if (length(bytes) && identical(bytes[[length(bytes)]], as.raw(0x0d))) {
@@ -105,23 +134,6 @@
     stop("The dsFlower node secret must contain exactly 32 bytes as 64 hex digits.",
          call. = FALSE)
   }
-  if (.Platform$OS.type == "unix") {
-    mode <- suppressWarnings(as.integer(info$mode[[1]]))
-    expected_mode <- as.integer(strtoi("600", base = 8))
-    if (is.na(mode) || !identical(mode, expected_mode)) {
-      stop("The dsFlower node secret must have Unix mode exactly 0600.",
-           call. = FALSE)
-    }
-    current_user <- unname(Sys.info()[["effective_user"]])
-    if (is.null(current_user) || is.na(current_user) || !nzchar(current_user)) {
-      current_user <- unname(Sys.info()[["user"]])
-    }
-    if (is.null(current_user) || is.na(current_user) || !nzchar(current_user) ||
-        is.na(info$uname[[1]]) || !identical(info$uname[[1]], current_user)) {
-      stop("The dsFlower node secret is not owned by the current service user.",
-           call. = FALSE)
-    }
-  }
   parent_after <- .validate_node_secret_parent(path, euid)
   if (!identical(parent_after, parent_before)) {
     stop("The dsFlower node-secret parent changed while validating the key.",
@@ -130,19 +142,49 @@
   invisible(path)
 }
 
-#' Ensure a dedicated per-node 256-bit secret for deterministic releases
-#'
-#' The secret is created at RUN TIME, never from `.onLoad`, so an image build cannot
-#' accidentally bake one key into every deployed node.  There is deliberately no
-#' statistical-RNG fallback: missing CSPRNG entropy or unsafe permissions fail closed.
+#' Atomically write a fresh dsFlower node secret
 #' @keywords internal
-.ensure_node_secret <- function() {
-  path <- .node_secret_path()
-  if (file.exists(path)) return(.validate_node_secret(path))
+.write_node_secret_atomic <- function(path, parent) {
   if (!file.exists("/dev/urandom")) {
     stop("/dev/urandom is unavailable; refusing to create a DP node secret.",
          call. = FALSE)
   }
+  entropy <- tryCatch(.read_os_entropy(32L), error = function(e) raw(0))
+  if (length(entropy) != 32L) {
+    stop("Could not read 32 bytes of operating-system entropy; refusing a DP release.",
+         call. = FALSE)
+  }
+  value <- paste(sprintf("%02x", as.integer(entropy)), collapse = "")
+  tmp <- tempfile(pattern = ".node-secret-", tmpdir = parent)
+  on.exit(unlink(tmp), add = TRUE)
+  # file.create() has no mode formal. A restrictive umask prevents a readable
+  # window before chmod; rename then replaces an invalid regular key atomically.
+  old_umask <- if (.Platform$OS.type == "unix") Sys.umask("0077") else NULL
+  created <- tryCatch(
+    file.create(tmp),
+    finally = if (!is.null(old_umask)) Sys.umask(old_umask)
+  )
+  if (length(created) != 1L || !isTRUE(created)) {
+    stop("Could not create a private temporary node-secret file.",
+         call. = FALSE)
+  }
+  writeLines(value, tmp, useBytes = TRUE)
+  if (.Platform$OS.type == "unix") Sys.chmod(tmp, "0600")
+  if (!file.rename(tmp, path)) {
+    stop("Could not atomically install the dsFlower node secret.", call. = FALSE)
+  }
+  invisible(path)
+}
+
+#' Ensure a dedicated per-node 256-bit secret for deterministic releases
+#'
+#' The secret is created at RUN TIME, never from `.onLoad`, so an image build
+#' cannot accidentally bake one key into every deployed node. Missing, malformed
+#' or permissively-mode'd regular files owned by the service user are replaced
+#' with fresh operating-system entropy. Unsafe paths and ownership fail closed.
+#' @keywords internal
+.ensure_node_secret <- function() {
+  path <- .node_secret_path()
   parent <- dirname(path)
   parent_existed <- dir.exists(parent)
   old_umask <- if (.Platform$OS.type == "unix") Sys.umask("0077") else NULL
@@ -164,36 +206,35 @@
   parent_before <- .validate_node_secret_parent(path, euid)
 
   lock <- filelock::lock(paste0(path, ".lock"), timeout = 10000)
-  if (is.null(lock)) stop("Timed out creating the dsFlower node secret.", call. = FALSE)
+  if (is.null(lock)) {
+    stop("Timed out creating the dsFlower node secret.", call. = FALSE)
+  }
   on.exit(filelock::unlock(lock), add = TRUE)
-  if (!file.exists(path)) {
-    entropy <- tryCatch(.read_os_entropy(32L),
-                        error = function(e) raw(0))
-    if (length(entropy) != 32L) {
-      stop("Could not read 32 bytes of operating-system entropy; refusing a DP release.",
-           call. = FALSE)
+
+  if (.path_is_symlink(path)) {
+    stop("The dsFlower node secret must not be a symbolic link.", call. = FALSE)
+  }
+  if (file.exists(path)) {
+    valid <- tryCatch({
+      .validate_node_secret(path)
+      TRUE
+    }, error = function(e) e)
+    if (isTRUE(valid)) return(invisible(path))
+
+    info <- file.info(path)
+    if (nrow(info) != 1L || is.na(info$isdir[[1]]) ||
+        isTRUE(info$isdir[[1]]) || !.path_is_regular_file(path)) {
+      stop(conditionMessage(valid), call. = FALSE)
     }
-    value <- paste(sprintf("%02x", as.integer(entropy)), collapse = "")
-    tmp <- tempfile(pattern = ".node-secret-", tmpdir = parent)
-    on.exit(unlink(tmp), add = TRUE)
-    # base::file.create() has no `mode` formal: passing mode="0600" is
-    # interpreted through `...` as a second filename. Use a restrictive umask
-    # at creation time so there is no group/world-readable window before chmod.
-    old_umask <- Sys.umask("0077")
-    created <- tryCatch(
-      file.create(tmp),
-      finally = Sys.umask(old_umask)
-    )
-    if (length(created) != 1L || !isTRUE(created)) {
-      stop("Could not create a private temporary node-secret file.",
-           call. = FALSE)
-    }
-    writeLines(value, tmp, useBytes = TRUE)
-    Sys.chmod(tmp, "0600")
-    if (!file.rename(tmp, path)) {
-      stop("Could not atomically install the dsFlower node secret.", call. = FALSE)
+    if (.Platform$OS.type == "unix") {
+      owner <- suppressWarnings(as.integer(info$uid[[1]]))
+      if (is.na(owner) || !identical(owner, as.integer(euid))) {
+        stop(conditionMessage(valid), call. = FALSE)
+      }
     }
   }
+
+  .write_node_secret_atomic(path, parent)
   parent_after <- .validate_node_secret_parent(path, euid)
   if (!identical(parent_after, parent_before)) {
     stop("The dsFlower node-secret parent changed while creating the key.",

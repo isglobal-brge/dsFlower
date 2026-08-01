@@ -240,6 +240,11 @@
 #' @return A Flower handle object (assigned server-side).
 #' @export
 flowerInitDS <- function(data_symbol) {
+  # Initialize persistent privacy state before the first dsFlower operation
+  # inspects a session object. This runs only in a live service/session, never
+  # from package installation or namespace loading, and consumes no allocation.
+  .privacy_runtime_bootstrap()
+
   # data_symbol is a STRING (e.g. "D"), not the object itself.
   # Pattern matches dsOMOP: get(symbol, parent.frame())
   owner_env <- parent.frame()
@@ -580,7 +585,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   feature_columns <- columns$feature_columns
   template_name <- run_config[["template_name"]] %||% NULL
   run_token <- .generate_run_token()
-  .ensure_node_secret()
+  .privacy_runtime_bootstrap()
   max_releases <- as.integer(run_config[["privacy-max-releases"]])
   reservation <- .reserve_privacy_run(run_token, max_releases)
   admitted <- FALSE
@@ -879,7 +884,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   # Revalidate cryptographic + accounting state after every non-private
   # preflight, but before a ClientApp can release a model. The reservation was
   # made before prepare touched private data and is idempotent by run_token.
-  .ensure_node_secret()
+  .privacy_runtime_bootstrap()
   manifest_path <- file.path(handle$staging_dir, "manifest.json")
   manifest <- tryCatch(
     jsonlite::fromJSON(manifest_path, simplifyVector = FALSE),
