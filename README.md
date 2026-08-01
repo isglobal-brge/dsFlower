@@ -142,8 +142,22 @@ The node secret is 32 bytes from the operating-system CSPRNG, created at runtime
 stored outside staging with mode `0600` and never exposed to submitted code. Its
 file must be owned by the Rock service UID; its real parent directory may be
 owned by that UID or root, but must not be writable by group or other users.
-The parent is checked before and after the key is opened. It is deliberately
-independent of R's mutable RNG and `datashield.seed`. DP
+The parent is checked before and after the key is opened. When both state paths
+are explicitly provided as process environment variables, the supplied Rock
+image bootstraps after runtime mounts are ready and before opening its port.
+Otherwise it deliberately waits for the first `flowerInitDS()`, when DataSHIELD
+profile options exist. Neither `configure` nor `.onLoad()` creates privacy state,
+and both Docker builds assert that no seed or ledger entered the image. A
+bootstrap storage error does not take Rock down; every private entry point
+retries and remains fail-closed until the mount is repaired.
+
+A missing, malformed or permissively-mode'd regular key owned by the service UID
+is atomically replaced from fresh OS entropy. The ledger records an append-only
+key epoch/fingerprint without advancing the privacy allocation counter. A
+symlink, foreign-owned file or unsafe parent is never followed or overwritten.
+Existing exact retries still use their cached bytes or a public no-op, so an old
+key is not needed to recompute a release. The secret is deliberately independent
+of R's mutable RNG and `datashield.seed`. DP
 Gaussian noise, Poisson sampling and HookApp partitioning use separate
 ChaCha20-backed streams. Data-independent Torch initialization/dropout uses a
 separate HMAC-derived seed in the framework PRNG; it is not used as the DP noise
@@ -229,6 +243,14 @@ its distribution, not the possibility of every form of model inversion.
 Options use the `dsflower.*` prefix, with the standard
 `default.dsflower.*` DataSHIELD fallback.
 
+The supplied Rock image performs a pre-service bootstrap only when a deployment
+explicitly provides both `DSFLOWER_NODE_SECRET_FILE` and
+`DSFLOWER_PRIVACY_LEDGER_PATH`. Without both, it waits for the first session so
+Opal/Armadillo profile R options retain their historical precedence. If an ENV
+and R option both name a ledger, they must resolve to the same path; a conflict
+fails closed instead of silently creating a fresh accountant. Epsilon and all
+other policy controls remain normal DataSHIELD profile options.
+
 | Option suffix | Default | Meaning |
 |---|---:|---|
 | `dp_total_epsilon` | `3` | Lifetime epsilon for the accounting domain; hard maximum `10`. |
@@ -240,9 +262,9 @@ Options use the `dsflower.*` prefix, with the standard
 | `dp_unit` | `row` | Lifetime adjacency unit: exactly `row` or `patient`. |
 | `patient_column` | unset | Required explicit stable identifier when `dp_unit="patient"`; never auto-detected. |
 | `dp_allow_multiple_domains` | `FALSE` | Opt-in reserved for demonstrably disjoint populations. |
-| `privacy_ledger_path` | persistent node path | SQLite ledger; ephemeral paths are rejected. |
+| `privacy_ledger_path` | persistent node path | SQLite ledger; R option keeps precedence and a conflicting runtime ENV is rejected. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |
-| `node_secret_path` | `/var/lib/dsflower/node_secret` | Dedicated 256-bit node key. |
+| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; deployment ENV may select a secret-manager path. |
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |
 | `max_fab_bytes` | `52428800` | Per-FAB compressed upload cap. |
 | `app_spool_max_bytes` | `1073741824` | Global logical-byte cap across all uploaded FABs and unpacked apps. |
@@ -317,15 +339,17 @@ options(
   default.dsflower.dp_budget_decay = 0.5,
   default.dsflower.dp_unit = "row",
   default.dsflower.privacy_ledger_path = "/var/lib/dsflower/privacy/ledger.sqlite",
-  default.dsflower.node_secret_path = "/run/secrets/dsflower_node_key",
+  default.dsflower.node_secret_path = "/var/lib/dsflower/privacy/noise_root",
   default.dsflower.app_spool_root = "/var/lib/dsflower/appstore",
   default.dsflower.hook_enabled = FALSE
 )
 ```
 
 Policy values are bound when a domain is first initialized; incompatible changes
-then fail closed. Deleting, rolling back or cloning the ledger/secret state can
-invalidate the declared lifetime guarantee and must be prevented operationally.
+then fail closed. Losing or corrupting the seed causes a recorded runtime
+rotation and does not reset accounting. Deleting, rolling back or cloning the
+ledger can invalidate the declared lifetime guarantee and must be prevented
+operationally.
 The one-way `trim-utf8-v1` to `trim-utf8-v2` identifier migration preserves row
 accounting. In patient mode it proceeds only when the ledger has no legacy
 claims, and atomically exhausts every outstanding legacy reservation before
@@ -352,12 +376,13 @@ container digests remain the deployment identity for byte-for-byte artifacts.
 
 An existing OS-managed `uv` is part of the administrator's trusted computing
 base. If no `uv` is installed, dsFlower does not execute a mutable remote
-installer or a `latest` URL. Automatic bootstrap requires both an exact official
-release tag in `DSFLOWER_UV_VERSION` and its platform archive digest in
-`DSFLOWER_UV_SHA256`; a mismatch fails before extraction. For containers,
-persist the ledger and app-store directories and inject the stable node secret
-separately. Do not mount all of `/var/lib/dsflower`, because that path also
-contains the baked venvs.
+installer or a `latest` URL. Automatic Python bootstrap requires both an exact
+official release tag in `DSFLOWER_UV_VERSION` and its platform archive digest
+in `DSFLOWER_UV_SHA256`; a mismatch fails before extraction. For containers,
+persist `/var/lib/dsflower/privacy/` (ledger plus the runtime-generated seed) and
+the app-store directory. A secret-manager file may instead be selected through
+`DSFLOWER_NODE_SECRET_FILE`. Do not mount all of `/var/lib/dsflower`, because
+that path also contains the baked venvs.
 
 The deterministic CSPRNG is keyed by the dedicated node secret and a unique
 ledger release identity. This prevents averaging exact retries and stream reuse,

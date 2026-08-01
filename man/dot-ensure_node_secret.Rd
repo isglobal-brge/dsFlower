@@ -7,8 +7,9 @@
 .ensure_node_secret()
 }
 \description{
-The secret is created at RUN TIME, never from `.onLoad`, so an image build cannot
-accidentally bake one key into every deployed node.  There is deliberately no
-statistical-RNG fallback: missing CSPRNG entropy or unsafe permissions fail closed.
+The secret is created at RUN TIME, never from `.onLoad`, so an image build
+cannot accidentally bake one key into every deployed node. Missing, malformed
+or permissively-mode'd regular files owned by the service user are replaced
+with fresh operating-system entropy. Unsafe paths and ownership fail closed.
 }
 \keyword{internal}

@@ -13,6 +13,7 @@ local_runtime_privacy_state <- function(.local_envir = parent.frame()) {
                        .local_envir = .local_envir)
   withr::local_envvar(c(
     DSFLOWER_NODE_SECRET_FILE = secret,
+    DSFLOWER_PRIVACY_LEDGER_PATH = NA_character_,
     DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
     DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
   ), .local_envir = .local_envir)

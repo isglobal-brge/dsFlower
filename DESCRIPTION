@@ -28,6 +28,7 @@ Imports:
     tools,
     utils
 Suggests:
+    DSI,
     resourcer,
     dsImaging,
     testthat (>= 3.0.0),

@@ -42,7 +42,20 @@ RUN R -e 'p<-c("arrow","DBI","digest","filelock","jsonlite","processx","rappdirs
  && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsFlower.tar.gz \
  && R -e '.libPaths(c("/var/lib/rock/R/library", .libPaths())); dsFlower:::.ensure_python_env("pytorch")' \
  && chown -R rock:rock /var/lib/rock/R/library/dsFlower /var/lib/dsflower \
- && rm -rf /tmp/dsFlower.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv
+ && install -d -o rock -g rock -m 0700 /var/lib/dsflower/privacy \
+ && rm -rf /tmp/dsFlower.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv \
+ && test ! -e /var/lib/dsflower/privacy/noise_root \
+ && test ! -L /var/lib/dsflower/privacy/noise_root \
+ && test ! -e /var/lib/dsflower/node_secret \
+ && test ! -L /var/lib/dsflower/node_secret \
+ && test ! -e /var/lib/dsflower/privacy/ledger.sqlite \
+ && test ! -L /var/lib/dsflower/privacy/ledger.sqlite
 
-# ENTRYPOINT / CMD / exposed port are inherited from datashield/rock-base — do NOT
-# override them, or the rock server will not start correctly.
+# Keep the upstream entrypoint/CMD untouched. Its final service hook already runs
+# as `rock`, after Rock has prepared its mounts. The wrapper bootstraps early only
+# with explicit process paths; otherwise the first session uses profile options.
+# This code is never run at build.
+RUN grep -Eq 'exec[[:space:]]+gosu[[:space:]]+rock[[:space:]]+/opt/obiba/bin/start.sh' /docker-entrypoint.sh \
+ && test -x /opt/obiba/bin/start.sh \
+ && mv /opt/obiba/bin/start.sh /opt/obiba/bin/start-rock-upstream.sh
+COPY --chmod=0755 dsflower-rock-start.sh /opt/obiba/bin/start.sh

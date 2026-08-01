@@ -54,31 +54,54 @@ walkthrough.
 
 ## Persistent privacy state
 
-The container image is replaceable; the privacy identity is not. Production
-deployments must preserve these two server-owned resources across restarts,
+The container image is replaceable; privacy state is runtime state. Production
+deployments must preserve these server-owned resources across restarts,
 rescheduling and image upgrades:
 
 - the directory containing the SQLite ledger, normally
   `/var/lib/dsflower/privacy/`;
 - the private Tier-2 upload spool, normally `/var/lib/dsflower/appstore/`, if
   verified uploads must survive container replacement;
-- the same 256-bit node secret, normally `/var/lib/dsflower/node_secret`, or a
-  secret-manager path configured through `DSFLOWER_NODE_SECRET_FILE` /
-  `dsflower.node_secret_path`.
+- the runtime-generated 256-bit node secret, normally
+  `/var/lib/dsflower/privacy/noise_root`, or a secret-manager path configured
+  through `DSFLOWER_NODE_SECRET_FILE`.
 
 Do not mount all of `/var/lib/dsflower` over this image: that would hide the baked
-`venvs/` directory. Mount the privacy and appstore subdirectories separately and
-inject the secret file. The mounted privacy directory must be owned by the Rock
+`venvs/` directory. Mount the privacy and appstore subdirectories separately.
+The existing Rock entrypoint is preserved. Its service-start hook initializes
+the ledger and seed as the `rock` UID after mounts are ready only when both state
+paths were explicitly provided as environment variables; otherwise the first
+session initializes them after profile options are available. Both Docker builds
+fail if either file was created during installation, so no deployment can inherit
+a seed baked into an image. If the runtime mount is temporarily unusable, Rock
+still starts; private dsFlower calls retry and fail closed until it is repaired.
+
+The mounted privacy directory must be owned by the Rock
 process UID and must not be writable by group or other users (`0700` is the
 recommended mode); the ledger itself is enforced as `0600`. The secret file must
 also be owned by the Rock process UID with exact mode `0600`; its real parent may
-be owned by that UID or root, but must not be writable by group or other users. A
-ledger and secret
-form one node identity: do not clone
-them to a second node, restore only one of them, or roll either one back. Backups
-must retain both consistently. dsFlower deliberately declares no Docker `VOLUME`,
-because the correct persistent-volume and secret wiring belongs to the
-Rock/orchestrator deployment.
+be owned by that UID or root, but must not be writable by group or other users.
+If a service-owned regular seed is missing, malformed or has unsafe permissions,
+dsFlower atomically generates a new one and records a new key epoch without
+changing the ledger budget. Unsafe symlinks/ownership remain fail-closed. Ledger
+loss or rollback is not recoverable this way and can invalidate lifetime DP, so
+the ledger requires durable backup. Do not clone a complete node state to a
+concurrent node. dsFlower deliberately declares no Docker `VOLUME`, because the
+correct persistent-volume wiring belongs to the Rock/orchestrator deployment.
+
+Set both `DSFLOWER_NODE_SECRET_FILE` and `DSFLOWER_PRIVACY_LEDGER_PATH` to opt in
+to pre-service bootstrap. With neither (or only one), the wrapper does not guess:
+Opal and Armadillo inject profile R options only after creating a session, so
+bootstrap is deferred to `flowerInitDS()`. R-option precedence is preserved for
+existing deployments. A conflicting ledger ENV and R option is rejected instead
+of selecting a new empty accountant.
+
+This runtime contract is connector-neutral, but persistence is an orchestrator
+property. A profile manager that removes and recreates Rock without reattaching
+the same durable volume cannot preserve lifetime accounting. In that setup,
+including currently managed Armadillo Docker profiles without volume support,
+run this Rock as an externally managed Compose/Kubernetes service (or add named
+volume support to the profile manager) and point the profile at it.
 
 ## Notes
 

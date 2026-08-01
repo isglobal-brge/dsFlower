@@ -161,6 +161,23 @@ the key is opened. There is no fallback to R's RNG, a client seed,
 `datashield.seed`, a predictable constant
 or a secret baked into a container image.
 
+The official image wraps Rock's existing service-start hook, which already runs
+as the `rock` UID after runtime mounts are prepared. If a deployment explicitly
+provides both state-path environment variables, that hook initializes the ledger
+and seed before the service opens its port. Otherwise it defers until the first
+`flowerInitDS()`, when DataSHIELD profile options are available. `configure`,
+`.onLoad()` and Docker build never create privacy state; both image builds contain
+negative assertions for the files. If runtime storage is unavailable, Rock
+remains up for operational repair, while private entry points retry and remain
+fail-closed.
+
+Missing, malformed or permissively-mode'd service-owned regular keys are
+atomically regenerated and recorded in the ledger as a new append-only key
+epoch. This does not alter policies, reservations or counters. Symlinks,
+foreign-owned files and unsafe parents remain fail-closed. Old releases are
+never recomputed after rotation: an exact retry receives its cached response or
+a data-independent no-op.
+
 DP Gaussian values come from a ChaCha20 stream with domain-separated subkeys.
 Poisson sampling and HookApp partitioning use their own ChaCha20 subkeys. Torch
 initialization/dropout is data-independent and uses a separate HMAC-derived seed
@@ -262,6 +279,14 @@ unit is replaced.
 Options follow DataSHIELD's `dsflower.*` / `default.dsflower.*` fallback. The
 important privacy options are:
 
+The supplied Rock runtime performs early bootstrap only when the deployment
+provides both node-wide state-path environment variables. Otherwise it defers to
+the first session because Opal/Armadillo inject profile R options only after that
+session exists. This preserves historical R-option precedence. When both an ENV
+and option specify a ledger, they must resolve to the same path or bootstrap
+fails closed. Policy options such as epsilon and delta remain session/profile
+options.
+
 | Option | Default | Meaning |
 |---|---:|---|
 | `dp_total_epsilon` | `3` | Node/domain lifetime epsilon, maximum `10` |
@@ -269,13 +294,13 @@ important privacy options are:
 | `dp_budget_decay` | `0.5` | Geometric `rho`, in `[0.5, 0.99]` |
 | `dp_min_release_epsilon` | `1e-6` | Per-message numerical viability threshold and hard safety minimum, not an allocation floor |
 | `dp_min_release_delta` | `1e-12` | Per-message numerical viability threshold and hard safety minimum |
-| `privacy_ledger_path` | persistent node path | SQLite ledger; ephemeral paths rejected |
+| `privacy_ledger_path` | persistent node path | SQLite ledger; conflicting option/ENV paths are rejected |
 | `dp_privacy_domain` | `node` | Accountant domain |
 | `dp_unit` | `row` | Lifetime adjacency unit (`row` or `patient`) |
 | `patient_column` | unset | Required explicit stable ID column in patient mode |
 | `dp_allow_multiple_domains` | `FALSE` | Requires certified disjoint populations |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound |
-| `node_secret_path` | `/var/lib/dsflower/node_secret` | Dedicated 256-bit key |
+| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV may select another path |
 | `tunnel_chunk_bytes` | `524288` | Per-exchange decoded tunnel payload cap (16--512 KiB); larger streams use multiple exact chunks below DSI's expression-parser limit |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; TCP backpressure when full |
 | `tunnel_request_max_bytes` | `67108864` | Pre-decode cap for an encoded fan-out request |
@@ -311,15 +336,15 @@ options(
   default.dsflower.dp_budget_decay = 0.5,
   default.dsflower.dp_unit = "row",
   default.dsflower.privacy_ledger_path = "/var/lib/dsflower/privacy/ledger.sqlite",
-  default.dsflower.node_secret_path = "/run/secrets/dsflower_node_key",
+  default.dsflower.node_secret_path = "/var/lib/dsflower/privacy/noise_root",
   default.dsflower.hook_enabled = FALSE
 )
 ```
 
-Changing a bound after the ledger has been initialized is rejected. To rotate a
-node secret without changing past releases, keep the old key available until no
-active/retryable run references it; production secret rotation should use key IDs
-and a secret manager.
+Changing a bound after the ledger has been initialized is rejected. Seed loss,
+malformation or an unsafe mode causes an automatic CSPRNG rotation and a new
+auditable key epoch; it does not reset or refund the accountant. Administrators
+can still select a secret-manager path through `DSFLOWER_NODE_SECRET_FILE`.
 
 Deterministic noise is generated from HMAC(node secret, unique ledger release
 identity) and a domain-separated ChaCha20 stream. It gives computational DP
@@ -377,13 +402,14 @@ Production images should be selected by immutable digest, including the Rock bas
 image used to build dsFlower; the supplied Dockerfiles deliberately have no base
 image default.
 
-The ledger directory and node secret are persistent state, not image contents.
-They must survive rescheduling/upgrades and be backed up consistently as one node
-identity; neither may be rolled back or cloned to another node. Container
-deployments should persist `/var/lib/dsflower/privacy/` and inject the secret file
-separately. Mounting all of `/var/lib/dsflower` would hide the baked `venvs/` and
-is therefore not recommended. The package intentionally leaves volume/secret
-wiring to the Rock or cluster orchestrator.
+The ledger and node secret are runtime state, never image contents. Container
+deployments should persist `/var/lib/dsflower/privacy/`, which contains both by
+default; a missing seed is recoverable, while deletion or rollback of the ledger
+can reset composition and invalidate the guarantee. Neither ledger nor a full
+node state directory may be cloned to a concurrent node protecting the same
+population. Mounting all of `/var/lib/dsflower` would hide the baked `venvs/` and
+is therefore not recommended. The package intentionally leaves volume wiring to
+the Rock or cluster orchestrator.
 
 ## 8. Residual boundaries
 
