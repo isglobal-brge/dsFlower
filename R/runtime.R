@@ -146,8 +146,12 @@
                                      extra_pypath = NULL) {
   venv_bin <- file.path(venv_path, "bin")
   current_path <- Sys.getenv("PATH", "")
-  secret_path <- .validate_node_secret(.node_secret_path())
-  ledger_path <- .privacy_ledger_path()
+  # This is the final common boundary before trusted Python can make a private
+  # release. Bootstrap here as defence in depth so a future launch path cannot
+  # accidentally depend on an earlier caller having materialized the key.
+  privacy_state <- .privacy_runtime_bootstrap()
+  secret_path <- .validate_node_secret(privacy_state$secret_path)
+  ledger_path <- privacy_state$ledger_path
   if (!file.exists(ledger_path)) {
     stop("The privacy ledger was not initialized before SuperNode launch.",
          call. = FALSE)

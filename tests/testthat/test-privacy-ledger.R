@@ -570,6 +570,46 @@ test_that("ephemeral node-secret paths require the explicit test escape hatch", 
   expect_error(dsFlower:::.node_secret_path(), "must be persistent")
 })
 
+test_that("node-secret ENV stays authoritative without blocking rotation", {
+  withr::with_tempdir({
+    from_env <- file.path(getwd(), "env", "noise_root")
+    from_option <- file.path(getwd(), "option", "noise_root")
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = from_env,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
+    ))
+    withr::local_options(list(dsflower.node_secret_path = from_option))
+    expect_identical(
+      dsFlower:::.node_secret_path(),
+      dsFlower:::.canonical_state_path(from_env)
+    )
+
+    withr::local_envvar(c(DSFLOWER_NODE_SECRET_FILE = NA_character_))
+    expect_identical(
+      dsFlower:::.node_secret_path(),
+      dsFlower:::.canonical_state_path(from_option)
+    )
+  })
+})
+
+test_that("every private release gate bootstraps state before proceeding", {
+  call_order <- function(fn) {
+    all.names(body(fn), functions = TRUE, unique = FALSE)
+  }
+  expect_before <- function(fn, first, second) {
+    calls <- call_order(fn)
+    expect_false(is.na(match(first, calls)))
+    expect_false(is.na(match(second, calls)))
+    expect_lt(match(first, calls), match(second, calls))
+  }
+
+  expect_before(flowerInitDS, ".privacy_runtime_bootstrap", "get")
+  expect_before(
+    flowerPrepareRunDS, ".privacy_runtime_bootstrap", ".reserve_privacy_run")
+  expect_before(
+    flowerEnsureSuperNodeDS, ".privacy_runtime_bootstrap", ".supernode_ensure")
+})
+
 test_that("loading the package never materializes runtime privacy state", {
   withr::with_tempdir({
     secret <- file.path(getwd(), "privacy", "noise_root")

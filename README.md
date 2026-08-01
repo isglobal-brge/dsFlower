@@ -172,11 +172,14 @@ to a verified discrete-Gaussian sampler would require a new mechanism/accountant
 ABI and a privacy-policy migration, rather than a drop-in RNG change.
 
 DataSHIELD does not define a portable, connector-level confidential seed for
-Opal or Armadillo. `dsBase::setSeedDS()` sets R's mutable `.Random.seed` from an
-analyst-supplied integer, so it is a reproducibility facility rather than a
-secret mechanism key. A deployment-specific R option may exist, but dsFlower
-intentionally neither depends on nor exposes it; the dedicated node secret is
-the fail-closed source of keyed release randomness.
+Opal or Armadillo. Current Opal releases inject a short `datashield.seed` R
+option derived from the Opal service secret and log the resulting integer;
+Armadillo stores an administrator-editable nine-digit value in each profile.
+`dsBase::setSeedDS()` separately replaces R's mutable `.Random.seed` from an
+analyst-supplied integer and returns the resulting state. These are
+reproducibility/masking facilities, not confidential 256-bit DP mechanism keys.
+dsFlower intentionally neither depends on nor exposes them; the dedicated node
+secret is the fail-closed source of keyed release randomness.
 
 ## Data and output minimization
 
@@ -248,8 +251,10 @@ explicitly provides both `DSFLOWER_NODE_SECRET_FILE` and
 `DSFLOWER_PRIVACY_LEDGER_PATH`. Without both, it waits for the first session so
 Opal/Armadillo profile R options retain their historical precedence. If an ENV
 and R option both name a ledger, they must resolve to the same path; a conflict
-fails closed instead of silently creating a fresh accountant. Epsilon and all
-other policy controls remain normal DataSHIELD profile options.
+fails closed instead of silently selecting different accounting state. For the
+recoverable node key, `DSFLOWER_NODE_SECRET_FILE` deliberately takes precedence
+over the R option, so a stale option never blocks safe regeneration. Epsilon and
+all other policy controls remain normal DataSHIELD profile options.
 
 | Option suffix | Default | Meaning |
 |---|---:|---|
@@ -264,7 +269,7 @@ other policy controls remain normal DataSHIELD profile options.
 | `dp_allow_multiple_domains` | `FALSE` | Opt-in reserved for demonstrably disjoint populations. |
 | `privacy_ledger_path` | persistent node path | SQLite ledger; R option keeps precedence and a conflicting runtime ENV is rejected. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |
-| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; deployment ENV may select a secret-manager path. |
+| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; `DSFLOWER_NODE_SECRET_FILE` takes precedence when a deployment selects a secret-manager path. |
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |
 | `max_fab_bytes` | `52428800` | Per-FAB compressed upload cap. |
 | `app_spool_max_bytes` | `1073741824` | Global logical-byte cap across all uploaded FABs and unpacked apps. |

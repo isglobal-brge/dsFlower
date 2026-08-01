@@ -44,12 +44,17 @@ RUN R -e 'p<-c("arrow","DBI","digest","filelock","jsonlite","processx","rappdirs
  && chown -R rock:rock /var/lib/rock/R/library/dsFlower /var/lib/dsflower \
  && install -d -o rock -g rock -m 0700 /var/lib/dsflower/privacy \
  && rm -rf /tmp/dsFlower.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv \
+ && test ! -e "${DSFLOWER_NODE_SECRET_FILE:-/var/lib/dsflower/privacy/noise_root}" \
+ && test ! -L "${DSFLOWER_NODE_SECRET_FILE:-/var/lib/dsflower/privacy/noise_root}" \
+ && test ! -e "${DSFLOWER_PRIVACY_LEDGER_PATH:-/var/lib/dsflower/privacy/ledger.sqlite}" \
+ && test ! -L "${DSFLOWER_PRIVACY_LEDGER_PATH:-/var/lib/dsflower/privacy/ledger.sqlite}" \
  && test ! -e /var/lib/dsflower/privacy/noise_root \
  && test ! -L /var/lib/dsflower/privacy/noise_root \
  && test ! -e /var/lib/dsflower/node_secret \
  && test ! -L /var/lib/dsflower/node_secret \
  && test ! -e /var/lib/dsflower/privacy/ledger.sqlite \
- && test ! -L /var/lib/dsflower/privacy/ledger.sqlite
+ && test ! -L /var/lib/dsflower/privacy/ledger.sqlite \
+ && R -e '.libPaths(c("/var/lib/rock/R/library", .libPaths())); p<-c(Sys.getenv("DSFLOWER_NODE_SECRET_FILE",unset=""),Sys.getenv("DSFLOWER_PRIVACY_LEDGER_PATH",unset=""),dsFlower:::.dsf_option("node_secret_path",""),dsFlower:::.dsf_option("privacy_ledger_path",""),"/var/lib/dsflower/privacy/noise_root","/var/lib/dsflower/privacy/ledger.sqlite"); p<-as.character(p); p<-p[!is.na(p)&nzchar(p)]; if(any(file.exists(p)|vapply(p,dsFlower:::.path_is_symlink,logical(1)))) stop("privacy state was created during image build")'
 
 # Keep the upstream entrypoint/CMD untouched. Its final service hook already runs
 # as `rock`, after Rock has prepared its mounts. The wrapper bootstraps early only

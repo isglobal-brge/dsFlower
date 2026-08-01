@@ -20,6 +20,45 @@ local_runtime_privacy_state <- function(.local_envir = parent.frame()) {
   invisible(state_dir)
 }
 
+test_that("the final Python boundary creates and repairs missing privacy state", {
+  withr::with_tempdir({
+    state_dir <- file.path(getwd(), "privacy")
+    secret <- file.path(state_dir, "noise_root")
+    ledger <- file.path(state_dir, "ledger.sqlite")
+    withr::local_options(list(dsflower.privacy_ledger_path = ledger))
+    withr::local_envvar(c(
+      DSFLOWER_NODE_SECRET_FILE = secret,
+      DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    ))
+
+    expect_false(file.exists(secret))
+    expect_false(file.exists(ledger))
+    dir.create(file.path(getwd(), "staging-1"))
+    first_env <- dsFlower:::.build_clean_python_env(
+      file.path(getwd(), "venv"), file.path(getwd(), "staging-1"))
+    first_secret <- readLines(secret, warn = FALSE)
+    expect_match(first_secret, "^[0-9a-f]{64}$")
+    expect_true(file.exists(ledger))
+    expect_identical(unname(first_env[["DSFLOWER_NODE_SECRET_FILE"]]), secret)
+    expect_identical(unname(first_env[["DSFLOWER_PRIVACY_LEDGER_PATH"]]), ledger)
+
+    unlink(secret)
+    dir.create(file.path(getwd(), "staging-2"))
+    second_env <- dsFlower:::.build_clean_python_env(
+      file.path(getwd(), "venv"), file.path(getwd(), "staging-2"))
+    expect_match(readLines(secret, warn = FALSE), "^[0-9a-f]{64}$")
+    expect_false(identical(readLines(secret, warn = FALSE), first_secret))
+    expect_identical(unname(second_env[["DSFLOWER_NODE_SECRET_FILE"]]), secret)
+
+    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
+    on.exit(DBI::dbDisconnect(con), add = TRUE)
+    expect_equal(DBI::dbGetQuery(
+      con, "SELECT COUNT(*) AS n FROM privacy_key_epochs")$n, 2L)
+  })
+})
+
 test_that("the mandatory Python integrity bootstrap installs or fails closed", {
   staging <- withr::local_tempdir()
   source_dir <- withr::local_tempdir()

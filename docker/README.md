@@ -93,8 +93,10 @@ Set both `DSFLOWER_NODE_SECRET_FILE` and `DSFLOWER_PRIVACY_LEDGER_PATH` to opt i
 to pre-service bootstrap. With neither (or only one), the wrapper does not guess:
 Opal and Armadillo inject profile R options only after creating a session, so
 bootstrap is deferred to `flowerInitDS()`. R-option precedence is preserved for
-existing deployments. A conflicting ledger ENV and R option is rejected instead
-of selecting a new empty accountant.
+existing ledger deployments, and a conflicting ledger ENV and R option is
+rejected instead of silently selecting different accounting state. The node-key
+ENV is authoritative over its R option, so a stale key path cannot block
+regeneration.
 
 This runtime contract is connector-neutral, but persistence is an orchestrator
 property. A profile manager that removes and recreates Rock without reattaching
