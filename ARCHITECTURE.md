@@ -284,8 +284,9 @@ provides both node-wide state-path environment variables. Otherwise it defers to
 the first session because Opal/Armadillo inject profile R options only after that
 session exists. This preserves historical R-option precedence. When both an ENV
 and option specify a ledger, they must resolve to the same path or bootstrap
-fails closed. Policy options such as epsilon and delta remain session/profile
-options.
+fails closed. `DSFLOWER_NODE_SECRET_FILE` instead takes precedence over a stale
+key-path option so recoverable regeneration never blocks. Policy options such as
+epsilon and delta remain session/profile options.
 
 | Option | Default | Meaning |
 |---|---:|---|
@@ -300,7 +301,7 @@ options.
 | `patient_column` | unset | Required explicit stable ID column in patient mode |
 | `dp_allow_multiple_domains` | `FALSE` | Requires certified disjoint populations |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound |
-| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV may select another path |
+| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV takes precedence when it selects another path |
 | `tunnel_chunk_bytes` | `524288` | Per-exchange decoded tunnel payload cap (16--512 KiB); larger streams use multiple exact chunks below DSI's expression-parser limit |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; TCP backpressure when full |
 | `tunnel_request_max_bytes` | `67108864` | Pre-decode cap for an encoded fan-out request |
@@ -345,6 +346,8 @@ Changing a bound after the ledger has been initialized is rejected. Seed loss,
 malformation or an unsafe mode causes an automatic CSPRNG rotation and a new
 auditable key epoch; it does not reset or refund the accountant. Administrators
 can still select a secret-manager path through `DSFLOWER_NODE_SECRET_FILE`.
+That process-level path is authoritative if a stale DataSHIELD profile option
+names another key, so the mismatch never blocks a recoverable rotation.
 
 Deterministic noise is generated from HMAC(node secret, unique ledger release
 identity) and a domain-separated ChaCha20 stream. It gives computational DP

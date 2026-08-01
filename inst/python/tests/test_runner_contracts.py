@@ -108,6 +108,66 @@ class PublicPrivacyTailTests(unittest.TestCase):
                 for tree in booster["trees"] for weight in tree["w"]))
 
 
+class ReplaySafetyTests(unittest.TestCase):
+    def test_replay_never_reads_private_data_or_new_seed(self):
+        claim = {
+            "status": "replay", "message_id": "m-replay", "release_index": 1,
+            "max_releases": 2, "run_token": "run_" + "a" * 32,
+            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+        }
+        incoming = np.asarray([1.0, 2.0], dtype=np.float32)
+        cached = np.asarray([9.0, 8.0], dtype=np.float32)
+        private_access = AssertionError("replay touched private release state")
+
+        for has_cache in (True, False):
+            with self.subTest(has_cache=has_cache):
+                msg = Message(
+                    content=RecordDict({
+                        "arrays": ArrayRecord(numpy_ndarrays=[incoming])
+                    }),
+                    dst_node_id=1,
+                    message_type="train",
+                )
+                context = SimpleNamespace(state=RecordDict())
+                if has_cache:
+                    client_app._cache_reply(context, claim, [cached])
+
+                with (mock.patch.object(
+                          client_app.release_guard, "claim_release",
+                          return_value=claim),
+                      mock.patch.object(
+                          client_app.release_guard, "release_id",
+                          side_effect=private_access) as release_id,
+                      mock.patch.object(
+                          client_app, "load_pinned_run_config",
+                          side_effect=private_access) as load_config,
+                      mock.patch.object(
+                          client_app, "load_data",
+                          side_effect=private_access) as load_data,
+                      mock.patch.object(
+                          client_app, "load_image_collection",
+                          side_effect=private_access) as load_images,
+                      mock.patch.object(
+                          client_app.seeding, "master_seed",
+                          side_effect=private_access) as master_seed,
+                      mock.patch.object(
+                          client_app, "_train_trees",
+                          side_effect=private_access) as train_trees,
+                      mock.patch.object(
+                          client_app, "_train_neural",
+                          side_effect=private_access) as train_neural):
+                    reply = client_app.train(msg, context)
+
+                for private_call in (
+                        release_id, load_config, load_data, load_images,
+                        master_seed, train_trees, train_neural):
+                    private_call.assert_not_called()
+                self.assertFalse(reply.has_error())
+                actual = reply.content["arrays"].to_numpy_ndarrays()[0]
+                np.testing.assert_array_equal(
+                    actual, cached if has_cache else incoming)
+
+
 class MultilabelRuntimeTests(unittest.TestCase):
     def test_tabular_loader_returns_n_by_l_targets(self):
         with tempfile.TemporaryDirectory() as manifest_dir:

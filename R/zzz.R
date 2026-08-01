@@ -26,6 +26,10 @@
   configured <- .dsf_option(
     "node_secret_path", "/var/lib/dsflower/privacy/noise_root")
   from_env <- Sys.getenv("DSFLOWER_NODE_SECRET_FILE", unset = "")
+  # Process-level configuration is authoritative and is also what the runtime
+  # wrapper can see before a DataSHIELD session injects profile R options.
+  # Selecting it consistently avoids blocking a safe key rotation merely
+  # because a stale profile option names another path.
   path <- if (nzchar(from_env)) from_env else configured
   if (length(path) != 1L || is.na(path) || !nzchar(as.character(path)) ||
       !.path_is_absolute(as.character(path))) {
