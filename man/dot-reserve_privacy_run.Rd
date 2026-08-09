@@ -2,11 +2,11 @@
 % Please edit documentation in R/privacy_ledger.R
 \name{.reserve_privacy_run}
 \alias{.reserve_privacy_run}
-\title{Atomically reserve the next lifetime allocation for a run}
+\title{Atomically reserve the next configured privacy allocation for a run}
 \usage{
 .reserve_privacy_run(run_token, max_releases)
 }
 \description{
-Atomically reserve the next lifetime allocation for a run
+Atomically reserve the next configured privacy allocation for a run
 }
 \keyword{internal}
