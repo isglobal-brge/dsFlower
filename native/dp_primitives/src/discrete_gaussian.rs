@@ -39,19 +39,21 @@
 //!
 //! This is a minimal port of OpenDP 0.15.1 commit c34d3d04a8872a51af523d9a2244be6171173b7d.
 //! The arithmetic and rejection rules are unchanged.  The only mechanism-level
-//! change is replacing vendored OpenSSL with buffered operating-system random
-//! bytes for each ABI invocation.
+//! change is replacing vendored OpenSSL with a domain-separated HMAC-SHA256
+//! stream keyed by dsFlower's canonical semantic training identity.
 
 use dashu_base::{Abs, BitTest, Sign};
 use dashu_int::{IBig, UBig};
 use dashu_ratio::RBig;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use zeroize::Zeroize;
 
-const ENTROPY_BUFFER_LENGTH: usize = 64 * 1024;
+const PRF_BLOCK_LENGTH: usize = 32;
+const PRF_DOMAIN: &[u8] = b"dsflower/dp-primitives/prf/v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SamplerError {
-    Entropy,
     InvalidState,
 }
 
@@ -59,35 +61,52 @@ trait RandomBytes {
     fn fill_bytes(&mut self, buffer: &mut [u8]) -> Result<(), SamplerError>;
 }
 
-pub(crate) struct BufferedSystemRandom {
-    buffer: Box<[u8; ENTROPY_BUFFER_LENGTH]>,
+pub(crate) struct SemanticPrfRandom {
+    base: Hmac<Sha256>,
+    block: [u8; PRF_BLOCK_LENGTH],
     cursor: usize,
+    counter: u64,
 }
 
-impl BufferedSystemRandom {
-    pub(crate) fn new() -> Result<Self, SamplerError> {
-        let mut buffer = Box::new([0_u8; ENTROPY_BUFFER_LENGTH]);
-        getrandom::fill(buffer.as_mut_slice()).map_err(|_| SamplerError::Entropy)?;
-        Ok(Self { buffer, cursor: 0 })
+impl SemanticPrfRandom {
+    pub(crate) fn new(mut key: [u8; 32], domain: &[u8]) -> Result<Self, SamplerError> {
+        let mut base =
+            Hmac::<Sha256>::new_from_slice(&key).map_err(|_| SamplerError::InvalidState)?;
+        key.zeroize();
+        base.update(PRF_DOMAIN);
+        base.update(&(domain.len() as u64).to_be_bytes());
+        base.update(domain);
+        Ok(Self {
+            base,
+            block: [0_u8; PRF_BLOCK_LENGTH],
+            cursor: PRF_BLOCK_LENGTH,
+            counter: 0,
+        })
     }
 
     fn refill(&mut self) -> Result<(), SamplerError> {
-        getrandom::fill(self.buffer.as_mut_slice()).map_err(|_| SamplerError::Entropy)?;
+        let mut mac = self.base.clone();
+        mac.update(&self.counter.to_be_bytes());
+        self.block.copy_from_slice(&mac.finalize().into_bytes());
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(SamplerError::InvalidState)?;
         self.cursor = 0;
         Ok(())
     }
 }
 
-impl RandomBytes for BufferedSystemRandom {
+impl RandomBytes for SemanticPrfRandom {
     fn fill_bytes(&mut self, buffer: &mut [u8]) -> Result<(), SamplerError> {
         let mut written = 0;
         while written < buffer.len() {
-            if self.cursor == self.buffer.len() {
+            if self.cursor == self.block.len() {
                 self.refill()?;
             }
-            let count = (buffer.len() - written).min(self.buffer.len() - self.cursor);
+            let count = (buffer.len() - written).min(self.block.len() - self.cursor);
             buffer[written..written + count]
-                .copy_from_slice(&self.buffer[self.cursor..self.cursor + count]);
+                .copy_from_slice(&self.block[self.cursor..self.cursor + count]);
             written += count;
             self.cursor += count;
         }
@@ -95,10 +114,11 @@ impl RandomBytes for BufferedSystemRandom {
     }
 }
 
-impl Drop for BufferedSystemRandom {
+impl Drop for SemanticPrfRandom {
     fn drop(&mut self) {
-        self.buffer.zeroize();
+        self.block.zeroize();
         self.cursor = 0;
+        self.counter = 0;
     }
 }
 
@@ -274,7 +294,7 @@ fn sample_discrete_laplace(scale: RBig, rng: &mut impl RandomBytes) -> Result<IB
 
 pub(crate) fn sample_discrete_gaussian(
     scale: RBig,
-    rng: &mut BufferedSystemRandom,
+    rng: &mut SemanticPrfRandom,
 ) -> Result<IBig, SamplerError> {
     sample_discrete_gaussian_with_rng(scale, rng)
 }
@@ -327,11 +347,23 @@ mod tests {
     }
 
     #[test]
-    fn system_random_refills_at_the_public_buffer_boundary() {
-        let mut rng = BufferedSystemRandom::new().expect("operating-system entropy");
-        let mut bytes = vec![0_u8; ENTROPY_BUFFER_LENGTH + 17];
-        rng.fill_bytes(&mut bytes).expect("buffer refill");
-        assert_eq!(rng.cursor, 17);
+    fn semantic_prf_has_a_stable_known_answer() {
+        let key = core::array::from_fn(|index| index as u8);
+        let domain = b"xgb/tree/00000001/level/00000002";
+        let mut rng = SemanticPrfRandom::new(key, domain).expect("semantic PRF");
+        let mut bytes = [0_u8; 64];
+        rng.fill_bytes(&mut bytes).expect("semantic PRF stream");
+        assert_eq!(
+            bytes,
+            [
+                0x22, 0x6a, 0x8c, 0x56, 0x2f, 0xb1, 0x4c, 0xe5, 0x71, 0x6f, 0x91, 0x1b, 0x97, 0xc9,
+                0xc1, 0x08, 0xcb, 0x8a, 0x10, 0x17, 0x15, 0x1b, 0x98, 0x09, 0x6e, 0x29, 0xcc, 0x34,
+                0x34, 0x0d, 0xf6, 0xda, 0xe8, 0x6c, 0xb6, 0x57, 0xa8, 0x0d, 0x81, 0x2a, 0xc7, 0x82,
+                0xa7, 0x76, 0xe9, 0x46, 0x6d, 0x6d, 0xbc, 0xaa, 0xdd, 0x39, 0xc8, 0x84, 0x6c, 0xb8,
+                0x44, 0x97, 0x7f, 0x4c, 0xec, 0x8b, 0xfe, 0xdb,
+            ]
+        );
+        assert_eq!(rng.cursor, PRF_BLOCK_LENGTH);
     }
 
     #[test]

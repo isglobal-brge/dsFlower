@@ -7,31 +7,29 @@ discrete Gaussian noise for signed 64-bit fixed-point statistics.
 The exact CKS20 sampler is a minimal source port from OpenDP 0.15.1 commit
 `c34d3d04a8872a51af523d9a2244be6171173b7d`. It keeps OpenDP's
 arbitrary-precision rational arithmetic and rejection rules, but does not link
-OpenDP or OpenSSL. Each invocation consumes buffered operating-system random
-bytes through `getrandom`; refills fail closed and never fall back to another
-generator. The buffer only amortizes system calls—it does not expand a seed
-through another PRG. Noise is added in arbitrary precision and then saturated
-to `i64`; saturation is deterministic post-processing of the release.
-The sampler distribution is exact conditional on independent uniform random
-bytes; a production build relies computationally on the operating-system RNG
-to realize that ideal source.
+OpenDP or OpenSSL. Each invocation consumes a domain-separated HMAC-SHA256
+stream keyed by a 32-byte key derived from the custodial root and the complete
+semantic training identity. The ABI never accepts the durable root or an
+analyst-provided seed. Equal semantic work reproduces identical noise without
+a database; a different mechanism coordinate uses a different domain. Noise is
+added in arbitrary precision and then saturated to `i64`; saturation is
+deterministic post-processing of the release. The exact sampler is therefore
+driven by a stream computationally indistinguishable from uniform bits under
+the HMAC-SHA256 PRF assumption.
 
 The source algorithm was exposed as `contrib` by pre-1.0 OpenDP. Porting and
 pinning it is not a substitute for dsFlower's own proof review, known-issue
 audit and cross-platform release tests. `UPSTREAM.env` records the exact
 upstream tree, archive and source-file hashes used for line-by-line review.
 
-No seed crosses the current ABI, so this primitive is not yet compatible with
-dsFlower's stateless sticky contract. Before activation, its adapter must feed
-the sampler a domain-separated stream derived from the custodial node root and
-the canonical semantic training identity. Equivalent retries must therefore
-recompute the same bytes without a database or artifact cache; a changed
-effective statistic or mechanism configuration must derive a different stream.
+Only a per-training derived key crosses the trusted ABI. The caller must bind it
+to the canonical effective statistic and complete mechanism configuration, and
+must use a unique canonical domain for every tree/level release coordinate.
 
 This library is not itself a complete DP algorithm.  A caller must prove and
 enforce contribution bounds, fixed-point sensitivity, scale calibration,
-within-training composition, semantic PRF binding, and egress sanitization. Until the native
-engine adapters do so, no capability may be advertised.
+within-training composition, semantic PRF binding, and egress sanitization.
+Until the native engine adapters do so, no capability may be advertised.
 
 The exact rejection sampler and arbitrary-precision arithmetic are
 variable-time. Its output-distribution proof does not cover timing or resource

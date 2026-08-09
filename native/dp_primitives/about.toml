@@ -1,4 +1,4 @@
-accepted = ["Apache-2.0", "MIT"]
+accepted = ["Apache-2.0", "BSD-3-Clause", "MIT"]
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
