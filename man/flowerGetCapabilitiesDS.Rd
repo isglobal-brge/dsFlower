@@ -4,10 +4,7 @@
 \alias{flowerGetCapabilitiesDS}
 \title{Get Server Capabilities}
 \usage{
-flowerGetCapabilitiesDS(handle_symbol = NULL)
-}
-\arguments{
-\item{handle_symbol}{Ignored compatibility argument.}
+flowerGetCapabilitiesDS()
 }
 \value{
 Named list of capabilities.
@@ -16,7 +13,5 @@ Named list of capabilities.
 DataSHIELD AGGREGATE method. Returns information about the server's
 Flower capabilities including Python version, the hash-pinned declarative
 runner vocabulary, and disclosure settings. The response is independent of
-cohort contents, handle state, filesystem paths, and other sessions. The
-legacy template catalogue is retained as an explicitly deprecated empty
-field.
+cohort contents, handle state, filesystem paths, and other sessions.
 }

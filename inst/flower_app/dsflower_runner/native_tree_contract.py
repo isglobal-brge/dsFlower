@@ -8,8 +8,8 @@ future node-owned adapter must satisfy before it can touch private data:
   parameters;
 * resource limits are explicit and may only reject work, never silently alter a
   privacy mechanism;
-* a keyed semantic identity makes memoization stable without disclosing the
-  node's persistent identity root (which is separate from its noise root); and
+* the sole persistent noise root keys a semantic identity, so equivalent work
+  can be recomputed with identical randomness without a query database; and
 * the result channel contains only fixed metadata and a digest of a separately
   transported, non-executable model/synopsis artifact.  It has no free-form log,
   path or exception field.
@@ -495,9 +495,7 @@ def _canonical_public_schema(value, mode, task, resources):
 
 def _canonical_data_scope(value):
     scope = _mapping(value, "data scope")
-    fields = frozenset((
-        "snapshot_hash", "cohort_hash", "schema_hash", "privacy_epoch_hash",
-    ))
+    fields = frozenset(("snapshot_hash", "cohort_hash", "schema_hash"))
     _exact_fields(scope, fields, "data scope")
     canonical = {}
     for name in sorted(fields):
@@ -604,26 +602,24 @@ def invocation_identity(value):
     return "inv1_" + digest
 
 
-def semantic_query_identity(identity_root, value):
+def semantic_query_identity(noise_root, value):
     """Return a domain-separated HMAC identity for sticky DP randomness.
 
     A native-tight identity includes every engine parameter because it can change
     the sequence/sensitivity of private accesses.  In synopsis-flex mode only
     the task, schema, dataset scope and synopsis/privacy mechanism remain bound.
     The engine and ``engine_params`` are downstream postprocessing and are
-    omitted so one cached DP synopsis can serve XGBoost, LightGBM, CatBoost and
-    local HPO for that task.  Resource ceilings are non-semantic in both modes:
+    omitted so one deterministic DP synopsis can serve XGBoost, LightGBM,
+    CatBoost and local HPO for that task. Resource ceilings are non-semantic:
     implementations must reject at a ceiling and never silently clip work to it.
 
-    ``identity_root`` is a persistent node-internal HMAC key dedicated to
-    identities.  It must not be the DP noise root, and the returned identifier
-    must never be exposed through the analyst-facing protocol.  Epsilon/delta
-    are deliberately absent because cache lookup precedes privacy reservation;
-    the ledger binds a committed artifact to the active policy separately.
+    ``noise_root`` is the sole persistent node-internal HMAC key. The returned
+    identifier must never be exposed through the analyst-facing protocol.
+    Epsilon, delta and every mechanism pin are part of the identity.
     """
-    if not isinstance(identity_root, (bytes, bytearray, memoryview)) or \
-            len(identity_root) < 32:
-        raise ValueError("identity root must be at least 32 bytes")
+    if not isinstance(noise_root, (bytes, bytearray, memoryview)) or \
+            len(noise_root) != 32:
+        raise ValueError("noise root must be exactly 32 bytes")
     manifest = canonical_engine_manifest(value)
     material = {
         "identity_version": 1,
@@ -631,18 +627,7 @@ def semantic_query_identity(identity_root, value):
         "mode": manifest["mode"],
         "task": manifest["task"],
         "public_schema": manifest["public_schema"],
-        # epsilon/delta describe the later accountant allocation.  Identity is
-        # claimed before that reservation so cache lookup cannot depend on them;
-        # the durable ledger separately binds a replay to its policy hash.
-        "privacy": {
-            "mechanism": manifest["privacy"]["mechanism"],
-            "unit": manifest["privacy"]["unit"],
-            "adjacency": manifest["privacy"]["adjacency"],
-            "unit_canonicalization": manifest["privacy"]["unit_canonicalization"],
-            "contribution_strategy": manifest["privacy"]["contribution_strategy"],
-            "max_rows_per_unit": manifest["privacy"]["max_rows_per_unit"],
-            "mechanism_params": manifest["privacy"]["mechanism_params"],
-        },
+        "privacy": manifest["privacy"],
         "data_scope": manifest["data_scope"],
     }
     if manifest["mode"] == "native-tight":
@@ -652,7 +637,7 @@ def semantic_query_identity(identity_root, value):
     else:
         prefix = "sq1s_"
     digest = hmac.new(
-        bytes(identity_root),
+        bytes(noise_root),
         b"dsflower/native-tree/semantic-query/v1\x00" + _canonical_json(material),
         hashlib.sha256,
     ).hexdigest()

@@ -210,7 +210,7 @@
     "forcedsplits_filename", "gpu_device_id", "input_model", "logging_level",
     "machine_list_file", "machines", "max_rows_per_unit", "model_file", "n_jobs", "noise",
     "noise_multiplier", "noise_root", "noise_seed", "nthread", "num_threads",
-    "output_model", "patient_column", "privacy", "privacy_budget", "requirements", "requirement",
+    "output_model", "patient_column", "privacy", "requirements", "requirement",
     "sensitivity", "snapshot_file", "task_type", "thread_count", "train_dir",
     "unit", "unit_canonicalization", "updater", "verbose", "verbosity") ||
     startsWith(name, "contribution_") || startsWith(name, "dp_") ||

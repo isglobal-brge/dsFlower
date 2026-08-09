@@ -18,7 +18,8 @@ if RUNNER_ROOT not in sys.path:
 
 from dsflower_runner import (client_app, params, seeding, server_app, task,
                              validation)  # noqa: E402
-from flwr.common import ArrayRecord, Message, MetricRecord, RecordDict  # noqa: E402
+from flwr.common import (ArrayRecord, ConfigRecord, Message, MetricRecord,
+                         RecordDict)  # noqa: E402
 
 
 class ValidationSensitivityTests(unittest.TestCase):
@@ -343,7 +344,7 @@ class ValidationInferenceTests(unittest.TestCase):
         for got, want in zip(actual, expected):
             np.testing.assert_array_equal(got, want)
 
-    def test_server_rejects_legacy_tree_validation_track(self):
+    def test_server_rejects_removed_tree_validation_track(self):
         with self.assertRaisesRegex(ValueError, "must be neural"):
             validation.public_model_arrays({
                 "validation-model-track": "trees", "num-features": 2,
@@ -462,11 +463,24 @@ class ValidationInferenceTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                     "DSFLOWER_NODE_SECRET_FILE": secret}):
                 released = validation.private_model_validation(
-                    context, cfg, {"epsilon": 1.0, "delta": 1e-5},
-                    "run_test:1:1", arrays)
+                    context, cfg, {
+                        "epsilon": 1.0, "delta": 1e-5,
+                        "policy_hash": "1" * 64,
+                    }, 1, arrays)
+                replayed = validation.private_model_validation(
+                    context, {
+                        **cfg, "run-token": "another-run",
+                        "message-id": "another-message",
+                        "validation-model-path-b64": base64.b64encode(
+                            b"/another/public/path").decode("ascii"),
+                    }, {
+                        "epsilon": 1.0, "delta": 1e-5,
+                        "policy_hash": "1" * 64,
+                    }, 1, arrays)
             self.assertEqual(len(released), 1)
             self.assertEqual(released[0].shape, (16,))
             self.assertTrue(np.all(np.isfinite(released[0])))
+            np.testing.assert_array_equal(released[0], replayed[0])
             raw = validation.validation_contributions(
                 np.asarray([0, 1, 1]),
                 validation.neural_predictions(
@@ -475,7 +489,7 @@ class ValidationInferenceTests(unittest.TestCase):
                 validation.validation_layout("classification", bins=8)).sum(axis=0)
             self.assertFalse(np.array_equal(released[0], raw))
 
-    def test_node_rejects_legacy_tree_validation_before_private_read(self):
+    def test_node_rejects_removed_tree_validation_before_private_read(self):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "manifest.json"), "w",
                       encoding="utf-8") as handle:
@@ -497,7 +511,7 @@ class ValidationInferenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be neural"):
                     validation.private_model_validation(
                         context, cfg, {"epsilon": 1.0, "delta": 1e-5},
-                        "run_legacy:1:1", [np.zeros(1, dtype=np.float32)])
+                        1, [np.zeros(1, dtype=np.float32)])
             load_data.assert_not_called()
 
     def test_invalid_public_model_fails_before_private_frame_read(self):
@@ -524,7 +538,7 @@ class ValidationInferenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validation.private_model_validation(
                         context, cfg, {"epsilon": 1.0, "delta": 1e-5},
-                        "run_test:1:1", [np.zeros(3, dtype=np.float32)])
+                        1, [np.zeros(3, dtype=np.float32)])
 
     def test_invalid_public_preprocessing_fails_before_private_frame_read(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -552,7 +566,7 @@ class ValidationInferenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validation.private_model_validation(
                         context, cfg, {"epsilon": 1.0, "delta": 1e-5},
-                        "run_test:1:1", params.get_torch_params(model))
+                        1, params.get_torch_params(model))
 
     def test_server_sums_all_node_releases_and_saves_no_per_node_payload(self):
         layout = validation.validation_layout("classification", bins=8)
@@ -582,7 +596,13 @@ class ValidationInferenceTests(unittest.TestCase):
 
             @staticmethod
             def send_and_receive(messages, timeout):
-                del messages, timeout
+                for message in messages:
+                    config = message.content["config"]
+                    if (not isinstance(config, ConfigRecord)
+                            or config.get("server-round") != 1):
+                        raise AssertionError(
+                            "validation message has no canonical round")
+                del timeout
                 return [Reply(first, 1), Reply(second, 2)]
 
         cfg = {
@@ -651,7 +671,7 @@ class ValidationInferenceTests(unittest.TestCase):
                 json.dump({"dp-track": "validation"}, handle)
             context = type("Context", (), {
                 "node_config": {"manifest-dir": directory}})()
-            arrays = client_app._safe_public_noop_arrays(
+            arrays = client_app._safe_public_fallback_arrays(
                 message, context, track=None)
         self.assertEqual(len(arrays), 1)
         self.assertEqual(arrays[0].shape, (1,))
@@ -747,8 +767,8 @@ class ValidationInferenceTests(unittest.TestCase):
         context = type("Context", (), {"state": RecordDict()})()
         claim = {
             "status": "new", "message_id": "validation-message",
-            "release_index": 1, "max_releases": 1,
-            "run_token": "run_" + "a" * 32, "allocation_index": 1,
+            "release_index": 1, "num_rounds": 1,
+            "run_token": "run_" + "a" * 32,
             "epsilon": 1.0, "delta": 1e-5,
         }
         cfg = {
@@ -758,8 +778,6 @@ class ValidationInferenceTests(unittest.TestCase):
         private = np.arange(16, dtype=np.float64)
         with (mock.patch.object(client_app.release_guard, "claim_release",
                                 return_value=claim),
-              mock.patch.object(client_app.release_guard, "release_id",
-                                return_value="release:1"),
               mock.patch.object(client_app, "load_pinned_run_config",
                                 return_value=cfg),
               mock.patch.object(client_app, "load_dp_track",

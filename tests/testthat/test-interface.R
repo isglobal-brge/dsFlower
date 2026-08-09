@@ -4,13 +4,8 @@ local_interface_privacy_state <- function(.local_envir = parent.frame()) {
   state_dir <- tempfile("dsflower-interface-state-")
   dir.create(state_dir, recursive = TRUE)
   withr::defer(unlink(state_dir, recursive = TRUE), envir = .local_envir)
-  withr::local_options(list(
-    dsflower.privacy_ledger_path = file.path(state_dir, "ledger.sqlite")
-  ), .local_envir = .local_envir)
   withr::local_envvar(c(
     DSFLOWER_NODE_SECRET_FILE = file.path(state_dir, "node-secret"),
-    DSFLOWER_PRIVACY_LEDGER_PATH = NA_character_,
-    DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1",
     DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
   ), .local_envir = .local_envir)
   invisible(state_dir)
@@ -176,16 +171,16 @@ test_that(".dsf_option follows option chain", {
   })
 })
 
-test_that("run horizon and data routing are pinned before staging", {
+test_that("run rounds and data routing are pinned before staging", {
   expect_error(
-    dsFlower:::.normalizeRunHorizon(list("num-server-rounds" = 1.5)),
+    dsFlower:::.normalizeRunRounds(list("num-server-rounds" = 1.5)),
     "positive integer"
   )
+  expect_identical(
+    dsFlower:::.normalizeRunRounds(list())[["num-server-rounds"]], 1L)
   expect_error(
-    dsFlower:::.normalizeRunHorizon(list(
-      "num-server-rounds" = 2L, num_rounds = 3L
-    )),
-    "disagree"
+    dsFlower:::.addDpConfigToRunConfig(list(num_rounds = 2L)),
+    "num-server-rounds"
   )
   routed <- dsFlower:::.takeRunDataType(
     list(data_type = "IMAGE", "batch-size" = 8L), expected = "image")
@@ -314,7 +309,7 @@ test_that("validation config is pinned to one well-typed release", {
     "num-classes" = 4L, "num-labels" = 2L,
     "target-levels" = c("a", "b", "c", "d")))
   expect_identical(config[["dp-track"]], "validation")
-  expect_identical(config[["privacy-max-releases"]], 1L)
+  expect_identical(config[["num-server-rounds"]], 1L)
   expect_identical(config[["validation-bins"]], 24L)
   expect_false(config[["allow_per_node_metrics"]])
 
@@ -415,7 +410,8 @@ test_that("validation preparation persists the public contract before execution"
   manifest <- jsonlite::fromJSON(
     file.path(handle$staging_dir, "manifest.json"), simplifyVector = FALSE)
   expect_identical(manifest[["dp-track"]], "validation")
-  expect_identical(manifest[["privacy-max-releases"]], 1L)
+  expect_identical(manifest[["num-server-rounds"]], 1L)
+  expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
   expect_identical(manifest[["validation-model-track"]], "neural")
   expect_identical(manifest[["validation-task"]], "binary")
   expect_identical(manifest[["validation-bins"]], 16L)
@@ -490,8 +486,10 @@ test_that("flowerPrepareRunDS stages data correctly", {
   manifest <- jsonlite::fromJSON(manifest_path)
   expect_equal(manifest$n_samples, 200)
   expect_equal(manifest$target_column, "target")
-  expect_true(manifest[["privacy-reserved"]])
-  expect_equal(manifest[["privacy-allocation-index"]], 1L)
+  expect_identical(manifest[["num-server-rounds"]], 1L)
+  expect_gt(manifest[["privacy-epsilon"]], 0)
+  expect_gt(manifest[["privacy-delta"]], 0)
+  expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
 })
 
 test_that("flowerPrepareRunDS does not expose a minimum-size admission bit", {
@@ -511,114 +509,31 @@ test_that("flowerPrepareRunDS does not expose a minimum-size admission bit", {
   manifest <- jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
   expect_equal(manifest$n_samples, 2L)
   expect_equal(manifest$n_units, 2L)
-  expect_true(manifest[["privacy-reserved"]])
+  expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
 })
 
-test_that("prepare reserves before schema access and never refunds failures", {
+test_that("failed preparation does not alter a later training contract", {
   local_interface_privacy_state()
   dsFlower:::.setHandle(
-    "test_failed_prepare_reservation",
+    "test_failed_prepare_contract",
     mock_handle(table_data = data.frame(f1 = 1:5)))
-  withr::defer(dsFlower:::.removeHandle("test_failed_prepare_reservation"))
+  withr::defer(dsFlower:::.removeHandle("test_failed_prepare_contract"))
   expect_error(
-    flowerPrepareRunDS("test_failed_prepare_reservation", "target", "f1"),
+    flowerPrepareRunDS("test_failed_prepare_contract", "target", "f1"),
     "Private data preparation failed on this node"
   )
 
   dsFlower:::.setHandle(
-    "test_next_prepare_reservation",
+    "test_next_prepare_contract",
     mock_handle(table_data = data.frame(f1 = 1:5, target = rep(0:1, length.out = 5))))
-  withr::defer(dsFlower:::.removeHandle("test_next_prepare_reservation"))
+  withr::defer(dsFlower:::.removeHandle("test_next_prepare_contract"))
   expect_no_error(
-    flowerPrepareRunDS("test_next_prepare_reservation", "target", "f1"))
-  state <- dsFlower:::.getHandle("test_next_prepare_reservation")
+    flowerPrepareRunDS("test_next_prepare_contract", "target", "f1"))
+  state <- dsFlower:::.getHandle("test_next_prepare_contract")
   manifest <- jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
-  expect_equal(manifest[["privacy-allocation-index"]], 2L)
-})
-
-test_that("privacy-tail prepare never opens private sources and remains nonblocking", {
-  local_interface_privacy_state()
-  withr::local_options(list(
-    dsflower.dp_min_release_epsilon = 10,
-    dsflower.dp_unit = "patient",
-    dsflower.patient_column = "subject_id"
-  ))
-
-  private_access <- function(...) {
-    stop("private source was accessed", call. = FALSE)
-  }
-  local_mocked_bindings(
-    .loadTrainingData = private_access,
-    .stageData = private_access,
-    .stageFromDescriptor = private_access,
-    .stage_image_manifest = private_access
-  )
-
-  neural_config <- list(
-    "dp-track" = "neural",
-    "num-server-rounds" = 1L,
-    "num-features" = 2L,
-    "num-classes" = 2L,
-    "target-levels" = c(0, 1),
-    "feature-bounds" = list(lower = c(-1, -2), upper = c(1, 2)),
-    "loss-name" = "bce_logits",
-    "model-spec-b64" = "e30="
-  )
-
-  handles <- list(
-    tail_file = mock_handle(
-      data_path = "/private/must-not-be-opened.csv", data_format = "csv"),
-    tail_table = mock_handle(
-      table_data = data.frame(private = "must-not-be-read")),
-    tail_image = within(mock_handle(), {
-      source <- "descriptor"
-      source_kind <- "image_bundle"
-      descriptor <- structure(
-        list(source_kind = "image_bundle", private = "must-not-be-read"),
-        class = "FlowerDatasetDescriptor")
-      table_data <- NULL
-      data_format <- "descriptor"
-    })
-  )
-  withr::defer(for (handle_name in names(handles)) {
-    try(dsFlower:::.removeHandle(handle_name), silent = TRUE)
-  })
-
-  for (name in names(handles)) {
-    dsFlower:::.setHandle(name, handles[[name]])
-    config <- if (identical(name, "tail_file")) neural_config else list()
-    expect_no_error(flowerPrepareRunDS(name, "target", c("f1", "f2"), config))
-
-    state <- dsFlower:::.getHandle(name)
-    expect_true(state$prepared)
-    expect_false(state$node_ensured)
-    manifest_path <- file.path(state$staging_dir, "manifest.json")
-    expect_true(file.exists(manifest_path))
-    expect_setequal(list.files(state$staging_dir), "manifest.json")
-    manifest <- jsonlite::fromJSON(manifest_path, simplifyVector = FALSE)
-    expect_true(manifest[["privacy-reserved"]])
-    expect_false(manifest[["privacy-release-enabled"]])
-    expect_identical(manifest$n_samples, 0L)
-    expect_identical(manifest$n_units, 0L)
-    expect_identical(manifest$source_kind, "privacy_noop")
-    expect_identical(manifest[["dp-unit"]], "patient")
-    expect_identical(manifest$patient_column, "subject_id")
-    expect_false("data_file" %in% names(manifest))
-    expect_false("samples_file" %in% names(manifest))
-  }
-
-  neural_state <- dsFlower:::.getHandle("tail_file")
-  neural_manifest <- jsonlite::fromJSON(
-    file.path(neural_state$staging_dir, "manifest.json"), simplifyVector = FALSE)
-  expect_identical(neural_manifest[["dp-track"]], "neural")
-  expect_identical(neural_manifest[["num-features"]], 2L)
-  expect_identical(neural_manifest[["loss-name"]], "bce_logits")
-
-  # A new query receives the next public no-op allocation; it is not rejected.
-  old_token <- neural_state$run_token
-  expect_no_error(flowerPrepareRunDS(
-    "tail_file", "target", c("f1", "f2"), neural_config))
-  expect_false(identical(dsFlower:::.getHandle("tail_file")$run_token, old_token))
+  expect_gt(manifest[["privacy-epsilon"]], 0)
+  expect_gt(manifest[["privacy-delta"]], 0)
+  expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
 })
 
 test_that("run admission is independent of a rare target class", {
@@ -646,7 +561,7 @@ test_that("run admission is independent of a rare target class", {
 
 test_that("run admission fails closed without one exact privacy-unit count", {
   base_args <- list(
-    handle = NULL, target_column = "target", template_name = NULL,
+    handle = NULL, target_column = "target",
     n_samples = 20L, target_data = NULL,
     run_config = list("privacy-clipping_norm" = 1),
     data_type = "tabular"
@@ -692,7 +607,7 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
     .active_tunnel_port = function() 18080L,
     .supernode_ensure = function(superlink_address, manifest_dir,
                                  python_path, ca_cert_path = NULL,
-                                 template_name = NULL, insecure = FALSE) {
+                                 insecure = FALSE) {
       list(process = NULL, superlink_address = superlink_address,
            ca_cert_path = ca_cert_path)
     }
@@ -709,12 +624,16 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
   expect_true(grepl("MOCKCERT", written_pem))
   expect_equal(updated$ca_cert_path, ca_pem_path)
   manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
-  expect_true(manifest[["privacy-reserved"]])
-  expect_equal(manifest[["privacy-allocation-index"]], 1L)
   expect_gt(manifest[["privacy-epsilon"]], 0)
+  expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
+  pins <- jsonlite::fromJSON(
+    file.path(staging_dir, "pinned_packages.json"), simplifyVector = FALSE)
+  expect_identical(
+    as.character(pins$dsflower_runner),
+    dsFlower:::.compute_harness_hash())
 })
 
-test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)", {
+test_that("flowerEnsureSuperNodeDS works without ca_cert_pem", {
   local_interface_privacy_state()
   csv_path <- create_test_csv(n = 200)
   on.exit(unlink(csv_path))
@@ -729,7 +648,7 @@ test_that("flowerEnsureSuperNodeDS works without ca_cert_pem (backwards compat)"
     .active_tunnel_port = function() 18080L,
     .supernode_ensure = function(superlink_address, manifest_dir,
                                  python_path, ca_cert_path = NULL,
-                                 template_name = NULL, insecure = FALSE) {
+                                 insecure = FALSE) {
       list(process = NULL, superlink_address = superlink_address,
            ca_cert_path = ca_cert_path)
     }
@@ -830,11 +749,6 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("opacus_version" %in% names(caps))
   expect_true("runtime_versions_sha256" %in% names(caps))
   expect_identical(caps$runner_abi, 3L)
-  expect_true("templates" %in% names(caps))
-  expect_identical(caps$templates, character())
-  expect_true(caps$templates_deprecated)
-  expect_false(caps$allow_custom_config)
-  expect_true(caps$allow_custom_config_deprecated)
   expect_identical(caps$dp_tracks,
                    c("neural", "egress", "validation"))
   expect_setequal(
@@ -916,54 +830,6 @@ test_that("flowerGetCapabilitiesDS omits infrastructure and session state", {
   expect_true(caps$hook_resource_isolation_attested)
 })
 
-test_that("capabilities are invariant to existing or missing handle symbols", {
-  name <- "test_capabilities_no_rows"
-  dsFlower:::.setHandle(name, list(
-    data_path = tempfile(), source = "table",
-    table_data = data.frame(x = 1:8, y = 9:16),
-    prepared = FALSE, node_ensured = FALSE))
-  withr::defer(dsFlower:::.removeHandle(name))
-
-  existing <- flowerGetCapabilitiesDS(name)
-  missing <- flowerGetCapabilitiesDS("definitely_missing_handle")
-  expect_identical(existing, missing)
-  expect_false(any(c(
-    "data_n_rows", "data_n_cols", "data_columns", "data_source",
-    "prepared", "node_ensured", "has_imagedata", "image_assets"
-  ) %in% names(existing)))
-})
-
-test_that("disabled compatibility egress never looks up private symbols", {
-  existing_data <- data.frame(secret_a = 1:8, secret_b = 9:16)
-  requested <- c("requested_b", "requested_a")
-
-  existing <- flowerFeatureStatsDS("existing_data", requested)
-  missing <- flowerFeatureStatsDS("definitely_missing_data", requested)
-  expect_identical(existing, missing)
-  expect_identical(existing$features, requested)
-  expect_identical(existing$n, c(0, 0))
-  expect_identical(existing$sum, c(0, 0))
-  expect_identical(existing$sumsq, c(0, 0))
-  expect_true(existing$disabled)
-
-  # NULL cannot mean "all server columns" without creating a schema oracle.
-  empty <- flowerFeatureStatsDS("existing_data", NULL)
-  expect_identical(empty$features, character())
-  expect_identical(empty$n, numeric())
-
-  handle_name <- "test_disabled_egress_handle"
-  dsFlower:::.setHandle(handle_name, list(private = "state"))
-  withr::defer(dsFlower:::.removeHandle(handle_name))
-  expect_identical(
-    flowerMetricsDS(handle_name),
-    flowerMetricsDS("definitely_missing_handle")
-  )
-  expect_identical(
-    flowerLogDS(handle_name),
-    flowerLogDS("definitely_missing_handle")
-  )
-})
-
 test_that("flowerCheckConnectivityDS detects unreachable address", {
   result <- flowerCheckConnectivityDS("192.0.2.1:99999", timeout_secs = 1)
   expect_type(result, "list")
@@ -1015,32 +881,4 @@ test_that("flowerDestroyDS removes handle", {
 
   flowerDestroyDS("test_destroy")
   expect_error(dsFlower:::.getHandle("test_destroy"), "No Flower handle")
-})
-
-test_that(".parseFlowerMetrics handles missing log", {
-  result <- dsFlower:::.parseFlowerMetrics(NULL)
-  expect_s3_class(result, "data.frame")
-  expect_equal(nrow(result), 0)
-
-  result2 <- dsFlower:::.parseFlowerMetrics("/nonexistent/log.txt")
-  expect_s3_class(result2, "data.frame")
-  expect_equal(nrow(result2), 0)
-})
-
-test_that(".parseFlowerMetrics extracts metrics from log", {
-  log_path <- tempfile(fileext = ".log")
-  writeLines(c(
-    "[Round 1] loss = 0.693",
-    "[Round 1] accuracy = 0.55",
-    "[Round 2] loss = 0.500",
-    "[Round 2] accuracy = 0.70",
-    "Some other log line"
-  ), log_path)
-  on.exit(unlink(log_path))
-
-  metrics <- dsFlower:::.parseFlowerMetrics(log_path)
-  expect_s3_class(metrics, "data.frame")
-  expect_true(nrow(metrics) >= 4)
-  expect_true("loss" %in% metrics$metric)
-  expect_true("accuracy" %in% metrics$metric)
 })

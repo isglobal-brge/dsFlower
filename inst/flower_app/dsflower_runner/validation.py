@@ -19,6 +19,16 @@ _MAX_PUBLIC_ARRAYS = 256
 _MAX_PUBLIC_ELEMENTS = 8_000_000
 _MAX_PUBLIC_BYTES = 64 * 1024 * 1024
 _INFERENCE_BATCH_ROWS = 1024
+_VALIDATION_SEED_CONFIG_KEYS = frozenset({
+    "model-spec-b64", "loss-name", "num-classes", "num-labels",
+    "num-features", "feature-bounds", "target-bounds",
+    "validation-model-track", "validation-task", "validation-bins",
+    "validation-contract-sha256", "task-type", "nb-dispersion",
+    "gamma-shape", "huber-delta", "quantile-level",
+})
+_VALIDATION_SEED_PRIVACY_KEYS = frozenset({
+    "policy_hash", "epsilon", "delta", "clipping_norm", "adjacency",
+})
 
 
 def _integer(value, name, lower, upper):
@@ -297,11 +307,11 @@ def _apply_feature_bounds(X, cfg):
         _MAX_MODEL_ABS).astype(np.float32)
 
 
-def private_model_validation(context, cfg, pcfg, release_id, public_arrays,
+def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
                              on_private_start=None):
     """Validate public inputs, then read private data and emit one DP vector."""
     from . import seeding, task as task_module
-    from .params import load_user_model, set_torch_params
+    from .params import get_torch_params, load_user_model, set_torch_params
 
     layout = layout_from_config(cfg)
     _model_track(cfg)
@@ -325,7 +335,22 @@ def private_model_validation(context, cfg, pcfg, release_id, public_arrays,
     task_module.assert_pinned_unit_count(context, len(y), unit_ids)
     X_model = _apply_feature_bounds(X, cfg)
     predictions = neural_predictions(model, X_model, cfg.get("loss-name"))
-    master = seeding.master_seed(cfg, None, None, release_id)
+    canonical_units = (None if unit_ids is None else [
+        task_module._canonical_patient_id(value) for value in np.asarray(
+            unit_ids, dtype=object).tolist()
+    ])
+    master = seeding.master_seed(
+        "validation-gaussian/v1",
+        seeding.select_config(cfg, _VALIDATION_SEED_CONFIG_KEYS),
+        seeding.select_config(pcfg, _VALIDATION_SEED_PRIVACY_KEYS),
+        int(round_index),
+        public_arrays=get_torch_params(model),
+        private_arrays=(
+            np.asarray(X_model, dtype=np.float32),
+            np.asarray(y, dtype=np.float64),
+            np.asarray(predictions, dtype=np.float64),
+        ),
+        unit_ids=canonical_units)
     target_bounds = (target_bounds_from_config(cfg)
                      if layout["task"] in ("regression", "count") else None)
     released, _sigma = private_validation_vector(

@@ -14,10 +14,179 @@
 # SuperNode singleton registry -- keyed by SuperLink address
 .supernode_registry <- new.env(parent = emptyenv())
 
+.run_windows_powershell <- function(script) {
+  system_root <- Sys.getenv("SystemRoot", unset = "")
+  program_files <- Sys.getenv("ProgramFiles", unset = "")
+  candidates <- c(
+    if (nzchar(system_root)) file.path(
+      system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    if (nzchar(program_files)) file.path(
+      program_files, "PowerShell", "7", "pwsh.exe")
+  )
+  candidates <- candidates[file.exists(candidates)]
+  if (!length(candidates)) {
+    stop("Windows PowerShell is unavailable; refusing to manage a DP node secret.",
+         call. = FALSE)
+  }
+  script <- paste0("$ErrorActionPreference='Stop';", script)
+  utf16 <- iconv(script, from = "UTF-8", to = "UTF-16LE", toRaw = TRUE)[[1L]]
+  if (is.null(utf16)) {
+    stop("Could not encode the Windows privacy bootstrap command.",
+         call. = FALSE)
+  }
+  encoded <- jsonlite::base64_enc(utf16)
+  output <- suppressWarnings(system2(
+    candidates[[1L]],
+    c("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded),
+    stdout = TRUE, stderr = TRUE
+  ))
+  status <- attr(output, "status", exact = TRUE)
+  if (!is.null(status) && !identical(as.integer(status), 0L)) {
+    stop("The Windows privacy bootstrap command failed closed.", call. = FALSE)
+  }
+  output
+}
+
+.powershell_literal <- function(value) {
+  paste0("'", gsub("'", "''", enc2utf8(value), fixed = TRUE), "'")
+}
+
+.read_windows_os_entropy <- function(n, runner = .run_windows_powershell) {
+  script <- paste0(
+    "$b=New-Object byte[] ", as.integer(n), ";",
+    "$r=[Security.Cryptography.RandomNumberGenerator]::Create();",
+    "try{$r.GetBytes($b);",
+    "[Console]::Out.Write(([BitConverter]::ToString($b)).Replace('-',''))}",
+    "finally{$r.Dispose()}"
+  )
+  encoded <- paste(runner(script), collapse = "")
+  if (!grepl(paste0("^[0-9A-Fa-f]{", 2L * n, "}$"), encoded, perl = TRUE)) {
+    stop("Windows did not return the requested operating-system entropy.",
+         call. = FALSE)
+  }
+  pairs <- substring(encoded, seq.int(1L, nchar(encoded), by = 2L),
+                     seq.int(2L, nchar(encoded), by = 2L))
+  as.raw(strtoi(pairs, base = 16L))
+}
+
 .read_os_entropy <- function(n) {
+  value <- suppressWarnings(as.numeric(n))
+  if (length(value) != 1L || is.na(value) || !is.finite(value) || value < 1 ||
+      value != floor(value) || value > .Machine$integer.max) {
+    stop("The operating-system entropy size must be a positive integer.",
+         call. = FALSE)
+  }
+  n <- as.integer(value)
+  if (.Platform$OS.type == "windows") {
+    return(.read_windows_os_entropy(n))
+  }
+  if (.Platform$OS.type != "unix") {
+    stop("This platform has no supported operating-system entropy source.",
+         call. = FALSE)
+  }
   con <- file("/dev/urandom", open = "rb", raw = TRUE)
   on.exit(close(con), add = TRUE)
-  readBin(con, "raw", n = as.integer(n))
+  readBin(con, "raw", n = n)
+}
+
+.windows_path_has_reparse_point <- function(
+    path, runner = .run_windows_powershell) {
+  if (!file.exists(path) && !dir.exists(path)) return(FALSE)
+  literal <- .powershell_literal(path)
+  script <- paste0(
+    "$i=Get-Item -LiteralPath ", literal, " -Force -ErrorAction Stop;",
+    "$found=$false;while($null -ne $i){",
+    "if(($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)",
+    "{$found=$true;break};$i=$i.Parent};",
+    "if($found){[Console]::Out.Write('1')}else{[Console]::Out.Write('0')}"
+  )
+  result <- paste(runner(script), collapse = "")
+  if (!result %in% c("0", "1")) {
+    stop("Could not validate the Windows node-secret path.", call. = FALSE)
+  }
+  identical(result, "1")
+}
+
+.privacy_path_is_link <- function(path) {
+  if (.Platform$OS.type == "windows") {
+    return(.windows_path_has_reparse_point(path))
+  }
+  .path_is_symlink(path)
+}
+
+.windows_set_private_acl <- function(
+    path, is_directory, runner = .run_windows_powershell) {
+  literal <- .powershell_literal(path)
+  acl_type <- if (isTRUE(is_directory)) {
+    "DirectorySecurity"
+  } else {
+    "FileSecurity"
+  }
+  inheritance <- if (isTRUE(is_directory)) {
+    paste0(
+      "([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor ",
+      "[Security.AccessControl.InheritanceFlags]::ObjectInherit)"
+    )
+  } else {
+    "[Security.AccessControl.InheritanceFlags]::None"
+  }
+  script <- paste0(
+    "$p=", literal, ";$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;",
+    "$acl=New-Object Security.AccessControl.", acl_type, ";",
+    "$acl.SetOwner($sid);$acl.SetAccessRuleProtection($true,$false);",
+    "$rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,",
+    "[Security.AccessControl.FileSystemRights]::FullControl,", inheritance, ",",
+    "[Security.AccessControl.PropagationFlags]::None,",
+    "[Security.AccessControl.AccessControlType]::Allow);",
+    "[void]$acl.AddAccessRule($rule);Set-Acl -LiteralPath $p -AclObject $acl;",
+    "[Console]::Out.Write('OK')"
+  )
+  result <- paste(runner(script), collapse = "")
+  if (!identical(result, "OK")) {
+    stop("Could not protect the Windows node-secret path.", call. = FALSE)
+  }
+  invisible(path)
+}
+
+.windows_validate_private_acl <- function(
+    path, runner = .run_windows_powershell) {
+  literal <- .powershell_literal(path)
+  script <- paste0(
+    "$p=", literal, ";$acl=Get-Acl -LiteralPath $p -ErrorAction Stop;",
+    "$me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;",
+    "$trusted=@($me,'S-1-5-18','S-1-5-32-544');",
+    "$owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;",
+    "$ok=$acl.AreAccessRulesProtected -and ($trusted -contains $owner);$mine=$false;",
+    "$rules=$acl.GetAccessRules($true,$true,",
+    "[Security.Principal.SecurityIdentifier]);foreach($r in $rules){",
+    "if($r.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow){",
+    "$sid=$r.IdentityReference.Value;if($trusted -notcontains $sid){$ok=$false};",
+    "if($sid -eq $me -and (($r.FileSystemRights -band ",
+    "[Security.AccessControl.FileSystemRights]::FullControl) -eq ",
+    "[Security.AccessControl.FileSystemRights]::FullControl)){$mine=$true}}};",
+    "if($ok -and $mine){[Console]::Out.Write('OK')}",
+    "else{[Console]::Out.Write('UNSAFE')}"
+  )
+  result <- paste(runner(script), collapse = "")
+  if (!identical(result, "OK")) {
+    stop("The Windows node-secret ACL is not private to the service identity.",
+         call. = FALSE)
+  }
+  invisible(path)
+}
+
+.windows_replace_file_atomic <- function(
+    replacement, destination, runner = .run_windows_powershell) {
+  script <- paste0(
+    "[IO.File]::Replace(", .powershell_literal(replacement), ",",
+    .powershell_literal(destination), ",$null);",
+    "[Console]::Out.Write('OK')"
+  )
+  result <- paste(runner(script), collapse = "")
+  if (!identical(result, "OK")) {
+    stop("Could not atomically install the Windows node secret.", call. = FALSE)
+  }
+  invisible(destination)
 }
 
 #' Resolve the dedicated dsFlower node-secret path
@@ -36,8 +205,9 @@
     stop("The dsFlower node-secret path must be absolute.", call. = FALSE)
   }
   path <- as.character(path)
-  if (.path_is_symlink(path)) {
-    stop("The dsFlower node secret must not be a symbolic link.", call. = FALSE)
+  if (.privacy_path_is_link(path)) {
+    stop("The dsFlower node secret must not be a link or reparse point.",
+         call. = FALSE)
   }
   path <- .canonical_state_path(path)
   allow_test_tmp <- identical(
@@ -53,7 +223,7 @@
 #' @keywords internal
 .validate_node_secret_parent <- function(path, euid = NULL) {
   parent <- dirname(path)
-  if (.path_is_symlink(parent)) {
+  if (.privacy_path_is_link(parent)) {
     stop("The dsFlower node-secret parent must be a real directory.",
          call. = FALSE)
   }
@@ -75,6 +245,8 @@
       stop("The dsFlower node-secret parent must not be writable by group or other users.",
            call. = FALSE)
     }
+  } else if (.Platform$OS.type == "windows") {
+    .windows_validate_private_acl(parent)
   }
   normalizePath(parent, winslash = "/", mustWork = TRUE)
 }
@@ -100,8 +272,8 @@
 .validate_node_secret <- function(path) {
   euid <- if (.Platform$OS.type == "unix") .privacy_effective_uid() else NULL
   parent_before <- .validate_node_secret_parent(path, euid)
-  if (!file.exists(path) || .path_is_symlink(path)) {
-    stop("The dsFlower node secret is missing or is a symbolic link: ", path,
+  if (!file.exists(path) || .privacy_path_is_link(path)) {
+    stop("The dsFlower node secret is missing or is a link/reparse point: ", path,
          call. = FALSE)
   }
   info <- file.info(path)
@@ -121,6 +293,8 @@
       stop("The dsFlower node secret is not owned by the current service user.",
            call. = FALSE)
     }
+  } else if (.Platform$OS.type == "windows") {
+    .windows_validate_private_acl(path)
   }
   # Accept 64 hex bytes with no terminator, LF, or CRLF. Read one byte beyond
   # the largest valid representation so a valid first line plus hidden trailing
@@ -149,10 +323,6 @@
 #' Atomically write a fresh dsFlower node secret
 #' @keywords internal
 .write_node_secret_atomic <- function(path, parent) {
-  if (!file.exists("/dev/urandom")) {
-    stop("/dev/urandom is unavailable; refusing to create a DP node secret.",
-         call. = FALSE)
-  }
   entropy <- tryCatch(.read_os_entropy(32L), error = function(e) raw(0))
   if (length(entropy) != 32L) {
     stop("Could not read 32 bytes of operating-system entropy; refusing a DP release.",
@@ -172,10 +342,16 @@
     stop("Could not create a private temporary node-secret file.",
          call. = FALSE)
   }
+  if (.Platform$OS.type == "windows") {
+    .windows_set_private_acl(tmp, is_directory = FALSE)
+  }
   writeLines(value, tmp, useBytes = TRUE)
   if (.Platform$OS.type == "unix") Sys.chmod(tmp, "0600")
-  if (!file.rename(tmp, path)) {
-    stop("Could not atomically install the dsFlower node secret.", call. = FALSE)
+  if (.Platform$OS.type == "windows" && file.exists(path)) {
+    .windows_replace_file_atomic(tmp, path)
+  } else if (!file.rename(tmp, path)) {
+    stop("Could not atomically install the dsFlower node secret.",
+         call. = FALSE)
   }
   invisible(path)
 }
@@ -203,8 +379,14 @@
     stop("Could not create the dsFlower secret directory: ", parent,
          call. = FALSE)
   }
+  if (.privacy_path_is_link(parent)) {
+    stop("The dsFlower node-secret parent must be a real directory.",
+         call. = FALSE)
+  }
   if (.Platform$OS.type == "unix" && !parent_existed) {
     Sys.chmod(parent, "0700")
+  } else if (.Platform$OS.type == "windows" && !parent_existed) {
+    .windows_set_private_acl(parent, is_directory = TRUE)
   }
   euid <- if (.Platform$OS.type == "unix") .privacy_effective_uid() else NULL
   parent_before <- .validate_node_secret_parent(path, euid)
@@ -215,8 +397,9 @@
   }
   on.exit(filelock::unlock(lock), add = TRUE)
 
-  if (.path_is_symlink(path)) {
-    stop("The dsFlower node secret must not be a symbolic link.", call. = FALSE)
+  if (.privacy_path_is_link(path)) {
+    stop("The dsFlower node secret must not be a link or reparse point.",
+         call. = FALSE)
   }
   if (file.exists(path)) {
     valid <- tryCatch({
@@ -235,6 +418,10 @@
       if (is.na(owner) || !identical(owner, as.integer(euid))) {
         stop(conditionMessage(valid), call. = FALSE)
       }
+    } else if (.Platform$OS.type == "windows") {
+      # Malformed content may be rotated, but an unsafe ACL is an ownership
+      # failure and must never be papered over by replacement.
+      .windows_validate_private_acl(path)
     }
   }
 
@@ -330,7 +517,7 @@
 
 #' Remove stale staging directories older than 24 hours
 #' @keywords internal
-.cleanup_stale_staging <- function(max_age_hours = 24) {
+.cleanup_stale_staging <- function(max_age_hours = 24, bases = NULL) {
   # A long-running federated job may legitimately outlive the age threshold.
   # Protect both processes owned by this R session and live SuperNodes discovered
   # through /proc before considering any directory for deletion.
@@ -349,7 +536,18 @@
   active <- unique(vapply(active, function(path)
     normalizePath(path, winslash = "/", mustWork = FALSE), character(1)))
 
-  for (base in c("/dev/shm", tempdir())) {
+  if (is.null(bases)) {
+    temp_parent <- dirname(tempdir())
+    old_session_roots <- tryCatch(
+      list.dirs(temp_parent, full.names = TRUE, recursive = FALSE),
+      error = function(e) character())
+    old_session_roots <- old_session_roots[
+      startsWith(basename(old_session_roots), "Rtmp")]
+    bases <- unique(c(.stagingBaseCandidates(create = FALSE),
+                      old_session_roots))
+  }
+
+  for (base in bases) {
     dsflower_dir <- file.path(base, "dsflower")
     if (!dir.exists(dsflower_dir)) next
     subdirs <- list.dirs(dsflower_dir, full.names = TRUE, recursive = FALSE)

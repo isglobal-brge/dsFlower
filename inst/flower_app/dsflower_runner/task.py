@@ -10,6 +10,7 @@ import json
 import math
 import ntpath
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -20,6 +21,7 @@ _MAX_LOCAL_EPOCHS = 1_000
 _MAX_SERVER_ROUNDS = 500
 _MAX_LEARNING_RATE = 10.0
 _MAX_NUMERIC_ABS = 1.0e6
+_MAX_PATIENT_ID_BYTES = 4096
 _MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
 _INVALID_IMAGE = "__dsflower_invalid_image__"
 _ASCII_ID_TRIM = " \t\r\n"
@@ -201,10 +203,10 @@ def _canonical_patient_id(value):
     """Apply the exact public trim-utf8-v2 patient-ID mapping."""
     try:
         text = ("" if value is None else str(value)).strip(_ASCII_ID_TRIM)
-        text.encode("utf-8", errors="strict")
+        encoded = text.encode("utf-8", errors="strict")
     except (TypeError, UnicodeError, ValueError):
         return _MISSING_PATIENT_UNIT
-    if (not text
+    if (not text or len(encoded) > _MAX_PATIENT_ID_BYTES
             or text.lower() in ("na", "nan", "null", "<na>", "nat")):
         return _MISSING_PATIENT_UNIT
     return text
@@ -297,7 +299,9 @@ def load_image_collection(context=None):
 
     assets = manifest.get("assets", {}) or {}
     images = assets.get("images", {}) or {}
-    images_root = images.get("root") or manifest["data_root"]
+    images_root = images.get("root")
+    if not isinstance(images_root, str) or not images_root:
+        raise ValueError("image manifest must pin an image-root asset")
     if not os.path.isdir(images_root):
         raise ValueError("image data root is unavailable")
     path_col = images.get("path_col", "relative_path")
@@ -330,32 +334,23 @@ def load_privacy_config(context=None):
     per-node metrics are suppressed/bucketed by default (disclosure backstop).
     """
     manifest = _load_manifest(context)
-    if manifest.get("privacy-reserved") is not True:
-        raise ValueError("manifest has no committed privacy reservation")
-    release_enabled = bool(manifest.get("privacy-release-enabled", False))
     epsilon = float(manifest.get("privacy-epsilon", 0.0))
     delta = float(manifest.get("privacy-delta", 0.0))
     clipping_norm = float(manifest.get("privacy-clipping_norm", 1.0))
-    # The manifest is server-written, but during the staging transition it may
-    # still carry client-PROPOSED DP params (the run_config is merged in at stage
-    # time), so the node treats them as untrusted. First: legal ranges (a corrupted
-    # value must not silently produce zero/infinite noise that voids the guarantee).
+    policy_hash = manifest.get("privacy-policy-sha256")
+    if (not isinstance(policy_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", policy_hash) is None):
+        raise ValueError("manifest has no canonical stateless privacy policy")
+    # Treat even server-written values as untrusted at the Python boundary. A
+    # corrupted value must not silently produce zero/infinite noise.
     if not (clipping_norm > 0 and math.isfinite(clipping_norm)):
         raise ValueError(
             "invalid DP clipping norm in manifest")
-    if release_enabled and not (
+    if not (
         epsilon > 0 and 0.0 < delta < 1.0
         and math.isfinite(epsilon) and math.isfinite(delta)
     ):
-        raise ValueError("enabled DP release has invalid epsilon/delta")
-    if not release_enabled and not (
-        epsilon >= 0.0 and delta >= 0.0
-        and math.isfinite(epsilon) and math.isfinite(delta)
-    ):
-        # The accountant preserves the exact (possibly tiny) scheduled values
-        # in the ledger/manifest even when numerical policy turns the operation
-        # into a data-independent no-op.
-        raise ValueError("disabled DP allocation has invalid epsilon/delta")
+        raise ValueError("stateless DP release has invalid epsilon/delta")
     # Then: HARDCODED node ceilings (NOT manifest-derived -- a client-influenced
     # manifest cannot raise its own ceiling). Reject anything weaker than policy; an
     # inflated epsilon or a near-1 delta would void the (epsilon, delta) guarantee
@@ -415,7 +410,7 @@ def load_privacy_config(context=None):
         "epsilon": epsilon,
         "delta": delta,
         "clipping_norm": clipping_norm,
-        "release_enabled": release_enabled,
+        "policy_hash": policy_hash,
         "adjacency": "replace_one",
         # Improved Tier-2 floor (sample-and-aggregate) policy. k is a fixed,
         # administrator-pinned value: deriving it from private n would expose n
@@ -457,13 +452,10 @@ def load_run_pins(context=None):
     Every value that feeds the DP-SGD noise calibration -- the loss (a coupling
     loss breaks the per-sample bound), batch size, local epochs, and rounds (they
     set the composition horizon), and num-classes (the head width + label gate) --
-    is read from the tamper-proof manifest. The client run config is a fallback
-    ONLY during the node-package transition; once staging pins these, the manifest
-    is authoritative and the client cannot stretch the horizon against a fixed
-    ledger debit. (Learning rate is not DP-critical and may come from the config.)
+    is read from the tamper-proof manifest. Public defaults are applied only by
+    this trusted loader; the client run config is never authoritative.
     """
     manifest = _load_manifest(context)
-    cfg = _run_config(context)
 
     def required(key, cast):
         if key not in manifest:
@@ -486,7 +478,7 @@ def load_run_pins(context=None):
     def bounded_float(key, default, lower, upper, *, lower_open=False,
                       upper_open=False):
         try:
-            value = float(manifest.get(key, cfg.get(key, default)))
+            value = float(manifest.get(key, default))
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("manifest pin '%s' must be finite" % key) from exc
         lower_ok = value > lower if lower_open else value >= lower
@@ -496,7 +488,7 @@ def load_run_pins(context=None):
         return value
 
     def pinned_bool(key, default):
-        value = manifest.get(key, cfg.get(key, default))
+        value = manifest.get(key, default)
         if type(value) is not bool:
             raise ValueError("manifest pin '%s' must be boolean" % key)
         return value
@@ -539,12 +531,10 @@ def load_run_pins(context=None):
 
     learning_rate = bounded_float(
         "learning-rate", 0.01, 0.0, _MAX_LEARNING_RATE, lower_open=True)
-    optimizer = str(manifest.get(
-        "optimizer-name", cfg.get("optimizer-name", "sgd"))).lower()
+    optimizer = str(manifest.get("optimizer-name", "sgd")).lower()
     if optimizer not in ("sgd", "adam", "adamw", "rmsprop"):
         raise ValueError("optimizer-name is not on the trusted allowlist")
-    scheduler = str(manifest.get(
-        "scheduler-name", cfg.get("scheduler-name", "none"))).lower()
+    scheduler = str(manifest.get("scheduler-name", "none")).lower()
     if scheduler not in ("none", "step", "exponential", "cosine"):
         raise ValueError("scheduler-name is not on the trusted allowlist")
 
@@ -693,34 +683,6 @@ def load_pinned_run_config(context=None):
         if key in manifest:
             cfg[key] = manifest[key]
     return cfg
-
-
-def _decode_feature_norm(cfg, n_features):
-    """Decode the client's GLOBAL feature mean/SD from the run config (same b64 JSON
-    the neural track standardizes with). Returns (mean, sd) float arrays of length
-    n_features, or None if absent / malformed / length-mismatched (caller falls back
-    to the [0,1] binning prior). SDs are floored to a positive value."""
-    raw = cfg.get("feature-norm-b64")
-    if not raw:
-        return None                       # absent -> caller uses the [0,1] prior (legit)
-    # Present-but-malformed/mismatched is unexpected (the client sent it): FAIL CLOSED
-    # rather than silently falling back to [0,1], which would resurrect the degenerate
-    # binning bug without anyone noticing.
-    import base64
-    import json as _json
-    try:
-        norm = _json.loads(base64.b64decode(str(raw), validate=True).decode("utf-8"))
-        mean = np.asarray(norm["means"], dtype=np.float64)
-        sd = np.asarray(norm["sds"], dtype=np.float64)
-    except Exception as e:
-        raise RuntimeError("feature-norm-b64 present but undecodable: %s" % e)
-    if mean.shape[0] != int(n_features) or sd.shape[0] != int(n_features):
-        raise RuntimeError(
-            "feature-norm length (%d/%d) != num features (%d)"
-            % (mean.shape[0], sd.shape[0], int(n_features)))
-    sd = np.where(np.isfinite(sd) & (sd > 1e-8), sd, 1.0)
-    mean = np.where(np.isfinite(mean), mean, 0.0)
-    return mean, sd
 
 
 def load_tabular_patient_ids(context=None):

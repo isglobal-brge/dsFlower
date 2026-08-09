@@ -1,58 +1,26 @@
-"""Atomic release guard for the server-owned lifetime privacy reservation."""
+"""Stateless release identity and exact-request replay guard.
 
+The node-written manifest pins one training's privacy contract and Flower's
+per-message ConfigRecord supplies its public round coordinate. A message
+identifier is used only to find an in-memory reply cache; it never selects
+privacy randomness or authorizes a release.
+"""
+
+import hashlib
 import json
+import math
 import os
 import re
-import sqlite3
-import stat
-from pathlib import Path
+
+from flwr.common import ArrayRecord, ConfigRecord
 
 
 _TOKEN_RE = re.compile(r"^run_[0-9a-f]{32}$")
-_LEDGER_MODE = 0o600
-_UNSAFE_DIRECTORY_WRITE = stat.S_IWGRP | stat.S_IWOTH
-
-
-def _ledger_path_state(path):
-    """Validate the server-owned ledger path and return stable identities.
-
-    A private parent directory prevents a different UID from replacing SQLite's
-    database or sidecar files.  The before/after identities catch ordinary path
-    replacement while SQLite opens the database.  They cannot exclude a process
-    running as the same UID swapping a path out and back between both checks.
-    """
-    parent = os.path.dirname(path)
-    try:
-        parent_info = os.lstat(parent)
-        path_info = os.lstat(path)
-    except OSError as exc:
-        raise RuntimeError("trusted privacy-ledger path is missing or unsafe") from exc
-
-    if not stat.S_ISDIR(parent_info.st_mode):
-        raise RuntimeError("privacy ledger parent must be a real directory")
-    if parent_info.st_uid != os.geteuid():
-        raise RuntimeError("privacy ledger parent must be owned by the node EUID")
-    if stat.S_IMODE(parent_info.st_mode) & _UNSAFE_DIRECTORY_WRITE:
-        raise RuntimeError(
-            "privacy ledger parent must not be writable by group or other users"
-        )
-
-    if not stat.S_ISREG(path_info.st_mode):
-        raise RuntimeError("privacy ledger must be a regular file")
-    if path_info.st_uid != os.geteuid():
-        raise RuntimeError("privacy ledger must be owned by the node EUID")
-    if stat.S_IMODE(path_info.st_mode) != _LEDGER_MODE:
-        raise RuntimeError("privacy ledger must have mode 0600")
-
-    return (
-        (parent_info.st_dev, parent_info.st_ino),
-        (path_info.st_dev, path_info.st_ino),
-    )
-
-
-def _assert_ledger_path_unchanged(path, expected):
-    if _ledger_path_state(path) != expected:
-        raise RuntimeError("privacy ledger path changed while opening")
+_MAX_ROUNDS = 500
+_MAX_ARRAYS = 256
+_MAX_SERIALIZED_ARRAY_BYTES = 64 * 1024 * 1024 + _MAX_ARRAYS * 4096
+_CACHE_META_KEY = "dsflower-last-release-meta"
+_CACHE_ARRAYS_KEY = "dsflower-last-release"
 
 
 def _manifest(context):
@@ -63,155 +31,165 @@ def _manifest(context):
         raise RuntimeError("privacy guard has no manifest directory")
     path = os.path.join(manifest_dir, "manifest.json")
     with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def _message_id(msg):
-    metadata = getattr(msg, "metadata", None)
-    value = str(getattr(metadata, "message_id", "") or "")
-    if not value:
-        value = "group:" + str(getattr(metadata, "group_id", "") or "")
-    if not value or value == "group:":
-        raise RuntimeError("privacy guard requires a Flower message identifier")
-    if len(value) > 512 or "\x00" in value:
-        raise RuntimeError("invalid Flower message identifier")
+        value = json.load(fh)
+    if not isinstance(value, dict):
+        raise RuntimeError("privacy manifest must be a JSON object")
     return value
 
 
-def _same_number(a, b):
-    return float(a) == float(b)
+def _exact_int(value, label, lower, upper):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError("%s must be an exact integer" % label)
+    if value < lower or value > upper:
+        raise RuntimeError("%s is outside [%d, %d]" % (label, lower, upper))
+    return value
 
 
-def claim_release(context, msg):
-    """Reserve one run-local release before any private computation.
+def _finite_float(value, label, lower, upper):
+    if isinstance(value, bool):
+        raise RuntimeError("%s must be a finite number" % label)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("%s must be a finite number" % label) from exc
+    if not math.isfinite(number) or number <= lower or number > upper:
+        raise RuntimeError("%s is outside its valid range" % label)
+    return number
 
-    Returns a dict with ``status`` in {``new``, ``replay``, ``noop``}.  Messages
-    beyond the server-pinned horizon are not rejected: callers return the incoming
-    public arrays unchanged, which is independent of node data.
-    """
+
+def _fixed_manifest(context):
     manifest = _manifest(context)
-    if manifest.get("privacy-reserved") is not True:
-        raise RuntimeError("run has no committed privacy reservation")
     token = str(manifest.get("run_token", ""))
     if not _TOKEN_RE.fullmatch(token):
         raise RuntimeError("invalid privacy run token in manifest")
-    expected_max = int(manifest.get("privacy-max-releases", 0))
-    if expected_max < 1:
-        raise RuntimeError("invalid privacy release horizon in manifest")
+    policy_hash = manifest.get("privacy-policy-sha256")
+    if (not isinstance(policy_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", policy_hash) is None):
+        raise RuntimeError("manifest has no canonical stateless privacy policy")
+    if manifest.get("privacy-adjacency") != "replace_one":
+        raise RuntimeError("manifest must pin replace-one privacy adjacency")
 
-    db_path = os.environ.get("DSFLOWER_PRIVACY_LEDGER_PATH", "")
-    if not db_path or not os.path.isabs(db_path):
-        raise RuntimeError("trusted privacy-ledger path is missing or unsafe")
-    path_state = _ledger_path_state(db_path)
+    num_rounds = _exact_int(
+        manifest.get("num-server-rounds"),
+        "manifest num-server-rounds", 1, _MAX_ROUNDS)
 
+    epsilon = _finite_float(
+        manifest.get("privacy-epsilon"), "manifest privacy-epsilon",
+        0.0, 10.0)
+    delta = _finite_float(
+        manifest.get("privacy-delta"), "manifest privacy-delta",
+        0.0, 1.0e-3)
+    return num_rounds, epsilon, delta, policy_hash
+
+
+def _server_round(msg, num_rounds):
+    content = getattr(msg, "content", None)
+    try:
+        config = content["config"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("train message is missing its ConfigRecord") from exc
+    if not isinstance(config, ConfigRecord):
+        raise RuntimeError("train message config must be a ConfigRecord")
+    try:
+        value = config["server-round"]
+    except KeyError as exc:
+        raise RuntimeError("train ConfigRecord is missing server-round") from exc
+    return _exact_int(value, "server-round", 1, num_rounds)
+
+
+def _message_id(msg):
+    """Return a bounded cache hint; an absent identifier simply disables it."""
+    metadata = getattr(msg, "metadata", None)
+    value = str(getattr(metadata, "message_id", "") or "")
+    if not value:
+        group = str(getattr(metadata, "group_id", "") or "")
+        value = ("group:" + group) if group else ""
+    if len(value) > 512 or "\x00" in value:
+        return ""
+    return value
+
+
+def _frame(digest, value):
+    raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
+    digest.update(len(raw).to_bytes(8, "big"))
+    digest.update(raw)
+
+
+def _request_id(msg, round_index):
+    """Hash the exact bounded public ArrayRecord and its round coordinate."""
+    content = getattr(msg, "content", None)
+    try:
+        arrays = content["arrays"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("train message is missing its ArrayRecord") from exc
+    if not isinstance(arrays, ArrayRecord):
+        raise RuntimeError("train message arrays must be an ArrayRecord")
+    entries = list(arrays.items())
+    if not 1 <= len(entries) <= _MAX_ARRAYS:
+        raise RuntimeError("train ArrayRecord exceeds the public array-count cap")
+
+    digest = hashlib.sha256(b"dsflower/public-request/v1\x00")
+    digest.update(int(round_index).to_bytes(8, "big"))
+    total = 0
+    for key, item in entries:
+        data = getattr(item, "data", None)
+        if (getattr(item, "stype", None) != "numpy.ndarray"
+                or not isinstance(data, bytes)):
+            raise RuntimeError("train ArrayRecord needs NumPy tensor encoding")
+        total += len(data)
+        if total > _MAX_SERIALIZED_ARRAY_BYTES:
+            raise RuntimeError("train ArrayRecord exceeds the public model-size cap")
+        shape = getattr(item, "shape", None)
+        if not isinstance(shape, (list, tuple)):
+            raise RuntimeError("train ArrayRecord has invalid shape metadata")
+        _frame(digest, key)
+        _frame(digest, getattr(item, "dtype", ""))
+        _frame(digest, ",".join(str(value) for value in shape))
+        _frame(digest, data)
+    return digest.hexdigest()
+
+
+def _cached_status(context, message_id, round_index, request_id):
+    state = getattr(context, "state", None)
+    if state is None or not hasattr(state, "get"):
+        return "new"
+    meta = state.get(_CACHE_META_KEY)
+    if meta is None or not hasattr(meta, "get"):
+        return "new"
+
+    cached_message = str(meta.get("message-id", "") or "")
+    cached_request = str(meta.get("request-id", "") or "")
+    cached_round = meta.get("release-index")
+    exact = (cached_request == request_id
+             and cached_round == round_index)
+    if exact and state.get(_CACHE_ARRAYS_KEY) is not None:
+        return "replay"
+
+    # A message-id collision or a second payload for the same provisional round
+    # must fail before private data is read.  Message ids do not establish
+    # identity; they only make these accidental/malicious cache collisions visible.
+    if ((message_id and cached_message == message_id)
+            or (cached_request and cached_round == round_index)):
+        if not exact:
+            raise RuntimeError("cached round identity does not match request payload")
+    return "new"
+
+
+def claim_release(context, msg):
+    """Return a stateless round claim, optionally replaying an exact RAM cache."""
+    num_rounds, epsilon, delta, policy_hash = _fixed_manifest(context)
+    round_index = _server_round(msg, num_rounds)
+    request_id = _request_id(msg, round_index)
     message_id = _message_id(msg)
-    # mode=rw prevents SQLite from creating a replacement database if the path
-    # disappears after validation.  URI quoting is handled by pathlib.
-    db_uri = Path(db_path).as_uri() + "?mode=rw"
-    try:
-        con = sqlite3.connect(
-            db_uri, timeout=10.0, isolation_level=None, uri=True
-        )
-    except sqlite3.Error as exc:
-        raise RuntimeError("privacy ledger could not be opened safely") from exc
-    try:
-        _assert_ledger_path_unchanged(db_path, path_state)
-        con.execute("PRAGMA busy_timeout = 10000")
-        con.execute("PRAGMA foreign_keys = ON")
-        con.execute("BEGIN IMMEDIATE")
-        row = con.execute(
-            "SELECT domain, allocation_index, epsilon, delta, max_releases, "
-            "claimed_releases FROM privacy_reservations WHERE run_token = ?",
-            (token,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("privacy reservation is absent from the ledger")
-        domain, allocation_index, epsilon, delta, max_releases, claimed = row
-        if str(domain) != str(manifest.get("privacy-domain", "")):
-            raise RuntimeError("manifest/ledger privacy domain mismatch")
-        if int(allocation_index) != int(manifest.get("privacy-allocation-index", -1)):
-            raise RuntimeError("manifest/ledger allocation mismatch")
-        if int(max_releases) != expected_max:
-            raise RuntimeError("manifest/ledger release horizon mismatch")
-        if not _same_number(epsilon, manifest.get("privacy-epsilon", -1)) or not _same_number(
-            delta, manifest.get("privacy-delta", -1)
-        ):
-            raise RuntimeError("manifest/ledger epsilon or delta mismatch")
-
-        prior = con.execute(
-            "SELECT release_index FROM privacy_release_claims "
-            "WHERE run_token = ? AND message_id = ?",
-            (token, message_id),
-        ).fetchone()
-        if prior is not None:
-            con.execute("COMMIT")
-            return {
-                "status": "replay",
-                "run_token": token,
-                "allocation_index": int(allocation_index),
-                "release_index": int(prior[0]),
-                "epsilon": float(epsilon),
-                "delta": float(delta),
-                "max_releases": int(max_releases),
-                "message_id": message_id,
-            }
-
-        enabled = bool(manifest.get("privacy-release-enabled", False))
-        if int(claimed) >= int(max_releases) or not enabled or epsilon <= 0 or delta <= 0:
-            con.execute("COMMIT")
-            return {
-                "status": "noop",
-                "run_token": token,
-                "allocation_index": int(allocation_index),
-                "release_index": None,
-                "epsilon": float(epsilon),
-                "delta": float(delta),
-                "max_releases": int(max_releases),
-                "message_id": message_id,
-            }
-
-        release_index = int(claimed) + 1
-        changed = con.execute(
-            "UPDATE privacy_reservations SET claimed_releases = claimed_releases + 1 "
-            "WHERE run_token = ? AND claimed_releases = ? "
-            "AND claimed_releases < max_releases",
-            (token, int(claimed)),
-        ).rowcount
-        if changed != 1:
-            raise RuntimeError("privacy release claim lost its atomic race")
-        con.execute(
-            "INSERT INTO privacy_release_claims "
-            "(run_token, message_id, release_index, created_at) "
-            "VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            (token, message_id, release_index),
-        )
-        con.execute("COMMIT")
-        return {
-            "status": "new",
-            "run_token": token,
-            "allocation_index": int(allocation_index),
-            "release_index": release_index,
-            "epsilon": float(epsilon),
-            "delta": float(delta),
-            "max_releases": int(max_releases),
-            "message_id": message_id,
-        }
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise
-    finally:
-        con.close()
-
-
-def release_id(claim):
-    """Domain-separated identity used by deterministic randomness."""
-    if claim.get("release_index") is None:
-        raise RuntimeError("a no-op has no private release identity")
-    return "%s:%d:%d" % (
-        claim["run_token"],
-        int(claim["allocation_index"]),
-        int(claim["release_index"]),
-    )
+    status = _cached_status(
+        context, message_id, round_index, request_id)
+    return {
+        "status": status,
+        "release_index": round_index,
+        "epsilon": epsilon,
+        "delta": delta,
+        "num_rounds": num_rounds,
+        "message_id": message_id,
+        "request_id": request_id,
+        "policy_hash": policy_hash,
+    }

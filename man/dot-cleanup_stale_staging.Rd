@@ -4,7 +4,7 @@
 \alias{.cleanup_stale_staging}
 \title{Remove stale staging directories older than 24 hours}
 \usage{
-.cleanup_stale_staging(max_age_hours = 24)
+.cleanup_stale_staging(max_age_hours = 24, bases = NULL)
 }
 \description{
 Remove stale staging directories older than 24 hours

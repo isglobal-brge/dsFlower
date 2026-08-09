@@ -416,16 +416,6 @@ if gpu_present; then
   provision_framework "pytorch-gpu" "auto" "${PYTORCH_CHECK}" ${PYTORCH_DEPS}
 fi
 
-# Remove venvs from dropped frameworks so no obsolete venv lingers. Native tree
-# learners are not exposed by this runner ABI; sklearn was replaced by the
-# reviewed PyTorch/Opacus declarative path.
-for _obsolete in xgboost sklearn; do
-  if [ -d "${VENV_ROOT}/${_obsolete}" ]; then
-    log_info "  removing obsolete venv: ${_obsolete}"
-    rm -rf "${VENV_ROOT}/${_obsolete}"
-  fi
-done
-
 # Fix Python permissions (Rock runs as non-root 'rock' user)
 if [ -d "/root/.local/share/uv/python" ]; then
   chmod -R 755 /root/.local/share/uv/python/ 2>/dev/null
@@ -452,7 +442,7 @@ done
 ROCK_LIB="/var/lib/rock/R/library"
 if [ -d "${ROCK_LIB}" ]; then
   log_info "Checking R dependencies..."
-  for pkg in arrow digest jsonlite processx rappdirs yaml; do
+  for pkg in arrow digest filelock jsonlite processx; do
     Rscript --vanilla -e "
       if (!requireNamespace('${pkg}', quietly=TRUE, lib.loc='${ROCK_LIB}')) {
         cat('Installing ${pkg}...\n')

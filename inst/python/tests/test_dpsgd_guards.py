@@ -68,8 +68,7 @@ def _package_hash(package_dir):
 class ManifestPrivacyContractTests(unittest.TestCase):
     def test_adjacency_and_hook_resource_limits_are_server_pinned(self):
         manifest = {
-            "privacy-reserved": True,
-            "privacy-release-enabled": True,
+            "privacy-policy-sha256": "1" * 64,
             "privacy-epsilon": 1.0,
             "privacy-delta": 1e-5,
             "privacy-clipping_norm": 1.0,
@@ -130,13 +129,18 @@ class ManifestPrivacyContractTests(unittest.TestCase):
                     "app_params": {}, "round_index": 1, "num_rounds": 1,
                     "task": "classification", "num_classes": 2,
                 }, pcfg,
-                {}, timeout=7)
+                {}, timeout=7, child_seed=b"c" * 32)
 
         self.assertIsNone(result)
         self.assertEqual(captured["env"]["DSF_RLIMIT_AS"], str(2048 * 1024 * 1024))
         self.assertEqual(captured["env"]["DSF_RLIMIT_FSIZE"], str(256 * 1024 * 1024))
         self.assertEqual(captured["env"]["DSF_RLIMIT_NPROC"], "16")
         self.assertEqual(captured["env"]["DSF_RLIMIT_CPU"], "7")
+        self.assertEqual(captured["env"]["DSF_DETERMINISTIC_SEED"],
+                         (b"c" * 32).hex())
+        self.assertEqual(captured["env"]["PYTHONHASHSEED"],
+                         str(int.from_bytes(b"c" * 4, "big")))
+        self.assertEqual(captured["env"]["CUBLAS_WORKSPACE_CONFIG"], ":4096:8")
 
     def test_hook_requires_independent_resource_isolation_attestation(self):
         pcfg = {
@@ -171,18 +175,96 @@ class ManifestPrivacyContractTests(unittest.TestCase):
                     tier2_lib, "_pinned_user_package", return_value="/hook/__init__.py"), \
                 mock.patch.object(
                     tier2_lib, "_run_isolated",
-                    side_effect=lambda *args: [array.copy() for array in old]) as run, \
+                    side_effect=lambda *args, **kwargs: [
+                        array.copy() for array in old]) as run, \
                 mock.patch.object(
                     tier2_lib.time, "monotonic", side_effect=[100.0, 101.0]), \
                 mock.patch.object(tier2_lib.time, "sleep") as sleep:
             result = tier2_lib.gated_local_update(
                 "hookpkg", old, np.zeros((6, 1)), np.zeros(6), {}, pcfg,
-                seed=b"s" * 32, hook_caps=caps)
+                seed=b"s" * 32, execution_seed=b"e" * 32,
+                hook_caps=caps)
 
         self.assertEqual(run.call_count, 3)
         self.assertTrue(all(call.args[-1] == 1 for call in run.call_args_list))
+        self.assertTrue(all(len(call.kwargs["child_seed"]) == 32
+                            for call in run.call_args_list))
         sleep.assert_called_once_with(9.0)
         self.assertEqual(result[0].shape, old[0].shape)
+
+    def test_hook_noise_key_is_bound_to_the_validated_pre_noise_update(self):
+        old = [np.zeros(2, dtype=np.float64)]
+        pcfg = {
+            "hook_enabled": True, "sample_aggregate": False,
+            "egress_timeout": 1, "egress_time_pad": 0,
+            "clipping_norm": 1.0, "epsilon": 1.0, "delta": 1e-5,
+        }
+        caps = {"subprocess": True, "net_lock": True, "fs_isolation": True}
+        first = [np.asarray([1.0, 0.0])]
+        changed = [np.asarray([2.0, 0.0])]
+        noises = []
+
+        def capture_noise(new, _old, **kwargs):
+            noises.append(kwargs["rng"].normal(size=8))
+            return new
+
+        with mock.patch.object(
+                tier2_lib, "hook_execution_caps", return_value=caps), \
+                mock.patch.object(
+                    tier2_lib, "_pinned_user_package",
+                    return_value="/hook/__init__.py"), \
+                mock.patch.object(
+                    tier2_lib, "_run_isolated",
+                    side_effect=[first, first, changed]), \
+                mock.patch.object(
+                    tier2_lib.dp_harness, "output_perturbation",
+                    side_effect=capture_noise):
+            for _ in range(3):
+                tier2_lib.gated_local_update(
+                    "hookpkg", old, np.zeros((2, 1)), np.zeros(2), {}, pcfg,
+                    seed=b"s" * 32, execution_seed=b"e" * 32,
+                    hook_caps=caps, pad_release=False)
+
+        np.testing.assert_array_equal(noises[0], noises[1])
+        self.assertFalse(np.array_equal(noises[0], noises[2]))
+
+    def test_isolated_hook_python_and_numpy_training_are_deterministic(self):
+        cfg = {
+            "app_params": {}, "round_index": 1, "num_rounds": 1,
+            "task": "classification", "num_classes": 2,
+        }
+        pcfg = {
+            "egress_memory_mb": 2048, "egress_file_mb": 64,
+            "egress_processes": 16,
+        }
+        old = [np.zeros(2, dtype=np.float64)]
+        with tempfile.TemporaryDirectory() as root:
+            package = os.path.join(root, "seeded_hook")
+            os.makedirs(package)
+            module_file = os.path.join(package, "__init__.py")
+            with open(module_file, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "import random\n"
+                    "import numpy as np\n"
+                    "def local_update(global_arrays, X, y, cfg):\n"
+                    "    value = random.random() + np.random.random()\n"
+                    "    return [np.full_like(global_arrays[0], value)]\n")
+            common = (
+                "seeded_hook", module_file, old, np.zeros((2, 1)),
+                np.zeros(2), cfg, pcfg, {}, 10,
+            )
+            first = tier2_lib._run_isolated(
+                *common, child_seed=b"a" * 32)
+            replay = tier2_lib._run_isolated(
+                *common, child_seed=b"a" * 32)
+            changed = tier2_lib._run_isolated(
+                *common, child_seed=b"b" * 32)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(replay)
+        self.assertIsNotNone(changed)
+        np.testing.assert_array_equal(first[0], replay[0])
+        self.assertFalse(np.array_equal(first[0], changed[0]))
 
     def test_hostile_npy_shape_is_rejected_before_np_load(self):
         with tempfile.TemporaryDirectory() as root:
@@ -199,6 +281,39 @@ class ManifestPrivacyContractTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     tier2_lib._load_expected_f64_npy(path, (1,))
             load.assert_not_called()
+
+
+class NeuralSemanticConfigTests(unittest.TestCase):
+    def test_transport_aliases_canonicalize_to_effective_bounds(self):
+        bounds = {"lower": [0.0], "upper": [1.0]}
+        encoded = base64.b64encode(json.dumps(
+            bounds, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).decode("ascii")
+        pins = {"optimizer": "sgd"}
+        privacy = {"policy_hash": "1" * 64}
+
+        direct, _ = client_app._neural_seed_contract(
+            {"feature-bounds": bounds, "feature-bounds-b64": "ignored-one"},
+            pins, privacy)
+        changed_alias, _ = client_app._neural_seed_contract(
+            {"feature-bounds": bounds, "feature-bounds-b64": "ignored-two"},
+            pins, privacy)
+        encoded_only, _ = client_app._neural_seed_contract(
+            {"feature-bounds-b64": encoded}, pins, privacy)
+
+        self.assertEqual(direct, changed_alias)
+        self.assertEqual(direct, encoded_only)
+
+    def test_backbone_makes_model_fallback_inert(self):
+        pins = {"optimizer": "sgd"}
+        privacy = {"policy_hash": "1" * 64}
+        first = client_app._neural_seed_contract(
+            {"backbone": "resnet18", "model": "ignored-one"},
+            pins, privacy)
+        second = client_app._neural_seed_contract(
+            {"backbone": "resnet18", "model": "ignored-two"},
+            pins, privacy)
+        self.assertEqual(first, second)
 
 
 class DpSgdAccountingTests(unittest.TestCase):
@@ -445,29 +560,8 @@ class FiniteGateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             client_app._assert_finite_private_inputs(good_x, bad_y)
 
-    def test_legacy_normalization_is_totalized_before_patient_pooling(self):
-        import base64
-
-        encoded = base64.b64encode(json.dumps({
-            "means": [-4.0e30], "sds": [2.0e-8],
-        }).encode("utf-8")).decode("ascii")
-        normalized = client_app._apply_feature_norm(
-            np.zeros((2, 1), dtype=np.float32),
-            {"feature-norm-b64": encoded})
-        self.assertTrue(bool(np.isfinite(normalized).all()))
-        self.assertTrue(bool(
-            np.abs(normalized).max() <= dp_harness.MAX_PARAMETER_ABS))
-
-        for groups in (
-                np.asarray(["same", "same"]),
-                np.asarray(["first", "second"])):
-            pooled, _ = client_app._pool_by_patient(
-                normalized, np.asarray([0.0, 1.0]), groups, "mse")
-            totalized = client_app._totalize_private_features(pooled)
-            self.assertTrue(bool(np.isfinite(totalized).all()))
-
     def test_public_bounds_with_subnormal_span_remain_total(self):
-        transformed = client_app._apply_feature_norm(
+        transformed = client_app._apply_feature_bounds(
             np.asarray([[0.0], [np.nextafter(0.0, 1.0)]], dtype=np.float64),
             {"feature-bounds": {
                 "lower": [0.0], "upper": [np.nextafter(0.0, 1.0)]}})
@@ -757,8 +851,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         context = SimpleNamespace(state=RecordDict())
         claim = {
             "status": "new", "message_id": "m1", "release_index": 1,
-            "max_releases": 1, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 1, "run_token": "run_" + "a" * 32,
+            "epsilon": 1.0, "delta": 1e-5,
         }
         pins = {
             "loss_name": "mse", "batch_size": 2, "local_epochs": 1,
@@ -767,8 +861,6 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         model = torch.nn.Linear(2, 1)
         with (mock.patch.object(client_app.release_guard, "claim_release",
                                 return_value=claim),
-              mock.patch.object(client_app.release_guard, "release_id",
-                                return_value="release:1"),
               mock.patch.object(client_app, "load_pinned_run_config",
                                 return_value={"data-kind": "tabular"}),
               mock.patch.object(client_app, "load_dp_track", return_value="neural"),
@@ -807,8 +899,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         context = SimpleNamespace(state=RecordDict())
         claim = {
             "status": "new", "message_id": "m1", "release_index": 1,
-            "max_releases": 3, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 3, "run_token": "run_" + "a" * 32,
+            "epsilon": 1.0, "delta": 1e-5,
         }
         pins = {
             "loss_name": "mse", "batch_size": 2, "local_epochs": 1,
@@ -816,8 +908,6 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         }
         with (mock.patch.object(client_app.release_guard, "claim_release",
                                 return_value=claim),
-              mock.patch.object(client_app.release_guard, "release_id",
-                                return_value="release:1"),
               mock.patch.object(client_app, "load_pinned_run_config",
                                 return_value={"data-kind": "tabular"}),
               mock.patch.object(client_app, "load_dp_track", return_value="neural"),
@@ -848,15 +938,23 @@ class StrictNeuralInitializationTests(unittest.TestCase):
               mock.patch.object(
                   client_app.dp_harness, "per_sample_independence_probe",
                   side_effect=AssertionError("private architecture probe")) as probe,
+              mock.patch.object(client_app.seeding, "master_seed",
+                                return_value=b"m" * 32) as master_seed,
               mock.patch.object(client_app, "_dp_fit",
                                 return_value=([np.zeros(1)], 2)) as fit):
             result = client_app._train_neural(
-                SimpleNamespace(), {}, {"clipping_norm": 1.0}, pins,
-                model, b"m" * 32, input_dim=1, manifest_image=False)
+                SimpleNamespace(), {}, {
+                    "clipping_norm": 1.0, "policy_hash": "1" * 64,
+                }, {**pins, "round_index": 1}, model,
+                input_dim=1, manifest_image=False)
 
         probe.assert_not_called()
         fit.assert_called_once()
         self.assertEqual(result[1], 2)
+        self.assertEqual(master_seed.call_args.args[0], "neural-dpsgd/v1")
+        private_arrays = master_seed.call_args.kwargs["private_arrays"]
+        np.testing.assert_array_equal(private_arrays[0], X)
+        np.testing.assert_array_equal(private_arrays[1], y.astype(np.float32))
 
 
 class RunPinBoundsTests(unittest.TestCase):
@@ -899,23 +997,32 @@ class RunPinBoundsTests(unittest.TestCase):
                     task.load_run_pins(context)
 
     def test_learning_rate_must_be_finite_and_positive(self):
-        manifest = {
+        base = {
             "loss-name": "mse", "batch-size": 32, "local-epochs": 2,
             "num-server-rounds": 3, "num-classes": 2,
         }
         with tempfile.TemporaryDirectory() as manifest_dir:
-            with open(os.path.join(manifest_dir, "manifest.json"), "w",
-                      encoding="utf-8") as handle:
-                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir}, run_config={})
             for invalid in (
                     0.0, -0.1, task._MAX_LEARNING_RATE + 0.1,
                     float("nan"), float("inf")):
-                context = SimpleNamespace(
-                    node_config={"manifest-dir": manifest_dir},
-                    run_config={"learning-rate": invalid})
+                manifest = dict(base, **{"learning-rate": invalid})
+                with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump(manifest, handle)
                 with self.subTest(learning_rate=invalid):
                     with self.assertRaises(ValueError):
                         task.load_run_pins(context)
+
+            manifest = dict(base, **{"learning-rate": 0.1})
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            ignored = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir},
+                run_config={"learning-rate": float("nan")})
+            self.assertEqual(task.load_run_pins(ignored)["learning_rate"], 0.1)
 
     def test_bce_logits_is_restricted_to_binary_heads(self):
         manifest = {
@@ -1190,8 +1297,8 @@ class HookAppPublicConfigTests(unittest.TestCase):
         context = SimpleNamespace(state=RecordDict())
         claim = {
             "status": "new", "message_id": "m1", "release_index": 1,
-            "max_releases": 1, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 1, "run_token": "run_" + "a" * 32,
+            "epsilon": 1.0, "delta": 1e-5,
         }
         with (mock.patch.object(client_app.release_guard, "claim_release",
                                 return_value=claim),
@@ -1239,8 +1346,8 @@ class HookAppPublicConfigTests(unittest.TestCase):
         context = SimpleNamespace(state=RecordDict())
         claim = {
             "status": "new", "message_id": "m1", "release_index": 1,
-            "max_releases": 2, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 2, "run_token": "run_" + "a" * 32,
+            "epsilon": 1.0, "delta": 1e-5,
         }
         pcfg = {
             "epsilon": 1.0, "delta": 1e-5, "hook_enabled": True,
@@ -1253,8 +1360,6 @@ class HookAppPublicConfigTests(unittest.TestCase):
 
         with (mock.patch.object(client_app.release_guard, "claim_release",
                                 return_value=claim),
-              mock.patch.object(client_app.release_guard, "release_id",
-                                return_value="release:1"),
               mock.patch.object(client_app, "load_pinned_run_config",
                                 return_value=cfg),
               mock.patch.object(client_app, "load_dp_track", return_value="egress"),
@@ -1267,8 +1372,10 @@ class HookAppPublicConfigTests(unittest.TestCase):
               mock.patch.object(client_app, "load_tabular_patient_ids",
                                 return_value=None),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
-              mock.patch.object(client_app.seeding, "master_seed",
+              mock.patch.object(tier2_lib, "hook_master_seed",
                                 return_value=b"m" * 32),
+              mock.patch.object(tier2_lib, "hook_execution_seed",
+                                return_value=b"e" * 32),
               mock.patch.object(tier2_lib, "pad_hook_release"),
               mock.patch.object(tier2_lib, "gated_local_update",
                                 side_effect=capture_update)):
@@ -1345,8 +1452,8 @@ class Tier2PinTests(unittest.TestCase):
         context = SimpleNamespace(state=RecordDict())
         claim = {
             "status": "new", "message_id": "m1", "release_index": 1,
-            "max_releases": 2, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 2, "run_token": "run_" + "a" * 32,
+            "epsilon": 1.0, "delta": 1e-5,
         }
         pcfg = {
             "epsilon": 1.0, "delta": 1e-5, "hook_enabled": False,
@@ -1385,8 +1492,8 @@ class Tier2PinTests(unittest.TestCase):
         context = SimpleNamespace(state=RecordDict())
         claim = {
             "status": "new", "message_id": "m1", "release_index": 1,
-            "max_releases": 2, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 2, "run_token": "run_" + "a" * 32,
+            "epsilon": 1.0, "delta": 1e-5,
         }
         pcfg = {
             "epsilon": 1.0, "delta": 1e-5, "hook_enabled": True,
@@ -1426,8 +1533,8 @@ class ClientAppExceptionBoundaryTests(unittest.TestCase):
         context = SimpleNamespace(state=RecordDict())
         claim = {
             "status": "new", "message_id": "m-private", "release_index": 1,
-            "max_releases": 1, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 1, "run_token": "run_" + "a" * 32,
+            "epsilon": 1.0, "delta": 1e-5,
         }
         def fail_on_private_conversion(*_args, **kwargs):
             pd.DataFrame({"private_feature": [sentinel]}).to_numpy(
@@ -1442,8 +1549,6 @@ class ClientAppExceptionBoundaryTests(unittest.TestCase):
         with (redirect_stdout(stdout), redirect_stderr(stderr),
               mock.patch.object(client_app.release_guard, "claim_release",
                                 return_value=claim),
-              mock.patch.object(client_app.release_guard, "release_id",
-                                return_value="release:1"),
               mock.patch.object(client_app, "load_pinned_run_config",
                                 return_value={}),
               mock.patch.object(client_app, "load_dp_track", return_value="neural"),
@@ -1452,7 +1557,7 @@ class ClientAppExceptionBoundaryTests(unittest.TestCase):
               mock.patch.object(client_app, "load_run_pins",
                                 return_value={"num_rounds": 1}),
               mock.patch.object(client_app, "_prepare_neural_model",
-                                return_value=(object(), b"m" * 32, 1, False)),
+                                return_value=(object(), 1, False)),
               mock.patch.object(client_app, "_train_neural",
                                 side_effect=fail_on_private_conversion) as train_neural):
             reply = client_app.train(msg, context)
@@ -1492,6 +1597,16 @@ class PatientIdGateTests(unittest.TestCase):
                 ["p1", task._MISSING_PATIENT_UNIT],
             )
 
+    def test_oversized_patient_ids_totalize_before_grouping_and_seeding(self):
+        oversized = "x" * (task._MAX_PATIENT_ID_BYTES + 1)
+        loaded = task._load_patient_ids(
+            pd.DataFrame({"patient_id": [oversized]}),
+            self._patient_manifest())
+        self.assertEqual(loaded.tolist(), [task._MISSING_PATIENT_UNIT])
+        self.assertEqual(
+            tier2_lib._canonical_patient_id(oversized),
+            task._MISSING_PATIENT_UNIT)
+
     def test_v2_patient_id_fixture_matches_active_runner_components(self):
         em_space_id = "\u2003patient\u2003"
         values = [" \tpatient\r\n", em_space_id, "N/A",
@@ -1507,11 +1622,11 @@ class PatientIdGateTests(unittest.TestCase):
         self.assertEqual(
             [tier2_lib._canonical_patient_id(value) for value in values], expected)
 
-        legacy = self._patient_manifest()
-        legacy["patient-id-canonicalization"] = "trim-utf8-v1"
+        unsupported = self._patient_manifest()
+        unsupported["patient-id-canonicalization"] = "trim-utf8-v1"
         with self.assertRaisesRegex(ValueError, "unsupported"):
             task._load_patient_ids(
-                pd.DataFrame({"patient_id": ["p1"]}), legacy)
+                pd.DataFrame({"patient_id": ["p1"]}), unsupported)
 
     def test_missing_and_literal_sentinel_merge_conservatively(self):
         groups = [task._MISSING_PATIENT_UNIT, None]
@@ -1570,7 +1685,10 @@ class PatientIdGateTests(unittest.TestCase):
                       encoding="utf-8") as handle:
                 json.dump({
                     "data_type": "image", "samples_file": "samples.csv",
-                    "data_root": manifest_dir, "target_column": "label",
+                    "assets": {"images": {"type": "image_root",
+                                             "root": manifest_dir,
+                                             "path_col": "relative_path"}},
+                    "target_column": "label",
                     "patient_column": "patient_id",
                     "dp-unit": "patient",
                     "patient-id-canonicalization": "trim-utf8-v2",
@@ -1655,7 +1773,10 @@ class PatientIdGateTests(unittest.TestCase):
                       encoding="utf-8") as handle:
                 json.dump({
                     "data_type": "image", "samples_file": "samples.csv",
-                    "data_root": root, "target_column": "label",
+                    "assets": {"images": {"type": "image_root",
+                                             "root": root,
+                                             "path_col": "relative_path"}},
+                    "target_column": "label",
                     "task-type": "classification", "num-classes": 2,
                     "dp-unit": "row", "patient_column": None,
                     "patient-id-canonicalization": "trim-utf8-v2",

@@ -44,7 +44,7 @@ One-time, register dsFlower's DataSHIELD methods on the Opal it serves (admin):
 ```r
 library(opalr)
 o <- opal.login("administrator", Sys.getenv("OPAL_ADMIN_PW"), url = "https://<opal>")
-dsadmin.set_package_methods(o, "dsFlower")   # registers flowerFeatureStatsDS, etc.
+dsadmin.set_package_methods(o, "dsFlower")   # registers the current assign/aggregate methods
 opal.logout(o)
 ```
 
@@ -54,56 +54,46 @@ walkthrough.
 
 ## Persistent privacy state
 
-The container image is replaceable; privacy state is runtime state. Production
-deployments must preserve these server-owned resources across restarts,
-rescheduling and image upgrades:
-
-- the directory containing the SQLite ledger, normally
-  `/var/lib/dsflower/privacy/`;
-- the private Tier-2 upload spool, normally `/var/lib/dsflower/appstore/`, if
-  verified uploads must survive container replacement;
-- the runtime-generated 256-bit node secret, normally
-  `/var/lib/dsflower/privacy/noise_root`, or a secret-manager path configured
-  through `DSFLOWER_NODE_SECRET_FILE`.
+The container image is replaceable. Production deployments should preserve the
+runtime-generated 256-bit node secret, normally
+`/var/lib/dsflower/privacy/noise_root`, or provide a secret-manager path through
+`DSFLOWER_NODE_SECRET_FILE`. Preserve the private HookApp upload spool at
+`/var/lib/dsflower/appstore/` separately if verified uploads must survive
+container replacement.
 
 Do not mount all of `/var/lib/dsflower` over this image: that would hide the baked
 `venvs/` directory. Mount the privacy and appstore subdirectories separately.
 The existing Rock entrypoint is preserved. Its service-start hook initializes
-the ledger and seed as the `rock` UID after mounts are ready only when both state
-paths were explicitly provided as environment variables; otherwise the first
-session initializes them after profile options are available. Both Docker builds
-fail if either file was created during installation, so no deployment can inherit
-a seed baked into an image. If the runtime mount is temporarily unusable, Rock
-still starts; private dsFlower calls retry and fail closed until it is repaired.
+the secret as the `rock` UID after mounts are ready when its path is explicitly
+provided as an environment variable; otherwise the first session initializes it
+after profile options are available. Both Docker builds fail if the secret was
+created during installation, so no deployment can inherit a key baked into an
+image. If the runtime mount is temporarily unusable, Rock still starts; private
+dsFlower calls retry and generate or validate the key when the path is usable.
 
 The mounted privacy directory must be owned by the Rock
 process UID and must not be writable by group or other users (`0700` is the
-recommended mode); the ledger itself is enforced as `0600`. The secret file must
-also be owned by the Rock process UID with exact mode `0600`; its real parent may
+recommended mode). The secret file must be owned by the Rock process UID with
+exact mode `0600`; its real parent may
 be owned by that UID or root, but must not be writable by group or other users.
 If a service-owned regular seed is missing, malformed or has unsafe permissions,
-dsFlower atomically generates a new one and records a new key epoch without
-changing the ledger budget. Unsafe symlinks/ownership remain fail-closed. Ledger
-loss or rollback is not recoverable this way and can invalidate lifetime DP, so
-the ledger requires durable backup. Do not clone a complete node state to a
-concurrent node. dsFlower deliberately declares no Docker `VOLUME`, because the
-correct persistent-volume wiring belongs to the Rock/orchestrator deployment.
+dsFlower atomically generates a new one. Unsafe symlinks and foreign-owned paths
+remain fail-closed. A rotation produces an independent deterministic-noise
+domain; it never introduces a query-count lockout. Do not clone the same secret
+to concurrent nodes. dsFlower deliberately declares no Docker `VOLUME`, because
+the correct persistent-volume wiring belongs to the Rock/orchestrator deployment.
 
-Set both `DSFLOWER_NODE_SECRET_FILE` and `DSFLOWER_PRIVACY_LEDGER_PATH` to opt in
-to pre-service bootstrap. With neither (or only one), the wrapper does not guess:
-Opal and Armadillo inject profile R options only after creating a session, so
-bootstrap is deferred to `flowerInitDS()`. R-option precedence is preserved for
-existing ledger deployments, and a conflicting ledger ENV and R option is
-rejected instead of silently selecting different accounting state. The node-key
-ENV is authoritative over its R option, so a stale key path cannot block
-regeneration.
+Set `DSFLOWER_NODE_SECRET_FILE` to opt in to pre-service bootstrap. Without it,
+the wrapper does not guess: Opal and Armadillo inject profile R options only
+after creating a session, so bootstrap is deferred to `flowerInitDS()`. The
+node-key environment variable is authoritative over its R option, so a stale
+option cannot block regeneration.
 
 This runtime contract is connector-neutral, but persistence is an orchestrator
-property. A profile manager that removes and recreates Rock without reattaching
-the same durable volume cannot preserve lifetime accounting. In that setup,
-including currently managed Armadillo Docker profiles without volume support,
-run this Rock as an externally managed Compose/Kubernetes service (or add named
-volume support to the profile manager) and point the profile at it.
+property. If a profile manager recreates Rock without reattaching the same key
+volume, dsFlower safely creates a new key at first use. Use an externally managed
+Compose/Kubernetes service or secret manager when stable deterministic noise
+across replacements is required.
 
 ## Notes
 

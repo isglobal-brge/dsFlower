@@ -17,8 +17,8 @@
 #' Generate a unique run token
 #'
 #' Creates a token in the format \code{run_<32 hex digits>} from 128 bits of
-#' operating-system entropy.  The token is also a primary key in the persistent
-#' privacy ledger, so it must not depend on R's mutable statistical RNG.
+#' operating-system entropy. It identifies transient staging only and is never a
+#' privacy counter or an input to sticky semantic noise.
 #'
 #' @return Character; the run token string.
 #' @keywords internal
@@ -112,8 +112,8 @@
 }
 
 # Validate analyst-supplied column names without inspecting a private schema.
-# This runs before the lifetime reservation and is also the complete column
-# contract available to a data-free privacy-tail manifest.
+# This runs before private staging and defines the complete public column
+# contract.
 .normalizePublicColumnSelection <- function(target_column, feature_columns,
                                             run_config) {
   target_column <- as.character(unlist(target_column, use.names = FALSE))
@@ -286,7 +286,7 @@
 #'
 #' This is an internal staging invariant, not an analyst-visible statistic.
 #' Row mode counts rows. Patient mode counts the complete, canonical identifiers
-#' selected by the lifetime server policy and never falls back to rows.
+#' selected by the server policy and never falls back to rows.
 #' @keywords internal
 .countDpUnits <- function(data, dp_unit, patient_column = NULL) {
   unit <- tolower(as.character(unlist(dp_unit, use.names = FALSE)))
@@ -414,8 +414,8 @@
     return(data)
   }
 
-  # Compatibility path: classification labels may already be public integer
-  # codes. Validate against the public model class count; never infer a mapping.
+  # Numeric classification labels may be supplied as public integer codes.
+  # Validate against the public model class count; never infer a mapping.
   encoded <- .coerceNumericOrMissing(target)
   expected <- run_config[["num-classes"]] %||% 2L
   expected <- as.integer(unlist(expected, use.names = FALSE))
@@ -742,15 +742,13 @@
   c(
     .manifest_structural_fields()[.manifest_structural_fields() != "data_type"],
     "dp_enabled", "allow_per_node_metrics", "allow_exact_num_examples",
-    "fixed_client_sampling", "privacy-domain", "privacy-adjacency",
-    "privacy-reserved",
-    "privacy-release-enabled", "privacy-max-releases", "privacy-epsilon",
+    "fixed_client_sampling", "privacy-adjacency",
+    "privacy-policy-sha256", "privacy-epsilon",
     "privacy-delta", "privacy-clipping_norm", "privacy-sample_aggregate",
     "privacy-sa_blocks", "privacy-egress_time_pad",
     "privacy-egress_timeout", "privacy-egress_memory_mb",
     "privacy-egress_file_mb", "privacy-egress_processes",
-    "privacy-hook_enabled",
-    "privacy-allocation-index", "user-module", "app-params-sha256"
+    "privacy-hook_enabled", "user-module", "app-params-sha256"
   )
 }
 
@@ -768,14 +766,18 @@
     stop("run_config must have unique, non-empty field names.", call. = FALSE)
   }
   conflicts <- intersect(keys, .server_owned_run_config_fields())
+  conflicts <- unique(c(
+    conflicts,
+    keys[startsWith(tolower(keys), "privacy-") |
+           startsWith(tolower(keys), "privacy_")]
+  ))
   if (length(conflicts)) {
     stop("run_config cannot set server-owned manifest field(s): ",
          paste(conflicts, collapse = ", "), ".", call. = FALSE)
   }
-  retired <- intersect(keys, c("template_name", "template-name"))
-  if (length(retired)) {
-    stop("Named executable templates are retired. Submit a declarative model ",
-         "specification and dp-track instead.", call. = FALSE)
+  if ("num_rounds" %in% keys) {
+    stop("run_config must use the canonical 'num-server-rounds' field.",
+         call. = FALSE)
   }
   run_config
 }
@@ -823,9 +825,9 @@
   invisible(manifest_path)
 }
 
-#' Bind an accountant reservation to a prepared manifest
+#' Bind the stateless privacy contract to a prepared manifest
 #' @keywords internal
-.apply_privacy_reservation <- function(staging_dir, reservation) {
+.apply_privacy_contract <- function(staging_dir, contract) {
   manifest_path <- file.path(staging_dir, "manifest.json")
   if (!file.exists(manifest_path)) {
     stop("Prepared run manifest is missing.", call. = FALSE)
@@ -836,71 +838,44 @@
                              call. = FALSE))
   if (length(manifest[["run_token"]]) != 1L ||
       !identical(as.character(manifest[["run_token"]]),
-                 as.character(reservation$run_token))) {
-    stop("Privacy reservation run token does not match the prepared manifest.",
+                 as.character(contract$run_token))) {
+    stop("Privacy contract run token does not match the prepared manifest.",
          call. = FALSE)
   }
-  expected_horizon <- as.integer(manifest[["privacy-max-releases"]] %||% NA)
+  expected_horizon <- as.integer(manifest[["num-server-rounds"]] %||% NA)
   if (is.na(expected_horizon) ||
-      expected_horizon != as.integer(reservation$max_releases)) {
-    stop("Privacy reservation horizon does not match the prepared manifest.",
+      expected_horizon != as.integer(contract$num_rounds)) {
+    stop("Privacy contract horizon does not match the prepared manifest.",
          call. = FALSE)
   }
   manifest_unit <- as.character(manifest[["dp-unit"]] %||% "")
-  reservation_unit <- as.character(reservation$dp_unit %||% "")
+  contract_unit <- as.character(contract$dp_unit %||% "")
   manifest_patient <- manifest[["patient_column"]] %||% NULL
-  reservation_patient <- reservation$patient_column %||% NULL
+  contract_patient <- contract$patient_column %||% NULL
   manifest_canonicalization <- as.character(
     manifest[["patient-id-canonicalization"]] %||% "")
-  reservation_canonicalization <- as.character(
-    reservation$unit_canonicalization %||% "")
+  contract_canonicalization <- as.character(
+    contract$unit_canonicalization %||% "")
   manifest_adjacency <- as.character(
     manifest[["privacy-adjacency"]] %||% "")
-  reservation_adjacency <- as.character(reservation$adjacency %||% "")
-  if (!identical(manifest_unit, reservation_unit) ||
-      !identical(manifest_patient, reservation_patient) ||
-      !identical(manifest_canonicalization, reservation_canonicalization) ||
-      !identical(manifest_adjacency, reservation_adjacency)) {
-    stop("Privacy reservation unit does not match the prepared manifest.",
+  contract_adjacency <- as.character(contract$adjacency %||% "")
+  manifest_epsilon <- suppressWarnings(as.numeric(
+    manifest[["privacy-epsilon"]] %||% NA_real_))
+  manifest_delta <- suppressWarnings(as.numeric(
+    manifest[["privacy-delta"]] %||% NA_real_))
+  manifest_policy_hash <- as.character(
+    manifest[["privacy-policy-sha256"]] %||% "")
+  if (!identical(manifest_unit, contract_unit) ||
+      !identical(manifest_patient, contract_patient) ||
+      !identical(manifest_canonicalization, contract_canonicalization) ||
+      !identical(manifest_adjacency, contract_adjacency) ||
+      !identical(manifest_epsilon, as.numeric(contract$epsilon)) ||
+      !identical(manifest_delta, as.numeric(contract$delta)) ||
+      !identical(manifest_policy_hash, as.character(contract$policy_hash))) {
+    stop("Privacy contract does not match the prepared manifest.",
          call. = FALSE)
   }
-  manifest[["privacy-reserved"]] <- TRUE
-  manifest[["privacy-release-enabled"]] <- isTRUE(reservation$release_enabled)
-  manifest[["privacy-domain"]] <- reservation$domain
-  manifest[["privacy-allocation-index"]] <- reservation$allocation_index
-  manifest[["privacy-epsilon"]] <- reservation$epsilon
-  manifest[["privacy-delta"]] <- reservation$delta
   .write_manifest_atomic(manifest, manifest_path)
-}
-
-# Stage the numerically-impractical tail of the lifetime schedule without
-# opening a descriptor, table, metadata file, or image.  Every value here is a
-# public request, a server policy value, or a fixed data-independent constant.
-.stagePublicNoopManifest <- function(run_token, target_column, feature_columns,
-                                     data_type, run_config, reservation) {
-  extra_config <- .validate_manifest_extra_config(run_config)
-  staging_dir <- .ensureStagingDir(run_token)
-  manifest <- list(
-    run_token       = run_token,
-    data_type       = data_type,
-    data_format     = "none",
-    n_samples       = 0L,
-    n_units         = 0L,
-    n_input_samples = 0L,
-    dropped_missing = 0L,
-    target_column   = target_column,
-    feature_columns = feature_columns,
-    "dp-unit"       = reservation$dp_unit,
-    patient_column  = reservation$patient_column,
-    "patient-id-canonicalization" = reservation$unit_canonicalization,
-    "target-preencoded" = TRUE,
-    source_kind     = "privacy_noop",
-    staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
-  )
-  manifest <- .merge_manifest_config(manifest, extra_config)
-  manifest <- .normalize_dp_manifest(manifest)
-  .write_manifest_atomic(manifest, file.path(staging_dir, "manifest.json"))
-  staging_dir
 }
 
 #' Stage a validated tabular training frame
@@ -973,7 +948,7 @@
     staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
-  # Merge extra config (includes privacy settings from trust profile)
+  # Merge the server-authored mechanism and public run configuration.
   manifest <- .merge_manifest_config(manifest, extra_config)
 
   # Write manifest
@@ -1080,7 +1055,6 @@
   manifest <- list(
     run_token    = run_token,
     data_type    = "image",
-    data_root    = data_root,
     samples_file = samples_basename,
     n_samples    = prepared$n_samples,
     n_units      = .countDpUnits(
@@ -1092,6 +1066,8 @@
     patient_column = unit$patient_column,
     "patient-id-canonicalization" = unit$canonicalization,
     "target-preencoded" = TRUE,
+    assets = list(images = list(
+      type = "image_root", root = data_root, path_col = "relative_path")),
     staged_at    = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
@@ -1681,8 +1657,7 @@
 
 .imageAssetNeedsStaging <- function(asset_name, asset_type, extra_config) {
   if (identical(asset_type, "mask_root")) {
-    return(identical(extra_config[["template_name"]], "pytorch_unet2d") ||
-             !is.null(extra_config[["mask_asset"]]) ||
+    return(!is.null(extra_config[["mask_asset"]]) ||
              !is.null(extra_config[["mask_path_col"]]))
   }
   asset_name == "images" || asset_type %in% c("image_root", "wsi_root",
@@ -1881,12 +1856,6 @@
     }
   }
 
-  # For backward compat: set data_root from primary image asset
-  data_root <- NULL
-  if (!is.null(validated_assets$images)) {
-    data_root <- validated_assets$images$root
-  }
-
   if (!is.null(validated_assets$images)) {
     image_asset <- assets$images %||% list()
     image_path_col <- validated_assets$images$path_col %||% "relative_path"
@@ -1908,7 +1877,6 @@
   manifest <- list(
     run_token     = run_token,
     data_type     = "image",
-    data_root     = data_root,
     samples_file  = samples_basename,
     n_samples     = n_samples,
     n_units       = .countDpUnits(

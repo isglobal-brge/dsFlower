@@ -1,4 +1,4 @@
-test_that("Rock image privacy state is runtime-only", {
+test_that("Rock image noise root is runtime-only", {
   root <- normalizePath(testthat::test_path("..", ".."), mustWork = TRUE)
   dockerfile <- file.path(root, "docker", "Dockerfile")
   vision_dockerfile <- file.path(root, "docker", "Dockerfile.vision")
@@ -19,38 +19,20 @@ test_that("Rock image privacy state is runtime-only", {
     docker_text,
     "DSFLOWER_NODE_SECRET_FILE:-/var/lib/dsflower/privacy/noise_root",
     fixed = TRUE)
-  expect_match(
-    docker_text,
-    "DSFLOWER_PRIVACY_LEDGER_PATH:-/var/lib/dsflower/privacy/ledger.sqlite",
-    fixed = TRUE)
-  expect_match(docker_text, "test ! -e /var/lib/dsflower/privacy/ledger.sqlite",
-               fixed = TRUE)
   expect_match(vision_text, "test ! -e /var/lib/dsflower/privacy/noise_root",
                fixed = TRUE)
   expect_match(
     vision_text,
     "DSFLOWER_NODE_SECRET_FILE:-/var/lib/dsflower/privacy/noise_root",
     fixed = TRUE)
-  expect_match(
-    vision_text,
-    "DSFLOWER_PRIVACY_LEDGER_PATH:-/var/lib/dsflower/privacy/ledger.sqlite",
-    fixed = TRUE)
-  expect_match(vision_text,
-               "test ! -e /var/lib/dsflower/privacy/ledger.sqlite",
-               fixed = TRUE)
   expect_match(wrapper_text, "DSFLOWER_NODE_SECRET_FILE:-", fixed = TRUE)
-  expect_match(wrapper_text, "DSFLOWER_PRIVACY_LEDGER_PATH:-", fixed = TRUE)
   expect_match(wrapper_text, "deferred to the first session", fixed = TRUE)
   expect_match(docker_text, "exec[[:space:]]+gosu", fixed = TRUE)
   expect_match(docker_text, "start-rock-upstream.sh", fixed = TRUE)
   expect_match(
-    docker_text, "privacy state was created during image build", fixed = TRUE)
+    docker_text, "noise root was created during image build", fixed = TRUE)
   expect_match(
-    vision_text, "privacy state was created during image build", fixed = TRUE)
-  expect_false(grepl("dsFlower:::.privacy_ledger_path()", docker_text,
-                     fixed = TRUE))
-  expect_false(grepl("dsFlower:::.privacy_ledger_path()", vision_text,
-                     fixed = TRUE))
+    vision_text, "noise root was created during image build", fixed = TRUE)
   expect_match(wrapper_text, ".privacy_runtime_bootstrap", fixed = TRUE)
   expect_match(wrapper_text, "exec /opt/obiba/bin/start-rock-upstream.sh",
                fixed = TRUE)

@@ -242,7 +242,7 @@
 flowerInitDS <- function(data_symbol) {
   # Initialize persistent privacy state before the first dsFlower operation
   # inspects a session object. This runs only in a live service/session, never
-  # from package installation or namespace loading, and consumes no allocation.
+  # from package installation or namespace loading.
   .privacy_runtime_bootstrap()
 
   # data_symbol is a STRING (e.g. "D"), not the object itself.
@@ -336,9 +336,8 @@ flowerInitDS <- function(data_symbol) {
        call. = FALSE)
 }
 
-# Normalize the client-requested Flower horizon to one server-pinned key.  The
-# aliases are accepted only for compatibility and may not disagree.
-.normalizeRunHorizon <- function(run_config) {
+# Normalize the client-requested Flower round count to one server-pinned key.
+.normalizeRunRounds <- function(run_config) {
   parse_rounds <- function(value, field) {
     if (is.null(value)) return(NULL)
     value <- suppressWarnings(as.numeric(unlist(value, use.names = FALSE)))
@@ -348,16 +347,10 @@ flowerInitDS <- function(data_symbol) {
     }
     as.integer(value)
   }
-  modern <- parse_rounds(run_config[["num-server-rounds"]],
-                         "num-server-rounds")
-  legacy <- parse_rounds(run_config[["num_rounds"]], "num_rounds")
-  if (!is.null(modern) && !is.null(legacy) && modern != legacy) {
-    stop("num-server-rounds and num_rounds disagree.", call. = FALSE)
-  }
-  rounds <- modern %||% legacy %||% 1L
+  rounds <- parse_rounds(run_config[["num-server-rounds"]],
+                         "num-server-rounds") %||% 1L
   rounds <- .validateMaxRounds(rounds)
   run_config[["num-server-rounds"]] <- rounds
-  run_config[["num_rounds"]] <- NULL
   run_config
 }
 
@@ -754,7 +747,7 @@ flowerInitDS <- function(data_symbol) {
 # (the node is the trusted curator; there is no Secure Aggregation), and
 # disclosure is non-disclosive by default. Normalise the manifest run_config to
 # the DP-always contract. epsilon/delta are placeholders until prepare-time,
-# when the persistent accountant reserves before private staging.
+# when the server-owned per-training contract is bound before private staging.
 .bounded_server_number <- function(name, default, lower, upper,
                                    integer = FALSE) {
   value <- suppressWarnings(as.numeric(unlist(
@@ -772,7 +765,7 @@ flowerInitDS <- function(data_symbol) {
 
 .addDpConfigToRunConfig <- function(run_config) {
   run_config <- .validate_client_run_config(run_config)
-  run_config <- .normalizeRunHorizon(run_config)
+  run_config <- .normalizeRunRounds(run_config)
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
   if (length(track) != 1L || is.na(track) ||
@@ -795,15 +788,10 @@ flowerInitDS <- function(data_symbol) {
   run_config[["allow_exact_num_examples"]] <- FALSE
   run_config[["fixed_client_sampling"]]    <- TRUE
   policy <- .privacy_policy()  # validate admin policy before touching private data
-  max_releases <- if (identical(track, "validation")) 1L else
-    as.integer(run_config[["num-server-rounds"]])
-  run_config[["privacy-domain"]] <- policy$domain
   run_config[["privacy-adjacency"]] <- policy$adjacency
-  run_config[["privacy-reserved"]] <- FALSE
-  run_config[["privacy-release-enabled"]] <- FALSE
-  run_config[["privacy-max-releases"]] <- max_releases
-  run_config[["privacy-epsilon"]] <- 0
-  run_config[["privacy-delta"]] <- 0
+  run_config[["privacy-policy-sha256"]] <- policy$policy_hash
+  run_config[["privacy-epsilon"]] <- policy$per_training_epsilon
+  run_config[["privacy-delta"]] <- policy$per_training_delta
   run_config[["privacy-clipping_norm"]] <- as.numeric(.dsf_option("dp_clipping_norm", 1.0))
   # Improved Tier-2 floor policy (sample-and-aggregate): the node may split its private
   # data into a FIXED, administrator-pinned k, run the uploaded black-box update per
@@ -849,7 +837,7 @@ flowerInitDS <- function(data_symbol) {
 
 # Shared structural + DP enforcement for both prepare paths. DP is
 # unconditional and admission never branches on a private count.
-.enforceDisclosureAndDp <- function(handle, target_column, template_name,
+.enforceDisclosureAndDp <- function(handle, target_column,
                                     n_samples, target_data, run_config,
                                     data_type = "tabular",
                                     n_units = n_samples) {
@@ -862,8 +850,8 @@ flowerInitDS <- function(data_symbol) {
       unit_count != floor(unit_count)) {
     stop("Invalid staged privacy-unit count.", call. = FALSE)
   }
-  # The lifetime policy and reservation were validated before private staging.
-  # The clipping bound is likewise server-owned and cannot come from the analyst.
+  # The stateless per-training policy was validated before private staging. The
+  # clipping bound is likewise server-owned and cannot come from the analyst.
   dp_clip <- as.numeric(run_config[["privacy-clipping_norm"]] %||% 1.0)
   clip_ceiling  <- suppressWarnings(as.numeric(.dsf_option("dp_clip_ceiling", 100)))
   if (length(dp_clip) != 1L || !is.finite(dp_clip) || dp_clip <= 0 ||
@@ -876,11 +864,9 @@ flowerInitDS <- function(data_symbol) {
 
 #' Prepare a Training Run
 #'
-#' DataSHIELD ASSIGN method. Reserves the server-owned lifetime allocation,
-#' and, when that allocation is numerically viable, applies total public
-#' preprocessing and stages the training data. A non-viable geometric-tail
-#' allocation stages only a public no-op manifest and never opens the private
-#' source. No minimum-size or private-value admission bit is returned.
+#' DataSHIELD ASSIGN method. Validates the fixed stateless per-training privacy
+#' contract, applies total public preprocessing and stages the training data.
+#' Earlier trainings never change admission or the per-training contract.
 #'
 #' @param handle_symbol Character; symbol of the initialized handle.
 #' @param target_column Character; name of the target column.
@@ -911,14 +897,11 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     .cleanupStaging(handle$run_token)
   }
 
-  # Validate every analyst/admin-controlled value before charging or touching
-  # private data. The reservation then happens before file/table contents,
-  # labels, completeness or patient identifiers are inspected. Failed attempts
-  # are intentionally never refunded; the lifetime schedule remains
-  # non-blocking and simply assigns the next geometrically smaller allocation.
+  # Validate every analyst/admin-controlled value and the fixed privacy contract
+  # before touching private data. There is no historical counter or budget.
   descriptor_data_type <- if (identical(handle$source, "descriptor")) {
-    # source_kind is copied into the handle at initialization.  Do not inspect
-    # the descriptor merely to route a data-free privacy-tail allocation.
+    # source_kind is copied into the handle at initialization, so routing does
+    # not need to inspect private descriptor contents.
     if (identical(handle$source_kind, "image_bundle")) "image" else "tabular"
   } else {
     NULL
@@ -962,30 +945,12 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
     run_config[["validation-contract-sha256"]] <- actual_contract
   }
-  template_name <- run_config[["template_name"]] %||% NULL
   run_token <- .generate_run_token()
   .privacy_runtime_bootstrap()
-  max_releases <- as.integer(run_config[["privacy-max-releases"]])
-  reservation <- .reserve_privacy_run(run_token, max_releases)
+  num_rounds <- as.integer(run_config[["num-server-rounds"]])
+  contract <- .privacy_training_contract(run_token, num_rounds)
   admitted <- FALSE
   on.exit(if (!admitted) .cleanupStaging(run_token), add = TRUE)
-
-  if (!isTRUE(reservation$release_enabled)) {
-    staging_dir <- .stagePublicNoopManifest(
-      run_token, target_column, feature_columns, data_type,
-      run_config, reservation)
-    .apply_privacy_reservation(staging_dir, reservation)
-
-    handle$run_token       <- run_token
-    handle$staging_dir     <- staging_dir
-    handle$target_column   <- target_column
-    handle$feature_columns <- feature_columns
-    handle$template_name   <- template_name
-    handle$runtime_desc    <- NULL
-    handle$prepared        <- TRUE
-    admitted <- TRUE
-    return(.storeHandle(handle_symbol, handle))
-  }
 
   # From this point onward errors can be caused by private storage/content or
   # third-party decoders. Keep their text inside the node: the exterior DSI
@@ -1008,7 +973,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 
       data_type <- staged_manifest$data_type %||% "tabular"
       .enforceDisclosureAndDp(
-        handle, target_column, template_name, staged_manifest$n_samples,
+        handle, target_column, staged_manifest$n_samples,
         NULL, run_config, data_type = data_type,
         n_units = staged_manifest$n_units)
 
@@ -1039,22 +1004,12 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
         }
       }
 
-      # Resolve runtime descriptor: template -> framework -> venv -> paths
-      runtime_desc <- NULL
-      if (!is.null(template_name)) {
-        runtime_desc <- .resolve_template_runtime(template_name)
-        writeLines(
-          jsonlite::toJSON(runtime_desc, auto_unbox = TRUE, pretty = TRUE),
-          file.path(staging_dir, "runtime.json"))
-      }
-      .apply_privacy_reservation(staging_dir, reservation)
+      .apply_privacy_contract(staging_dir, contract)
 
       handle$run_token       <- run_token
       handle$staging_dir     <- staging_dir
       handle$target_column   <- target_column
       handle$feature_columns <- feature_columns
-      handle$template_name   <- template_name
-      handle$runtime_desc    <- runtime_desc
       handle$prepared        <- TRUE
       admitted <- TRUE
       return(.storeHandle(handle_symbol, handle))
@@ -1083,25 +1038,15 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     staged_manifest <- jsonlite::fromJSON(
       file.path(staging_dir, "manifest.json"), simplifyVector = TRUE)
     .enforceDisclosureAndDp(
-      handle, target_column, template_name, staged_manifest$n_samples,
+      handle, target_column, staged_manifest$n_samples,
       NULL, run_config, data_type = data_type,
       n_units = staged_manifest$n_units)
-    .apply_privacy_reservation(staging_dir, reservation)
-
-    # Resolve runtime descriptor
-    runtime_desc <- NULL
-    if (!is.null(template_name)) {
-      runtime_desc <- .resolve_template_runtime(template_name)
-      writeLines(jsonlite::toJSON(runtime_desc, auto_unbox = TRUE, pretty = TRUE),
-                 file.path(staging_dir, "runtime.json"))
-    }
+    .apply_privacy_contract(staging_dir, contract)
 
     handle$run_token       <- run_token
     handle$staging_dir     <- staging_dir
     handle$target_column   <- target_column
     handle$feature_columns <- feature_columns
-    handle$template_name   <- template_name
-    handle$runtime_desc    <- runtime_desc
     handle$prepared        <- TRUE
 
     admitted <- TRUE
@@ -1115,10 +1060,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #' Ensure SuperNode is Running
 #'
 #' DataSHIELD ASSIGN method. After connectivity and manifest validation, it
-#' idempotently confirms the allocation already reserved by
+#' idempotently confirms the stateless privacy contract established by
 #' \code{flowerPrepareRunDS} before any SuperNode can perform private computation.
 #' It then uses the singleton registry to ensure exactly one SuperNode per
-#' SuperLink address. Failed runs are not refunded.
+#' SuperLink address.
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @param superlink_address Character; the SuperLink address (host:port).
@@ -1128,8 +1073,6 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 #' @param ca_cert_pem Character or NULL; B64-encoded CA certificate PEM for
 #'   TLS verification. The SuperNode uses \code{--root-certificates} to
 #'   verify the SuperLink's identity.
-#' @param template_name Deprecated compatibility argument. Named executable
-#'   templates are retired; non-NULL values fail before any run-side effect.
 #' @param torch_backend Character or NULL; requested CPU/GPU backend. The node
 #'   validates availability and applies its own backend policy.
 #' @return Updated handle with SuperNode information.
@@ -1137,12 +1080,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
                                      federation_id = NULL,
                                      ca_cert_pem = NULL,
-                                     template_name = NULL,
                                      torch_backend = NULL) {
-  if (!is.null(template_name)) {
-    stop("Named executable templates are retired. The prepared declarative DP ",
-         "track selects the trusted runtime.", call. = FALSE)
-  }
   handle <- .getHandle(handle_symbol)
 
   # Per-run torch backend the researcher requested (cpu/gpu/auto). Recorded so
@@ -1205,16 +1143,6 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
          "threat model.", call. = FALSE)
   }
 
-  # Resolve template_name: explicit arg > handle > NULL
-  if (!is.null(template_name) && nzchar(template_name %||% "")) {
-    template_name <- .ds_arg(template_name)
-    if (is.list(template_name)) template_name <- template_name[[1]]
-  } else if (!is.null(handle$template_name)) {
-    template_name <- handle$template_name
-  }
-
-  # template_name resolved: explicit > handle > runtime.json
-
   # Pin the trusted runner for the default-deny code-integrity hook
   # (sitecustomize.py; ARCHITECTURE.md §7). The node writes the hash of its own
   # node-resident canonical runner; the submitted FAB's `dsflower_runner`
@@ -1222,11 +1150,32 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   # verification that makes the trusted training loop guaranteed, without trusting
   # the researcher who provisioned the app.
   harness_hash <- .compute_harness_hash()
-  if (nzchar(harness_hash)) {
-    writeLines(harness_hash,
-               file.path(handle$staging_dir, "expected_hash.txt"))
-    writeLines("dsflower_runner",
-               file.path(handle$staging_dir, "expected_template.txt"))
+  if (!nzchar(harness_hash)) {
+    stop("The canonical runner (dsflower_runner) is not installed on this node.",
+         call. = FALSE)
+  }
+  pins_path <- file.path(handle$staging_dir, "pinned_packages.json")
+  if (file.exists(pins_path)) {
+    pinned <- tryCatch(
+      jsonlite::fromJSON(pins_path, simplifyVector = FALSE),
+      error = function(e) NULL)
+    if (!is.list(pinned) ||
+        !identical(as.character(pinned[["dsflower_runner"]] %||% ""),
+                   harness_hash)) {
+      stop("Prepared package pins do not match the canonical runner.",
+           call. = FALSE)
+    }
+  } else {
+    pins_tmp <- tempfile(pattern = ".pinned-packages-",
+                         tmpdir = handle$staging_dir)
+    on.exit(unlink(pins_tmp), add = TRUE)
+    jsonlite::write_json(
+      list(dsflower_runner = harness_hash), pins_tmp, auto_unbox = TRUE)
+    Sys.chmod(pins_tmp, "0600")
+    if (!file.rename(pins_tmp, pins_path)) {
+      stop("Could not atomically write the canonical runner pin.",
+           call. = FALSE)
+    }
   }
 
   # Decode ca_cert_pem if B64-encoded from DSI transport
@@ -1260,19 +1209,18 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
          call. = FALSE)
   }
 
-  # Revalidate cryptographic + accounting state after every non-private
-  # preflight, but before a ClientApp can release a model. The reservation was
-  # made before prepare touched private data and is idempotent by run_token.
+  # Revalidate the root secret and stateless policy after every non-private
+  # preflight, but before a ClientApp can release a model.
   .privacy_runtime_bootstrap()
   manifest_path <- file.path(handle$staging_dir, "manifest.json")
   manifest <- tryCatch(
     jsonlite::fromJSON(manifest_path, simplifyVector = FALSE),
     error = function(e) stop("Could not read the prepared privacy manifest.",
                              call. = FALSE))
-  max_releases <- suppressWarnings(as.integer(
-    manifest[["privacy-max-releases"]] %||% NA_integer_))
-  reservation <- .reserve_privacy_run(handle$run_token, max_releases)
-  .apply_privacy_reservation(handle$staging_dir, reservation)
+  num_rounds <- suppressWarnings(as.integer(
+    manifest[["num-server-rounds"]] %||% NA_integer_))
+  contract <- .privacy_training_contract(handle$run_token, num_rounds)
+  .apply_privacy_contract(handle$staging_dir, contract)
 
   # Ensure SuperNode via singleton registry
   entry <- .supernode_ensure(
@@ -1280,7 +1228,6 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
     manifest_dir      = handle$staging_dir,
     python_path       = handle$python_path,
     ca_cert_path      = ca_cert_path,
-    template_name     = template_name,
     insecure          = via_tunnel
   )
 
@@ -1371,22 +1318,17 @@ flowerPingDS <- function() {
 #' DataSHIELD AGGREGATE method. Returns information about the server's
 #' Flower capabilities including Python version, the hash-pinned declarative
 #' runner vocabulary, and disclosure settings. The response is independent of
-#' cohort contents, handle state, filesystem paths, and other sessions. The
-#' legacy template catalogue is retained as an explicitly deprecated empty
-#' field.
+#' cohort contents, handle state, filesystem paths, and other sessions.
 #'
-#' @param handle_symbol Ignored compatibility argument.
 #' @return Named list of capabilities.
 #' @export
-flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
+flowerGetCapabilitiesDS <- function() {
   runtime <- .python_runtime_capabilities()
 
   # Disclosure settings
   settings <- .flowerDisclosureSettings()
 
   privacy_policy <- .privacy_policy()
-  privacy_audit_only <- identical(
-    privacy_policy$accounting_mode, "per-release-audit")
   runner_caps <- .RUNNER_PUBLIC_CAPABILITIES
   hook_enabled <- isTRUE(as.logical(.dsf_option("hook_enabled", FALSE)))
   hook_sandbox <- isTRUE(as.logical(
@@ -1412,41 +1354,20 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     torch_version       = runtime$torch_version,
     opacus_version      = runtime$opacus_version,
     runtime_versions_sha256 = runtime$runtime_versions_sha256,
-    templates           = settings$allowed_templates,
-    templates_deprecated = settings$allowed_templates_deprecated,
     dp_tracks           = runner_caps$dp_tracks,
     declarative_model_ops = runner_caps$declarative_model_ops,
     declarative_losses  = runner_caps$declarative_losses,
     aggregation_strategies = runner_caps$aggregation_strategies,
     max_rounds          = settings$max_rounds,
-    allow_custom_config = settings$allow_custom_config,
-    allow_custom_config_deprecated = settings$allow_custom_config_deprecated,
     min_samples         = 0L,
     min_clients_per_round = 1L,
     dp_required         = TRUE,
-    privacy_accountant  = if (privacy_audit_only) {
-      "audit-only-basic-composition-v1"
-    } else {
-      "bounded-geometric-basic-composition-v2"
-    },
-    privacy_accounting_mode = privacy_policy$accounting_mode,
-    privacy_lifetime_bound = !privacy_audit_only,
-    privacy_total_epsilon = if (privacy_audit_only) {
-      NA_real_
-    } else {
-      privacy_policy$total_epsilon
-    },
-    privacy_total_delta = if (privacy_audit_only) {
-      NA_real_
-    } else {
-      privacy_policy$total_delta
-    },
+    privacy_accountant  = "stateless-per-training-v1",
+    privacy_scope       = "per-training",
     privacy_per_training_epsilon = privacy_policy$per_training_epsilon,
     privacy_per_training_delta = privacy_policy$per_training_delta,
     privacy_unit        = privacy_policy$dp_unit,
     privacy_patient_column = privacy_policy$patient_column,
-    privacy_nonblocking = TRUE,
-    privacy_release_availability_unbounded = privacy_audit_only,
     runner_abi          = 3L,
     runner_sha256       = .compute_harness_hash(),
     dp_app_schema_versions = 1L,
@@ -1495,187 +1416,13 @@ flowerStatusDS <- function(handle_symbol) {
   )
 }
 
-#' Disabled node-metrics compatibility endpoint
+#' Query the server-owned stateless privacy policy
 #'
-#' Node metrics can encode data-dependent loss, counts, failures or timing and
-#' are outside the model mechanism's DP proof. This DataSHIELD AGGREGATE symbol
-#' is retained for protocol compatibility and always returns an empty data frame.
-#'
-#' @param handle_symbol Ignored compatibility argument.
-#' @param since_round Ignored compatibility argument.
-#' @return Empty data.frame with columns: round, metric, value.
+#' Returns only public, administrator-pinned per-training values.
+#' @return Named list describing the server-owned per-training privacy policy.
 #' @export
-flowerMetricsDS <- function(handle_symbol, since_round = 0L) {
-  # A log-derived metric can encode a data-dependent failure, duration, count,
-  # or loss and is not covered by the model mechanism's DP proof. Keep this
-  # aggregate for protocol compatibility, but expose no node-side metrics.
-  data.frame(round = integer(0), metric = character(0),
-             value = numeric(0), stringsAsFactors = FALSE)
-}
-
-#' Disabled node-log compatibility endpoint
-#'
-#' Node logs can encode data-dependent failures and timing and are not a DP
-#' mechanism. This DataSHIELD AGGREGATE symbol is retained for protocol
-#' compatibility and always returns an empty character vector.
-#'
-#' @param handle_symbol Ignored compatibility argument.
-#' @param last_n Ignored compatibility argument.
-#' @return Empty character vector.
-#' @export
-flowerLogDS <- function(handle_symbol, last_n = 50L) {
-  # Logs contain data-dependent failures/timing and are not a DP mechanism.
-  # Keep the aggregate for wire compatibility, but never release raw lines.
-  character(0)
-}
-
-#' Legacy per-feature statistics endpoint (DP-safe compatibility response)
-#'
-#' Exact sums and sums-of-squares are incompatible with dsFlower's DP-only egress
-#' contract.  The symbol remains callable by older clients, but returns a
-#' data-independent identity transform (n/sum/sumsq all zero).  New clients use
-#' public, analyst-supplied feature bounds instead.
-#'
-#' @param data_symbol Ignored compatibility argument.
-#' @param feature_columns Character or JSON-encoded character vector; feature
-#'   names supplied by the caller (order is preserved in the returned vectors).
-#'   NULL returns empty vectors because server-side schema is not inspected.
-#' @return Named list with the requested \code{features}, zero-valued
-#'   \code{n}/\code{sum}/\code{sumsq} vectors, \code{disabled = TRUE}, and a
-#'   reason. No statistic computed from feature values is returned.
-#' @export
-flowerFeatureStatsDS <- function(data_symbol, feature_columns = NULL) {
-  feats <- .ds_arg(feature_columns)
-  if (is.null(feats) || length(feats) == 0L) feats <- character()
-  feats <- as.character(unlist(feats, use.names = FALSE))
-  zero <- numeric(length(feats))
-  list(features = feats, n = zero, sum = zero, sumsq = zero,
-       disabled = TRUE, reason = "exact-feature-statistics-disabled")
-}
-
-#' Query the server-owned privacy accounting policy
-#'
-#' By default this exposes only the fixed policy, not other analysts' allocation
-#' count.  A custodian may set \code{dsflower.expose_privacy_status=TRUE} to expose
-#' the operational ledger status as well; neither response contains cohort data.
-#' @param handle_symbol Ignored compatibility argument.
-#' @param target_column Ignored compatibility argument.
-#' @return Named list describing the privacy accountant.
-#' @export
-flowerPrivacyBudgetDS <- function(handle_symbol = NULL, target_column = NULL) {
-  if (isTRUE(as.logical(.dsf_option("expose_privacy_status", FALSE)))) {
-    return(.privacy_budget_status())
-  }
-  policy <- .privacy_policy()
-  if (identical(policy$accounting_mode, "per-release-audit")) {
-    return(list(
-      accountant = "audit-only-basic-composition-v1",
-      accounting_mode = policy$accounting_mode,
-      domain = policy$domain,
-      lifetime_bound = FALSE,
-      nonblocking = TRUE,
-      release_availability_unbounded = TRUE,
-      guarantee_scope = "per-training-release",
-      per_training_epsilon = policy$per_training_epsilon,
-      per_training_delta = policy$per_training_delta,
-      dp_unit = policy$dp_unit,
-      patient_column = policy$patient_column,
-      unit_canonicalization = policy$unit_canonicalization,
-      adjacency = policy$adjacency,
-      composition_statement = paste(
-        "Finite-prefix composition is audit-only.",
-        "There is no finite lifetime epsilon/delta bound for an unlimited",
-        "sequence of semantically new releases.")))
-  }
-  list(
-    accountant = "bounded-geometric-basic-composition-v2",
-    accounting_mode = policy$accounting_mode,
-    domain = policy$domain,
-    lifetime_bound = TRUE,
-    total_epsilon = policy$total_epsilon,
-    total_delta = policy$total_delta,
-    decay = policy$decay,
-    dp_unit = policy$dp_unit,
-    patient_column = policy$patient_column,
-    unit_canonicalization = policy$unit_canonicalization,
-    adjacency = policy$adjacency,
-    nonblocking = TRUE,
-    release_availability_unbounded = FALSE)
-}
-
-# --- Internal metric parsing ---
-
-#' Parse training metrics from Flower log output
-#'
-#' @param log_path Character; path to the log file.
-#' @return Data.frame with columns: round, metric, value.
-#' @keywords internal
-.parseFlowerMetrics <- function(log_path) {
-  if (is.null(log_path) || !file.exists(log_path)) {
-    return(data.frame(
-      round = integer(0), metric = character(0),
-      value = numeric(0), stringsAsFactors = FALSE
-    ))
-  }
-
-  lines <- readLines(log_path, warn = FALSE)
-  rows <- list()
-
-  for (line in lines) {
-    # Pattern 1: [ROUND N] metric = value
-    m <- regmatches(line, regexec(
-      "\\[?[Rr]ound\\s+(\\d+)\\]?.*?(loss|accuracy|f1|precision|recall|auc|mse|mae|rmse|r2|num_examples|num_clients)\\s*[=:]\\s*([0-9eE.+-]+)",
-      line
-    ))[[1]]
-    if (length(m) == 4) {
-      rows[[length(rows) + 1]] <- data.frame(
-        round = as.integer(m[2]),
-        metric = m[3],
-        value = as.numeric(m[4]),
-        stringsAsFactors = FALSE
-      )
-      next
-    }
-
-    # Pattern 2: Flower evaluate format
-    m2 <- regmatches(line, regexec(
-      "round\\s+(\\d+)[^)]*\\bloss['\"]?\\s*[=:]\\s*([0-9eE.+-]+)",
-      line, ignore.case = TRUE
-    ))[[1]]
-    if (length(m2) == 3) {
-      rows[[length(rows) + 1]] <- data.frame(
-        round = as.integer(m2[2]),
-        metric = "loss",
-        value = as.numeric(m2[3]),
-        stringsAsFactors = FALSE
-      )
-    }
-
-    # Pattern 3: metrics_distributed format
-    m3 <- regmatches(line, regexec(
-      "'(accuracy|loss|f1|precision|recall)'\\s*:\\s*\\(\\s*(\\d+)\\s*,\\s*([0-9eE.+-]+)",
-      line
-    ))[[1]]
-    if (length(m3) == 4) {
-      rows[[length(rows) + 1]] <- data.frame(
-        round = as.integer(m3[3]),
-        metric = m3[2],
-        value = as.numeric(m3[4]),
-        stringsAsFactors = FALSE
-      )
-    }
-  }
-
-  if (length(rows) == 0) {
-    return(data.frame(
-      round = integer(0), metric = character(0),
-      value = numeric(0), stringsAsFactors = FALSE
-    ))
-  }
-
-  result <- do.call(rbind, rows)
-  rownames(result) <- NULL
-  result
+flowerPrivacyPolicyDS <- function() {
+  .privacy_policy_status()
 }
 
 #' Check TCP connectivity from this node to a given address

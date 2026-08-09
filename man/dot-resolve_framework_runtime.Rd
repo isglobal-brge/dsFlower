@@ -2,13 +2,13 @@
 % Please edit documentation in R/runtime.R
 \name{.resolve_framework_runtime}
 \alias{.resolve_framework_runtime}
-\title{Resolve the SuperNode runtime for a framework directly (no template).
+\title{Resolve the SuperNode runtime for a framework directly.
 Used for the dsFlower trusted runners (harness / tier2), which are torch apps.}
 \usage{
 .resolve_framework_runtime(framework)
 }
 \description{
-Resolve the SuperNode runtime for a framework directly (no template).
+Resolve the SuperNode runtime for a framework directly.
 Used for the dsFlower trusted runners (harness / tier2), which are torch apps.
 }
 \keyword{internal}

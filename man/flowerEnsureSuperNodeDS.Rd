@@ -9,7 +9,6 @@ flowerEnsureSuperNodeDS(
   superlink_address,
   federation_id = NULL,
   ca_cert_pem = NULL,
-  template_name = NULL,
   torch_backend = NULL
 )
 }
@@ -26,9 +25,6 @@ same federation.}
 TLS verification. The SuperNode uses \code{--root-certificates} to
 verify the SuperLink's identity.}
 
-\item{template_name}{Deprecated compatibility argument. Named executable
-templates are retired; non-NULL values fail before any run-side effect.}
-
 \item{torch_backend}{Character or NULL; requested CPU/GPU backend. The node
 validates availability and applies its own backend policy.}
 }
@@ -37,8 +33,8 @@ Updated handle with SuperNode information.
 }
 \description{
 DataSHIELD ASSIGN method. After connectivity and manifest validation, it
-idempotently confirms the allocation already reserved by
+idempotently confirms the stateless privacy contract established by
 \code{flowerPrepareRunDS} before any SuperNode can perform private computation.
 It then uses the singleton registry to ensure exactly one SuperNode per
-SuperLink address. Failed runs are not refunded.
+SuperLink address.
 }

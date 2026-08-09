@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index cc4ef46..0bcd975 100644
+index cc4ef46de59fa7c563c67bfc34760036789081c1..0bcd975b11360bb03203343358041494aee5c4d6 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -113,6 +113,7 @@ address, leak, undefined and thread.")
@@ -11,10 +11,10 @@ index cc4ef46..0bcd975 100644
  option(PLUGIN_SYCL "SYCL plugin" OFF)
  option(ADD_PKGCONFIG "Add xgboost.pc into system." ON)
 diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
-index 24c7afc..3e584dd 100644
+index 24c7afc35374fdec9007067be01141b4e5608f5b..6a73dbad92b5e0a1f30ca4d912201f3ae5dc2115 100644
 --- a/include/xgboost/c_api.h
 +++ b/include/xgboost/c_api.h
-@@ -89,6 +89,68 @@ XGB_DLL int XGBuildInfo(char const **out);
+@@ -89,6 +89,67 @@ XGB_DLL int XGBuildInfo(char const **out);
   */
  XGB_DLL const char *XGBGetLastError();
 
@@ -43,7 +43,6 @@ index 24c7afc..3e584dd 100644
 +  size_t noise_key_size;
 +  const char *mechanism_id;
 +  const char *noise_key_id;
-+  const char *privacy_epoch;
 +  const char *node_id_hash;
 +  const char *dataset_snapshot_hash;
 +  const char *cohort_hash;
@@ -84,7 +83,7 @@ index 24c7afc..3e584dd 100644
   * @brief register callback function for LOG(INFO) messages -- helpful messages
   *        that are not errors.
 diff --git a/plugin/CMakeLists.txt b/plugin/CMakeLists.txt
-index a11916e..eb96eb6 100644
+index a11916eb9814cd4285640e8f9322f2add4685928..eb96eb603b10d4b2784d646fe82ff75c46e5e559 100644
 --- a/plugin/CMakeLists.txt
 +++ b/plugin/CMakeLists.txt
 @@ -34,3 +34,9 @@ endif()
@@ -99,7 +98,7 @@ index a11916e..eb96eb6 100644
 +endif()
 diff --git a/plugin/dsflower/CMakeLists.txt b/plugin/dsflower/CMakeLists.txt
 new file mode 100644
-index 0000000..3ff2eb3
+index 0000000000000000000000000000000000000000..3ff2eb344a3a45aad8a3cee6aab6129b604eff03
 --- /dev/null
 +++ b/plugin/dsflower/CMakeLists.txt
 @@ -0,0 +1,8 @@
@@ -113,7 +112,7 @@ index 0000000..3ff2eb3
 +target_compile_definitions(objxgboost PUBLIC XGBOOST_USE_DSFLOWER_DP=1)
 diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
 new file mode 100644
-index 0000000..7bd2cee
+index 0000000000000000000000000000000000000000..fb265eb2a7c788270ee76030be51a8800618796b
 --- /dev/null
 +++ b/plugin/dsflower/README.md
 @@ -0,0 +1,27 @@
@@ -137,19 +136,19 @@ index 0000000..7bd2cee
 +
 +- patient-level contribution bounding;
 +- public or privately selected bins;
-+- cryptographically keyed, domain-separated noise;
++- deterministic, server-derived, domain-separated semantic PRF noise;
 +- privatized gradient/hessian histograms before split selection;
-+- explicit composition accounting and replay-stable release identity;
++- per-training composition accounting and deterministic semantic PRF identity;
 +- tests covering every egress and failure path.
 +
 +Build only for scaffold verification with `-DPLUGIN_DSFLOWER_DP=ON`.  Selecting
 +`grow_dsflower_dp_hist` always fails closed in this patch.
 diff --git a/plugin/dsflower/dsflower_context.cc b/plugin/dsflower/dsflower_context.cc
 new file mode 100644
-index 0000000..78bb734
+index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b076eb241
 --- /dev/null
 +++ b/plugin/dsflower/dsflower_context.cc
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,175 @@
 +/**
 + * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
 + * SPDX-License-Identifier: Apache-2.0
@@ -168,7 +167,6 @@ index 0000000..78bb734
 +namespace {
 +
 +constexpr std::size_t kHashSize = 64;
-+constexpr std::size_t kMaxTokenSize = 128;
 +
 +void SecureZero(unsigned char* ptr, std::size_t size) {
 +  volatile unsigned char* out = ptr;
@@ -200,19 +198,6 @@ index 0000000..78bb734
 +  return text.size() == kHashSize &&
 +         std::all_of(text.cbegin(), text.cend(), [](char c) {
 +           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-+         });
-+}
-+
-+bool IsToken(const char* value) {
-+  if (value == nullptr) {
-+    return false;
-+  }
-+  std::string_view text{value};
-+  return !text.empty() && text.size() <= kMaxTokenSize &&
-+         std::all_of(text.cbegin(), text.cend(), [](char c) {
-+           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-+                  (c >= '0' && c <= '9') || c == '.' || c == '_' ||
-+                  c == ':' || c == '-';
 +         });
 +}
 +
@@ -253,9 +238,6 @@ index 0000000..78bb734
 +    return Reject("every dsFlower identity/configuration pin must be a lowercase SHA-256 hex digest",
 +                  error);
 +  }
-+  if (!IsToken(input.privacy_epoch)) {
-+    return Reject("dsFlower privacy_epoch is missing or malformed", error);
-+  }
 +  if (input.privacy_unit == nullptr ||
 +      (std::string_view{input.privacy_unit} != "row" &&
 +       std::string_view{input.privacy_unit} != "patient")) {
@@ -288,7 +270,6 @@ index 0000000..78bb734
 +
 +  PrivacyContext next;
 +  next.noise_key_id = input.noise_key_id;
-+  next.privacy_epoch = input.privacy_epoch;
 +  next.node_id_hash = input.node_id_hash;
 +  next.dataset_snapshot_hash = input.dataset_snapshot_hash;
 +  next.cohort_hash = input.cohort_hash;
@@ -345,10 +326,10 @@ index 0000000..78bb734
 +}
 diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_context.h
 new file mode 100644
-index 0000000..ca0cbcd
+index 0000000000000000000000000000000000000000..1b99a79a7ae622e36f2aa7ac106439cfcc0722bc
 --- /dev/null
 +++ b/plugin/dsflower/dsflower_context.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,47 @@
 +/**
 + * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
 + * SPDX-License-Identifier: Apache-2.0
@@ -372,7 +353,6 @@ index 0000000..ca0cbcd
 +struct PrivacyContext {
 +  std::array<unsigned char, kNoiseKeySize> noise_key{};
 +  std::string noise_key_id;
-+  std::string privacy_epoch;
 +  std::string node_id_hash;
 +  std::string dataset_snapshot_hash;
 +  std::string cohort_hash;
@@ -399,7 +379,7 @@ index 0000000..ca0cbcd
 +#endif  // XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
 diff --git a/plugin/dsflower/dsflower_updater.cc b/plugin/dsflower/dsflower_updater.cc
 new file mode 100644
-index 0000000..1ea2fea
+index 0000000000000000000000000000000000000000..1ea2fea51bb1d2d2a03686834508301daa777027
 --- /dev/null
 +++ b/plugin/dsflower/dsflower_updater.cc
 @@ -0,0 +1,60 @@

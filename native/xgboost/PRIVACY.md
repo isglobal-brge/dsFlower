@@ -18,8 +18,8 @@ V1 keeps two mechanism identities separate:
   `native/dp_primitives`, but it is not yet connected to this updater and does
   not make the end-to-end tree mechanism complete.
 
-An artifact, ledger claim or replay identity for one profile is never valid for
-the other.  The mechanism ID, fixed-point scale or floating-point profile,
+One profile's semantic randomness identity is never valid for the other. The
+mechanism ID, fixed-point scale or floating-point profile,
 accountant version, all public bounds, cuts and training parameters belong in
 the canonical mechanism configuration hash.
 
@@ -33,13 +33,11 @@ python3 -m unittest discover -s native/xgboost/reference -p 'test_*.py' -v
 
 ## Threat model and privacy unit
 
-The analyst, submitted application and network are untrusted.  The Rock
-process, vetted native adapter, persistent node identity secret, semantic
-artifact store, privacy ledger, native fork and pinned sampler are inside the
-trusted computing base.  Compromise of that boundary or the raw server
-filesystem is out of scope.  A persistent noise key is needed only by the
-separate practical PRF profile; the discrete profile takes fresh private
-randomness from the operating system and persists the resulting artifact.
+The analyst, submitted application and network are untrusted. The Rock
+process, vetted native adapter, persistent node secret, native fork and pinned
+sampler are inside the trusted computing base. Compromise of that boundary or
+the raw server filesystem is out of scope. No query history, artifact cache or
+privacy database belongs to the mechanism.
 
 Adjacency is bounded `replace_one`: two datasets have the same public unit
 slots and differ in all values of at most one slot.  Before the native ABI is
@@ -49,19 +47,21 @@ server-side contribution bounding and canonicalization before XGBoost sees the
 matrix.  Row multiplicity, weights or duplicated unit identifiers are not
 accepted.
 
-Sticky release identity protects a repeated *identical* semantic query from
-averaging: the committed artifact is replayed byte-for-byte.  Its authenticated
-identity must bind at least the mechanism ID, node, privacy epoch, dataset
-snapshot, cohort, canonical query, allocation and every mechanism parameter.
-The practical PRF profile must additionally bind tree, depth, node, feature,
-bin and component into each noise coordinate.  The discrete profile does not
-derive deterministic noise: it samples once from private operating-system
-entropy and relies on atomic artifact commit/replay.  Changing any semantic
-input creates a distinct release and consumes a distinct allocation.  Replays
-of an already committed artifact are post-processing and do not add privacy
-loss; distinct releases compose.  If deployment policy does not cap distinct
-releases, this specification gives a per-training guarantee, not a finite
-lifetime epsilon for an unlimited sequence of new queries.
+Sticky randomness protects an identical semantic training from averaging. Its
+authenticated PRF input binds the mechanism and runtime versions, complete
+public configuration, per-training privacy contract, round coordinate, public
+model input and the effective bounded private statistic. Tree, depth, node,
+feature, bin and component additionally domain-separate coordinates. The same
+training therefore recomputes the same model without persistent query state;
+any effective semantic change derives a different stream. The guarantee is
+per training, and the accountant composes only that training's fixed tree and
+depth schedule.
+
+The current discrete primitive still consumes operating-system entropy and is
+therefore not activatable under this stateless contract. Its production ABI
+must first accept a deterministic, domain-separated PRF byte stream. Doing so
+makes the operational claim computational, even though the fixed-point sampler
+arithmetic remains exact conditional on uniform bytes.
 
 ## V1 training domain
 
@@ -207,24 +207,26 @@ at an integer shift.  Consequently the mathematical mechanism is
 discrete Gaussian distribution is sampled exactly; an implementation with an
 approximate sampler needs its own proved error term and delta allocation.
 
-An exact first release may use true sampler randomness and make replay sticky
-by persisting the committed artifact.  Replacing those coins with output from
-a finite persistent PRF/CSPRNG seed adds a computational assumption and no
-longer follows from the information-theoretic theorem alone.  Such a design
-must either carry an explicit computational qualifier or prove and charge a
-quantitative sampler error; it must not silently inherit the formal label.
+Production randomness must come only from a deterministic, domain-separated
+PRF stream keyed by the sole custodial node root and the complete canonical
+semantic training identity. This gives byte-identical recomputation without
+query history or stored reply artifacts. The finite PRF stream adds a
+computational pseudorandomness assumption and therefore must carry an explicit
+computational qualifier or a proved quantitative sampler-error term; it must
+not silently inherit the information-theoretic formal label.
 
 `native/dp_primitives` ports the exact CKS20 arithmetic and rejection rules from
 pinned OpenDP 0.15.1 source. It takes an integer scale directly, adds noise in
 arbitrary precision and applies saturating `i64` post-processing. It does not
-link OpenDP or OpenSSL and deliberately exposes no seed. Random bits come from
-a fail-closed, buffered operating-system source; the mathematical statement is
-conditional on those bits being independent and uniform, while the deployment
-trusts the platform RNG to realize that assumption. OpenDP labels the upstream
-pre-1.0 constructor `contrib`, so source pinning and a passing ABI test are
-necessary but not sufficient: dsFlower still requires an independent
-proof/code review, known-issue audit and Linux/macOS/Windows test matrix before
-treating the sampler gate as closed.
+link OpenDP or OpenSSL and deliberately exposes no seed. Its current random
+bits come from a fail-closed, buffered operating-system source, so this ABI is
+incompatible with dsFlower's stateless sticky contract and must remain
+disconnected. Before use, it must accept the deterministic semantic PRF byte
+stream described above. OpenDP labels the upstream pre-1.0 constructor
+`contrib`, so source pinning and a passing ABI test are necessary but not
+sufficient: dsFlower still requires an independent proof/code review,
+known-issue audit and Linux/macOS/Windows test matrix before treating the
+sampler gate as closed.
 
 The discrete oracle avoids transcendental calibration.  Represent public
 `epsilon` and `delta` as exact rationals and set
@@ -266,7 +268,7 @@ Hessian bins may be deterministically projected onto
 `{x: x >= 0, sum(x) <= total}` and the missing bin set to the non-negative
 residual.  `reference/mechanism_v1.py` contains an auditable Euclidean
 projection.  This and all tree decisions based exclusively on DP histograms
-are post-processing and spend no additional privacy budget.
+are post-processing and add no further privacy loss.
 
 ## Egress contract
 
@@ -278,7 +280,7 @@ histograms.  The sanitizer and adapter must ensure all of the following:
 - no raw histogram, gradient, Hessian, count, sketch, row prediction, leaf
   assignment, per-row error, training metric or private validation metric;
 - no feature/target names, unit identifiers, dataset paths, stack traces,
-  seeds, keys, key IDs, sampler state, ledger paths or native debug dumps;
+  seeds, keys, key IDs, sampler state or native debug dumps;
 - no partial model or data-dependent diagnostic on failure;
 - no raw-data-dependent logs, callbacks, timing-controlled output, model
   attributes or objective/base-score estimation;
@@ -286,9 +288,9 @@ histograms.  The sanitizer and adapter must ensure all of the following:
   sampler or native training path; isolation or a reviewed public coarsening
   schedule is required before capability activation;
 - finite, size-bounded model fields and an exact allowed-field/schema check
-  before the semantic artifact is committed;
-- a privacy reservation and exact semantic claim before computation, followed
-  by atomic commit and byte-identical replay for the same canonical identity.
+  before egress;
+- deterministic PRF binding to the complete canonical training identity, with
+  byte-identical recomputation for the same identity and no persistent cache.
 
 Predictions on analyst-supplied public records are post-processing.  Accuracy,
 loss, calibration, confusion matrices, survival metrics or cross-validation
@@ -305,16 +307,15 @@ Neither mechanism may be advertised until an independent review confirms:
    unnoised collective/buffer;
 3. joint noise before every data-dependent tree decision, with tests matching
    the oracle's root and later sensitivity geometry;
-4. mechanism-specific replay and concurrency tests; operating-system-randomness
-   and ABI tests with no seed input for the discrete profile, and
-   domain-separation plus key-wipe tests only for the practical PRF profile;
+4. mechanism-specific deterministic recomputation and concurrency tests,
+   domain separation, key wipe and cross-platform PRF-stream tests;
 5. for `fixed-point-discrete-v1`, an exact sampler or a reviewed quantitative
    sampler theorem plus explicit error accounting; for the practical profile,
    an explicit computational threat model and no formal-DP label;
 6. adversarial egress tests over success, rejection, interruption and lost-ACK
    replay paths; and
-7. semantic artifact and privacy-ledger invariants holding before capability
-   discovery is enabled; and
+7. canonical semantic identity and per-training composition invariants holding
+   before capability discovery is enabled; and
 8. identical source, ABI and artifact tests passing on supported Linux, macOS
    and Windows builds; and
 9. analyst-visible timing/resource behavior isolated or coarsened independently

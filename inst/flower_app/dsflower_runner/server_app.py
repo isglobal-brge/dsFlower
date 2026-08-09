@@ -26,7 +26,8 @@ import torch
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import (
     FedAvg, FedAdam, FedAdagrad, FedYogi, FedAvgM)
-from flwr.common import ArrayRecord, Context, Message, MetricRecord, RecordDict
+from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
+                         MetricRecord, RecordDict)
 
 from .params import get_torch_params, set_torch_params
 
@@ -131,6 +132,7 @@ def _run_validation(grid, cfg):
         return None, expected, False
     content = RecordDict({
         "arrays": ArrayRecord(numpy_ndarrays=public_arrays),
+        "config": ConfigRecord({"server-round": 1}),
     })
     messages = [Message(
         content=content, message_type="train", dst_node_id=node_id,
@@ -153,9 +155,7 @@ def _run_validation(grid, cfg):
             continue
         try:
             metrics = reply.content["metrics"]
-            if (int(metrics.get("replay-cache-missing", 0)) == 1
-                    or int(metrics.get("privacy-noop", 0)) == 1
-                    or int(metrics.get(
+            if (int(metrics.get(
                         "public-preflight-unavailable", 0)) == 1
                     or int(metrics.get(
                         "execution-unavailable", 0)) == 1):
@@ -250,15 +250,25 @@ class _RequireCompleteTrain:
         self.expected_train_nodes = int(expected_train_nodes)
         self.require_hook_executed = bool(require_hook_executed)
         self.available_rounds = set()
-        self.privacy_noop_rounds = set()
+        self.unavailable_rounds = set()
         self._last_available_arrays = None
         self._round_input_arrays = {}
         self._round_expected_nodes = {}
         super().__init__(**kwargs)
 
     def configure_train(self, server_round, arrays, config, grid):
+        # Use one immutable-per-round copy rather than the ConfigRecord reused by
+        # Flower's strategy loop.  The trusted ClientApp accepts only this exact
+        # public coordinate and independently checks it against its local manifest.
+        round_config = ConfigRecord(dict(config))
+        round_config["server-round"] = int(server_round)
         messages = list(super().configure_train(
-            server_round, arrays, config, grid))
+            server_round, arrays, round_config, grid))
+        for message in messages:
+            sent_config = message.content.get("config")
+            if (not isinstance(sent_config, ConfigRecord)
+                    or sent_config.get("server-round") != int(server_round)):
+                raise RuntimeError("Flower did not pin the canonical server round")
         connected = list(grid.get_node_ids())
         destinations = [message.metadata.dst_node_id for message in messages]
         if (len(connected) != self.expected_train_nodes
@@ -291,21 +301,19 @@ class _RequireCompleteTrain:
                 or (expected_nodes is not None and set(sources) != expected_nodes)):
             raise RuntimeError(
                 "Training replies do not match the configured federation roster.")
-        privacy_noop = []
+        unavailable = []
         for reply in replies:
             try:
                 metrics = reply.content["metrics"]
-                privacy_noop.append(
-                    int(metrics.get("privacy-noop", 0)) == 1
-                    or int(metrics.get("replay-cache-missing", 0)) == 1
-                    or int(metrics.get(
+                unavailable.append(
+                    int(metrics.get(
                         "public-preflight-unavailable", 0)) == 1
                     or int(metrics.get(
                         "execution-unavailable", 0)) == 1)
             except Exception:
-                privacy_noop.append(False)
-        if any(privacy_noop):
-            self.privacy_noop_rounds.add(int(server_round))
+                unavailable.append(False)
+        if any(unavailable):
+            self.unavailable_rounds.add(int(server_round))
             baseline = self._round_input_arrays.pop(
                 int(server_round), self._last_available_arrays)
             self._round_expected_nodes.pop(int(server_round), None)

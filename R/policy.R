@@ -5,30 +5,6 @@
 # following the DataSHIELD convention of double-fallback:
 #   getOption("dsflower.X", getOption("default.dsflower.X", hardcoded_default))
 
-# --- Template -> framework map ---
-# Maps a model/template name to the Python framework whose venv runs it; used
-# only to resolve the SuperNode venv when a run passes a template name (Tier-2
-# and no-template runs default to the pytorch venv via .resolve_framework_runtime).
-.TEMPLATE_METADATA <- list(
-  sklearn_logreg            = list(framework = "sklearn",        requires_secagg = FALSE),
-  sklearn_ridge             = list(framework = "sklearn",        requires_secagg = FALSE),
-  sklearn_sgd               = list(framework = "sklearn",        requires_secagg = FALSE),
-  pytorch_mlp               = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_logreg            = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_linear_regression = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_coxph             = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_poisson           = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_lognormal_aft         = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_cause_specific_cox    = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_multilabel        = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_multiclass        = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_resnet18          = list(framework = "pytorch_vision", requires_secagg = FALSE),
-  pytorch_densenet121       = list(framework = "pytorch_vision", requires_secagg = FALSE),
-  pytorch_unet2d            = list(framework = "pytorch_vision", requires_secagg = FALSE),
-  pytorch_tcn               = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_lstm              = list(framework = "pytorch",        requires_secagg = FALSE)
-)
-
 # Public vocabulary implemented by runner ABI 3.  These are capabilities of the
 # node-resident, hash-pinned executor; they are not names of executable app
 # templates. Keep this list in lockstep with model_spec.py, dp_harness.py, and
@@ -55,108 +31,6 @@
   )
 )
 
-
-#' Validate target distribution against trust profile thresholds
-#'
-#' Uses the explicit task type when provided and otherwise infers a conservative
-#' classification/survival interpretation from the target column. Validates:
-#' - Binary (2 unique values): min(table(target)) >= .disclosure_min_cell()
-#' - Multiclass (>2 unique): all(table(target) >= .disclosure_min_cell())
-#' - Survival (2-column target or event/status column): sum(events==1) >= .disclosure_min_cell()
-#' - Regression/count targets: no class-count check is applied.
-#'
-#' Error messages are deliberately generic to avoid leaking counts.
-#'
-#' @param data Data.frame or Arrow Table; the training data.
-#' @param target_column Character; name(s) of the target column(s).
-#' @param task_type Character task type ("classification", "regression",
-#'   "survival", etc.) or NULL.
-#' @return TRUE invisibly, or stops with an error.
-#' @keywords internal
-.validateClassDistribution <- function(data, target_column,
-                                       task_type = NULL) {
-  if (is.null(target_column) || length(target_column) == 0) {
-    return(invisible(TRUE))
-  }
-  task_type <- tolower(as.character(task_type %||% ""))
-  if (task_type %in% c("regression", "count", "continuous")) {
-    return(invisible(TRUE))
-  }
-
-  # Survival detection: 2-column target or column named "event"/"status"
-  is_survival <- identical(task_type, "survival")
-  if (length(target_column) == 2) {
-    is_survival <- TRUE
-    # Look for the event/status column (not the time column)
-    event_col <- NULL
-    for (tc in target_column) {
-      if (tc %in% names(data) &&
-          tolower(tc) %in% c("event", "status", "dead", "died",
-                              "censored", "censor")) {
-        event_col <- tc
-        break
-      }
-    }
-    if (is.null(event_col)) {
-      # Default: second column is the event indicator
-      event_col <- target_column[2]
-    }
-    if (event_col %in% names(data)) {
-      events <- data[[event_col]]
-      n_events <- sum(events == 1, na.rm = TRUE)
-      if (n_events < .disclosure_min_cell()) {
-        stop("Disclosive: operation blocked -- insufficient event counts to ",
-             "meet disclosure threshold. No further details available.",
-             call. = FALSE)
-      }
-    }
-    return(invisible(TRUE))
-  }
-
-  # Single target column
-  tc <- target_column[1]
-  if (!tc %in% names(data)) return(invisible(TRUE))
-
-  target_vals <- data[[tc]]
-  unique_vals <- unique(target_vals[!is.na(target_vals)])
-  n_unique <- length(unique_vals)
-
-  if (n_unique <= 1) {
-    return(invisible(TRUE))
-  }
-
-  # Check for survival-like single column (named event/status)
-  if (identical(task_type, "survival") ||
-      tolower(tc) %in% c("event", "status", "dead", "died")) {
-    n_events <- sum(target_vals == 1, na.rm = TRUE)
-    if (n_events < .disclosure_min_cell()) {
-      stop("Disclosive: operation blocked -- insufficient event counts to ",
-           "meet disclosure threshold. No further details available.",
-           call. = FALSE)
-    }
-    return(invisible(TRUE))
-  }
-
-  if (n_unique == 2) {
-    # Binary classification
-    counts <- table(target_vals)
-    if (min(counts) < .disclosure_min_cell()) {
-      stop("Disclosive: operation blocked -- insufficient class counts to ",
-           "meet disclosure threshold. No further details available.",
-           call. = FALSE)
-    }
-  } else {
-    # Multiclass
-    counts <- table(target_vals)
-    if (any(counts < .disclosure_min_cell())) {
-      stop("Disclosive: operation blocked -- insufficient class counts to ",
-           "meet disclosure threshold. No further details available.",
-           call. = FALSE)
-    }
-  }
-
-  invisible(TRUE)
-}
 
 #' Bucket a count to prevent exact sample sizes from leaking
 #'
@@ -201,13 +75,6 @@
                         getOption("default.nfilter.levels.max", 40))),
     # --- dsFlower-specific settings ---
     max_rounds = as.numeric(.dsf_option("max_rounds", 500)),
-    allow_custom_config = FALSE,
-    allow_custom_config_deprecated = TRUE,
-    # Retained as an empty compatibility field. Model flexibility is expressed
-    # through the declarative runner vocabulary, not legacy executable template
-    # names.
-    allowed_templates = character(),
-    allowed_templates_deprecated = TRUE,
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
     max_concurrent_runs = as.numeric(.dsf_option("max_concurrent_runs", Inf))
   )
@@ -266,7 +133,7 @@
 
 #' Resolve the server-owned differential-privacy unit
 #'
-#' The adjacency relation is a lifetime policy, not a per-run heuristic.
+#' The adjacency relation is a server-owned policy, not an analyst heuristic.
 #' \code{dsflower.dp_unit} defaults to \code{"row"}.  Selecting
 #' \code{"patient"} requires one explicit, stable
 #' \code{dsflower.patient_column}; no column-name auto-detection or row fallback
@@ -315,7 +182,7 @@
   pinned_unit <- run_config[["dp-unit"]] %||% policy$dp_unit
   pinned_unit <- tolower(as.character(unlist(pinned_unit, use.names = FALSE)))
   if (length(pinned_unit) != 1L || !identical(pinned_unit, policy$dp_unit)) {
-    stop("Prepared DP unit disagrees with the server lifetime policy.",
+    stop("Prepared DP unit disagrees with the server policy.",
          call. = FALSE)
   }
   if (identical(policy$dp_unit, "row")) return(NULL)
@@ -323,7 +190,7 @@
   explicit <- run_config[["patient_column"]] %||% policy$patient_column
   explicit <- as.character(unlist(explicit, use.names = FALSE))
   if (length(explicit) != 1L || !identical(explicit, policy$patient_column)) {
-    stop("Prepared patient column disagrees with the server lifetime policy.",
+    stop("Prepared patient column disagrees with the server policy.",
          call. = FALSE)
   }
   if (is.null(df) || !is.data.frame(df) || !explicit %in% names(df)) {
@@ -371,138 +238,6 @@
   ids
 }
 
-#' Legacy reduction of a training table to distinct patients
-#'
-#' Retained for compatibility with older internal extensions. Current run
-#' admission uses the server-authored \code{n_units} structural manifest field
-#' and deliberately does not inspect labels: a class/event threshold would make
-#' prepare success or failure a label-dependent transcript oracle.
-#'
-#' The canonical runner uses the same server-pinned patient column and collapses
-#' all of a patient's rows/images to one training example before DP-SGD. The
-#' formal privacy unit therefore matches this admission unit. Patient mode
-#' requires a stable, complete roster and never falls back to rows or images.
-#'
-#' @param samples Data.frame; training rows / image samples metadata.
-#' @param target_column Character; label column name(s).
-#' @param run_config Named list; trusted server-authored run configuration.
-#' @return list(n_patients, data) or NULL.
-#' @keywords internal
-.privacyDisclosureUnits <- function(samples, target_column, run_config = list()) {
-  if (is.null(samples) || !is.data.frame(samples) || !nrow(samples)) return(NULL)
-  pcol <- .detectPatientColumn(samples, run_config)
-  if (is.null(pcol)) return(NULL)
-
-  pid <- .canonicalPatientIds(samples[[pcol]])
-  n_patients <- length(unique(pid))
-
-  tc <- if (!is.null(target_column) && length(target_column) >= 1 &&
-            target_column[[1]] %in% names(samples)) target_column[[1]] else NULL
-  if (is.null(tc)) {
-    keep <- !duplicated(pid)
-    return(list(n_patients = n_patients, data = samples[keep, , drop = FALSE]))
-  }
-  # Exactly one row per patient.  A patient with inconsistent labels must not
-  # count once in every class; choose the deterministic mode (lexical first on
-  # ties), matching the runner's one-unit pooling contract.
-  selected <- vapply(unique(pid), function(id) {
-    idx <- which(pid == id)
-    labels <- samples[[tc]][idx]
-    usable <- !is.na(labels)
-    if (!any(usable)) return(idx[[1]])
-    counts <- table(labels[usable])
-    winners <- names(counts)[counts == max(counts)]
-    winner <- if (is.numeric(labels) || is.integer(labels)) {
-      as.character(min(as.numeric(winners)))
-    } else {
-      sort(winners, method = "radix")[[1]]
-    }
-    idx[which(as.character(labels) == winner)[[1]]]
-  }, integer(1))
-  list(n_patients = n_patients, data = samples[selected, , drop = FALSE])
-}
-
-# Backward-compatible internal name used by older tests/extensions.
-.imageDisclosureUnits <- function(samples, target_column, run_config = list()) {
-  .privacyDisclosureUnits(samples, target_column, run_config)
-}
-
-#' Sanitize training metrics before returning through DataSHIELD
-#'
-#' Only round-level aggregate metrics (loss, accuracy, F1, precision,
-#' recall, num_examples) are returned. Per-sample metrics, raw gradients,
-#' and any other potentially disclosive information is stripped.
-#'
-#' @param metrics Named list or data.frame of metrics from Flower
-#' @return Data frame with only safe columns, or empty data.frame
-#' @keywords internal
-.sanitizeMetrics <- function(metrics) {
-  if (is.null(metrics) || length(metrics) == 0) {
-    return(data.frame(
-      round = integer(0), metric = character(0),
-      value = numeric(0), stringsAsFactors = FALSE
-    ))
-  }
-
-  # Allowlisted metric names
-  safe_metrics <- c(
-    "loss", "accuracy", "f1", "f1_score",
-    "precision", "recall", "auc", "roc_auc",
-    "mse", "mae", "rmse", "r2",
-    "num_examples", "num_clients"
-  )
-
-  if (is.data.frame(metrics)) {
-    # Filter to safe columns
-    if ("metric" %in% names(metrics)) {
-      metrics <- metrics[tolower(metrics$metric) %in% safe_metrics, , drop = FALSE]
-    }
-    # Strip any path or IP columns
-    unsafe_cols <- grep("path|ip|host|pid|dir", names(metrics),
-                        ignore.case = TRUE, value = TRUE)
-    metrics <- metrics[, !names(metrics) %in% unsafe_cols, drop = FALSE]
-    # Bucket count-bearing metrics (num_examples, num_clients)
-    if ("metric" %in% names(metrics) && "value" %in% names(metrics)) {
-      count_rows <- tolower(metrics$metric) %in% c("num_examples", "num_clients")
-      if (any(count_rows)) {
-        metrics$value[count_rows] <- vapply(
-          metrics$value[count_rows],
-          function(v) as.numeric(dsImaging::safe_metadata_count(as.integer(v))),
-          numeric(1))
-      }
-    }
-    rownames(metrics) <- NULL
-    return(metrics)
-  }
-
-  # Convert named list to data.frame
-  if (is.list(metrics)) {
-    rows <- list()
-    for (nm in names(metrics)) {
-      if (tolower(nm) %in% safe_metrics) {
-        val <- metrics[[nm]]
-        if (is.numeric(val)) {
-          # Bucket count-bearing metrics
-          if (tolower(nm) %in% c("num_examples", "num_clients")) {
-            val <- as.numeric(dsImaging::safe_metadata_count(as.integer(val)))
-          }
-          rows[[length(rows) + 1]] <- data.frame(
-            metric = nm, value = val, stringsAsFactors = FALSE
-          )
-        }
-      }
-    }
-    if (length(rows) > 0) {
-      return(do.call(rbind, rows))
-    }
-  }
-
-  data.frame(
-    metric = character(0), value = numeric(0),
-    stringsAsFactors = FALSE
-  )
-}
-
 #' Validate training rounds against maximum allowed
 #'
 #' @param num_rounds Integer; requested number of training rounds
@@ -526,51 +261,4 @@
     )
   }
   num_rounds
-}
-
-#' Sanitize log lines before returning through DataSHIELD
-#'
-#' Strips filesystem paths, IP addresses, and other potentially
-#' identifying information from Flower log output.
-#'
-#' @param lines Character vector of log lines
-#' @param last_n Integer; maximum number of lines to return (default 50)
-#' @return Character vector of sanitized log lines
-#' @keywords internal
-.sanitizeLogs <- function(lines, last_n = 50L) {
-  if (is.null(lines) || length(lines) == 0) return(character(0))
-
-  last_n <- min(as.integer(last_n), 200L)
-  if (length(lines) > last_n) {
-    lines <- utils::tail(lines, last_n)
-  }
-
-  # Strip filesystem paths (Unix and Windows)
-  lines <- gsub("/[a-zA-Z0-9_./-]{3,}", "<path>", lines)
-  lines <- gsub("[A-Z]:\\\\[a-zA-Z0-9_.\\\\ -]{3,}", "<path>", lines)
-
-  # Strip IP addresses (IPv4)
-  lines <- gsub("\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b", "<ip>", lines)
-
-  # Strip port patterns (host:port)
-  lines <- gsub("<ip>:\\d+", "<ip>:<port>", lines)
-
-  # Strip PID references
-  lines <- gsub("\\bpid[= ]+\\d+", "pid=<pid>", lines, ignore.case = TRUE)
-
-  lines
-}
-
-#' Reject retired named-template inputs
-#'
-#' Models are data-only declarative specifications in the current runner. Named
-#' executable templates are retained only as a legacy argument shape and are not
-#' an authorization mechanism.
-#'
-#' @param app_template Character; the template name to validate
-#' @return TRUE invisibly, or stops with an error
-#' @keywords internal
-.validateTemplate <- function(app_template) {
-  stop("Named executable templates are retired. Submit a declarative model ",
-       "specification through the hash-pinned runner instead.", call. = FALSE)
 }

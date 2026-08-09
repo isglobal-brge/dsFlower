@@ -21,6 +21,44 @@ import os
 import sys
 
 
+def _seed_randomness():
+    """Seed libraries already present in the child without importing heavy ones.
+
+    NumPy is always loaded by ``main``.  If an uploaded package imports Torch,
+    a second call immediately before ``local_update`` seeds it as well.  The
+    final DP-noise key remains a domain-separated parent-only secret.
+    """
+    encoded = os.environ.get("DSF_DETERMINISTIC_SEED", "")
+    if len(encoded) != 64:
+        raise RuntimeError("isolated Hook seed is missing")
+    try:
+        seed = bytes.fromhex(encoded)
+    except ValueError as exc:
+        raise RuntimeError("isolated Hook seed is invalid") from exc
+    if len(seed) != 32:
+        raise RuntimeError("isolated Hook seed is invalid")
+
+    import random
+    import numpy as np
+
+    value = int.from_bytes(seed[:8], "big")
+    random.seed(value & 0x7FFF_FFFF)
+    np.random.seed(value & 0x7FFF_FFFF)
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        torch.manual_seed(value & 0x7FFF_FFFF_FFFF_FFFF)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(value & 0x7FFF_FFFF_FFFF_FFFF)
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+        cudnn = getattr(torch.backends, "cudnn", None)
+        if cudnn is not None:
+            cudnn.benchmark = False
+            cudnn.deterministic = True
+
+
 def _harden():
     """Best-effort, never-fatal child hardening. Resource limits + a Python-level network
     neuter. NOT a security boundary on its own (a determined child can evade Python-level
@@ -153,6 +191,8 @@ def main():
 
     import numpy as np
 
+    _seed_randomness()
+
     module_file = os.path.realpath(args.module_file)
 
     data = np.load(args.inp, allow_pickle=False)
@@ -167,6 +207,7 @@ def main():
     # resolve the name from a root containing a same-name ``foo.py`` or namespace
     # package; that would execute bytes outside the package digest.
     mod = _load_pinned_package(args.module, module_file)
+    _seed_randomness()
     res = mod.local_update([np.asarray(o).copy() for o in old], X, y, cfg)
     res = [np.asarray(w, dtype=np.float64) for w in res]  # arrays only -> .npy
 

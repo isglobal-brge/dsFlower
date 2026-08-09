@@ -50,19 +50,41 @@ _MAX_EGRESS_NDIM = 8
 _MAX_EGRESS_ELEMENTS = 8_000_000
 _MAX_EGRESS_BYTES = 64 * 1024 * 1024
 _MAX_PUBLIC_ARRAY_ABS = dp_harness.MAX_RELEASE_ABS
+_NEURAL_SEED_CONFIG_KEYS = frozenset({
+    "model-spec-b64", "loss-name", "num-classes", "num-labels",
+    "num-features", "feature-bounds", "feature-bounds-b64",
+    "backbone", "model", "image-size", "data-kind",
+    "target-bounds", "nb-dispersion", "gamma-shape", "huber-delta",
+    "quantile-level",
+})
+_NEURAL_SEED_PRIVACY_KEYS = frozenset({
+    "policy_hash", "epsilon", "delta", "clipping_norm", "adjacency",
+    "n_samples",
+})
 
 
-def _reply(msg, arrays, hook_executed=None, replay_cache_missing=False,
-           privacy_noop=False, public_preflight_unavailable=False,
+def _neural_seed_contract(cfg, pins, pcfg):
+    """Exact public inputs which can affect trusted neural execution."""
+    run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
+    bounds = _effective_feature_bounds(cfg)
+    run.pop("feature-bounds-b64", None)
+    if bounds is not None:
+        run["feature-bounds"] = bounds
+    if cfg.get("backbone") is not None:
+        run.pop("model", None)
+    return ({
+        "run": run,
+        "pins": dict(pins),
+    }, seeding.select_config(pcfg, _NEURAL_SEED_PRIVACY_KEYS))
+
+
+def _reply(msg, arrays, hook_executed=None,
+           public_preflight_unavailable=False,
            execution_unavailable=False):
     """Return arrays with one constant, data-independent aggregation weight."""
     metrics = {"num-examples": 1}
     if hook_executed is not None:
         metrics["hook-executed"] = int(bool(hook_executed))
-    if replay_cache_missing:
-        metrics["replay-cache-missing"] = 1
-    if privacy_noop:
-        metrics["privacy-noop"] = 1
     if public_preflight_unavailable:
         metrics["public-preflight-unavailable"] = 1
     if execution_unavailable:
@@ -74,7 +96,7 @@ def _reply(msg, arrays, hook_executed=None, replay_cache_missing=False,
 
 
 def _cache_reply(context, claim, arrays, hook_executed=None,
-                 public_preflight_unavailable=False, privacy_noop=False,
+                 public_preflight_unavailable=False,
                  execution_unavailable=False):
     context.state["dsflower-last-release"] = ArrayRecord(
         numpy_ndarrays=[np.asarray(a) for a in arrays])
@@ -82,12 +104,12 @@ def _cache_reply(context, claim, arrays, hook_executed=None,
         "message-id": claim["message_id"],
         "release-index": int(claim["release_index"]),
     }
+    if claim.get("request_id"):
+        meta["request-id"] = str(claim["request_id"])
     if hook_executed is not None:
         meta["hook-executed"] = int(bool(hook_executed))
     if public_preflight_unavailable:
         meta["public-preflight-unavailable"] = 1
-    if privacy_noop:
-        meta["privacy-noop"] = 1
     if execution_unavailable:
         meta["execution-unavailable"] = 1
     context.state["dsflower-last-release-meta"] = ConfigRecord(meta)
@@ -96,22 +118,26 @@ def _cache_reply(context, claim, arrays, hook_executed=None,
 def _replay_reply(context, claim, msg):
     meta = context.state.get("dsflower-last-release-meta")
     arrays = context.state.get("dsflower-last-release")
+    cached_request = (meta.get("request-id") if meta is not None else None)
+    exact_request = (
+        bool(claim.get("request_id"))
+        and cached_request == claim.get("request_id")
+        and meta.get("release-index") == int(claim["release_index"])
+    ) if meta is not None else False
     if (meta is not None and arrays is not None
-            and meta.get("message-id") == claim["message_id"]):
+            and exact_request):
         hook_status = meta.get("hook-executed")
         return _reply(
             msg, arrays.to_numpy_ndarrays(),
             hook_executed=(bool(hook_status) if hook_status is not None else None),
             public_preflight_unavailable=bool(meta.get(
                 "public-preflight-unavailable", 0)),
-            privacy_noop=bool(meta.get("privacy-noop", 0)),
             execution_unavailable=bool(meta.get(
                 "execution-unavailable", 0)))
-    # An old replay whose bytes are no longer cached gets no new private release.
-    # Mark this public infrastructure condition so the ServerApp cannot aggregate
-    # the fallback and falsely report the replayed round as trained.
-    return _safe_noop_reply(
-        msg, context, claim=claim, replay_cache_missing=True)
+    # Defensive fallback for inconsistent or externally-mutated Context state.
+    # The stateless guard normally returns ``new`` when reply bytes are absent.
+    return _safe_fallback_reply(
+        msg, context, claim=claim, execution_unavailable=True)
 
 
 def _validate_public_egress_arrays(arrays, label="HookApp", max_elements=None):
@@ -238,7 +264,7 @@ def _validate_public_neural_arrays(arrays, model):
     return arrays
 
 
-def _prepare_neural_model(msg, context, cfg, pins, private_release_id):
+def _prepare_neural_model(msg, context, cfg, pcfg, pins):
     """Build and initialize the node-owned model using public inputs only."""
     manifest_image = is_image_run(context)
     cfg_image = str(cfg.get("data-kind", "")).lower() == "image"
@@ -250,11 +276,14 @@ def _prepare_neural_model(msg, context, cfg, pins, private_release_id):
             + ("an image collection" if manifest_image else "tabular")
             + ". Use a vision model for imaging collections, a tabular model otherwise.")
     input_dim = _neural_input_dim(context, cfg, manifest_image)
-    master = seeding.master_seed(cfg, None, None, private_release_id)
-    seeding.seed_torch(seeding.sub_seed(master, "init"))
+    seed_config, seed_privacy = _neural_seed_contract(cfg, pins, pcfg)
+    public_master = seeding.master_seed(
+        "neural-public-init/v1", seed_config, seed_privacy,
+        int(pins["round_index"]))
+    seeding.seed_torch(seeding.sub_seed(public_master, "init"))
     model = load_user_model(cfg, input_dim, pins["loss_name"])
     _validate_public_neural_arrays(msg.content["arrays"], model)
-    return model, master, input_dim, manifest_image
+    return model, input_dim, manifest_image
 
 
 def _assert_finite_private_inputs(X, y):
@@ -358,8 +387,8 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
-    client run config -- so the client cannot stretch the composition horizon while
-    the ledger debits a fixed budget."""
+    client run config -- so the client cannot stretch the composition horizon
+    against the fixed per-training calibration."""
     _assert_finite_private_inputs(X, y)
     X = np.clip(X, -dp_harness.MAX_PARAMETER_ABS,
                 dp_harness.MAX_PARAMETER_ABS).astype(np.float32)
@@ -542,13 +571,8 @@ def _pool_by_patient(X, y, groups, loss_name):
     return Xp, np.asarray(yp, dtype=y.dtype)
 
 
-def _apply_feature_norm(X, cfg):
-    """Apply public clipped affine bounds, with legacy affine support.
-
-    Bounds are public constants. ``feature-norm-b64`` is retained only for legacy
-    saved runs; its arithmetic is totalised before any patient aggregation so even
-    extreme public mean/SD values cannot create a private success/failure oracle.
-    A length mismatch remains a public configuration error."""
+def _effective_feature_bounds(cfg):
+    """Return the one canonical public bounds object used by execution."""
     bounds = cfg.get("feature-bounds")
     raw_bounds = cfg.get("feature-bounds-b64")
     if bounds is None and raw_bounds:
@@ -558,6 +582,12 @@ def _apply_feature_norm(X, cfg):
                 str(raw_bounds), validate=True).decode("utf-8"))
         except Exception as e:
             raise RuntimeError("could not decode feature-bounds-b64: %s" % e)
+    return bounds
+
+
+def _apply_feature_bounds(X, cfg):
+    """Apply the public clipped affine transform pinned for this training."""
+    bounds = _effective_feature_bounds(cfg)
     if bounds is not None:
         lower = np.asarray(bounds.get("lower", []), dtype=np.float64)
         upper = np.asarray(bounds.get("upper", []), dtype=np.float64)
@@ -575,30 +605,10 @@ def _apply_feature_norm(X, cfg):
             transformed = (np.clip(safe, lower, upper) - center) / scale
         return _totalize_private_features(transformed)
 
-    raw = cfg.get("feature-norm-b64")
-    if not raw:
-        return _totalize_private_features(X)
-    import base64
-    try:
-        norm = json.loads(base64.b64decode(str(raw), validate=True).decode("utf-8"))
-        mean = np.asarray(norm["means"], dtype=np.float64)
-        sd = np.asarray(norm["sds"], dtype=np.float64)
-    except Exception as e:
-        raise RuntimeError("could not decode feature-norm-b64: %s" % e)
-    if mean.shape[0] != X.shape[1] or sd.shape[0] != X.shape[1]:
-        raise RuntimeError(
-            "feature-norm length (%d/%d) != num features (%d); refusing to train with a "
-            "mismatched normalization (would desync from prediction)."
-            % (mean.shape[0], sd.shape[0], X.shape[1]))
-    sd = np.where(np.isfinite(sd) & (sd > 1e-8), sd, 1.0)
-    mean = np.where(np.isfinite(mean), mean, 0.0)
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        Xn = (np.asarray(X, dtype=np.float64) - mean) / sd
-    return _totalize_private_features(Xn)
+    return _totalize_private_features(X)
 
 
-def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
-                  manifest_image):
+def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
     n_classes = int(pins["n_classes"])
 
     if manifest_image:
@@ -618,7 +628,7 @@ def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
         X, y = load_data(context)
         if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
             raise RuntimeError("staged feature width changed after model validation")
-        X = _apply_feature_norm(X, cfg)        # GLOBAL standardization (affine; commutes with mean-pool)
+        X = _apply_feature_bounds(X, cfg)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
         if pins["loss_name"] in _CLASSIFICATION_LOSSES:
             _assert_label_range(y, n_classes)
@@ -630,10 +640,25 @@ def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
         X = _totalize_private_features(X)
     task_module.assert_pinned_unit_count(context, len(y))
 
+    # Bind every stochastic DP-SGD axis only after preprocessing has produced
+    # the exact tensors consumed by training.  Parameter arrays are read back
+    # from the model so dtype coercions performed by set_torch_params are part
+    # of the effective, rather than merely transported, public model.
+    if pins["loss_name"] in ("cross_entropy", "hinge", "ordinal"):
+        seed_target = np.asarray(y, dtype=np.int64)
+    else:
+        seed_target = np.asarray(y, dtype=np.float32)
+    seed_config, seed_privacy = _neural_seed_contract(cfg, pins, pcfg)
+    master = seeding.master_seed(
+        "neural-dpsgd/v1", seed_config, seed_privacy,
+        int(pins["round_index"]),
+        public_arrays=get_torch_params(model),
+        private_arrays=(np.asarray(X, dtype=np.float32), seed_target))
+
     return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master)
 
 
-def _public_noop_arrays(msg, context, track):
+def _public_fallback_arrays(msg, context, track):
     """Bounded response independent of private rows when no release is available."""
     if track == "validation":
         # A standalone validator must never turn a failed/no-release node into
@@ -645,7 +670,7 @@ def _public_noop_arrays(msg, context, track):
         msg.content["arrays"], label="public fallback model")
 
 
-def _safe_public_noop_arrays(msg, context, track):
+def _safe_public_fallback_arrays(msg, context, track):
     """Construct a bounded fallback using public inputs/configuration only."""
     if track is None:
         try:
@@ -653,7 +678,7 @@ def _safe_public_noop_arrays(msg, context, track):
         except Exception:
             pass
     try:
-        return _public_noop_arrays(msg, context, track)
+        return _public_fallback_arrays(msg, context, track)
     except Exception:
         try:
             return _validate_public_egress_arrays(
@@ -662,9 +687,8 @@ def _safe_public_noop_arrays(msg, context, track):
             return [np.zeros(1, dtype=np.float32)]
 
 
-def _safe_noop_reply(msg, context, claim=None, track=None,
-                     hook_executed=None, replay_cache_missing=False,
-                     privacy_noop=False, public_preflight_unavailable=False,
+def _safe_fallback_reply(msg, context, claim=None, track=None,
+                     hook_executed=None, public_preflight_unavailable=False,
                      execution_unavailable=False):
     """Never expose a ClientApp exception through Flower's Error response."""
     if track is None:
@@ -672,7 +696,7 @@ def _safe_noop_reply(msg, context, claim=None, track=None,
             track = load_dp_track(context)
         except Exception:
             pass
-    arrays = _safe_public_noop_arrays(msg, context, track)
+    arrays = _safe_public_fallback_arrays(msg, context, track)
     # Once a private release path has been entered, keep success/failure
     # data-independent: a public unchanged model is still a valid no-release
     # Hook round.  Only the explicit pre-private readiness gate reports FALSE.
@@ -684,15 +708,12 @@ def _safe_noop_reply(msg, context, claim=None, track=None,
             _cache_reply(
                 context, claim, arrays, hook_executed=hook_status,
                 public_preflight_unavailable=public_preflight_unavailable,
-                privacy_noop=privacy_noop,
                 execution_unavailable=execution_unavailable)
         except Exception:
             pass
     try:
         return _reply(
             msg, arrays, hook_executed=hook_status,
-            replay_cache_missing=replay_cache_missing,
-            privacy_noop=privacy_noop,
             public_preflight_unavailable=public_preflight_unavailable,
             execution_unavailable=execution_unavailable)
     except Exception:
@@ -703,9 +724,6 @@ def _safe_noop_reply(msg, context, claim=None, track=None,
                 numpy_ndarrays=[np.zeros(1, dtype=np.float32)]),
             "metrics": MetricRecord({
                 "num-examples": 1,
-                **({"replay-cache-missing": 1}
-                   if replay_cache_missing else {}),
-                **({"privacy-noop": 1} if privacy_noop else {}),
                 **({"public-preflight-unavailable": 1}
                    if public_preflight_unavailable else {}),
                 **({"execution-unavailable": 1}
@@ -740,29 +758,19 @@ def train(msg: Message, context: Context) -> Message:
         # artifacts use the node-pinned track. The client cannot route its own code to a
         # tighter track, and the neural track only ever runs the hash-verified harness.
         track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
-        if claim["status"] == "noop":
-            if track == "egress":
-                arrays = _safe_public_noop_arrays(msg, context, track)
-                return _reply(
-                    msg, arrays, hook_executed=True, privacy_noop=True)
-            return _safe_noop_reply(
-                msg, context, claim=claim, track=track, privacy_noop=True)
-
         pcfg = load_privacy_config(context)
-        # SQLite is authoritative. The manifest copy is validated for structure,
-        # then replaced with the exact values returned by the atomic ledger claim.
+        # The node-written manifest is authoritative. The stateless guard validates
+        # its fixed policy and returns those exact per-training values.
         pcfg["epsilon"] = float(claim["epsilon"])
         pcfg["delta"] = float(claim["delta"])
-        private_release_id = release_guard.release_id(claim)
-
         if track == "validation":
-            if int(claim["max_releases"]) != 1:
+            if int(claim["num_rounds"]) != 1:
                 raise RuntimeError("validation release horizon must be exactly one")
             public_arrays = _validate_public_egress_arrays(
                 msg.content["arrays"], label="public validation model",
                 max_elements=_MAX_EGRESS_ELEMENTS)
             new_arrays = validation.private_model_validation(
-                context, cfg, pcfg, private_release_id, public_arrays,
+                context, cfg, pcfg, int(claim["release_index"]), public_arrays,
                 on_private_start=mark_private_started)
         elif track == "egress":
             from . import tier2_lib
@@ -774,7 +782,7 @@ def train(msg: Message, context: Context) -> Message:
             # bound. Per-release sigma scales with sqrt(R), which is much tighter
             # than splitting epsilon and delta linearly while preserving the same
             # run-level (epsilon, delta) guarantee.
-            num_rounds = int(claim["max_releases"])
+            num_rounds = int(claim["num_rounds"])
             pcfg_round = dict(pcfg)
             pcfg_round["composition_releases"] = num_rounds
             hook_caps = tier2_lib.hook_execution_caps(pcfg_round)
@@ -797,27 +805,32 @@ def train(msg: Message, context: Context) -> Message:
                 X, y = load_data(context)
                 unit_ids = load_tabular_patient_ids(context)
                 task_module.assert_pinned_unit_count(context, len(y), unit_ids)
-                master = seeding.master_seed(cfg, X, y, private_release_id)
+                master = tier2_lib.hook_master_seed(
+                    module_name, old, X, y, public_hook_cfg, pcfg_round,
+                    unit_ids=unit_ids)
+                execution_seed = tier2_lib.hook_execution_seed(
+                    module_name, old, public_hook_cfg, pcfg_round)
                 new_arrays = tier2_lib.gated_local_update(
                     module_name, old, X, y, public_hook_cfg, pcfg_round,
                     seed=seeding.sub_seed(master, "egress"),
+                    execution_seed=seeding.sub_seed(
+                        execution_seed, "egress-execution"),
                     hook_caps=hook_caps, unit_ids=unit_ids,
                     release_started=hook_started, pad_release=False)
             finally:
                 tier2_lib.pad_hook_release(hook_started, pcfg_round)
         else:  # neural (tabular or image)
             pins = load_run_pins(context)
-            if int(pins["num_rounds"]) != int(claim["max_releases"]):
+            if int(pins["num_rounds"]) != int(claim["num_rounds"]):
                 raise RuntimeError(
                     "neural calibration horizon does not match release guard")
             pins = dict(pins)
             pins["round_index"] = int(claim["release_index"])
-            model, master, input_dim, manifest_image = _prepare_neural_model(
-                msg, context, cfg, pins, private_release_id)
+            model, input_dim, manifest_image = _prepare_neural_model(
+                msg, context, cfg, pcfg, pins)
             mark_private_started()
             new_arrays, _n = _train_neural(
-                context, cfg, pcfg, pins, model, master, input_dim,
-                manifest_image)
+                context, cfg, pcfg, pins, model, input_dim, manifest_image)
 
         hook_status = True if track == "egress" else None
         _cache_reply(context, claim, new_arrays, hook_executed=hook_status)
@@ -826,7 +839,7 @@ def train(msg: Message, context: Context) -> Message:
         # Flower serializes uncaught exception strings into Error.reason. Those
         # strings can contain private values (for example pandas conversion errors),
         # so the trusted boundary must return content and never propagate/log them.
-        return _safe_noop_reply(
+        return _safe_fallback_reply(
             msg, context, claim=claim, track=track,
             hook_executed=hook_public_ready,
             public_preflight_unavailable=not private_started,

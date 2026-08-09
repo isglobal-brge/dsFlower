@@ -74,6 +74,7 @@ _CHILD = os.path.join(_HERE, "egress_child.py")
 _DEFAULT_TIMEOUT = 900                 # wall-clock seconds per child run
 _NPY_HEADER_SLACK = 4096               # bytes of .npy header allowed above the array payload
 _PAD_GUARD = 5.0                       # public setup/cleanup margin after all child timeouts
+_MAX_PATIENT_ID_BYTES = 4096
 _MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
 _ASCII_ID_TRIM = " \t\r\n"
 _APP_PARAMS_MAX_DEPTH = 8
@@ -83,6 +84,12 @@ _APP_PARAMS_MAX_KEY_BYTES = 128
 _APP_PARAMS_MAX_STRING_BYTES = 4096
 _PUBLIC_HOOK_CONFIG_KEYS = frozenset({
     "app_params", "round_index", "num_rounds", "task", "num_classes",
+})
+_HOOK_SEED_PRIVACY_KEYS = frozenset({
+    "policy_hash", "epsilon", "delta", "clipping_norm", "adjacency",
+    "sample_aggregate", "sa_blocks", "composition_releases",
+    "egress_timeout", "egress_memory_mb", "egress_file_mb",
+    "egress_processes",
 })
 _RESERVED_APP_PARAM_KEYS = frozenset({
     "privacy", "dp", "epsilon", "delta", "clipping_norm",
@@ -342,6 +349,51 @@ def _sanitize_cfg(cfg):
     }
 
 
+def hook_master_seed(module_name, global_arrays, X, y, cfg, pcfg,
+                     unit_ids=None):
+    """Bind Hook randomness to its exact effective inputs, without persistence."""
+    if not isinstance(module_name, str) or not module_name:
+        raise RuntimeError("Hook semantic module identity is invalid")
+    clean_cfg = _sanitize_cfg(cfg)
+    old = _as_f64_list(global_arrays)
+    canonical_units = (None if unit_ids is None else [
+        _canonical_patient_id(value) for value in np.asarray(
+            unit_ids, dtype=object).tolist()
+    ])
+    mechanism = ("hook-sample-aggregate/v1"
+                 if bool(pcfg.get("sample_aggregate", True))
+                 else "hook-output-perturbation/v1")
+    return seeding.master_seed(
+        mechanism,
+        {"module": module_name, "hook": clean_cfg},
+        seeding.select_config(pcfg, _HOOK_SEED_PRIVACY_KEYS),
+        int(clean_cfg["round_index"]),
+        public_arrays=old,
+        private_arrays=(np.asarray(X), np.asarray(y)),
+        unit_ids=canonical_units)
+
+
+def hook_execution_seed(module_name, global_arrays, cfg, pcfg):
+    """Public-only seed for S&A partitions and child training randomness.
+
+    A neighbouring private record must not reshuffle unaffected S&A blocks or
+    change their child RNGs.  The final DP noise uses ``hook_master_seed`` and
+    remains bound to all private inputs and validated pre-noise updates.
+    """
+    if not isinstance(module_name, str) or not module_name:
+        raise RuntimeError("Hook semantic module identity is invalid")
+    clean_cfg = _sanitize_cfg(cfg)
+    mechanism = ("hook-sample-aggregate-execution/v1"
+                 if bool(pcfg.get("sample_aggregate", True))
+                 else "hook-output-execution/v1")
+    return seeding.master_seed(
+        mechanism,
+        {"module": module_name, "hook": clean_cfg},
+        seeding.select_config(pcfg, _HOOK_SEED_PRIVACY_KEYS),
+        int(clean_cfg["round_index"]),
+        public_arrays=_as_f64_list(global_arrays))
+
+
 # --------------------------------------------------------------------------- #
 # Sandbox capability preflight (subprocess is universal; the rest is platform-gated)
 # --------------------------------------------------------------------------- #
@@ -543,7 +595,8 @@ def _is_regular(path):
         return False
 
 
-def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps, timeout):
+def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps,
+                  timeout, *, child_seed=None):
     """Run the untrusted local_update on (X, y) in a FRESH interpreter. Returns f64 arrays,
     or None on ANY failure (crash, timeout, wrong count/shape, non-finite, unreadable). The
     parent never imports or executes the upload; the result is loaded allow_pickle=False so
@@ -571,6 +624,15 @@ def _run_isolated(module_name, module_file, old, X, y, cfg, pcfg, caps, timeout)
             "DSF_RLIMIT_NPROC": str(int(pcfg.get("egress_processes", 128))),
             "DSF_NO_NET": "1",
         }
+        if child_seed is not None:
+            if (not isinstance(child_seed, (bytes, bytearray))
+                    or len(child_seed) != 32):
+                raise RuntimeError("Hook child seed must be 256 bits")
+            child_seed = bytes(child_seed)
+            env["DSF_DETERMINISTIC_SEED"] = child_seed.hex()
+            env["PYTHONHASHSEED"] = str(
+                int.from_bytes(child_seed[:4], "big"))
+            env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         cmd = _wrap_sandbox(base, caps, td)
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -639,10 +701,10 @@ def _choose_blocks(pcfg, full_sandbox):
 def _canonical_patient_id(value):
     try:
         text = ("" if value is None else str(value)).strip(_ASCII_ID_TRIM)
-        text.encode("utf-8", errors="strict")
+        encoded = text.encode("utf-8", errors="strict")
     except (TypeError, UnicodeError, ValueError):
         return _MISSING_PATIENT_UNIT
-    if (not text
+    if (not text or len(encoded) > _MAX_PATIENT_ID_BYTES
             or text.lower() in ("na", "nan", "null", "<na>", "nat")):
         return _MISSING_PATIENT_UNIT
     return text
@@ -680,8 +742,8 @@ def _patient_row_blocks(unit_ids, n_rows, k, partition_seed):
 
 
 def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
-                       hook_caps=None, unit_ids=None, release_started=None,
-                       pad_release=True):
+                       execution_seed=None, hook_caps=None, unit_ids=None,
+                       release_started=None, pad_release=True):
     """Run the upload out-of-process from the global model, then apply the DP gate in the
     trusted parent. The NODE picks the mechanism: sample-and-aggregate
     (conservative sensitivity min(2C,4C/k)) when the
@@ -704,11 +766,15 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
     # private data and complete with a data-independent unchanged model.
     if caps is None:
         return [o.astype(np.float32) for o in old]
+    if (not isinstance(seed, (bytes, bytearray)) or len(seed) != 32
+            or not isinstance(execution_seed, (bytes, bytearray))
+            or len(execution_seed) != 32):
+        raise RuntimeError("Hook release requires private and execution seed keys")
     release_started = (time.monotonic() if release_started is None
                        else float(release_started))
     try:
         module_file = _pinned_user_package(module_name)
-        partition_seed = seeding.sub_seed(seed, "partition")
+        partition_seed = seeding.sub_seed(execution_seed, "partition")
         if unit_ids is None:
             n_units = n
             row_blocks = None
@@ -730,23 +796,30 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
                 row_blocks, _ = _patient_row_blocks(
                     unit_ids, n, k, partition_seed)
             block_updates = []
-            for idx in row_blocks:
+            for block_index, idx in enumerate(row_blocks):
                 r = _validate(_run_isolated(
                     module_name, module_file, old, _take_rows(X, idx),
-                    _take_rows(y, idx), cfg, pcfg, caps, timeout), old)
+                    _take_rows(y, idx), cfg, pcfg, caps, timeout,
+                    child_seed=seeding.sub_seed(
+                        execution_seed, "child/%d" % block_index)), old)
                 block_updates.append(
                     r if r is not None else [o.copy() for o in old])
+            bound_updates = [
+                array for update in block_updates for array in update
+            ]
             gated = dp_harness.sample_and_aggregate(
                 block_updates, old,
                 clipping_norm=pcfg["clipping_norm"],
                 epsilon=pcfg["epsilon"],
                 delta=pcfg["delta"],
                 num_releases=pcfg.get("composition_releases", 1),
-                rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
+                rng=seeding.np_rng(seeding.bind_seed(
+                    seed, "hook-sample-aggregate-update/v1", bound_updates)),
             )
         else:
             r = _validate(_run_isolated(
-                module_name, module_file, old, X, y, cfg, pcfg, caps, timeout), old)
+                module_name, module_file, old, X, y, cfg, pcfg, caps, timeout,
+                child_seed=seeding.sub_seed(execution_seed, "child/0")), old)
             new = r if r is not None else [o.copy() for o in old]
             gated = dp_harness.output_perturbation(
                 new, old,
@@ -754,7 +827,8 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
                 epsilon=pcfg["epsilon"],
                 delta=pcfg["delta"],
                 num_releases=pcfg.get("composition_releases", 1),
-                rng=seeding.np_rng(seeding.sub_seed(seed, "noise")),
+                rng=seeding.np_rng(seeding.bind_seed(
+                    seed, "hook-output-update/v1", new)),
             )
         return [g.astype(np.float32) for g in gated]
     finally:

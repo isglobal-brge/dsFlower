@@ -11,7 +11,7 @@ Character; the run token string.
 }
 \description{
 Creates a token in the format \code{run_<32 hex digits>} from 128 bits of
-operating-system entropy.  The token is also a primary key in the persistent
-privacy ledger, so it must not depend on R's mutable statistical RNG.
+operating-system entropy. It identifies transient staging only and is never a
+privacy counter or an input to sticky semantic noise.
 }
 \keyword{internal}

@@ -219,12 +219,7 @@ test_that("global byte cap is enforced without a catalogue-count quota", {
   expect_false(dir.exists(file.path(root, second)))
 
   dsFlower::flowerAppDeleteDS(first)
-  withr::local_options(list(
-    dsflower.app_spool_max_bytes = 100,
-    # The retired option is deliberately ignored: catalogue size is limited
-    # only by the administrator-owned physical byte cap.
-    dsflower.app_spool_max_uploads = 1
-  ))
+  withr::local_options(list(dsflower.app_spool_max_bytes = 100))
   dsFlower::flowerAppPushDS(first, .enc_b64(as.raw(1)), 0)
   expect_true(dsFlower::flowerAppPushDS(
     second, .enc_b64(as.raw(2)), 0)$ok)
@@ -234,10 +229,7 @@ test_that("global byte cap is enforced without a catalogue-count quota", {
 test_that("concurrent uploads have no catalogue-count quota", {
   skip_on_os("windows")
   root <- .local_app_spool()
-  withr::local_options(list(
-    dsflower.app_spool_max_bytes = 1024,
-    dsflower.app_spool_max_uploads = 1
-  ))
+  withr::local_options(list(dsflower.app_spool_max_bytes = 1024))
   sync <- withr::local_tempdir()
   go <- file.path(sync, "go")
   ready <- file.path(sync, c("ready-1", "ready-2"))

@@ -6,6 +6,7 @@ set -eu
 TEST_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 python3 "$TEST_DIR/test_metadata.py"
+python3 "$TEST_DIR/../reference/test_mechanism_v1.py"
 if [ "${DSFLOWER_XGB_SKIP_BUILD:-0}" = "1" ]; then
   printf '%s\n' "skipped network/build smoke by explicit request"
 else

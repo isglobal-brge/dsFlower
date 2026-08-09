@@ -38,7 +38,7 @@ COPY dsFlower.tar.gz /tmp/dsFlower.tar.gz
 # exists. So the first federated run is still instant, but the image stays ~3 GB smaller.
 # Torch backend is AUTO-DETECTED (CPU on a CPU build host -> the small portable default),
 # never pinned, so a GPU host resolves to GPU and provisions the CUDA venv there.
-RUN R -e 'p<-c("arrow","DBI","digest","filelock","jsonlite","processx","rappdirs","RSQLite"); m<-p[!vapply(p,requireNamespace,logical(1),quietly=TRUE)]; if(length(m)) install.packages(m, repos="https://cloud.r-project.org")' \
+RUN R -e 'p<-c("arrow","digest","filelock","jsonlite","processx"); m<-p[!vapply(p,requireNamespace,logical(1),quietly=TRUE)]; if(length(m)) install.packages(m, repos="https://cloud.r-project.org")' \
  && R CMD INSTALL --library=/var/lib/rock/R/library /tmp/dsFlower.tar.gz \
  && R -e '.libPaths(c("/var/lib/rock/R/library", .libPaths())); dsFlower:::.ensure_python_env("pytorch")' \
  && chown -R rock:rock /var/lib/rock/R/library/dsFlower /var/lib/dsflower \
@@ -46,19 +46,15 @@ RUN R -e 'p<-c("arrow","DBI","digest","filelock","jsonlite","processx","rappdirs
  && rm -rf /tmp/dsFlower.tar.gz /var/lib/rock/.cache/uv /root/.cache/uv \
  && test ! -e "${DSFLOWER_NODE_SECRET_FILE:-/var/lib/dsflower/privacy/noise_root}" \
  && test ! -L "${DSFLOWER_NODE_SECRET_FILE:-/var/lib/dsflower/privacy/noise_root}" \
- && test ! -e "${DSFLOWER_PRIVACY_LEDGER_PATH:-/var/lib/dsflower/privacy/ledger.sqlite}" \
- && test ! -L "${DSFLOWER_PRIVACY_LEDGER_PATH:-/var/lib/dsflower/privacy/ledger.sqlite}" \
  && test ! -e /var/lib/dsflower/privacy/noise_root \
  && test ! -L /var/lib/dsflower/privacy/noise_root \
  && test ! -e /var/lib/dsflower/node_secret \
  && test ! -L /var/lib/dsflower/node_secret \
- && test ! -e /var/lib/dsflower/privacy/ledger.sqlite \
- && test ! -L /var/lib/dsflower/privacy/ledger.sqlite \
- && R -e '.libPaths(c("/var/lib/rock/R/library", .libPaths())); p<-c(Sys.getenv("DSFLOWER_NODE_SECRET_FILE",unset=""),Sys.getenv("DSFLOWER_PRIVACY_LEDGER_PATH",unset=""),dsFlower:::.dsf_option("node_secret_path",""),dsFlower:::.dsf_option("privacy_ledger_path",""),"/var/lib/dsflower/privacy/noise_root","/var/lib/dsflower/privacy/ledger.sqlite"); p<-as.character(p); p<-p[!is.na(p)&nzchar(p)]; if(any(file.exists(p)|vapply(p,dsFlower:::.path_is_symlink,logical(1)))) stop("privacy state was created during image build")'
+ && R -e '.libPaths(c("/var/lib/rock/R/library", .libPaths())); p<-c(Sys.getenv("DSFLOWER_NODE_SECRET_FILE",unset=""),dsFlower:::.dsf_option("node_secret_path",""),"/var/lib/dsflower/privacy/noise_root"); p<-as.character(p); p<-p[!is.na(p)&nzchar(p)]; if(any(file.exists(p)|vapply(p,dsFlower:::.path_is_symlink,logical(1)))) stop("noise root was created during image build")'
 
 # Keep the upstream entrypoint/CMD untouched. Its final service hook already runs
 # as `rock`, after Rock has prepared its mounts. The wrapper bootstraps early only
-# with explicit process paths; otherwise the first session uses profile options.
+# with an explicit node-key path; otherwise the first session uses profile options.
 # This code is never run at build.
 RUN grep -Eq 'exec[[:space:]]+gosu[[:space:]]+rock[[:space:]]+/opt/obiba/bin/start.sh' /docker-entrypoint.sh \
  && test -x /opt/obiba/bin/start.sh \

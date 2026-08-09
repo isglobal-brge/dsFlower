@@ -24,9 +24,7 @@ flowerPrepareRunDS(
 Updated handle with staging information.
 }
 \description{
-DataSHIELD ASSIGN method. Reserves the server-owned lifetime allocation,
-and, when that allocation is numerically viable, applies total public
-preprocessing and stages the training data. A non-viable geometric-tail
-allocation stages only a public no-op manifest and never opens the private
-source. No minimum-size or private-value admission bit is returned.
+DataSHIELD ASSIGN method. Validates the fixed stateless per-training privacy
+contract, applies total public preprocessing and stages the training data.
+Earlier trainings never change admission or the per-training contract.
 }

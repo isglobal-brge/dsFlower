@@ -9,6 +9,6 @@
 \description{
 This is an internal staging invariant, not an analyst-visible statistic.
 Row mode counts rows. Patient mode counts the complete, canonical identifiers
-selected by the lifetime server policy and never falls back to rows.
+selected by the server policy and never falls back to rows.
 }
 \keyword{internal}
