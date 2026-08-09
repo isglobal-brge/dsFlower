@@ -6,7 +6,6 @@ per-site metrics never leave the node.
 """
 
 import base64
-import json
 import math
 import os
 
@@ -15,7 +14,6 @@ import numpy as np
 _MAX_BINS = 512
 _MAX_CLASSES = 1024
 _MAX_VECTOR = 1 << 22
-_MAX_MODEL_BYTES = 64 * 1024 * 1024
 _MAX_MODEL_ABS = 1.0e6
 _MAX_PUBLIC_ARRAYS = 256
 _MAX_PUBLIC_ELEMENTS = 8_000_000
@@ -134,14 +132,15 @@ def neural_predictions(model, X, loss_name):
     if values.ndim != 2 or not bool(np.all(np.isfinite(values))):
         raise ValueError("validation features must be one finite matrix")
     loss = str(loss_name).lower()
-    output_limit = _MAX_MODEL_ABS if loss in ("mse", "huber") else 30.0
+    output_limit = (_MAX_MODEL_ABS
+                    if loss in ("mse", "huber", "quantile") else 30.0)
 
     def interpret(logits):
         logits = torch.clamp(
             torch.nan_to_num(logits, nan=0.0, posinf=output_limit,
                              neginf=-output_limit),
             -output_limit, output_limit)
-        if loss in ("mse", "huber"):
+        if loss in ("mse", "huber", "quantile"):
             return logits.squeeze(-1)
         if loss in ("poisson_nll", "negbin_nll", "gamma_nll"):
             return torch.exp(logits.squeeze(-1))
@@ -176,90 +175,10 @@ def neural_predictions(model, X, loss_name):
     return np.concatenate(predictions, axis=0)
 
 
-def decode_public_booster(array, *, input_dim):
-    """Parse and fully bound a public dsFlower DP-GBDT before private reads."""
-    value = np.asarray(array)
-    if (value.ndim != 1 or value.dtype != np.uint8
-            or value.nbytes < 2 or value.nbytes > _MAX_MODEL_BYTES):
-        raise ValueError("validation booster needs one bounded uint8 array")
-    try:
-        booster = json.loads(value.tobytes().decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError("validation booster is not valid JSON") from exc
-    if not isinstance(booster, dict):
-        raise ValueError("validation booster must be an object")
-    objective = str(booster.get("objective", ""))
-    if objective not in ("binary:logistic", "reg:squarederror"):
-        raise ValueError("unsupported validation booster objective")
-    depth = _integer(booster.get("depth"), "validation booster depth", 1, 10)
-    features = _integer(input_dim, "validation feature count", 1, 65536)
-    try:
-        base = float(booster.get("base_margin"))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("validation booster base margin must be finite") from exc
-    if not math.isfinite(base) or abs(base) > _MAX_MODEL_ABS:
-        raise ValueError("validation booster base margin must be finite")
-    trees = booster.get("trees")
-    if not isinstance(trees, list) or not 1 <= len(trees) <= 200000:
-        raise ValueError("validation booster tree count is invalid")
-    internal, leaves = (1 << depth) - 1, 1 << depth
-    for tree in trees:
-        if not isinstance(tree, dict):
-            raise ValueError("validation booster tree must be an object")
-        feat = np.asarray(tree.get("feat"))
-        threshold = np.asarray(tree.get("thr"), dtype=np.float64)
-        weights = np.asarray(tree.get("w"), dtype=np.float64)
-        if (feat.shape != (internal,) or threshold.shape != (internal,)
-                or weights.shape != (leaves,)):
-            raise ValueError("validation booster tree geometry is invalid")
-        try:
-            feat_number = feat.astype(np.float64)
-            feat_integer = feat.astype(np.int64)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("validation booster feature indices are invalid") from exc
-        if (not bool(np.all(np.isfinite(feat_number)))
-                or not bool(np.all(feat_number == feat_integer))
-                or bool(np.any(feat_integer < 0))
-                or bool(np.any(feat_integer >= features))):
-            raise ValueError("validation booster feature indices are invalid")
-        if (not bool(np.all(np.isfinite(threshold)))
-                or not bool(np.all(np.isfinite(weights)))
-                or bool(np.any(np.abs(threshold) > _MAX_MODEL_ABS))
-                or bool(np.any(np.abs(weights) > _MAX_MODEL_ABS))):
-            raise ValueError("validation booster values are invalid")
-    ranges = booster.get("feature_ranges")
-    if not isinstance(ranges, list) or len(ranges) != features:
-        raise ValueError("validation booster feature ranges are invalid")
-    for bounds in ranges:
-        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
-            raise ValueError("validation booster feature ranges are invalid")
-        lower, upper = _target_bounds(
-            {"lower": bounds[0], "upper": bounds[1]})
-        if lower >= upper:
-            raise ValueError("validation booster feature ranges are invalid")
-    if objective == "reg:squarederror":
-        margin = booster.get("margin_bounds")
-        if not isinstance(margin, (list, tuple)) or len(margin) != 2:
-            raise ValueError("regression booster needs public margin bounds")
-        _target_bounds({"lower": margin[0], "upper": margin[1]})
-    return booster
-
-
-def booster_predictions(booster, X):
-    """Evaluate a validated dsFlower booster through its trusted implementation."""
-    from . import dp_gbdt
-    values = np.asarray(X, dtype=np.float64)
-    if values.ndim != 2 or not bool(np.all(np.isfinite(values))):
-        raise ValueError("validation features must be one finite matrix")
-    if str(booster.get("objective")) == "binary:logistic":
-        return dp_gbdt.predict_proba(booster, values)
-    return dp_gbdt.predict_value(booster, values)
-
-
 def _model_track(cfg):
     track = str(cfg.get("validation-model-track", "")).lower()
-    if track not in ("neural", "trees"):
-        raise ValueError("validation model track must be neural or trees")
+    if track != "neural":
+        raise ValueError("validation model track must be neural")
     return track
 
 
@@ -310,21 +229,8 @@ def _bounded_public_arrays(arrays, *, max_elements=None):
 
 def public_model_arrays(cfg):
     """Load the researcher-side public model which the ServerApp will send."""
-    track = _model_track(cfg)
+    _model_track(cfg)
     path = _public_model_path(cfg)
-    if track == "trees":
-        with open(path, "rb") as handle:
-            payload = handle.read(_MAX_MODEL_BYTES + 1)
-        if len(payload) > _MAX_MODEL_BYTES:
-            raise ValueError("validation booster exceeds the transport cap")
-        wire = np.frombuffer(payload, dtype=np.uint8).copy()
-        decode_public_booster(wire, input_dim=cfg.get("num-features"))
-        # The booster wire is uint8, so its byte and element counts coincide.
-        # Let the 64 MiB transport ceiling, rather than the neural tensor cap,
-        # govern this single declarative JSON artifact.
-        return _bounded_public_arrays(
-            [wire], max_elements=_MAX_PUBLIC_BYTES)
-
     import torch
     from . import model_spec
     from .params import get_torch_params
@@ -391,31 +297,6 @@ def _apply_feature_bounds(X, cfg):
         _MAX_MODEL_ABS).astype(np.float32)
 
 
-def _apply_tree_bounds(X, cfg):
-    """Repeat the tree track's raw clipping and midpoint imputation exactly."""
-    values = np.asarray(X, dtype=np.float64)
-    bounds = cfg.get("feature-bounds")
-    if bounds is None:
-        safe = np.where(np.isfinite(values), values, 0.0)
-        return np.clip(
-            safe, -_MAX_MODEL_ABS, _MAX_MODEL_ABS).astype(np.float32)
-    if not isinstance(bounds, dict):
-        raise ValueError("validation feature bounds are invalid")
-    lower = np.asarray(bounds.get("lower"), dtype=np.float64)
-    upper = np.asarray(bounds.get("upper"), dtype=np.float64)
-    if (lower.shape != (values.shape[1],) or upper.shape != (values.shape[1],)
-            or not bool(np.all(np.isfinite(lower)))
-            or not bool(np.all(np.isfinite(upper)))
-            or not bool(np.all(lower < upper))
-            or bool(np.any(np.abs(lower) > _MAX_MODEL_ABS))
-            or bool(np.any(np.abs(upper) > _MAX_MODEL_ABS))):
-        raise ValueError("validation feature bounds are invalid")
-    midpoint = lower + (upper - lower) / 2.0
-    safe = np.where(np.isfinite(values), values, midpoint)
-    return np.clip(
-        safe, -_MAX_MODEL_ABS, _MAX_MODEL_ABS).astype(np.float32)
-
-
 def private_model_validation(context, cfg, pcfg, release_id, public_arrays,
                              on_private_start=None):
     """Validate public inputs, then read private data and emit one DP vector."""
@@ -423,54 +304,27 @@ def private_model_validation(context, cfg, pcfg, release_id, public_arrays,
     from .params import load_user_model, set_torch_params
 
     layout = layout_from_config(cfg)
-    track = _model_track(cfg)
+    _model_track(cfg)
     input_dim = _node_input_dim(context)
     if not isinstance(public_arrays, (list, tuple)) or not public_arrays:
         raise ValueError("validation needs public model arrays")
 
     # Everything through model construction/decoding is public and occurs
     # before load_data opens the staged private frame.
-    if track == "neural":
-        loss = str(cfg.get("loss-name", "")).lower()
-        model = load_user_model(cfg, input_dim, loss)
-        set_torch_params(model, list(public_arrays))
-        booster = None
-    else:
-        if len(public_arrays) != 1:
-            raise ValueError("validation booster must be one public array")
-        booster = decode_public_booster(public_arrays[0], input_dim=input_dim)
-        actual = ("binary" if booster["objective"] == "binary:logistic"
-                  else "regression")
-        if actual != str(cfg.get("validation-task", "")):
-            raise ValueError("validation task disagrees with booster objective")
-        if actual == "regression":
-            expected_bounds = target_bounds_from_config(cfg)
-            model_bounds = booster.get("target_bounds")
-            if (not isinstance(model_bounds, (list, tuple))
-                    or len(model_bounds) != 2
-                    or [float(model_bounds[0]), float(model_bounds[1])] != [
-                        expected_bounds["lower"], expected_bounds["upper"]]):
-                raise ValueError(
-                    "validation target bounds disagree with booster contract")
-        model = None
+    loss = str(cfg.get("loss-name", "")).lower()
+    model = load_user_model(cfg, input_dim, loss)
+    set_torch_params(model, list(public_arrays))
 
     empty_public_shape = np.empty((0, input_dim), dtype=np.float64)
-    if track == "neural":
-        _apply_feature_bounds(empty_public_shape, cfg)
-    else:
-        _apply_tree_bounds(empty_public_shape, cfg)
+    _apply_feature_bounds(empty_public_shape, cfg)
 
     if on_private_start is not None:
         on_private_start()
     X, y = task_module.load_data(context)
     unit_ids = task_module.load_tabular_patient_ids(context)
     task_module.assert_pinned_unit_count(context, len(y), unit_ids)
-    if track == "neural":
-        X_model = _apply_feature_bounds(X, cfg)
-        predictions = neural_predictions(model, X_model, cfg.get("loss-name"))
-    else:
-        X_model = _apply_tree_bounds(X, cfg)
-        predictions = booster_predictions(booster, X_model)
+    X_model = _apply_feature_bounds(X, cfg)
+    predictions = neural_predictions(model, X_model, cfg.get("loss-name"))
     master = seeding.master_seed(cfg, None, None, release_id)
     target_bounds = (target_bounds_from_config(cfg)
                      if layout["task"] in ("regression", "count") else None)

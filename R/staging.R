@@ -725,8 +725,6 @@
   }
 
   expected <- run_config[["num-classes"]] %||% NULL
-  if (identical(tolower(as.character(run_config[["dp-track"]] %||% "")),
-                "trees")) expected <- 2L
   if (!is.null(expected)) {
     expected <- suppressWarnings(as.integer(unlist(expected, use.names = FALSE)))
     if (length(expected) != 1L || is.na(expected) ||

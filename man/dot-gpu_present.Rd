@@ -7,8 +7,7 @@
 .gpu_present()
 }
 \description{
-The single GPU check used to pick CUDA-vs-CPU builds for BOTH torch and
-xgboost, so "is the GPU applied" is decided consistently. In a container the
+The single GPU check used to pick CUDA-vs-CPU torch builds. In a container the
 GPU is visible only if it was started GPU-enabled (nvidia runtime / --gpus),
 so this correctly reflects what the node can actually use. Force with
 \code{DSFLOWER_FORCE_GPU=1} / \code{0}.

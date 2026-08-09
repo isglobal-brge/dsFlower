@@ -41,8 +41,6 @@ builds and executes the computation with the canonical runner:
 
 - neural/vision models use Opacus DP-SGD with per-example or per-patient gradient
   clipping and a CSPRNG-backed Gaussian stream;
-- DP-GBDT uses data-independent tree structure, bounded gradients/Hessians and
-  node-side Gaussian leaf-histogram noise;
 - only allowlisted, per-sample-safe operations and losses are admitted;
 - the manifest pins mechanism, model spec, loss, batch size, local epochs,
   horizon, feature count, optimizer/scheduler configuration and public
@@ -52,12 +50,11 @@ This contract reaches `nn.Module`-level granularity because the trusted runner
 owns the training loop and observes per-sample gradients. Extending the
 declarative vocabulary is the safe way to add flexibility.
 
-The `xgboost` request name maps to the canonical runner's own pure-NumPy
-random-split DP-GBDT. It is not native XGBoost and currently admits only binary
-logistic and bounded squared-error objectives. Native XGBoost, LightGBM and
-CatBoost have additional data-dependent binning, topology, category and stopping
-surfaces; they need a separately reviewed mechanism/adapter and cannot be made
-formal DP by perturbing serialized model bytes after ordinary training.
+No tree learner is exposed by this runner ABI. Native XGBoost, LightGBM and
+CatBoost have data-dependent binning, topology, category and stopping surfaces;
+they need separately reviewed node-owned mechanisms and cannot be made formal DP
+by validating public parameters or perturbing serialized model bytes after
+ordinary training.
 
 ### HookApp (legacy name: Tier2)
 
@@ -120,8 +117,8 @@ public result `available=false` with no metrics, node status or zero-filled
 substitute; this operational availability signal is outside the DP transcript.
 Exact labels, predictions, counts and node metrics are never released.
 
-The current track validates tabular neural and DP-GBDT artifacts; vision
-artifacts fail explicitly. Supported layouts cover binary, multiclass, ordinal
+The current track validates tabular neural artifacts; vision artifacts fail
+explicitly. Supported layouts cover binary, multiclass, ordinal
 and multilabel classification plus bounded regression/count outcomes. Probability
 bins are public and bounded at 512; class/label counts are public and bounded at
 1024. Validation on an independently assigned dataset is external validation;

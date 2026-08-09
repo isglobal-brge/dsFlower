@@ -11,13 +11,13 @@
 # --- Framework dependency map ---
 
 .BASE_PYTHON_DEPS <- c("flwr>=1.31.0,<1.32.0", "numpy>=1.21.0", "pandas>=1.3.0",
-                        "pyarrow>=10.0.0", "cryptography>=41.0.0")
+                        "pyarrow>=10.0.0", "cryptography>=42.0.0")
 
-# Provisioned frameworks: torch (linear/MLP + DP-SGD), pytorch_vision (imaging),
-# xgboost (gradient-boosted trees — the one model class torch cannot express).
+# Provisioned framework: one PyTorch/Opacus environment for neural and imaging
+# tracks. Native tree learners are not part of this runner ABI.
 # sklearn was dropped: its linear models are redundant with pytorch_logreg (and
 # torch gives rigorous Opacus DP-SGD), and its tree models have no federated
-# protocol. Each torch/xgboost build is GPU- or CPU-adaptive (see .gpu_present).
+# protocol. Each torch build is GPU- or CPU-adaptive (see .gpu_present).
 .FRAMEWORK_PYTHON_DEPS <- list(
   # ONE torch venv serves BOTH tabular (logreg/mlp) and vision — pytorch_vision is
   # a superset, so it's merged in (the "pytorch_vision" framework aliases to this
@@ -28,15 +28,16 @@
               "torchvision>=0.15.0,<1.0.0",
               "Pillow>=9.0.0", "nibabel>=5.0.0", "pydicom>=2.4.0",
               "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0")
-  # No xgboost venv: the trees track's random-split DP-GBDT is pure numpy,
-  # which the torch venv already provides, so the xgboost LIBRARY is never imported
-  # node-side. One venv runs every dp-track (deps: nothing more than needed).
 )
 
 .FRAMEWORK_HEALTH_IMPORT <- list(
-  # comma-separated single import: a venv missing opacus (DP), cryptography,
-  # torchvision, or monai is reported unhealthy and re-provisioned.
-  pytorch = "torchvision, opacus, monai, cryptography"
+  # A single import statement verifies every direct runtime dependency, so a
+  # partially populated venv is reported unhealthy and re-provisioned.
+  pytorch = paste(c(
+    "flwr", "numpy", "pandas", "pyarrow", "cryptography", "torch",
+    "opacus", "torchvision", "PIL", "nibabel", "pydicom", "nrrd",
+    "SimpleITK", "monai"
+  ), collapse = ", ")
 )
 
 #' Resolve the effective torch backend for THIS run. GPU presence is detected at
@@ -81,9 +82,9 @@
 }
 
 #' Normalize a framework / dp-track to its venv. dsFlower runs in ONE torch venv
-#' (torch + opacus + torchvision + monai + numpy); every dp-track runs there --
-#' neural via Opacus DP-SGD and trees via the pure-numpy DP-GBDT (no xgboost
-#' library). The egress track uses output perturbation only when every HookApp
+#' (torch + opacus + torchvision + monai + numpy); every dp-track runs there.
+#' Neural training uses Opacus DP-SGD. The egress track uses output perturbation
+#' only when every HookApp
 #' execution gate holds; otherwise it is a data-independent no-op. The backend
 #' picks WHICH copy: "pytorch" (cpu,
 #' the universal default) or "pytorch-gpu" (cuda), resolved as late as possible
@@ -108,8 +109,7 @@
 
 #' TRUE when a usable NVIDIA GPU is visible to this process.
 #'
-#' The single GPU check used to pick CUDA-vs-CPU builds for BOTH torch and
-#' xgboost, so "is the GPU applied" is decided consistently. In a container the
+#' The single GPU check used to pick CUDA-vs-CPU torch builds. In a container the
 #' GPU is visible only if it was started GPU-enabled (nvidia runtime / --gpus),
 #' so this correctly reflects what the node can actually use. Force with
 #' \code{DSFLOWER_FORCE_GPU=1} / \code{0}.

@@ -3,9 +3,9 @@
 \name{.framework_venv}
 \alias{.framework_venv}
 \title{Normalize a framework / dp-track to its venv. dsFlower runs in ONE torch venv
-(torch + opacus + torchvision + monai + numpy); every dp-track runs there --
-neural via Opacus DP-SGD and trees via the pure-numpy DP-GBDT (no xgboost
-library). The egress track uses output perturbation only when every HookApp
+(torch + opacus + torchvision + monai + numpy); every dp-track runs there.
+Neural training uses Opacus DP-SGD. The egress track uses output perturbation
+only when every HookApp
 execution gate holds; otherwise it is a data-independent no-op. The backend
 picks WHICH copy: "pytorch" (cpu,
 the universal default) or "pytorch-gpu" (cuda), resolved as late as possible
@@ -16,9 +16,9 @@ build pytorch-gpu) -- no code change, no install-time backend lock-in.}
 }
 \description{
 Normalize a framework / dp-track to its venv. dsFlower runs in ONE torch venv
-(torch + opacus + torchvision + monai + numpy); every dp-track runs there --
-neural via Opacus DP-SGD and trees via the pure-numpy DP-GBDT (no xgboost
-library). The egress track uses output perturbation only when every HookApp
+(torch + opacus + torchvision + monai + numpy); every dp-track runs there.
+Neural training uses Opacus DP-SGD. The egress track uses output perturbation
+only when every HookApp
 execution gate holds; otherwise it is a data-independent no-op. The backend
 picks WHICH copy: "pytorch" (cpu,
 the universal default) or "pytorch-gpu" (cuda), resolved as late as possible
