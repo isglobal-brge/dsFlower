@@ -33,6 +33,8 @@ for PATCH in "$DSFLOWER_XGB_ROOT"/patches/*.patch; do
     --cached --whitespace=error-all "$PATCH"
 done
 EXPECTED_TREE=$(GIT_INDEX_FILE="$EXPECTED_INDEX" git -C "$SOURCE" write-tree)
+[ "$EXPECTED_TREE" = "$DSFLOWER_XGB_PATCHED_TREE" ] ||
+  die "checksummed patchset tree does not match DSFLOWER_XGB_PATCHED_TREE"
 
 # Materialize every build-visible worktree entry, including ignored and
 # untracked files, in an independent index.  The submodule contents are checked

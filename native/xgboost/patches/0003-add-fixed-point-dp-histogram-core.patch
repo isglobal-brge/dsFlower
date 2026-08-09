@@ -2,11 +2,15 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 0bcd975b11360bb03203343358041494aee5c4d6..6aa7b31f28f1fe28f996a4242ae79b21d458fc18 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -115,4 +115,6 @@ option(PLUGIN_RMM "Build with RAPIDS Memory Manager (RMM)" OFF)
+@@ -115,4 +115,10 @@ option(PLUGIN_RMM "Build with RAPIDS Memory Manager (RMM)" OFF)
  option(PLUGIN_FEDERATED "Build with Federated Learning" OFF)
  option(PLUGIN_DSFLOWER_DP "Build the fail-closed dsFlower DP histogram scaffold" OFF)
-+option(DSFLOWER_DP_CORE_TESTING
-+       "Compile the unreviewed dsFlower DP histogram core for isolated tests" OFF)
++option(DSFLOWER_DP_CORE
++       "Compile the curated dsFlower DP histogram core" OFF)
++if(DSFLOWER_DP_CORE AND NOT PLUGIN_DSFLOWER_DP)
++  message(FATAL_ERROR
++          "DSFLOWER_DP_CORE requires the explicitly enabled dsFlower plugin")
++endif()
  ## TODO: 1. Add check if DPC++ compiler is used for building
  option(PLUGIN_SYCL "SYCL plugin" OFF)
 diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
@@ -54,18 +58,18 @@ index 3ff2eb344a3a45aad8a3cee6aab6129b604eff03..f6fb85b645776fdf124001445ba738d8
 +          "dsFlower forbids XGBoost debug output because it exposes raw training state")
 +endif()
 +
-+if(DSFLOWER_DP_CORE_TESTING)
++if(DSFLOWER_DP_CORE)
 +  set(DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR "" CACHE PATH
 +      "Directory containing dsflower_dp_primitives.h")
 +  set(DSFLOWER_DP_PRIMITIVES_LIBRARY "" CACHE FILEPATH
 +      "Exact dsFlower DP primitives import/shared library")
 +  if(NOT IS_DIRECTORY "${DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR}")
 +    message(FATAL_ERROR
-+            "DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR is required for core testing")
++            "DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR is required for the DP core")
 +  endif()
 +  if(NOT EXISTS "${DSFLOWER_DP_PRIMITIVES_LIBRARY}")
 +    message(FATAL_ERROR
-+            "DSFLOWER_DP_PRIMITIVES_LIBRARY is required for core testing")
++            "DSFLOWER_DP_PRIMITIVES_LIBRARY is required for the DP core")
 +  endif()
 +
 +  target_sources(objxgboost PRIVATE
@@ -81,7 +85,7 @@ index 3ff2eb344a3a45aad8a3cee6aab6129b604eff03..f6fb85b645776fdf124001445ba738d8
 +    ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_updater.cc
 +    ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_dp_hist.cc
 +    TARGET_DIRECTORY objxgboost
-+    PROPERTIES COMPILE_DEFINITIONS XGBOOST_DSFLOWER_DP_CORE_TESTING=1)
++    PROPERTIES COMPILE_DEFINITIONS XGBOOST_DSFLOWER_DP_CORE=1)
 +endif()
 diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
 index 5d9216dff4e1deb3697983b6efd6c0a198109b58..f998ca6e6c3f263807e9e3e0be328f1e3a42ae1e 100644
@@ -111,7 +115,7 @@ index 5d9216dff4e1deb3697983b6efd6c0a198109b58..f998ca6e6c3f263807e9e3e0be328f1e
 -v2 records but does not yet consume/enforce the total `max_trees`; the training
 -patch must add the successful-round counter before capability activation.
 +requires CPU, one output, one tree per round, one exclusive updater, and an
-+explicit `boost_from_average=0`.  The isolated core described below counts
++explicit `boost_from_average=0`.  The curated core described below counts
 +successful trees across every Booster sharing one installed context and rejects
 +tree index `max_trees`; a normal build still rejects before this path.
 
@@ -132,7 +136,7 @@ index 5d9216dff4e1deb3697983b6efd6c0a198109b58..f998ca6e6c3f263807e9e3e0be328f1e
  - patient-level contribution bounding;
 -- public or privately selected bins (v2 validates public cuts but does not use
 -  them for training yet);
-+- public or privately selected bins (v3 validates public cuts and the isolated
++- public or privately selected bins (v3 validates public cuts and the curated
 +  core consumes them directly);
  - a separately reviewed sampler consuming only the server-derived,
    domain-separated semantic PRF stream;
@@ -142,12 +146,12 @@ index 5d9216dff4e1deb3697983b6efd6c0a198109b58..f998ca6e6c3f263807e9e3e0be328f1e
 -`grow_dsflower_dp_hist` always fails closed in this patch.
 +`grow_dsflower_dp_hist` always fails closed in a normal build.
 +
-+## Isolated fixed-point core
++## Curated fixed-point core
 +
-+`DSFLOWER_DP_CORE_TESTING=ON` compiles a CPU-only test core and is off by
-+default.  Test builds must explicitly provide the ABI-v2 deterministic
-+`dsflower_dp_primitives` header and shared/import library.  This switch is not a
-+capability switch and is never set by the production build script.
++`DSFLOWER_DP_CORE=ON` compiles the CPU-only bundle core and is off by default.
++Curated builds must explicitly provide the ABI-v2 deterministic
++`dsflower_dp_primitives` header and shared/import library.  The switch is an
++internal bundle capability only and is not connected to public discovery.
 +
 +The core clips and fixed-point quantizes one gradient/Hessian contribution per
 +row, builds each active node histogram from its own rows, and sends the complete
@@ -209,6 +213,14 @@ index ba98cd2a8b01c2e31d5314c2d931510d9b681013..5d69784d5c2acea7b76445ea4b729334
 -  out.sealed_labels = source.sealed_labels;
    return out;
  }
+@@ -317,5 +324,5 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
+   }
+   if (input.mechanism_id == nullptr ||
+-      std::string_view{input.mechanism_id} != kScaffoldMechanismId) {
+-    return Reject("dsFlower mechanism_id does not match this scaffold", error);
++      std::string_view{input.mechanism_id} != kMechanismId) {
++    return Reject("dsFlower mechanism_id does not match the fixed-point core", error);
+   }
 @@ -336,7 +343,10 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
      return Reject("dsFlower contribution_strategy must be one-record-per-unit-v1", error);
    }
@@ -303,8 +315,8 @@ index ba98cd2a8b01c2e31d5314c2d931510d9b681013..5d69784d5c2acea7b76445ea4b729334
 @@ -477,5 +527,9 @@ XGB_DLL int XGBDsFlowerPrivacyScaffoldStatus(const char** out_status) {
    API_BEGIN();
    xgboost_CHECK_C_ARG_PTR(out_status);
-+#if defined(XGBOOST_DSFLOWER_DP_CORE_TESTING)
-+  *out_status = "test-only:fixed-point-core:no-production-capability";
++#if defined(XGBOOST_DSFLOWER_DP_CORE)
++  *out_status = "bundle-core:fixed-point-discrete-v1:internal-only";
 +#else
    *out_status = "scaffold-only:no-dp-histogram-privatization";
 +#endif
@@ -314,14 +326,21 @@ diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_conte
 index 3d5fe651153fd78b97ef9566a724d77a97e4dbb9..740b41805b769ea2101915a369c046e7e34c7c76 100644
 --- a/plugin/dsflower/dsflower_context.h
 +++ b/plugin/dsflower/dsflower_context.h
-@@ -28,4 +28,6 @@ inline constexpr std::size_t kMaxTotalCuts = 16384;
+@@ -23,5 +23,4 @@ namespace xgboost::tree::dsflower {
+-inline constexpr char kScaffoldMechanismId[] =
+-    "dsflower.xgboost.dp_hist.v0-scaffold";
++inline constexpr char kMechanismId[] = "xgboost/fixed-point-discrete/v1";
+ inline constexpr std::size_t kNoiseKeySize = 32;
+ inline constexpr std::size_t kMaxFeatures = 8192;
+ inline constexpr std::size_t kMaxTotalCuts = 16384;
+@@ -28,4 +27,6 @@ inline constexpr std::size_t kMaxTotalCuts = 16384;
  inline constexpr std::uint64_t kMaxTrees = 10000;
  inline constexpr std::uint64_t kMaxDepth = 30;
 +inline constexpr std::uint64_t kMaxFixedPointScale = UINT64_C(1) << 31;
 +inline constexpr std::uint64_t kMaxExactSamplerScale = UINT64_C(1) << 53;
 
  class SensitiveKey {
-@@ -86,4 +88,7 @@ struct PrivacyContext {
+@@ -86,4 +87,7 @@ struct PrivacyContext {
    std::uint64_t max_trees{0};
    std::uint64_t max_depth{0};
 +  std::uint64_t fixed_point_scale{0};
@@ -329,7 +348,7 @@ index 3d5fe651153fd78b97ef9566a724d77a97e4dbb9..740b41805b769ea2101915a369c046e7
 +  std::uint64_t level_noise_scale{0};
    std::uint64_t generation{0};
    std::vector<float> feature_lower_bounds;
-@@ -121,4 +126,7 @@ bool PrivacyContextReady();
+@@ -121,4 +125,7 @@ bool PrivacyContextReady();
  bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
                                       std::uint64_t* out_generation, std::string* error);
 +bool TryGetNextTreeIndex(std::uint64_t generation, std::uint64_t* out_tree_index,
@@ -1062,7 +1081,7 @@ index 39f53801464de1ad2db744ed50ebdabee0e716ff..e9ee27c0a8f75781cfe70b9a575dabb4
 @@ -4,4 +4,7 @@
   */
  #include "dsflower_context.h"
-+#if defined(XGBOOST_DSFLOWER_DP_CORE_TESTING)
++#if defined(XGBOOST_DSFLOWER_DP_CORE)
 +#include "dsflower_dp_hist.h"
 +#endif
 
@@ -1077,7 +1096,7 @@ index 39f53801464de1ad2db744ed50ebdabee0e716ff..e9ee27c0a8f75781cfe70b9a575dabb4
 @@ -64,5 +67,16 @@ class DsFlowerDpHistUpdater final : public TreeUpdater {
          << "dsFlower XGBoost max_depth does not match the context-bound exact depth";
      CHECK_EQ(trees.size(), 1) << "dsFlower XGBoost requires one tree per boosting round";
-+#if defined(XGBOOST_DSFLOWER_DP_CORE_TESTING)
++#if defined(XGBOOST_DSFLOWER_DP_CORE)
 +    CHECK_EQ(out_position.size(), 1)
 +        << "dsFlower XGBoost requires one output-position vector per tree";
 +    std::string error;
