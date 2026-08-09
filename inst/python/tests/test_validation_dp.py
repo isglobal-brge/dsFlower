@@ -16,7 +16,7 @@ RUNNER_ROOT = os.path.abspath(os.path.join(
 if RUNNER_ROOT not in sys.path:
     sys.path.insert(0, RUNNER_ROOT)
 
-from dsflower_runner import (client_app, params, seeding, server_app, task,
+from dsflower_runner import (client_app, dp_harness, params, server_app, task,
                              validation)  # noqa: E402
 from flwr.common import (ArrayRecord, ConfigRecord, Message, MetricRecord,
                          RecordDict)  # noqa: E402
@@ -88,35 +88,145 @@ class ValidationSensitivityTests(unittest.TestCase):
 
 
 class ValidationReleaseTests(unittest.TestCase):
-    def test_private_release_requires_secure_rng(self):
+    def setUp(self):
+        self._secret_dir = tempfile.TemporaryDirectory()
+        secret = os.path.join(self._secret_dir.name, "node-secret")
+        with open(secret, "w", encoding="ascii") as handle:
+            handle.write("31" * 32)
+        os.chmod(secret, 0o600)
+        self._secret_env = mock.patch.dict(
+            os.environ, {"DSFLOWER_NODE_SECRET_FILE": secret})
+        self._secret_env.start()
+
+    def tearDown(self):
+        self._secret_env.stop()
+        self._secret_dir.cleanup()
+
+    @staticmethod
+    def _raw_and_key(y, predictions, layout, *, unit_ids=None):
+        raw = validation._summed_validation_contributions(
+            y, predictions, layout, unit_ids=unit_ids)
+        sigma = dp_harness.compute_output_sigma(
+            1.0, 1e-5, layout["sensitivity"], num_releases=1)
+        return raw, validation._validation_noise_key(raw, layout, sigma)
+
+    def test_private_release_requires_custodial_secret(self):
         layout = validation.validation_layout("classification", bins=8)
-        with self.assertRaises(RuntimeError):
+        with mock.patch.dict(
+                os.environ, {"DSFLOWER_NODE_SECRET_FILE": ""}):
+            with self.assertRaises(RuntimeError):
+                validation.private_validation_vector(
+                    np.asarray([0, 1]), np.asarray([0.2, 0.8]), layout,
+                    epsilon=1.0, delta=1e-5)
+
+    def test_private_release_rejects_forged_layout_sensitivity(self):
+        layout = validation.validation_layout("classification", bins=8)
+        with self.assertRaises(ValueError):
             validation.private_validation_vector(
-                np.asarray([0, 1]), np.asarray([0.2, 0.8]), layout,
-                epsilon=1.0, delta=1e-5, rng=np.random.default_rng(1))
+                np.asarray([0, 1]), np.asarray([0.2, 0.8]),
+                {**layout, "sensitivity": 0.01},
+                epsilon=1.0, delta=1e-5)
 
     def test_same_release_key_is_byte_deterministic(self):
         layout = validation.validation_layout("classification", bins=8)
         kwargs = dict(y=np.asarray([0, 1, 1]),
                       predictions=np.asarray([0.1, 0.7, 0.9]),
                       layout=layout, epsilon=1.0, delta=1e-5)
-        one, sigma_one = validation.private_validation_vector(
-            rng=seeding.SecureNumpyRng(b"a" * 32), **kwargs)
-        two, sigma_two = validation.private_validation_vector(
-            rng=seeding.SecureNumpyRng(b"a" * 32), **kwargs)
+        one, sigma_one = validation.private_validation_vector(**kwargs)
+        two, sigma_two = validation.private_validation_vector(**kwargs)
         self.assertEqual(one.tobytes(), two.tobytes())
         self.assertEqual(sigma_one, sigma_two)
         self.assertFalse(np.array_equal(
             one, validation.validation_contributions(
                 kwargs["y"], kwargs["predictions"], layout).sum(axis=0)))
 
+    def test_row_permutation_and_patient_relabel_keep_release_and_key(self):
+        layout = validation.validation_layout("classification", bins=8)
+        y = np.asarray([0, 1, 0, 1, 1, 0])
+        predictions = np.asarray([0.1, 0.8, 0.3, 0.7, 0.9, 0.2])
+        patient_ids = np.asarray(["a", "a", "b", "c", "c", "b"])
+        relabeled = np.asarray(["z", "z", "x", "q", "q", "x"])
+        permutation = np.asarray([5, 2, 4, 0, 3, 1])
+
+        raw, key = self._raw_and_key(
+            y, predictions, layout, unit_ids=patient_ids)
+        permuted_raw, permuted_key = self._raw_and_key(
+            y[permutation], predictions[permutation], layout,
+            unit_ids=relabeled[permutation])
+        np.testing.assert_array_equal(raw, permuted_raw)
+        self.assertEqual(key, permuted_key)
+
+        released, _ = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5,
+            unit_ids=patient_ids)
+        permuted, _ = validation.private_validation_vector(
+            y[permutation], predictions[permutation], layout,
+            epsilon=1.0, delta=1e-5,
+            unit_ids=relabeled[permutation])
+        np.testing.assert_array_equal(released, permuted)
+
+    def test_distinct_scores_in_same_bins_keep_release_and_key(self):
+        layout = validation.validation_layout("classification", bins=8)
+        y = np.asarray([0, 0, 1, 1], dtype=np.int32)
+        first_scores = np.asarray([0.02, 0.24, 0.76, 0.99])
+        second_scores = np.asarray([0.10, 0.20, 0.80, 0.90],
+                                   dtype=np.float32)
+        first_raw, first_key = self._raw_and_key(
+            y, first_scores, layout)
+        represented_layout = dict(reversed(list(layout.items())))
+        represented_layout["non-semantic-note"] = "different artifact"
+        second_raw, second_key = self._raw_and_key(
+            y.astype(np.float64), second_scores, represented_layout)
+        np.testing.assert_array_equal(first_raw, second_raw)
+        self.assertEqual(first_key, second_key)
+        first, _ = validation.private_validation_vector(
+            y, first_scores, layout, epsilon=1.0, delta=1e-5)
+        second, _ = validation.private_validation_vector(
+            y.astype(np.float64), second_scores, layout,
+            epsilon=1.0, delta=1e-5)
+        np.testing.assert_array_equal(first, second)
+
+    def test_changed_sufficient_statistic_changes_release_key(self):
+        layout = validation.validation_layout("classification", bins=8)
+        y = np.asarray([0, 1, 1])
+        first_scores = np.asarray([0.1, 0.7, 0.9])
+        second_scores = np.asarray([0.1, 0.2, 0.9])
+        first_raw, first_key = self._raw_and_key(y, first_scores, layout)
+        second_raw, second_key = self._raw_and_key(y, second_scores, layout)
+        self.assertFalse(np.array_equal(first_raw, second_raw))
+        self.assertNotEqual(first_key, second_key)
+
+    def test_changed_effective_sigma_changes_release_key(self):
+        layout = validation.validation_layout("classification", bins=8)
+        raw = validation._summed_validation_contributions(
+            np.asarray([0, 1]), np.asarray([0.1, 0.9]), layout)
+        first = validation._validation_noise_key(raw, layout, 1.0)
+        second = validation._validation_noise_key(raw, layout, 2.0)
+        self.assertNotEqual(first, second)
+
+    def test_metric_subset_is_postprocessing_of_one_release(self):
+        layout = validation.validation_layout("classification", bins=16)
+        y = np.asarray([0, 0, 1, 1])
+        predictions = np.asarray([0.05, 0.2, 0.8, 0.95])
+        released, _ = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5)
+        complete = validation.validation_metrics(released, layout)
+        requested = {name: complete[name]
+                     for name in ("accuracy", "roc_auc")}
+        replayed, _ = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5)
+        np.testing.assert_array_equal(released, replayed)
+        self.assertEqual(requested, {
+            "accuracy": complete["accuracy"],
+            "roc_auc": complete["roc_auc"],
+        })
+
     def test_empty_cohort_reaches_the_dp_mechanism(self):
         layout = validation.validation_layout("classification", bins=8)
         released, sigma = validation.private_validation_vector(
             np.asarray([], dtype=np.float64),
             np.asarray([], dtype=np.float64), layout,
-            epsilon=1.0, delta=1e-5,
-            rng=seeding.SecureNumpyRng(b"e" * 32))
+            epsilon=1.0, delta=1e-5)
         self.assertEqual(released.shape, (layout["size"],))
         self.assertTrue(np.all(np.isfinite(released)))
         self.assertGreater(sigma, 0.0)
@@ -221,7 +331,6 @@ class ValidationReleaseTests(unittest.TestCase):
             validation.private_validation_vector(
                 np.asarray([0, 1]), np.asarray([0.2, 0.8]), layout,
                 epsilon=1.0, delta=1e-5,
-                rng=seeding.SecureNumpyRng(b"u" * 32),
                 unit_ids=np.asarray(["only-one"]))
 
     def test_binary_metrics_are_postprocessing_of_histogram(self):
@@ -451,6 +560,9 @@ class ValidationInferenceTests(unittest.TestCase):
             cfg = {
                 "validation-model-track": "neural",
                 "validation-task": "binary", "validation-bins": 8,
+                "validation-contract-sha256": "a" * 64,
+                "validation-metrics": ["accuracy", "roc_auc", "brier"],
+                "validation-thresholds": [0.25, 0.5, 0.75],
                 "num-features": 2, "num-classes": 2, "num-labels": 2,
                 "loss-name": "bce_logits",
                 "model-spec-b64": base64.b64encode(
@@ -471,12 +583,15 @@ class ValidationInferenceTests(unittest.TestCase):
                     context, {
                         **cfg, "run-token": "another-run",
                         "message-id": "another-message",
+                        "validation-contract-sha256": "b" * 64,
+                        "validation-metrics": ["accuracy"],
+                        "validation-thresholds": [0.42],
                         "validation-model-path-b64": base64.b64encode(
                             b"/another/public/path").decode("ascii"),
                     }, {
                         "epsilon": 1.0, "delta": 1e-5,
                         "policy_hash": "1" * 64,
-                    }, 1, arrays)
+                    }, 99, arrays)
             self.assertEqual(len(released), 1)
             self.assertEqual(released[0].shape, (16,))
             self.assertTrue(np.all(np.isfinite(released[0])))
