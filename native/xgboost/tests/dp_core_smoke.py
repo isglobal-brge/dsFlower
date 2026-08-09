@@ -55,7 +55,9 @@ def configure_core_api(lib: ct.CDLL) -> None:
     ]
 
 
-def make_booster(lib: ct.CDLL, matrix: ct.c_void_p, objective: bytes) -> ct.c_void_p:
+def make_booster(
+    lib: ct.CDLL, matrix: ct.c_void_p, objective: bytes, *, nthread: int = 1
+) -> ct.c_void_p:
     booster = ct.c_void_p()
     matrices = (ct.c_void_p * 1)(matrix)
     assert lib.XGBoosterCreate(matrices, 1, ct.byref(booster)) == 0
@@ -68,7 +70,7 @@ def make_booster(lib: ct.CDLL, matrix: ct.c_void_p, objective: bytes) -> ct.c_vo
         (b"max_delta_step", b"1"),
         (b"lambda", b"1"),
         (b"eta", b"0.3"),
-        (b"nthread", b"1"),
+        (b"nthread", str(nthread).encode("ascii")),
         (b"updater", b"grow_dsflower_dp_hist"),
     ):
         assert lib.XGBoosterSetParam(booster, name, value) == 0
@@ -82,6 +84,19 @@ def make_matrix_with_missing(lib: ct.CDLL) -> ct.c_void_p:
         features, 4, 1, ct.c_float(math.nan), ct.byref(matrix)
     ) == 0
     set_labels(lib, matrix, (0.0, 0.0, 1.0, 1.0))
+    return matrix
+
+
+def make_scalar_matrix(
+    lib: ct.CDLL, values: tuple[float, ...], labels: tuple[float, ...]
+) -> ct.c_void_p:
+    assert len(values) == len(labels)
+    features = (ct.c_float * len(values))(*values)
+    matrix = ct.c_void_p()
+    assert lib.XGDMatrixCreateFromMat(
+        features, len(values), 1, ct.c_float(math.nan), ct.byref(matrix)
+    ) == 0
+    set_labels(lib, matrix, labels)
     return matrix
 
 
@@ -211,6 +226,47 @@ def assert_sticky_recomputation(lib: ct.CDLL) -> None:
         assert first == second, "identical semantic training must be byte-identical"
     finally:
         assert lib.XGDMatrixFree(matrix) == 0
+
+
+def train_semantic_case(
+    lib: ct.CDLL,
+    values: tuple[float, ...],
+    labels: tuple[float, ...],
+    nthread: int,
+) -> bytes:
+    matrix = make_scalar_matrix(lib, values, labels)
+    booster = ct.c_void_p()
+    try:
+        context, keepalive = context_for(
+            matrix, b"regression", b"reg:squarederror",
+            max_trees=1, key_byte=91,
+        )
+        assert keepalive
+        assert lib.XGBDsFlowerSetPrivacyContext(ct.byref(context)) == 0
+        booster = make_booster(
+            lib, matrix, b"reg:squarederror", nthread=nthread)
+        assert lib.XGBoosterUpdateOneIter(booster, 0, matrix) == 0, last_error(lib)
+        return copy_buffer(
+            lib, "XGBoosterSaveModelToBuffer", booster, b'{"format":"json"}'
+        )
+    finally:
+        if booster:
+            assert lib.XGBoosterFree(booster) == 0
+        assert lib.XGBDsFlowerClearPrivacyContext() == 0
+        assert lib.XGDMatrixFree(matrix) == 0
+
+
+def assert_effective_training_determinism(lib: ct.CDLL) -> None:
+    cases = (
+        ((0.0, 1.0, 2.0, 3.0), (0.0, 0.0, 1.0, 1.0), 1),
+        ((0.0, 1.0, 2.0, 3.0), (0.0, 0.0, 1.0, 1.0), 4),
+        ((0.25, 1.25, 2.25, 3.25), (0.0, 0.0, 1.0, 1.0), 4),
+        ((3.0, 2.0, 1.0, 0.0), (1.0, 1.0, 0.0, 0.0), 4),
+    )
+    models = [train_semantic_case(lib, *case) for case in cases]
+    assert all(model == models[0] for model in models[1:]), (
+        "thread count, same-bin values or row order changed the model bytes"
+    )
 
 
 def float32(value: float) -> float:
@@ -438,6 +494,7 @@ def main(library: str, primitives_library: str | None = None) -> None:
         assert_objective(lib, b"regression", b"reg:squarederror")
         assert_objective(lib, b"binary_classification", b"binary:logistic")
         assert_sticky_recomputation(lib)
+        assert_effective_training_determinism(lib)
         assert_missing_value_path(lib, primitives)
         assert_cross_booster_tree_bound(lib)
         assert_failed_preflight_does_not_consume_tree(lib)
