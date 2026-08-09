@@ -46,11 +46,11 @@ jobs:
         run: |
           python native/dp_primitives/tests/abi_smoke.py
           python native/dp_primitives/tests/test_metadata.py
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+      - name: Audit locked dependency graph
         if: runner.os == 'Linux'
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: native/dp_primitives
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file native/dp_primitives/Cargo.lock
       - name: Verify third-party license inventory
         if: runner.os == 'Linux'
         shell: bash
