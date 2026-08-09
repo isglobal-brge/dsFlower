@@ -279,6 +279,18 @@ class XGBoostBundleTests(unittest.TestCase):
             require_node_owner=True, parent_chain=False)
 
     @unittest.skipUnless(
+        sys.platform.startswith("linux"), "Linux POSIX ACL invariant")
+    def test_linux_posix_acl_uses_the_effective_mode_mask(self):
+        manifest_file = self.directory.root / bundle.MANIFEST_NAME
+        with mock.patch.object(bundle.os, "listxattr", return_value=[
+                "system.posix_acl_access", "system.posix_acl_default"]):
+            bundle._secure_metadata(manifest_file)
+        with mock.patch.object(
+                bundle.os, "listxattr", return_value=["system.nfs4_acl"]), \
+                self.assertRaises(bundle.BundleVerificationError):
+            bundle._secure_metadata(manifest_file)
+
+    @unittest.skipUnless(
         sys.platform == "darwin", "macOS extended ACL invariant")
     def test_macos_extended_acl_is_rejected(self):
         manifest_file = self.directory.root / bundle.MANIFEST_NAME
