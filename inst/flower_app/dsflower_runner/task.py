@@ -690,6 +690,15 @@ def load_pinned_run_config(context=None):
         ]
         if str(manifest.get("validation-model-track", "")) == "neural":
             required.append("model-spec-b64")
+        elif str(manifest.get("validation-model-track", "")) == "native_tree":
+            required.extend([
+                "validation-native-tree-request-b64",
+                "validation-native-tree-request-sha256",
+                "validation-artifact-format", "validation-artifact-sha256",
+                "validation-artifact-size-bytes",
+                "validation-profile-sha256", "validation-profile-size-bytes",
+                "validation-public-schema-sha256",
+            ])
         for key in required:
             if key not in manifest:
                 raise ValueError("manifest is missing validation pin '%s'" % key)
@@ -706,6 +715,12 @@ def load_pinned_run_config(context=None):
         "task-type", "app-params-b64", "app-params-sha256",
         "target-bounds", "target-levels", "validation-model-track",
         "validation-task", "validation-bins", "validation-contract-sha256",
+        "validation-native-tree-request-b64",
+        "validation-native-tree-request-sha256",
+        "validation-artifact-format", "validation-artifact-sha256",
+        "validation-artifact-size-bytes",
+        "validation-profile-sha256", "validation-profile-size-bytes",
+        "validation-public-schema-sha256",
         "learning-rate", "weight-decay", "l1-penalty",
         "optimizer-name", "optimizer-momentum", "optimizer-nesterov",
         "optimizer-beta1", "optimizer-beta2", "optimizer-eps",

@@ -79,6 +79,7 @@ jobs:
           "$contract_python" -m unittest -v \
             inst/python/tests/test_native_tree_contract.py \
             inst/python/tests/test_native_tree_flower_app.py \
+            inst/python/tests/test_native_tree_validation_app.py \
             inst/python/tests/test_sitecustomize.py \
             inst/python/tests/test_xgboost_accounting.py \
             inst/python/tests/test_xgboost_adapter.py \

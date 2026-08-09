@@ -306,7 +306,7 @@ test_that("validation config is pinned to one well-typed release", {
     "validation-task" = "binary", "task-type" = "classification",
     "loss-name" = "bce_logits", "num-server-rounds" = 1L,
     "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L)),
-    "validation-model-track must be neural")
+    "exact XGBoost.*pin set")
 
   config <- dsFlower:::.addDpConfigToRunConfig(list(
     "dp-track" = "validation", "validation-model-track" = "neural",

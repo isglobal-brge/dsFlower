@@ -292,10 +292,18 @@
     stop("The verified native XGBoost runtime is unavailable on this node.",
          call. = FALSE)
   }
+  native_validation <- identical(track, "validation") &&
+    is.list(manifest) &&
+    identical(as.character(
+      manifest[["validation-model-track"]] %||% ""), "native_tree")
   # The release runner is node-resident and hash-pinned. Resolve its framework
   # from the server-validated manifest, never from an analyst executable path.
   runtime_desc <- .resolve_framework_runtime(
-    if (identical(track, "native_tree")) "native_tree" else "pytorch")
+    if (identical(track, "native_tree") || native_validation) {
+      "native_tree"
+    } else {
+      "pytorch"
+    })
   supernode_cmd <- runtime_desc$supernode_cmd
 
   # Create log directory
