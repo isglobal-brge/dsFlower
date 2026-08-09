@@ -48,8 +48,14 @@ jobs:
       - name: Validate Python contracts
         shell: bash
         run: |
-          python3 -m pip install --disable-pip-version-check numpy==2.4.6
-          python3 -m unittest -v \
+          python3 -m venv "$RUNNER_TEMP/xgb-contract-venv"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            contract_python="$RUNNER_TEMP/xgb-contract-venv/Scripts/python.exe"
+          else
+            contract_python="$RUNNER_TEMP/xgb-contract-venv/bin/python"
+          fi
+          "$contract_python" -m pip install --disable-pip-version-check numpy==2.4.6
+          "$contract_python" -m unittest -v \
             inst/python/tests/test_native_tree_contract.py \
             inst/python/tests/test_xgboost_accounting.py \
             inst/python/tests/test_xgboost_adapter.py \
