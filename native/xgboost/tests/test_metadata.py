@@ -86,6 +86,7 @@ def main() -> None:
         assert claim not in patch_text
 
     allowed_top_level = {
+        ".gitattributes",
         "LICENSES.md",
         "PATCHES.sha256",
         "PRIVACY.md",
