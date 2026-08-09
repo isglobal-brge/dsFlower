@@ -276,17 +276,21 @@ def _windows_secure_acl(path, *, require_node_owner, parent_chain=False):
         current = _windows_current_user_sid(advapi, kernel)
         local_system = _windows_well_known_sid(advapi, 22)
         administrators = _windows_well_known_sid(advapi, 26)
+        owner_rights = _windows_well_known_sid(advapi, 71)
         trusted_installer = ct.c_void_p()
         if not advapi.ConvertStringSidToSidW(
                 "S-1-5-80-956008885-3418522649-1831038044-"
                 "1853292631-2271478464", ct.byref(trusted_installer)):
             _reject()
         try:
-            trusted_sids = (
+            trusted_owners = (
                 current, local_system, administrators, trusted_installer)
             if require_node_owner and not any(
-                    advapi.EqualSid(owner, sid) for sid in trusted_sids):
+                    advapi.EqualSid(owner, sid) for sid in trusted_owners):
                 _reject()
+            # OWNER RIGHTS (S-1-3-4) resolves to the already-validated owner;
+            # it does not grant an independent principal access to the path.
+            trusted_sids = trusted_owners + (owner_rights,)
 
             acl = ct.cast(dacl, ct.POINTER(_Acl)).contents
             replacement_rights = (
