@@ -55,7 +55,8 @@ def main() -> int:
             "default-features": False,
             "features": ["std"],
         },
-        "getrandom": {"version": "=0.4.3", "default-features": False},
+        "hmac": {"version": "=0.12.1", "default-features": False},
+        "sha2": {"version": "=0.10.9", "default-features": False},
         "zeroize": {"version": "=1.8.2", "default-features": False},
     }
 
@@ -63,6 +64,8 @@ def main() -> int:
     assert 'name = "opendp"' not in lock
     assert 'name = "openssl"' not in lock
     assert 'name = "openssl-src"' not in lock
+    assert 'name = "getrandom"' not in lock
+    assert 'name = "rand"' not in lock
     for name in dependencies:
         assert f'name = "{name}"' in lock
 
@@ -72,7 +75,16 @@ def main() -> int:
         "dashu-base": "0.4.3",
         "dashu-int": "0.4.3",
         "dashu-ratio": "0.4.4",
-        "getrandom": "0.4.3",
+        "block-buffer": "0.10.4",
+        "cpufeatures": "0.2.17",
+        "crypto-common": "0.1.7",
+        "digest": "0.10.7",
+        "generic-array": "0.14.7",
+        "hmac": "0.12.1",
+        "sha2": "0.10.9",
+        "subtle": "2.6.1",
+        "typenum": "1.20.1",
+        "version_check": "0.9.5",
         "libc": "0.2.189",
         "num-modular": "0.6.5",
         "rustversion": "1.0.23",
@@ -97,13 +109,14 @@ def main() -> int:
     )
     rust = (ROOT / "src" / "lib.rs").read_text(encoding="utf-8")
     sampler = (ROOT / "src" / "discrete_gaussian.rs").read_text(encoding="utf-8")
-    assert re.search(r"DSFLOWER_DP_PRIMITIVES_ABI_VERSION\s+1U", header)
-    assert "const ABI_VERSION: u32 = 1;" in rust
-    mechanism_id = "cks20-discrete-gaussian-i64-system-random-v1"
+    assert re.search(r"DSFLOWER_DP_PRIMITIVES_ABI_VERSION\s+2U", header)
+    assert "const ABI_VERSION: u32 = 2;" in rust
+    mechanism_id = "cks20-discrete-gaussian-i64-hmac-sha256-v1"
     assert mechanism_id in header
     assert mechanism_id in rust
     assert OPENDP_COMMIT in sampler
-    assert "getrandom::fill" in sampler
+    assert "Hmac::<Sha256>" in sampler
+    assert "getrandom" not in sampler
     assert "use openssl" not in sampler.lower()
     print("native DP primitive metadata: OK")
     return 0

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import pathlib
 import platform
+import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -43,18 +45,31 @@ def _load() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_int64),
         ctypes.c_size_t,
         ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_int64),
     ]
     library.dsflower_dp_add_discrete_gaussian_i64.restype = ctypes.c_int32
     return library
 
 
-def _sample(library: ctypes.CDLL, length: int = 256) -> tuple[int, ...]:
+def _sample(
+    library: ctypes.CDLL,
+    length: int = 256,
+    *,
+    domain_bytes: bytes = b"abi-smoke/tree/1/level/0",
+) -> tuple[int, ...]:
     array_type = ctypes.c_int64 * length
+    key_type = ctypes.c_uint8 * 32
+    domain_type = ctypes.c_uint8 * len(domain_bytes)
     source = array_type(*([0] * length))
     output = array_type()
+    key = key_type(*range(1, 33))
+    domain = domain_type.from_buffer_copy(domain_bytes)
     status = library.dsflower_dp_add_discrete_gaussian_i64(
-        source, length, 32, output
+        source, length, 32, key, len(key), domain, len(domain), output
     )
     if status != 0:
         raise AssertionError(f"sampler returned status {status}")
@@ -63,15 +78,20 @@ def _sample(library: ctypes.CDLL, length: int = 256) -> tuple[int, ...]:
 
 def main() -> int:
     library = _load()
-    assert library.dsflower_dp_primitives_abi_version() == 1
+    assert library.dsflower_dp_primitives_abi_version() == 2
     assert (
         library.dsflower_dp_primitives_mechanism_id().decode("ascii")
-        == "cks20-discrete-gaussian-i64-system-random-v1"
+        == "cks20-discrete-gaussian-i64-hmac-sha256-v1"
     )
-    assert len(_sample(library)) == 256
+    expected = _sample(library)
+    assert hashlib.sha256(struct.pack("<256q", *expected)).hexdigest() == (
+        "44173323e6061cd07c3038d17d7ff04bee21fe4bb8b727cfed3fa2edfcb92dab"
+    )
+    assert expected == _sample(library)
+    assert expected != _sample(library, domain_bytes=b"abi-smoke/tree/1/level/1")
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(lambda _: _sample(library), range(8)))
-    assert all(len(result) == 256 for result in results)
+    assert all(result == expected for result in results)
     print("native DP primitive ABI smoke: OK")
     return 0
 

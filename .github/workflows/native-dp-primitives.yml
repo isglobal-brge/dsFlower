@@ -58,6 +58,7 @@ jobs:
           cargo install cargo-about --version 0.9.1 --locked --features cli
           cd native/dp_primitives
           cargo about generate --config about.toml --output-file /tmp/dsflower-third-party.html about.hbs
+          perl -pi -e 's/\r$//; s/[ \t]+$//' /tmp/dsflower-third-party.html
           diff -u THIRD_PARTY_LICENSES.html /tmp/dsflower-third-party.html
       - name: Link and run C and C++ consumers (Unix)
         if: runner.os != 'Windows'
