@@ -107,6 +107,16 @@ class _BundleDirectory:
         # of the service account's home models the node-owned deployment root.
         self.temporary = tempfile.TemporaryDirectory(dir=Path.home())
         self.root = Path(self.temporary.name).resolve()
+        if os.name == "nt":
+            identity = subprocess.run(
+                ["whoami"], check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            if not identity:
+                raise RuntimeError("Windows test identity is unavailable")
+            subprocess.run([
+                "icacls", str(self.root), "/inheritance:r", "/grant:r",
+                "%s:(OI)(CI)F" % identity,
+            ], check=True, capture_output=True, text=True)
         self.xgboost_bytes = b"real-xgboost-binary"
         self.primitive_bytes = b"real-dp-primitive"
         self.manifest = _manifest(self.xgboost_bytes, self.primitive_bytes)
