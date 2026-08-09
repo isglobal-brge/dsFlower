@@ -391,8 +391,9 @@ flowerInitDS <- function(data_symbol) {
   bins <- suppressWarnings(as.numeric(unlist(
     run_config[["validation-bins"]] %||% 32L, use.names = FALSE)))
   if (length(model_track) != 1L || is.na(model_track) ||
-      !identical(model_track, "neural")) {
-    stop("validation-model-track must be neural.", call. = FALSE)
+      !model_track %in% c("neural", "native_tree")) {
+    stop("validation-model-track must be neural or native_tree.",
+         call. = FALSE)
   }
   if (length(task) != 1L || is.na(task) ||
       !task %in% c("binary", "multiclass", "ordinal", "multilabel",
@@ -454,6 +455,71 @@ flowerInitDS <- function(data_symbol) {
     stop("validation-task disagrees with the pinned model loss.",
          call. = FALSE)
   }
+  native_fields <- c(
+    "validation-native-tree-request-b64",
+    "validation-native-tree-request-sha256",
+    "validation-artifact-format", "validation-artifact-sha256",
+    "validation-artifact-size-bytes",
+    "validation-profile-sha256", "validation-profile-size-bytes",
+    "validation-public-schema-sha256")
+  present_native <- intersect(native_fields, names(run_config))
+  if (identical(model_track, "neural")) {
+    if (length(present_native)) {
+      stop("Native-tree validation pins require validation-model-track=",
+           "'native_tree'.", call. = FALSE)
+    }
+  } else {
+    if (!identical(task, if (identical(loss, "bce_logits")) "binary" else
+                   if (identical(loss, "mse")) "regression" else "") ||
+        !identical(sort(present_native), sort(native_fields))) {
+      stop("Native-tree validation requires the exact XGBoost binary or ",
+           "regression public pin set.", call. = FALSE)
+    }
+    if (!is.null(run_config[["model-spec-b64"]])) {
+      stop("Native-tree validation does not accept a neural model spec.",
+           call. = FALSE)
+    }
+    request <- .validate_native_tree_request_wire(
+      run_config[["validation-native-tree-request-b64"]],
+      run_config[["validation-native-tree-request-sha256"]])
+    expected_request_task <- if (identical(task, "binary")) "binary" else
+      "regression"
+    if (!identical(request$value$engine, "xgboost") ||
+        !identical(request$value$task, expected_request_task) ||
+        !identical(request$value$public_schema$sha256,
+                   run_config[["validation-public-schema-sha256"]])) {
+      stop("Native-tree validation request differs from its public pins.",
+           call. = FALSE)
+    }
+    digests <- c(
+      run_config[["validation-artifact-sha256"]],
+      run_config[["validation-profile-sha256"]],
+      run_config[["validation-public-schema-sha256"]])
+    if (any(vapply(digests, function(value) {
+      !is.character(value) || length(value) != 1L || is.na(value) ||
+        !grepl("^[0-9a-f]{64}$", value)
+    }, logical(1)))) {
+      stop("Native-tree validation SHA-256 pins are invalid.", call. = FALSE)
+    }
+    artifact_size <- suppressWarnings(as.numeric(unlist(
+      run_config[["validation-artifact-size-bytes"]], use.names = FALSE)))
+    profile_size <- suppressWarnings(as.numeric(unlist(
+      run_config[["validation-profile-size-bytes"]], use.names = FALSE)))
+    if (length(artifact_size) != 1L || !is.finite(artifact_size) ||
+        artifact_size != floor(artifact_size) || artifact_size < 1 ||
+        artifact_size > 64 * 1024^2 || length(profile_size) != 1L ||
+        !is.finite(profile_size) || profile_size != floor(profile_size) ||
+        profile_size < 1 || profile_size > 128 * 1024L ||
+        !identical(run_config[["validation-artifact-format"]],
+                   "dsflower-xgboost-ensemble-json-v1")) {
+      stop("Native-tree validation artifact/profile pins are outside their ",
+           "public bounds.", call. = FALSE)
+    }
+    run_config[["validation-native-tree-request-b64"]] <- request$b64
+    run_config[["validation-native-tree-request-sha256"]] <- request$sha256
+    run_config[["validation-artifact-size-bytes"]] <- as.integer(artifact_size)
+    run_config[["validation-profile-size-bytes"]] <- as.integer(profile_size)
+  }
   run_config[["validation-model-track"]] <- model_track
   run_config[["validation-task"]] <- task
   run_config[["validation-bins"]] <- as.integer(bins)
@@ -497,12 +563,24 @@ flowerInitDS <- function(data_symbol) {
 
 .validatePreparedNativeTreeContract <- function(run_config, feature_columns,
                                                 target_column) {
-  if (!identical(run_config[["dp-track"]], "native_tree")) {
+  native_training <- identical(run_config[["dp-track"]], "native_tree")
+  native_validation <- identical(run_config[["dp-track"]], "validation") &&
+    identical(run_config[["validation-model-track"]], "native_tree")
+  if (!native_training && !native_validation) {
     return(invisible(TRUE))
   }
+  request_b64 <- if (native_training) {
+    run_config[["native-tree-request-b64"]]
+  } else {
+    run_config[["validation-native-tree-request-b64"]]
+  }
+  request_sha256 <- if (native_training) {
+    run_config[["native-tree-request-sha256"]]
+  } else {
+    run_config[["validation-native-tree-request-sha256"]]
+  }
   pinned <- .validate_native_tree_request_wire(
-    run_config[["native-tree-request-b64"]],
-    run_config[["native-tree-request-sha256"]])
+    request_b64, request_sha256)
   schema <- pinned$value$public_schema
   target <- schema$target
   request_features <- as.character(unlist(schema$features, use.names = FALSE))
@@ -592,6 +670,21 @@ flowerInitDS <- function(data_symbol) {
     num_classes = as.integer(run_config[["num-classes"]]),
     num_labels = as.integer(run_config[["num-labels"]]),
     model_spec_b64 = run_config[["model-spec-b64"]] %||% NULL)
+  if (identical(run_config[["validation-model-track"]], "native_tree")) {
+    payload$native_tree_request_b64 <-
+      run_config[["validation-native-tree-request-b64"]]
+    payload$native_tree_request_sha256 <-
+      run_config[["validation-native-tree-request-sha256"]]
+    payload$artifact_format <- run_config[["validation-artifact-format"]]
+    payload$artifact_sha256 <- run_config[["validation-artifact-sha256"]]
+    payload$artifact_size_bytes <-
+      as.integer(run_config[["validation-artifact-size-bytes"]])
+    payload$profile_sha256 <- run_config[["validation-profile-sha256"]]
+    payload$profile_size_bytes <-
+      as.integer(run_config[["validation-profile-size-bytes"]])
+    payload$public_schema_sha256 <-
+      run_config[["validation-public-schema-sha256"]]
+  }
   canonical <- as.character(jsonlite::toJSON(
     payload, auto_unbox = TRUE, null = "null", na = "null",
     digits = NA, always_decimal = TRUE, pretty = FALSE))
@@ -1009,9 +1102,17 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   routed <- .takeRunDataType(run_config, expected = descriptor_data_type)
   run_config <- routed$run_config
   data_type <- routed$data_type
-  if (identical(run_config[["dp-track"]], "native_tree") &&
+  native_tabular <- identical(run_config[["dp-track"]], "native_tree") ||
+    (identical(run_config[["dp-track"]], "validation") &&
+     identical(run_config[["validation-model-track"]], "native_tree"))
+  if (native_tabular &&
       !identical(data_type, "tabular")) {
-    stop("The native_tree track accepts tabular data only.", call. = FALSE)
+    label <- if (identical(run_config[["dp-track"]], "native_tree")) {
+      "The native_tree track"
+    } else {
+      "Native-tree validation"
+    }
+    stop(label, " accepts tabular data only.", call. = FALSE)
   }
   columns <- .normalizePublicColumnSelection(
     target_column, feature_columns, run_config)

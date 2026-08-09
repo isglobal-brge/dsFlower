@@ -66,6 +66,8 @@ _RUNTIME_PKGS = {"flwr", "flwr_serverapp", "flwr_clientapp"}
 # is insufficient: without this gate it could point Flower at another callable.
 _UNIFIED_CLIENTAPP_REF = "dsflower_runner.client_app:app"
 _NATIVE_TREE_CLIENTAPP_REF = "dsflower_runner.native_tree_client_app:app"
+_NATIVE_TREE_VALIDATION_CLIENTAPP_REF = (
+    "dsflower_runner.native_tree_validation_client_app:app")
 
 
 def _load_canonical_clientapp_ref():
@@ -76,10 +78,14 @@ def _load_canonical_clientapp_ref():
         with open(MANIFEST_FILE, encoding="utf-8") as handle:
             manifest = json.load(handle)
         track = manifest.get("dp-track") if isinstance(manifest, dict) else None
+        validation_track = (manifest.get("validation-model-track")
+                            if isinstance(manifest, dict) else None)
     except Exception:
         return ""
     if track == "native_tree":
         return _NATIVE_TREE_CLIENTAPP_REF
+    if track == "validation" and validation_track == "native_tree":
+        return _NATIVE_TREE_VALIDATION_CLIENTAPP_REF
     if track in ("neural", "egress", "validation"):
         return _UNIFIED_CLIENTAPP_REF
     return ""

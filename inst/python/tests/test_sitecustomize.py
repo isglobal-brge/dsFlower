@@ -179,11 +179,18 @@ class ParentImportBoundaryTests(unittest.TestCase):
                 ("neural", "dsflower_runner.client_app:app",
                  "dsflower_runner.native_tree_client_app:app"),
                 ("native_tree", "dsflower_runner.native_tree_client_app:app",
+                 "dsflower_runner.client_app:app"),
+                ("native_validation",
+                 "dsflower_runner.native_tree_validation_client_app:app",
                  "dsflower_runner.client_app:app")):
             with self.subTest(track=track), tempfile.TemporaryDirectory() as root:
                 with open(os.path.join(root, "manifest.json"), "w",
                           encoding="utf-8") as fh:
-                    json.dump({"dp-track": track}, fh)
+                    manifest = ({
+                        "dp-track": "validation",
+                        "validation-model-track": "native_tree",
+                    } if track == "native_validation" else {"dp-track": track})
+                    json.dump(manifest, fh)
                 hook, _finder = _load_hook(root)
                 hook._verified_packages.add("dsflower_runner")
                 calls = []
