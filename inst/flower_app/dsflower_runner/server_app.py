@@ -19,6 +19,8 @@ metrics only (validation).
 import json
 import math
 import os
+import shutil
+import tempfile
 
 import numpy as np
 import torch
@@ -188,6 +190,89 @@ def _run_validation(grid, cfg):
     return metrics, expected, True
 
 
+def _pool_private_vectors(vectors, size):
+    if not vectors:
+        raise RuntimeError("no private validation vectors are available")
+    checked = []
+    for value in vectors:
+        vector = np.asarray(value, dtype=np.float64)
+        if vector.shape != (int(size),) or not bool(np.all(np.isfinite(vector))):
+            raise RuntimeError("private validation vector has invalid geometry")
+        checked.append(vector)
+    stacked = np.stack(checked, axis=0).astype(np.float64, copy=False)
+    scale = np.max(np.abs(stacked), axis=0)
+    normalized = np.divide(
+        stacked, scale, out=np.zeros_like(stacked), where=scale > 0.0)
+    wide = (np.sum(normalized.astype(np.longdouble), axis=0,
+                   dtype=np.longdouble)
+            * scale.astype(np.longdouble))
+    limit = np.longdouble(np.finfo(np.float64).max)
+    pooled = np.asarray(np.clip(wide, -limit, limit), dtype=np.float64)
+    if not bool(np.all(np.isfinite(pooled))):
+        raise RuntimeError("pooled private validation vector overflowed")
+    return pooled
+
+
+def _run_holdout(grid, cfg, final_arrays, training_roster):
+    """Evaluate one final aggregate; no per-node value is persisted or returned."""
+    import time
+    from . import validation
+
+    layout = validation.holdout_layout_from_config(dict(cfg))
+    expected = int(cfg.get("min-train-nodes", 2))
+    timeout = float(cfg.get("round-timeout", 3600))
+    node_ids = list(grid.get_node_ids())
+    try:
+        pinned_roster = {int(value) for value in training_roster}
+        current_roster = {int(value) for value in node_ids}
+    except Exception as exc:
+        raise RuntimeError("holdout federation roster is invalid") from exc
+    if (len(node_ids) != expected or len(current_roster) != expected
+            or current_roster != pinned_roster):
+        raise RuntimeError("holdout federation roster changed after training")
+    content = RecordDict({
+        "arrays": final_arrays,
+        "config": ConfigRecord({
+            "server-round": int(cfg.get("num-server-rounds", 1)),
+            "dsflower-operation": "holdout-evaluate",
+        }),
+    })
+    messages = [Message(
+        content=content, message_type="train", dst_node_id=node_id,
+        group_id="dsflower-holdout-v1") for node_id in node_ids]
+    started = time.monotonic()
+    replies = list(grid.send_and_receive(messages, timeout=timeout))
+    if time.monotonic() - started > timeout + 1.0:
+        raise RuntimeError("holdout evaluation exceeded its public timeout")
+    try:
+        sources = [int(reply.metadata.src_node_id) for reply in replies]
+    except Exception as exc:
+        raise RuntimeError("holdout replies have no verifiable node identity") from exc
+    if (len(replies) != expected or len(set(sources)) != expected
+            or set(sources) != {int(value) for value in node_ids}):
+        raise RuntimeError("holdout replies do not match the training roster")
+    replies = [reply for _, reply in sorted(
+        zip(sources, replies), key=lambda item: item[0])]
+    vectors = []
+    for reply in replies:
+        if reply.has_error():
+            raise RuntimeError("one or more holdout releases are unavailable")
+        metrics = reply.content.get("metrics")
+        if (not isinstance(metrics, MetricRecord)
+                or int(metrics.get("public-preflight-unavailable", 0)) == 1
+                or int(metrics.get("execution-unavailable", 0)) == 1):
+            raise RuntimeError("one or more holdout releases are unavailable")
+        arrays = reply.content["arrays"].to_numpy_ndarrays()
+        if len(arrays) != 1:
+            raise RuntimeError("holdout release has invalid geometry")
+        vectors.append(arrays[0])
+    pooled = _pool_private_vectors(vectors, layout["size"])
+    bounds = (validation.holdout_target_bounds_from_config(dict(cfg))
+              if layout["task"] in ("regression", "count") else None)
+    return validation.validation_metrics(
+        pooled, layout, target_bounds=bounds)
+
+
 def _save_validation(cfg, metrics, n_nodes, available):
     results_dir = cfg.get("results-dir")
     if not results_dir:
@@ -246,9 +331,11 @@ class _RequireCompleteTrain:
     """Reject a round unless the configured federation replies successfully."""
 
     def __init__(self, *, expected_train_nodes,
-                 require_hook_executed=False, **kwargs):
+                 require_hook_executed=False, stable_roster=False, **kwargs):
         self.expected_train_nodes = int(expected_train_nodes)
         self.require_hook_executed = bool(require_hook_executed)
+        self.stable_roster = bool(stable_roster)
+        self.training_roster = None
         self.available_rounds = set()
         self.unavailable_rounds = set()
         self._last_available_arrays = None
@@ -278,6 +365,13 @@ class _RequireCompleteTrain:
                 "%d node(s) are connected in round %d, expected exactly %d; "
                 "refusing an unexpected federation roster."
                 % (len(connected), server_round, self.expected_train_nodes))
+        connected_roster = frozenset(int(value) for value in connected)
+        if self.stable_roster:
+            if self.training_roster is None:
+                self.training_roster = connected_roster
+            elif connected_roster != self.training_roster:
+                raise RuntimeError(
+                    "atomic holdout federation roster changed between rounds")
         self._round_input_arrays[int(server_round)] = arrays
         self._round_expected_nodes[int(server_round)] = set(destinations)
         return messages
@@ -370,7 +464,7 @@ _STRATEGIES = {
 }
 
 
-def _build_strategy(cfg, min_nodes, track=None):
+def _build_strategy(cfg, min_nodes, track=None, stable_roster=False):
     name = str(cfg.get("strategy", "fedavg")).lower()
     if name not in _STRATEGIES:
         raise ValueError(f"Unsupported aggregation strategy: {name}")
@@ -409,23 +503,70 @@ def _build_strategy(cfg, min_nodes, track=None):
         specific = {}
     return _STRATEGIES[name](
         expected_train_nodes=min_nodes,
-        require_hook_executed=(track == "egress"), **common, **specific)
+        require_hook_executed=(track == "egress"),
+        stable_roster=stable_roster, **common, **specific)
 
 
 def _run_fedavg(grid, cfg, track):
     num_rounds = int(cfg.get("num-server-rounds", 1))
     min_nodes = int(cfg.get("min-train-nodes", 2))
+    has_holdout = cfg.get("resampling-contract-sha256") is not None
     model, initial = _initial_arrays(cfg, track)
-    strategy = _build_strategy(cfg, min_nodes, track=track)
+    strategy = _build_strategy(
+        cfg, min_nodes, track=track, stable_roster=has_holdout)
     result = strategy.start(grid=grid, initial_arrays=initial, num_rounds=num_rounds)
-    _save_results(cfg, model, result, available_rounds=strategy.available_rounds)
+    holdout_metrics = None
+    if has_holdout:
+        if track != "neural" or str(cfg.get("data-kind", "")).lower() != "tabular":
+            raise RuntimeError("atomic holdout is implemented only for tabular neural runs")
+        if strategy.available_rounds != set(range(1, num_rounds + 1)):
+            raise RuntimeError("atomic holdout requires every training round")
+        holdout_metrics = _run_holdout(
+            grid, cfg, result.arrays, strategy.training_roster)
+    _save_results(
+        cfg, model, result, available_rounds=strategy.available_rounds,
+        holdout_metrics=holdout_metrics)
 
 
-def _save_results(cfg, model, result, available_rounds=None):
+def _save_results(cfg, model, result, available_rounds=None,
+                  holdout_metrics=None):
     results_dir = cfg.get("results-dir")
     if not results_dir:
         return
     os.makedirs(results_dir, exist_ok=True)
+    if holdout_metrics is not None:
+        transaction = tempfile.mkdtemp(prefix=".holdout-", dir=results_dir)
+        published = []
+        try:
+            nested = dict(cfg)
+            nested["results-dir"] = transaction
+            _save_results(
+                nested, model, result, available_rounds=available_rounds)
+            _save_holdout(nested, holdout_metrics)
+            names = sorted(os.listdir(transaction))
+            if "history.json" not in names or "holdout.json" not in names:
+                raise RuntimeError("atomic holdout transaction is incomplete")
+            for name in [value for value in names if value != "history.json"]:
+                destination = os.path.join(results_dir, name)
+                if os.path.exists(destination):
+                    raise RuntimeError("atomic holdout output already exists")
+                os.replace(os.path.join(transaction, name), destination)
+                published.append(destination)
+            history = os.path.join(results_dir, "history.json")
+            if os.path.exists(history):
+                raise RuntimeError("atomic holdout output already exists")
+            os.replace(os.path.join(transaction, "history.json"), history)
+            published.append(history)
+        except Exception:
+            for path in published:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise
+        finally:
+            shutil.rmtree(transaction, ignore_errors=True)
+        return
     final_arrays = result.arrays.to_numpy_ndarrays()
     if not final_arrays:
         raise RuntimeError(
@@ -455,6 +596,40 @@ def _save_results(cfg, model, result, available_rounds=None):
         history.append(row)
     with open(os.path.join(results_dir, "history.json"), "w") as f:
         json.dump(history, f)
+
+
+def _save_holdout(cfg, metrics):
+    results_dir = cfg.get("results-dir")
+    if not results_dir:
+        raise RuntimeError("holdout results directory is missing")
+    from . import validation
+    layout = validation.holdout_layout_from_config(dict(cfg))
+    required_metric = {
+        "binary": "accuracy", "multiclass": "accuracy",
+        "ordinal": "accuracy", "multilabel": "macro_f1",
+        "regression": "mae", "count": "mae",
+    }[layout["task"]]
+    if (not isinstance(metrics, dict) or required_metric not in metrics
+            or any(key in metrics for key in (
+                "per_node", "predictions", "folds"))):
+        raise RuntimeError("holdout metrics violate the pooled-only contract")
+    payload = {
+        "pooled_only": True,
+        "privacy": "node-dp-pooled-postprocessing",
+        "method": "holdout",
+        "task": layout["task"],
+        "n_nodes": int(cfg.get("min-train-nodes", 0)),
+        "metrics": metrics,
+    }
+    final = os.path.join(results_dir, "holdout.json")
+    temporary = final + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, allow_nan=False, separators=(",", ":"))
+        os.replace(temporary, final)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # --------------------------------------------------------------------------- #

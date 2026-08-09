@@ -1,0 +1,537 @@
+"""Atomic neural holdout and engine-agnostic partition regressions."""
+
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
+from flwr.common import ArrayRecord, ConfigRecord, Message, MetricRecord, RecordDict
+
+
+FLOWER_APP = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "flower_app"))
+if FLOWER_APP not in sys.path:
+    sys.path.insert(0, FLOWER_APP)
+
+from dsflower_runner import (client_app, release_guard, resampling, server_app,
+                             validation)  # noqa: E402
+
+
+class PartitionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.secret = os.path.join(self.tmp.name, "node-secret")
+        with open(self.secret, "w", encoding="ascii") as handle:
+            handle.write("42" * 32)
+        os.chmod(self.secret, stat.S_IRUSR | stat.S_IWUSR)
+        self.secret_env = mock.patch.dict(
+            os.environ, {"DSFLOWER_NODE_SECRET_FILE": self.secret})
+        self.secret_env.start()
+
+    def tearDown(self):
+        self.secret_env.stop()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def contract(unit="patient", numerator=200000):
+        return resampling.holdout_contract(numerator, unit)
+
+    def test_patient_assignment_is_sticky_per_unit_and_order_independent(self):
+        contract = self.contract()
+        ids = np.asarray(["p3", "p1", "p2", "p1", "p3"])
+        first = resampling.holdout_mask(
+            contract, n_rows=len(ids), unit_ids=ids)
+        order = np.asarray([3, 4, 2, 0, 1])
+        permuted = resampling.holdout_mask(
+            contract, n_rows=len(ids), unit_ids=ids[order])
+
+        by_id = {unit: bool(first[index]) for index, unit in enumerate(ids)}
+        self.assertTrue(all(bool(permuted[index]) == by_id[unit]
+                            for index, unit in enumerate(ids[order])))
+        self.assertEqual(bool(first[0]), bool(first[4]))
+        self.assertEqual(bool(first[1]), bool(first[3]))
+        for unit in np.unique(ids):
+            self.assertEqual(len(set(first[ids == unit].tolist())), 1)
+        self.assertTrue(set(ids[first]).isdisjoint(set(ids[~first])))
+        np.testing.assert_array_equal(
+            first, resampling.holdout_mask(
+                contract, n_rows=len(ids), unit_ids=ids))
+
+    def test_row_assignment_depends_only_on_ordinal_and_contract(self):
+        contract = self.contract(unit="row", numerator=500000)
+        first = resampling.holdout_mask(contract, n_rows=128)
+        replay = resampling.holdout_mask(contract, n_rows=128)
+        changed_values = np.linspace(-1e9, 1e9, 128)  # never an input axis
+        del changed_values
+        np.testing.assert_array_equal(first, replay)
+        self.assertTrue(bool(np.any(first)))
+        self.assertTrue(bool(np.any(~first)))
+
+    def test_fraction_changes_are_nested_not_partition_rerolls(self):
+        small = resampling.holdout_mask(
+            self.contract(unit="row", numerator=200000), n_rows=4096)
+        large = resampling.holdout_mask(
+            self.contract(unit="row", numerator=300000), n_rows=4096)
+        self.assertTrue(bool(np.all(~small | large)))
+        self.assertGreater(int(np.sum(large)), int(np.sum(small)))
+
+    def test_partition_opens_the_custodial_secret_once_not_per_row(self):
+        original = resampling.seeding._node_secret
+        with mock.patch.object(
+                resampling.seeding, "_node_secret", wraps=original) as read_secret:
+            resampling.holdout_mask(
+                self.contract(unit="row", numerator=200000), n_rows=4096)
+        self.assertEqual(read_secret.call_count, 1)
+
+    def test_contract_rejects_seed_fields_and_hash_drift(self):
+        contract = self.contract()
+        self.assertEqual(
+            contract["sha256"],
+            "00b0a490eb3d92fec7ce532e452523a32cbf73d19953372194faffc21eb4c75b")
+        with self.assertRaisesRegex(ValueError, "field|seed"):
+            resampling.validate_holdout_contract({**contract, "seed": 7})
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            resampling.validate_holdout_contract({**contract, "sha256": "0" * 64})
+
+
+class ReleaseGuardHoldoutTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        contract = resampling.holdout_contract(200000, "row")
+        self.manifest = {
+            "run_token": "run_" + "a" * 32,
+            "privacy-adjacency": "replace_one",
+            "privacy-policy-sha256": "1" * 64,
+            "privacy-epsilon": 2.0,
+            "privacy-delta": 1e-5,
+            "privacy-training-epsilon": 1.6,
+            "privacy-training-delta": 8e-6,
+            "privacy-holdout-epsilon": 2.0 - 2.0 * 0.8,
+            "privacy-holdout-delta": 1e-5 - 1e-5 * 0.8,
+            "num-server-rounds": 2,
+            "dp-unit": "row",
+            "patient_column": None,
+            **resampling.manifest_fields(contract),
+        }
+        with open(os.path.join(self.tmp.name, "manifest.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(self.manifest, handle)
+        self.context = SimpleNamespace(
+            node_config={"manifest-dir": self.tmp.name}, state=RecordDict())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def message(operation="train", server_round=1, message_id="m"):
+        return SimpleNamespace(
+            metadata=SimpleNamespace(message_id=message_id, group_id="g"),
+            content=RecordDict({
+                "arrays": ArrayRecord(numpy_ndarrays=[np.asarray([1.0])]),
+                "config": ConfigRecord({
+                    "server-round": server_round,
+                    "dsflower-operation": operation,
+                }),
+            }))
+
+    def test_job_budget_is_split_by_fixed_operation_not_history(self):
+        train = release_guard.claim_release(
+            self.context, self.message("train", 1))
+        evaluate = release_guard.claim_release(
+            self.context, self.message("holdout-evaluate", 2))
+        self.assertEqual((train["epsilon"], train["delta"]), (1.6, 8e-6))
+        self.assertEqual(
+            (evaluate["epsilon"], evaluate["delta"]),
+            (2.0 - 2.0 * 0.8, 1e-5 - 1e-5 * 0.8))
+        self.assertEqual(evaluate["operation"], "holdout-evaluate")
+
+    def test_train_and_holdout_cache_identities_do_not_collide(self):
+        train_msg = self.message("train", 2, message_id="train-message")
+        train = release_guard.claim_release(self.context, train_msg)
+        client_app._cache_reply(
+            self.context, train, [np.asarray([1.0])])
+
+        evaluate_msg = self.message(
+            "holdout-evaluate", 2, message_id="holdout-message")
+        evaluate = release_guard.claim_release(self.context, evaluate_msg)
+        self.assertEqual(evaluate["status"], "new")
+        self.assertNotEqual(evaluate["request_id"], train["request_id"])
+        client_app._cache_reply(
+            self.context, evaluate, [np.asarray([2.0])])
+        replay = release_guard.claim_release(self.context, evaluate_msg)
+        self.assertEqual(replay["status"], "replay")
+
+    def test_holdout_operation_requires_manifest_contract(self):
+        self.manifest.pop("resampling-contract-sha256")
+        with open(os.path.join(self.tmp.name, "manifest.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(self.manifest, handle)
+        with self.assertRaisesRegex(RuntimeError, "holdout contract"):
+            release_guard.claim_release(
+                self.context, self.message("holdout-evaluate", 2))
+
+
+class NeuralHoldoutTests(unittest.TestCase):
+    def test_training_receives_only_complement_and_evaluation_only_test(self):
+        X = np.arange(12, dtype=np.float32).reshape(6, 2)
+        y = np.asarray([0, 1, 0, 1, 0, 1], dtype=np.float32)
+        mask = np.asarray([False, True, False, True, False, True])
+        pins = {"loss_name": "bce_logits", "n_classes": 2}
+        cfg = {"loss-name": "bce_logits", "task-type": "classification",
+               "num-classes": 2, "holdout-validation-bins": 8}
+
+        with mock.patch.object(
+                client_app.resampling, "holdout_mask_from_context",
+                return_value=mask):
+            train = client_app._holdout_partition(
+                None, X, y, None, subset="train")
+            test = client_app._holdout_partition(
+                None, X, y, None, subset="test")
+
+        np.testing.assert_array_equal(train[0], X[~mask])
+        np.testing.assert_array_equal(train[1], y[~mask])
+        np.testing.assert_array_equal(test[0], X[mask])
+        np.testing.assert_array_equal(test[1], y[mask])
+        self.assertIsNone(train[2])
+
+        model = object()
+        captured = {}
+        with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
+              mock.patch.object(client_app, "load_tabular_patient_ids",
+                                return_value=None),
+              mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
+              mock.patch.object(client_app, "_apply_feature_bounds",
+                                side_effect=lambda values, ignored: values),
+              mock.patch.object(client_app, "is_image_run", return_value=False),
+              mock.patch.object(
+                  client_app.resampling, "holdout_mask_from_context",
+                  return_value=mask),
+              mock.patch.object(validation, "neural_predictions",
+                                side_effect=lambda ignored_model, values, loss:
+                                np.full(len(values), 0.75)),
+              mock.patch.object(
+                  validation, "private_validation_vector",
+                  side_effect=lambda yy, predictions, layout, **kwargs:
+                  (captured.update(y=yy.copy(), predictions=predictions.copy())
+                   or (np.ones(layout["size"]), 1.0)))):
+            released = client_app._holdout_neural_release(
+                None, cfg, {"epsilon": 0.4, "delta": 2e-6}, pins,
+                model, input_dim=2)
+
+        np.testing.assert_array_equal(captured["y"], y[mask])
+        self.assertEqual(len(captured["predictions"]), int(mask.sum()))
+        self.assertEqual(len(released), 1)
+
+    def test_empty_train_and_test_sides_fail_with_one_uniform_outcome(self):
+        X = np.arange(8, dtype=np.float32).reshape(4, 2)
+        y = np.asarray([0, 1, 0, 1], dtype=np.float32)
+        messages = []
+        cases = (("train", np.ones(4, dtype=bool)),
+                 ("test", np.zeros(4, dtype=bool)))
+        for subset, mask in cases:
+            with (mock.patch.object(
+                    client_app.resampling, "holdout_mask_from_context",
+                    return_value=mask),
+                  self.assertRaises(RuntimeError) as caught):
+                client_app._holdout_partition(
+                    None, X, y, None, subset=subset)
+            messages.append(str(caught.exception))
+        self.assertEqual(messages, [
+            "atomic holdout partition is unavailable",
+            "atomic holdout partition is unavailable",
+        ])
+
+    def test_neural_training_partitions_before_the_dp_fit(self):
+        import torch
+
+        X = np.arange(12, dtype=np.float32).reshape(6, 2)
+        y = np.asarray([0, 1, 0, 1, 0, 1], dtype=np.float32)
+        mask = np.asarray([False, True, False, True, False, True])
+        model = torch.nn.Linear(2, 1)
+        cfg = {"resampling-contract-sha256": "a" * 64}
+        pins = {"loss_name": "bce_logits", "n_classes": 2,
+                "round_index": 1}
+        captured = {}
+
+        def fake_fit(_model, values, target, _pcfg, _pins, n_staged,
+                     _cfg, master):
+            captured.update(
+                X=values.copy(), y=target.copy(), n_staged=n_staged,
+                master=master)
+            return [np.asarray([1.0])], len(target)
+
+        with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
+              mock.patch.object(client_app, "load_tabular_patient_ids",
+                                return_value=None),
+              mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
+              mock.patch.object(client_app, "_apply_feature_bounds",
+                                side_effect=lambda values, ignored: values),
+              mock.patch.object(client_app.resampling,
+                                "holdout_mask_from_context",
+                                return_value=mask),
+              mock.patch.object(client_app, "_neural_seed_contract",
+                                return_value=({}, {})),
+              mock.patch.object(client_app.seeding, "master_seed",
+                                return_value=b"semantic-master"),
+              mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
+            client_app._train_neural(
+                None, cfg, {}, pins, model, input_dim=2,
+                manifest_image=False)
+
+        np.testing.assert_array_equal(captured["X"], X[~mask])
+        np.testing.assert_array_equal(captured["y"], y[~mask])
+        self.assertEqual(captured["n_staged"], len(y))
+
+    def test_image_holdout_fails_before_loading_private_images(self):
+        with (mock.patch.object(client_app, "load_image_collection") as load,
+              self.assertRaisesRegex(RuntimeError, "tabular neural")):
+            client_app._train_neural(
+                None, {"resampling-contract-sha256": "a" * 64}, {},
+                {"loss_name": "bce_logits", "n_classes": 2}, object(),
+                input_dim=2, manifest_image=True)
+        load.assert_not_called()
+
+    def test_dp_fit_calibrates_to_post_partition_dataset(self):
+        import torch
+
+        model = torch.nn.Linear(2, 1)
+        model._dsflower_release_keys = tuple(
+            name for name, _ in torch.nn.Module.named_parameters(model))
+        X = np.arange(6, dtype=np.float32).reshape(3, 2)
+        y = np.asarray([0, 1, 0], dtype=np.float32)
+        pcfg = {
+            "n_samples": 6, "clipping_norm": 1.0,
+            "epsilon": 1.6, "delta": 8e-6,
+        }
+        pins = {
+            "loss_name": "bce_logits", "batch_size": 2,
+            "local_epochs": 1, "num_rounds": 1, "n_classes": 2,
+            "learning_rate": 0.1, "round_index": 1,
+            "optimizer": {
+                "name": "sgd", "weight_decay": 0.0, "momentum": 0.0,
+                "nesterov": False, "l1_penalty": 0.0,
+            },
+            "scheduler": {"name": "none"},
+        }
+        captured = {}
+
+        def make_private(inner_model, optimizer, trainloader, **kwargs):
+            captured.update(kwargs)
+            return inner_model, optimizer, [], None
+
+        with (mock.patch.object(
+                  client_app.dp_harness, "make_private_dpsgd",
+                  side_effect=make_private),
+              mock.patch.object(
+                  client_app.dp_harness, "assert_releasable")):
+            client_app._dp_fit(
+                model, X, y, pcfg, pins, n_staged=6, cfg={},
+                master=b"\x01" * 32)
+
+        self.assertEqual(captured["n_samples"], len(X))
+        self.assertNotEqual(captured["n_samples"], pcfg["n_samples"])
+
+        fresh = torch.nn.Linear(2, 1)
+        fresh._dsflower_release_keys = tuple(
+            name for name, _ in torch.nn.Module.named_parameters(fresh))
+        with (mock.patch.object(
+                  client_app.dp_harness, "make_private_dpsgd") as make_private,
+              self.assertRaisesRegex(RuntimeError, "staged sample count")):
+            client_app._dp_fit(
+                fresh, X, y, pcfg, pins, n_staged=5, cfg={},
+                master=b"\x01" * 32)
+        make_private.assert_not_called()
+
+
+class ServerHoldoutTests(unittest.TestCase):
+    @staticmethod
+    def reply(request, vector):
+        return Message(content=RecordDict({
+            "arrays": ArrayRecord(numpy_ndarrays=[vector]),
+            "metrics": MetricRecord({"num-examples": 1}),
+        }), reply_to=request)
+
+    def test_server_pools_one_vector_and_never_returns_fold_or_node_values(self):
+        cfg = {
+            "num-server-rounds": 2, "min-train-nodes": 2,
+            "loss-name": "bce_logits", "task-type": "classification",
+            "num-classes": 2, "num-labels": 2,
+            "holdout-validation-bins": 4,
+        }
+        layout = validation.holdout_layout_from_config(cfg)
+
+        class Grid:
+            @staticmethod
+            def get_node_ids():
+                return [11, 22]
+
+            def send_and_receive(self, messages, timeout):
+                del timeout
+                vectors = [np.ones(layout["size"]), np.full(layout["size"], 2.0)]
+                return [ServerHoldoutTests.reply(message, vector)
+                        for message, vector in zip(messages, vectors)]
+
+        metrics = server_app._run_holdout(
+            Grid(), cfg, ArrayRecord(numpy_ndarrays=[np.asarray([1.0])]),
+            {11, 22})
+        self.assertIsInstance(metrics, dict)
+        self.assertIn("accuracy", metrics)
+        self.assertNotIn("per_node", metrics)
+        self.assertNotIn("folds", metrics)
+
+    def test_atomic_training_rejects_roster_replacement_between_rounds(self):
+        class Grid:
+            node_ids = [11, 22]
+
+            @classmethod
+            def get_node_ids(cls):
+                return list(cls.node_ids)
+
+        strategy = server_app._build_strategy(
+            {"strategy": "fedavg"}, min_nodes=2, stable_roster=True)
+        arrays = ArrayRecord(numpy_ndarrays=[np.asarray([0.0])])
+        strategy.configure_train(1, arrays, ConfigRecord(), Grid())
+        self.assertEqual(strategy.training_roster, frozenset({11, 22}))
+        Grid.node_ids = [11, 33]
+        with self.assertRaisesRegex(RuntimeError, "roster changed"):
+            strategy.configure_train(2, arrays, ConfigRecord(), Grid())
+
+    def test_empty_partition_outcomes_never_save_an_acceptable_model(self):
+        cfg = {
+            "resampling-contract-sha256": "a" * 64,
+            "data-kind": "tabular", "num-server-rounds": 1,
+            "min-train-nodes": 2,
+        }
+        result = SimpleNamespace(
+            arrays=ArrayRecord(numpy_ndarrays=[np.asarray([1.0])]),
+            train_metrics_clientapp={})
+        initial = ArrayRecord(numpy_ndarrays=[np.asarray([0.0])])
+
+        train_empty = SimpleNamespace(
+            available_rounds=set(), training_roster=frozenset({11, 22}),
+            start=mock.Mock(return_value=result))
+        with (mock.patch.object(
+                  server_app, "_initial_arrays", return_value=(None, initial)),
+              mock.patch.object(
+                  server_app, "_build_strategy", return_value=train_empty),
+              mock.patch.object(server_app, "_run_holdout") as evaluate,
+              mock.patch.object(server_app, "_save_results") as save,
+              self.assertRaisesRegex(RuntimeError, "every training round")):
+            server_app._run_fedavg(None, cfg, "neural")
+        evaluate.assert_not_called()
+        save.assert_not_called()
+
+        test_empty = SimpleNamespace(
+            available_rounds={1}, training_roster=frozenset({11, 22}),
+            start=mock.Mock(return_value=result))
+        with (mock.patch.object(
+                  server_app, "_initial_arrays", return_value=(None, initial)),
+              mock.patch.object(
+                  server_app, "_build_strategy", return_value=test_empty),
+              mock.patch.object(
+                  server_app, "_run_holdout",
+                  side_effect=RuntimeError(
+                      "one or more holdout releases are unavailable")),
+              mock.patch.object(server_app, "_save_results") as save,
+              self.assertRaisesRegex(RuntimeError, "releases are unavailable")):
+            server_app._run_fedavg(None, cfg, "neural")
+        save.assert_not_called()
+
+    def test_model_and_holdout_use_history_as_atomic_commit_marker(self):
+        with tempfile.TemporaryDirectory() as results_dir:
+            cfg = {
+                "results-dir": results_dir,
+                "num-server-rounds": 1,
+                "min-train-nodes": 2,
+                "loss-name": "bce_logits",
+                "task-type": "classification",
+                "num-classes": 2,
+                "holdout-validation-bins": 4,
+            }
+            result = SimpleNamespace(
+                arrays=ArrayRecord(numpy_ndarrays=[np.asarray([1.0])]),
+                train_metrics_clientapp={},
+            )
+            metrics = {"accuracy": 0.75}
+
+            server_app._save_results(
+                cfg, None, result, available_rounds={1},
+                holdout_metrics=metrics)
+
+            self.assertTrue(os.path.isfile(os.path.join(results_dir, "model.npz")))
+            self.assertTrue(os.path.isfile(os.path.join(results_dir, "holdout.json")))
+            self.assertTrue(os.path.isfile(os.path.join(results_dir, "history.json")))
+            self.assertFalse(any(
+                name.startswith(".holdout-") for name in os.listdir(results_dir)))
+
+    def test_failed_holdout_transaction_publishes_no_model_or_commit_marker(self):
+        with tempfile.TemporaryDirectory() as results_dir:
+            cfg = {
+                "results-dir": results_dir,
+                "num-server-rounds": 1,
+                "min-train-nodes": 2,
+                "loss-name": "bce_logits",
+                "task-type": "classification",
+                "num-classes": 2,
+                "holdout-validation-bins": 4,
+            }
+            result = SimpleNamespace(
+                arrays=ArrayRecord(numpy_ndarrays=[np.asarray([1.0])]),
+                train_metrics_clientapp={},
+            )
+            with (mock.patch.object(
+                    server_app, "_save_holdout",
+                    side_effect=RuntimeError("forced holdout failure")),
+                  self.assertRaisesRegex(RuntimeError, "forced holdout failure")):
+                server_app._save_results(
+                    cfg, None, result, available_rounds={1},
+                    holdout_metrics={"accuracy": 0.75})
+
+            self.assertEqual(os.listdir(results_dir), [])
+
+    def test_transaction_rolls_back_after_partial_publication(self):
+        for fail_at in (2, 4):
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as results_dir:
+                cfg = {
+                    "results-dir": results_dir,
+                    "num-server-rounds": 1,
+                    "min-train-nodes": 2,
+                    "loss-name": "bce_logits",
+                    "task-type": "classification",
+                    "num-classes": 2,
+                    "holdout-validation-bins": 4,
+                }
+                result = SimpleNamespace(
+                    arrays=ArrayRecord(
+                        numpy_ndarrays=[np.asarray([1.0])]),
+                    train_metrics_clientapp={})
+                real_replace = server_app.os.replace
+                publications = 0
+
+                def crashing_replace(source, destination):
+                    nonlocal publications
+                    if (os.path.dirname(destination) == results_dir
+                            and os.path.dirname(source) != results_dir):
+                        publications += 1
+                        if publications == fail_at:
+                            raise OSError("forced publication crash")
+                    return real_replace(source, destination)
+
+                with (mock.patch.object(
+                          server_app.os, "replace",
+                          side_effect=crashing_replace),
+                      self.assertRaisesRegex(OSError, "publication crash")):
+                    server_app._save_results(
+                        cfg, None, result, available_rounds={1},
+                        holdout_metrics={"accuracy": 0.75})
+                self.assertEqual(publications, fail_at)
+                self.assertEqual(os.listdir(results_dir), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

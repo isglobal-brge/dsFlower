@@ -745,6 +745,8 @@
     "fixed_client_sampling", "privacy-adjacency",
     "privacy-policy-sha256", "privacy-epsilon",
     "privacy-delta", "privacy-clipping_norm", "privacy-sample_aggregate",
+    "privacy-training-epsilon", "privacy-training-delta",
+    "privacy-holdout-epsilon", "privacy-holdout-delta",
     "privacy-sa_blocks", "privacy-egress_time_pad",
     "privacy-egress_timeout", "privacy-egress_memory_mb",
     "privacy-egress_file_mb", "privacy-egress_processes",

@@ -79,10 +79,49 @@ def _fixed_manifest(context):
     delta = _finite_float(
         manifest.get("privacy-delta"), "manifest privacy-delta",
         0.0, 1.0e-3)
-    return num_rounds, epsilon, delta, policy_hash
+    holdout = manifest.get("resampling-contract-sha256") is not None
+    budgets = {
+        "train": (epsilon, delta),
+    }
+    if holdout:
+        try:
+            from . import resampling
+        except ImportError:  # direct module tests
+            import resampling
+        try:
+            resampling.contract_from_manifest(manifest)
+        except Exception as exc:
+            raise RuntimeError("manifest has no valid holdout contract") from exc
+        expected = {
+            "privacy-training-epsilon": epsilon * 0.8,
+            "privacy-training-delta": delta * 0.8,
+            "privacy-holdout-epsilon": epsilon - epsilon * 0.8,
+            "privacy-holdout-delta": delta - delta * 0.8,
+        }
+        actual = {}
+        for key, value in expected.items():
+            actual[key] = _finite_float(
+                manifest.get(key), "manifest %s" % key, 0.0,
+                10.0 if key.endswith("epsilon") else 1.0e-3)
+            if not math.isclose(actual[key], value, rel_tol=1.0e-15,
+                                abs_tol=0.0):
+                raise RuntimeError(
+                    "manifest holdout budget differs from its fixed job allocation")
+        budgets["train"] = (
+            actual["privacy-training-epsilon"],
+            actual["privacy-training-delta"])
+        budgets["holdout-evaluate"] = (
+            actual["privacy-holdout-epsilon"],
+            actual["privacy-holdout-delta"])
+    return {
+        "num_rounds": num_rounds,
+        "policy_hash": policy_hash,
+        "budgets": budgets,
+        "holdout": holdout,
+    }
 
 
-def _server_round(msg, num_rounds):
+def _message_config(msg):
     content = getattr(msg, "content", None)
     try:
         config = content["config"]
@@ -90,11 +129,26 @@ def _server_round(msg, num_rounds):
         raise RuntimeError("train message is missing its ConfigRecord") from exc
     if not isinstance(config, ConfigRecord):
         raise RuntimeError("train message config must be a ConfigRecord")
+    return config
+
+
+def _server_round(msg, num_rounds):
+    config = _message_config(msg)
     try:
         value = config["server-round"]
     except KeyError as exc:
         raise RuntimeError("train ConfigRecord is missing server-round") from exc
     return _exact_int(value, "server-round", 1, num_rounds)
+
+
+def _operation(msg, fixed):
+    config = _message_config(msg)
+    value = config.get("dsflower-operation", "train")
+    if value == "holdout-evaluate" and not fixed["holdout"]:
+        raise RuntimeError("holdout evaluation requires a pinned holdout contract")
+    if not isinstance(value, str) or value not in fixed["budgets"]:
+        raise RuntimeError("train message has an unsupported release operation")
+    return value
 
 
 def _message_id(msg):
@@ -115,7 +169,7 @@ def _frame(digest, value):
     digest.update(raw)
 
 
-def _request_id(msg, round_index):
+def _request_id(msg, operation, round_index):
     """Hash the exact bounded public ArrayRecord and its round coordinate."""
     content = getattr(msg, "content", None)
     try:
@@ -129,6 +183,7 @@ def _request_id(msg, round_index):
         raise RuntimeError("train ArrayRecord exceeds the public array-count cap")
 
     digest = hashlib.sha256(b"dsflower/public-request/v1\x00")
+    _frame(digest, operation)
     digest.update(int(round_index).to_bytes(8, "big"))
     total = 0
     for key, item in entries:
@@ -149,7 +204,7 @@ def _request_id(msg, round_index):
     return digest.hexdigest()
 
 
-def _cached_status(context, message_id, round_index, request_id):
+def _cached_status(context, message_id, operation, round_index, request_id):
     state = getattr(context, "state", None)
     if state is None or not hasattr(state, "get"):
         return "new"
@@ -159,8 +214,10 @@ def _cached_status(context, message_id, round_index, request_id):
 
     cached_message = str(meta.get("message-id", "") or "")
     cached_request = str(meta.get("request-id", "") or "")
+    cached_operation = str(meta.get("operation", "train") or "")
     cached_round = meta.get("release-index")
     exact = (cached_request == request_id
+             and cached_operation == operation
              and cached_round == round_index)
     if exact and state.get(_CACHE_ARRAYS_KEY) is not None:
         return "replay"
@@ -169,7 +226,8 @@ def _cached_status(context, message_id, round_index, request_id):
     # must fail before private data is read.  Message ids do not establish
     # identity; they only make these accidental/malicious cache collisions visible.
     if ((message_id and cached_message == message_id)
-            or (cached_request and cached_round == round_index)):
+            or (cached_request and cached_operation == operation
+                and cached_round == round_index)):
         if not exact:
             raise RuntimeError("cached round identity does not match request payload")
     return "new"
@@ -177,19 +235,23 @@ def _cached_status(context, message_id, round_index, request_id):
 
 def claim_release(context, msg):
     """Return a stateless round claim, optionally replaying an exact RAM cache."""
-    num_rounds, epsilon, delta, policy_hash = _fixed_manifest(context)
+    fixed = _fixed_manifest(context)
+    num_rounds = fixed["num_rounds"]
+    operation = _operation(msg, fixed)
+    epsilon, delta = fixed["budgets"][operation]
     round_index = _server_round(msg, num_rounds)
-    request_id = _request_id(msg, round_index)
+    request_id = _request_id(msg, operation, round_index)
     message_id = _message_id(msg)
     status = _cached_status(
-        context, message_id, round_index, request_id)
+        context, message_id, operation, round_index, request_id)
     return {
         "status": status,
+        "operation": operation,
         "release_index": round_index,
         "epsilon": epsilon,
         "delta": delta,
         "num_rounds": num_rounds,
         "message_id": message_id,
         "request_id": request_id,
-        "policy_hash": policy_hash,
+        "policy_hash": fixed["policy_hash"],
     }
