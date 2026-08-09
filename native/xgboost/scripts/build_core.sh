@@ -25,6 +25,12 @@ CMAKE_COMMAND=${CMAKE:-cmake}
 "$SCRIPT_DIR/verify_patched.sh" "$SOURCE"
 require_command "$CMAKE_COMMAND"
 
+case "$(uname -s 2>/dev/null || true)" in
+  Darwin) BUNDLE_RPATH='@loader_path' ;;
+  Linux) BUNDLE_RPATH='$ORIGIN' ;;
+  *) BUNDLE_RPATH='' ;;
+esac
+
 "$CMAKE_COMMAND" -S "$SOURCE" -B "$BUILD" \
   -DPLUGIN_DSFLOWER_DP=ON \
   -DDSFLOWER_DP_CORE=ON \
@@ -42,6 +48,7 @@ require_command "$CMAKE_COMMAND"
   -DCMAKE_CXX_STANDARD=17 \
   -DCMAKE_CXX_STANDARD_REQUIRED=ON \
   -DCMAKE_CXX_EXTENSIONS=OFF \
+  -DCMAKE_BUILD_RPATH="$BUNDLE_RPATH" \
   -DCMAKE_BUILD_TYPE=Release
 "$CMAKE_COMMAND" --build "$BUILD" --target xgboost \
   --config Release \
