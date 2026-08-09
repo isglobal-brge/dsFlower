@@ -260,7 +260,10 @@ def _child(bundle_root, secret_file, work):
     from dsflower_runner import xgboost_bundle, xgboost_predictor
 
     if not xgboost_bundle.is_verified_bundle(client_app._NATIVE_BUNDLE):
-        raise AssertionError("real curated bundle was not loaded and verified")
+        probe = xgboost_bundle.probe_xgboost_bundle(bundle_root)
+        raise AssertionError(
+            "real curated bundle was not loaded and verified: %s" %
+            probe.error_code)
     _exercise_task(
         work, "binary", client_app, server_app,
         native_tree_request, xgboost_predictor)
