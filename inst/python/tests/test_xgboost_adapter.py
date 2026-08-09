@@ -18,6 +18,7 @@ sys.path.insert(0, FLOWER_APP)
 
 from dsflower_runner import seeding
 from dsflower_runner import xgboost_adapter as adapter
+from dsflower_runner import xgboost_bundle
 
 
 def _typed(kind, value):
@@ -233,7 +234,7 @@ class XGBoostManifestTests(unittest.TestCase):
 
 
 class XGBoostMaterializationTests(unittest.TestCase):
-    def test_patient_units_are_unique_record_ordered_and_immutable(self):
+    def test_patient_units_are_record_ordered_and_immutable(self):
         X, y, units = _data()
         materialized = adapter.materialize_xgboost_units(
             _manifest(), X, y, unit_ids=units)
@@ -247,6 +248,7 @@ class XGBoostMaterializationTests(unittest.TestCase):
         self.assertEqual(materialized.privacy_unit, "patient")
         self.assertFalse(materialized.features.flags.writeable)
         self.assertFalse(materialized.target.flags.writeable)
+        self.assertNotIn("rows", repr(materialized))
 
         permutation = np.asarray([2, 0, 1])
         replay = adapter.materialize_xgboost_units(
@@ -264,13 +266,49 @@ class XGBoostMaterializationTests(unittest.TestCase):
             unicode_order.features, materialized.features)
         np.testing.assert_array_equal(unicode_order.target, materialized.target)
 
-    def test_duplicate_missing_and_misaligned_patient_units_fail(self):
+    def test_patient_duplicates_and_invalid_ids_aggregate_without_oracle(self):
+        X = np.asarray([
+            [10.0, np.nan], [30.0, 1.0], [70.0, 3.0], [90.0, 5.0],
+        ], dtype=np.float64)
+        y = np.asarray([1.0, 0.0, 1.0, np.nan], dtype=np.float64)
+        units = ["same", " same ", None, "<NA>"]
+        with mock.patch.object(
+                adapter.xgboost_accounting,
+                "validate_fixed_point_unit_geometry",
+                wraps=adapter.xgboost_accounting.validate_fixed_point_unit_geometry
+        ) as geometry:
+            materialized = adapter.materialize_xgboost_units(
+                _manifest(), X, y, unit_ids=units)
+        self.assertEqual(materialized.features.shape, (2, 2))
+        self.assertEqual(geometry.call_args.args[0], 2)
+        np.testing.assert_allclose(
+            materialized.features,
+            np.asarray([[20.0, 1.0], [80.0, 4.0]], dtype=np.float32))
+        np.testing.assert_array_equal(
+            materialized.target, np.asarray([0.0, 0.0], dtype=np.float32))
+
+        permutation = np.asarray([3, 0, 2, 1])
+        replay = adapter.materialize_xgboost_units(
+            _manifest(), X[permutation], y[permutation],
+            unit_ids=[units[index] for index in permutation])
+        self.assertEqual(
+            materialized.features.tobytes(), replay.features.tobytes())
+        self.assertEqual(materialized.target.tobytes(), replay.target.tobytes())
+
+        all_invalid = adapter.materialize_xgboost_units(
+            _manifest(), X[:3], np.asarray([1.0, 0.0, 1.0]),
+            unit_ids=["", None, "x" * 5000])
+        self.assertEqual(all_invalid.features.shape, (1, 2))
+        self.assertEqual(all_invalid.target.tolist(), [1.0])
+
+        numeric_ids = adapter.materialize_xgboost_units(
+            _manifest(), X[:2], np.asarray([0.0, 1.0]), unit_ids=[7, "7"])
+        self.assertEqual(numeric_ids.features.shape[0], 1)
+        self.assertEqual(numeric_ids.target.tolist(), [0.0])
+
+    def test_only_structurally_misaligned_patient_ids_fail(self):
         X, y, _ = _data()
-        for units in (
-                ["same", "same", "third"],
-                ["one", None, "three"],
-                ["one", "two"],
-                [["one"], ["two"], ["three"]]):
+        for units in (["one", "two"], np.asarray([["one", "two", "three"]])):
             with self.subTest(units=units):
                 with self.assertRaises(ValueError):
                     adapter.materialize_xgboost_units(
@@ -324,22 +362,39 @@ class XGBoostMaterializationTests(unittest.TestCase):
         self.assertEqual(first.target.tobytes(),
                          different_nan.target.tobytes())
 
-    def test_missing_is_bound_but_infinity_bounds_and_shapes_fail(self):
+    def test_private_numeric_values_totalize_but_structural_shapes_fail(self):
         X, y, units = _data()
-        cases = []
         missing = X.copy(); missing[0, 0] = np.nan
         materialized = adapter.materialize_xgboost_units(
             _manifest(), missing, y, unit_ids=units)
         self.assertEqual(int(np.isnan(materialized.features[:, 0]).sum()), 1)
 
-        bad = X.copy(); bad[0, 0] = np.inf
-        cases.append((bad, y, units, "finite"))
-        bad = X.copy(); bad[0, 0] = 101.0
-        cases.append((bad, y, units, "bounds"))
-        bad_y = y.copy(); bad_y[0] = 0.5
-        cases.append((X, bad_y, units, "binary"))
-        cases.append((X[:, :1], y, units, "feature"))
-        cases.append((X, y[:2], units, "row"))
+        private_values = np.asarray([
+            [np.inf, -np.inf], [-np.inf, np.inf],
+            [101.0, -6.0], [np.nan, np.nan],
+        ], dtype=np.float64)
+        private_target = np.asarray(
+            [0.5, np.nan, np.inf, -np.inf], dtype=np.float64)
+        totalized = adapter.materialize_xgboost_units(
+            _manifest(), private_values, private_target,
+            unit_ids=["a", "b", "c", "d"])
+        self.assertTrue(bool(np.all(
+            np.isnan(totalized.features) |
+            ((totalized.features >= np.asarray([0.0, -5.0])) &
+             (totalized.features <= np.asarray([100.0, 5.0]))))))
+        self.assertEqual(int(np.isnan(totalized.features).sum()), 2)
+        self.assertEqual(sorted(totalized.target.tolist()), [0.0, 0.0, 0.0, 1.0])
+
+        regression = adapter.materialize_xgboost_units(
+            _manifest("regression"), X[:3],
+            np.asarray([-np.inf, np.nan, np.inf]),
+            unit_ids=["a", "b", "c"])
+        self.assertEqual(sorted(regression.target.tolist()), [-10.0, 0.0, 10.0])
+
+        cases = [
+            (X[:, :1], y, units, "feature"),
+            (X, y[:2], units, "row"),
+        ]
         for bad_x, bad_y, bad_units, error in cases:
             with self.subTest(error=error):
                 with self.assertRaisesRegex(ValueError, error):
@@ -356,23 +411,80 @@ class XGBoostMaterializationTests(unittest.TestCase):
                     manifest, X, y, unit_ids=units)
             copy_array.assert_not_called()
 
+        budget = _manifest()["resources"]["memory_mib"] * 1024 * 1024
         with mock.patch.object(
-                adapter, "_materialization_peak_bytes",
-                return_value=4097 * 1024 * 1024):
-            with self.assertRaisesRegex(ValueError, "memory ceiling"):
+                adapter, "_native_training_peak_bytes", return_value=budget):
+            admitted = adapter.materialize_xgboost_units(
+                _manifest(), X, y, unit_ids=units)
+            self.assertEqual(admitted.features.shape[1], 2)
+
+        with mock.patch.object(
+                adapter, "_native_training_peak_bytes",
+                return_value=budget + 1), mock.patch.object(
+                    adapter, "_numeric_array",
+                    side_effect=AssertionError("copied before full preflight")) \
+                as copy_array:
+            with self.assertRaisesRegex(ValueError, "complete native training"):
                 adapter.materialize_xgboost_units(
                     _manifest(), X, y, unit_ids=units)
+            copy_array.assert_not_called()
+
+    def test_complete_native_peak_pins_core_sampler_and_resident_buffers(self):
+        manifest = _manifest()
+        profile = adapter.canonical_xgboost_profile(manifest)
+        observed = adapter._native_training_peak_bytes(
+            3, 2, "patient", profile, manifest["resources"])
+        frontier = 4
+        cells = frontier * ((3 + 2) + (3 + 2))
+        coordinates = 2 * (cells + 1)
+        cuts = 6
+        core = (
+            16 * cells + 32 * coordinates + 64 * frontier + 4 * 3 +
+            16 * 3 + 4 * cuts + 1024 * 1024)
+        materialization = adapter._materialization_peak_bytes(3, 2, "patient")
+        dataset = 3 * (24 * 2 + 96) + 8 * 4
+        artifact = 8 * manifest["resources"]["max_artifact_bytes"]
+        subtotal = core + materialization + dataset + artifact
+        self.assertEqual(
+            observed, subtotal + subtotal // 4 + 16 * 1024 * 1024)
+
+    def test_empty_and_all_invalid_inputs_become_trainable_sentinel_units(self):
+        for task in ("binary_classification", "regression"):
+            with self.subTest(task=task):
+                empty = adapter.materialize_xgboost_units(
+                    _manifest(task), np.empty((0, 2), dtype=np.float64),
+                    np.empty((0,), dtype=np.float64), unit_ids=[])
+                self.assertEqual(empty.features.shape, (1, 2))
+                self.assertTrue(bool(np.all(np.isnan(empty.features))))
+                self.assertEqual(empty.target.tolist(), [0.0])
+
+        invalid = adapter.materialize_xgboost_units(
+            _manifest(),
+            np.asarray([[np.nan, np.inf], [np.nan, -np.inf]]),
+            np.asarray([np.nan, np.inf]), unit_ids=[None, ""])
+        self.assertEqual(invalid.features.shape, (1, 2))
+        self.assertTrue(bool(np.isnan(invalid.features[0, 0])))
+        self.assertEqual(invalid.features[0, 1], np.float32(0.0))
+        self.assertEqual(invalid.target.tolist(), [0.0])
 
 
 class XGBoostPrfAndBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _bundle(digest):
+        return xgboost_bundle.TrustedXGBoostBundle(
+            token=xgboost_bundle._CONSTRUCTION_TOKEN,
+            bundle_sha256=digest,
+            xgboost=object(), dp_primitives=object(),
+        )
+
     def _prepare(self, manifest=None, X=None, y=None, units=None,
-                 native_bundle_sha256="f" * 64):
+                 bundle_sha256="f" * 64):
         if X is None:
             X, y, units = _data()
         with mock.patch.object(seeding, "_node_secret", return_value=b"k" * 32):
             return adapter.prepare_xgboost_training(
-                manifest or _manifest(), X, y, unit_ids=units,
-                native_bundle_sha256=native_bundle_sha256)
+                manifest or _manifest(), X, y,
+                native_bundle=self._bundle(bundle_sha256), unit_ids=units)
 
     def test_prf_is_sticky_private_bound_and_resource_independent(self):
         first = self._prepare()
@@ -536,10 +648,17 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
 
         self.assertNotEqual(
             first._noise_key,
-            self._prepare(native_bundle_sha256="e" * 64)._noise_key)
-        for fingerprint in (None, "F" * 64, "f" * 63):
-            with self.subTest(fingerprint=fingerprint), self.assertRaises(ValueError):
-                self._prepare(native_bundle_sha256=fingerprint)
+            self._prepare(bundle_sha256="e" * 64)._noise_key)
+        X, y, units = _data()
+        for untrusted in (None, object(), "f" * 64):
+            with self.subTest(untrusted=type(untrusted).__name__), \
+                    mock.patch.object(
+                        seeding, "_node_secret",
+                        side_effect=AssertionError("secret touched before bundle")), \
+                    self.assertRaisesRegex(ValueError, "verified native"):
+                adapter.prepare_xgboost_training(
+                    _manifest(), X, y, unit_ids=units,
+                    native_bundle=untrusted)
 
     def test_row_prf_is_permutation_and_nan_payload_invariant(self):
         manifest = _manifest()
@@ -574,16 +693,90 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
                 manifest=manifest, X=changed, y=y,
                 units=None)._noise_key)
 
-    def test_training_boundary_is_unconditionally_fail_closed(self):
+    def test_patient_prf_binds_only_effective_bounded_records(self):
+        raw_x = np.asarray([
+            [10.0, -5.0], [30.0, 5.0], [60.0, 0.0], [70.0, 1.0],
+        ], dtype=np.float64)
+        raw_y = np.asarray([0.0, 1.0, 1.0, 1.0], dtype=np.float64)
+        raw_units = ["patient", " patient ", None, "<NA>"]
+        first = self._prepare(X=raw_x, y=raw_y, units=raw_units)
+
+        effective = self._prepare(
+            X=np.asarray([[20.0, 0.0], [65.0, 0.5]], dtype=np.float64),
+            y=np.asarray([0.0, 1.0], dtype=np.float64),
+            units=["effective-a", "effective-b"])
+        self.assertEqual(first._noise_key, effective._noise_key)
+        self.assertNotIn("rows", repr(first))
+
+        permutation = np.asarray([3, 1, 0, 2])
+        replay = self._prepare(
+            X=raw_x[permutation], y=raw_y[permutation],
+            units=[raw_units[index] for index in permutation])
+        self.assertEqual(first._noise_key, replay._noise_key)
+        np.testing.assert_array_equal(first.features, replay.features)
+        np.testing.assert_array_equal(first.target, replay.target)
+
+        duplicate_x = np.vstack((raw_x, np.asarray([[20.0, 0.0]])))
+        duplicate_y = np.append(raw_y, 0.0)
+        duplicate_units = raw_units + ["patient"]
+        duplicate = self._prepare(
+            X=duplicate_x, y=duplicate_y, units=duplicate_units)
+        self.assertEqual(first._noise_key, duplicate._noise_key)
+
+        equivalent_x = raw_x.copy()
+        equivalent_x[0, 0] = 11.0
+        equivalent_x[1, 0] = 29.0
+        equivalent_units = ["patient", "patient", "", "x" * 5000]
+        equivalent = self._prepare(
+            X=equivalent_x, y=raw_y, units=equivalent_units)
+        self.assertEqual(first._noise_key, equivalent._noise_key)
+
+        outlier_x = raw_x.copy()
+        outlier_x[3, 0] = np.inf
+        clipped_x = raw_x.copy()
+        clipped_x[3, 0] = 100.0
+        self.assertEqual(
+            self._prepare(
+                X=outlier_x, y=raw_y, units=raw_units)._noise_key,
+            self._prepare(
+                X=clipped_x, y=raw_y, units=raw_units)._noise_key)
+
+        changed_x = raw_x.copy()
+        changed_x[1, 1] = 1.0
+        self.assertNotEqual(
+            first._noise_key,
+            self._prepare(
+                X=changed_x, y=raw_y, units=raw_units)._noise_key)
+
+    def test_training_boundary_delegates_only_a_prepared_verified_request(self):
         prepared = self._prepare()
-        for status in (
-                "scaffold-only:no-dp-histogram-privatization",
-                "test-only:fixed-point-dp-core",
-                "unknown-future-capability"):
-            with self.subTest(status=status), self.assertRaises(
-                    adapter.NativeXGBoostUnavailable) as raised:
-                adapter.train_xgboost_native(prepared, native_status=status)
-            self.assertNotIn(status, str(raised.exception))
+        with mock.patch.object(
+                adapter.xgboost_native, "train",
+                return_value=b'{"safe":true}') as train:
+            self.assertEqual(
+                adapter.train_xgboost_native(prepared), b'{"safe":true}')
+        train.assert_called_once_with(prepared)
+        with self.assertRaises(ValueError):
+            adapter.train_xgboost_native(object())
+        with self.assertRaises(TypeError):
+            adapter.train_xgboost_native(prepared, native_status="forged")
+
+    def test_prepared_public_views_cannot_change_the_native_request(self):
+        prepared = self._prepare()
+        profile = prepared.profile
+        profile["max_depth"] = 30
+        parameters = prepared.native_parameters
+        parameters["updater"] = "grow_histmaker"
+        self.assertEqual(prepared.profile["max_depth"], 3)
+        self.assertEqual(
+            prepared.native_parameters["updater"],
+            "grow_dsflower_dp_hist")
+        with self.assertRaises(ValueError):
+            prepared.features[0, 0] = np.float32(1.0)
+        with self.assertRaises(AttributeError):
+            prepared.profile = profile
+        with self.assertRaises(AttributeError):
+            prepared.num_boost_round = 999
 
     def test_no_seed_round_or_callbacks_cross_native_parameters(self):
         prepared = self._prepare()

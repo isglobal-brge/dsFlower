@@ -71,7 +71,10 @@ jobs:
             inst/python/tests/test_native_tree_contract.py \
             inst/python/tests/test_xgboost_accounting.py \
             inst/python/tests/test_xgboost_adapter.py \
-            inst/python/tests/test_xgboost_sanitizer.py
+            inst/python/tests/test_xgboost_sanitizer.py \
+            inst/python/tests/test_xgboost_bundle.py \
+            inst/python/tests/test_xgboost_native.py \
+            inst/python/tests/test_xgboost_predictor.py
       - name: Verify fail-closed build and curated DP bundle
         shell: bash
         run: native/xgboost/tests/run.sh
