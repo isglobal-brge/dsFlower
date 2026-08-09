@@ -681,6 +681,39 @@ def load_pinned_run_config(context=None):
         for key in neural_public_keys:
             if key in cfg and (key not in manifest or cfg[key] != manifest[key]):
                 raise ValueError("Flower neural config does not match manifest pin")
+    resampling_fields = (
+        "resampling-version", "resampling-method", "resampling-assignment",
+        "resampling-test-numerator", "resampling-test-denominator",
+        "resampling-privacy-unit", "resampling-unit-canonicalization",
+        "resampling-contract-sha256", "holdout-validation-bins")
+    holdout_bound_fields = {"holdout-target-lower", "holdout-target-upper"}
+    supplied_resampling = {
+        key for key in cfg if str(key).lower().startswith((
+            "resampling-", "resampling_", "holdout-", "holdout_"))}
+    if manifest.get("resampling-contract-sha256") is not None:
+        try:
+            from . import resampling
+            resampling.contract_from_manifest(manifest)
+        except Exception as exc:
+            raise ValueError("manifest has no valid holdout contract") from exc
+        expected_supplied = set(resampling_fields)
+        supplied_bounds = supplied_resampling & holdout_bound_fields
+        if supplied_bounds and supplied_bounds != holdout_bound_fields:
+            raise ValueError("Flower holdout target bounds are incomplete")
+        if supplied_bounds:
+            bounds = manifest.get("target-bounds")
+            if (not isinstance(bounds, dict)
+                    or cfg.get("holdout-target-lower") != bounds.get("lower")
+                    or cfg.get("holdout-target-upper") != bounds.get("upper")):
+                raise ValueError("Flower holdout target bounds do not match manifest pin")
+            expected_supplied |= holdout_bound_fields
+        if supplied_resampling != expected_supplied:
+            raise ValueError("Flower holdout config has an unexpected field or seed axis")
+        for key in resampling_fields:
+            if key not in manifest or cfg.get(key) != manifest[key]:
+                raise ValueError("Flower holdout config does not match manifest pin")
+    elif supplied_resampling:
+        raise ValueError("Flower config requests holdout without a manifest contract")
     if str(manifest.get("dp-track", "")).lower() == "validation":
         required = [
             "validation-model-track", "validation-task", "validation-bins",
@@ -728,6 +761,10 @@ def load_pinned_run_config(context=None):
         "scheduler-name", "scheduler-step-size", "scheduler-gamma",
         "scheduler-min-lr",
         "nb-dispersion", "gamma-shape", "huber-delta", "quantile-level",
+        "resampling-version", "resampling-method", "resampling-assignment",
+        "resampling-test-numerator", "resampling-test-denominator",
+        "resampling-privacy-unit", "resampling-unit-canonicalization",
+        "resampling-contract-sha256", "holdout-validation-bins",
     )
     for key in keys:
         if key in manifest:

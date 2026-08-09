@@ -39,7 +39,7 @@ from .params import get_torch_params, set_torch_params, load_user_model
 # sys.path / PYTHONPATH cannot shadow dp_harness and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import (dp_harness, release_guard, seeding,
+from . import (dp_harness, release_guard, resampling, seeding,
                task as task_module, validation)
 
 
@@ -103,6 +103,7 @@ def _cache_reply(context, claim, arrays, hook_executed=None,
     meta = {
         "message-id": claim["message_id"],
         "release-index": int(claim["release_index"]),
+        "operation": str(claim.get("operation", "train")),
     }
     if claim.get("request_id"):
         meta["request-id"] = str(claim["request_id"])
@@ -119,9 +120,12 @@ def _replay_reply(context, claim, msg):
     meta = context.state.get("dsflower-last-release-meta")
     arrays = context.state.get("dsflower-last-release")
     cached_request = (meta.get("request-id") if meta is not None else None)
+    cached_operation = (meta.get("operation", "train")
+                        if meta is not None else None)
     exact_request = (
         bool(claim.get("request_id"))
         and cached_request == claim.get("request_id")
+        and cached_operation == str(claim.get("operation", "train"))
         and meta.get("release-index") == int(claim["release_index"])
     ) if meta is not None else False
     if (meta is not None and arrays is not None
@@ -610,6 +614,10 @@ def _apply_feature_bounds(X, cfg):
 
 def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
     n_classes = int(pins["n_classes"])
+    has_holdout = cfg.get("resampling-contract-sha256") is not None
+    if has_holdout and manifest_image:
+        raise RuntimeError(
+            "atomic holdout currently supports tabular neural data only")
 
     if manifest_image:
         from . import vision
@@ -617,8 +625,6 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
         image_size = vision._validate_image_size(cfg.get("image-size", 224))
         paths, y, groups = load_image_collection(context)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
-        if pins["loss_name"] in _CLASSIFICATION_LOSSES:
-            _assert_label_range(y, n_classes)
         encoder, feat_dim = vision.build_backbone(backbone)
         if int(feat_dim) != int(input_dim):
             raise RuntimeError("backbone feature width changed after model validation")
@@ -628,18 +634,22 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
         X, y = load_data(context)
         if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
             raise RuntimeError("staged feature width changed after model validation")
-        X = _apply_feature_bounds(X, cfg)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
-        if pins["loss_name"] in _CLASSIFICATION_LOSSES:
-            _assert_label_range(y, n_classes)
         groups = load_tabular_patient_ids(context)
 
+    task_module.assert_pinned_unit_count(
+        context, len(y), patient_ids=groups)
+    if has_holdout:
+        X, y, groups = _holdout_partition(
+            context, X, y, groups, subset="train")
+    if not manifest_image:
+        X = _apply_feature_bounds(X, cfg)
     X = _totalize_private_features(X)
+    if pins["loss_name"] in _CLASSIFICATION_LOSSES:
+        _assert_label_range(y, n_classes)
     if groups is not None:
         X, y = _pool_by_patient(X, y, groups, pins["loss_name"])
         X = _totalize_private_features(X)
-    task_module.assert_pinned_unit_count(context, len(y))
-
     # Bind every stochastic DP-SGD axis only after preprocessing has produced
     # the exact tensors consumed by training.  Parameter arrays are read back
     # from the model so dtype coercions performed by set_torch_params are part
@@ -656,6 +666,48 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
         private_arrays=(np.asarray(X, dtype=np.float32), seed_target))
 
     return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master)
+
+
+def _holdout_partition(context, X, y, unit_ids, *, subset):
+    """Select one pre-training holdout side without exposing its roster."""
+    if subset not in ("train", "test"):
+        raise ValueError("holdout subset must be train or test")
+    values = np.asarray(X)
+    target = np.asarray(y)
+    if values.ndim < 1 or target.ndim < 1 or values.shape[0] != target.shape[0]:
+        raise RuntimeError("holdout inputs must share one row axis")
+    mask = resampling.holdout_mask_from_context(
+        context, n_rows=int(target.shape[0]), unit_ids=unit_ids)
+    selected = mask if subset == "test" else ~mask
+    if not bool(np.any(selected)):
+        raise RuntimeError("atomic holdout partition is unavailable")
+    selected_units = (None if unit_ids is None
+                      else np.asarray(unit_ids)[selected])
+    return values[selected], target[selected], selected_units
+
+
+def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim):
+    """Evaluate the final public aggregate on test units and release one vector."""
+    if is_image_run(context):
+        raise RuntimeError(
+            "atomic holdout currently supports tabular neural data only")
+    X, y = load_data(context)
+    if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
+        raise RuntimeError("staged feature width changed before holdout evaluation")
+    unit_ids = load_tabular_patient_ids(context)
+    task_module.assert_pinned_unit_count(
+        context, len(y), patient_ids=unit_ids)
+    X, y, unit_ids = _holdout_partition(
+        context, X, y, unit_ids, subset="test")
+    X = _apply_feature_bounds(X, cfg)
+    layout = validation.holdout_layout_from_config(cfg)
+    predictions = validation.neural_predictions(model, X, pins["loss_name"])
+    bounds = (validation.holdout_target_bounds_from_config(cfg)
+              if layout["task"] in ("regression", "count") else None)
+    released, _sigma = validation.private_validation_vector(
+        y, predictions, layout, epsilon=pcfg["epsilon"], delta=pcfg["delta"],
+        target_bounds=bounds, num_releases=1, unit_ids=unit_ids)
+    return [released.astype(np.float64)]
 
 
 def _public_fallback_arrays(msg, context, track):
@@ -763,7 +815,23 @@ def train(msg: Message, context: Context) -> Message:
         # its fixed policy and returns those exact per-training values.
         pcfg["epsilon"] = float(claim["epsilon"])
         pcfg["delta"] = float(claim["delta"])
-        if track == "validation":
+        if claim.get("operation", "train") == "holdout-evaluate":
+            if track != "neural":
+                raise RuntimeError("holdout evaluation requires the neural track")
+            pins = dict(load_run_pins(context))
+            if int(pins["num_rounds"]) != int(claim["num_rounds"]):
+                raise RuntimeError(
+                    "neural calibration horizon does not match release guard")
+            pins["round_index"] = int(pins["num_rounds"])
+            model, input_dim, manifest_image = _prepare_neural_model(
+                msg, context, cfg, pcfg, pins)
+            if manifest_image:
+                raise RuntimeError(
+                    "atomic holdout currently supports tabular neural data only")
+            mark_private_started()
+            new_arrays = _holdout_neural_release(
+                context, cfg, pcfg, pins, model, input_dim)
+        elif track == "validation":
             if int(claim["num_rounds"]) != 1:
                 raise RuntimeError("validation release horizon must be exactly one")
             public_arrays = _validate_public_egress_arrays(

@@ -175,6 +175,46 @@ def layout_from_config(cfg):
     raise ValueError("unsupported validation task %r" % task)
 
 
+def holdout_layout_from_config(cfg):
+    """Fixed validation layout for an atomic training holdout."""
+    if not isinstance(cfg, dict):
+        raise ValueError("holdout configuration must be an object")
+    loss = str(cfg.get("loss-name", "")).lower()
+    task = str(cfg.get("task-type", "")).lower()
+    bins = cfg.get("holdout-validation-bins", 32)
+    if loss == "bce_logits":
+        return validation_layout("classification", n_classes=2, bins=bins)
+    if loss in ("cross_entropy", "hinge"):
+        return validation_layout(
+            "classification", n_classes=cfg.get("num-classes", 2), bins=bins)
+    if loss == "ordinal":
+        return validation_layout(
+            "ordinal", n_classes=cfg.get("num-classes", 2), bins=bins)
+    if loss == "multilabel_bce":
+        return validation_layout(
+            "multilabel", n_labels=cfg.get("num-labels", 2), bins=bins)
+    if task in ("regression", "count"):
+        bounds = holdout_target_bounds_from_config(cfg)
+        if task == "count" and bounds["lower"] < 0.0:
+            raise ValueError("count holdout requires non-negative target bounds")
+        if loss == "gamma_nll" and bounds["lower"] <= 0.0:
+            raise ValueError("gamma holdout requires strictly positive target bounds")
+        return validation_layout(task)
+    raise ValueError("loss/task has no trusted holdout validation semantics")
+
+
+def holdout_target_bounds_from_config(cfg):
+    bounds = cfg.get("target-bounds")
+    if isinstance(bounds, dict):
+        lower, upper = _target_bounds(bounds)
+    else:
+        lower, upper = _target_bounds({
+            "lower": cfg.get("holdout-target-lower"),
+            "upper": cfg.get("holdout-target-upper"),
+        })
+    return {"lower": lower, "upper": upper}
+
+
 def _target_bounds(value):
     if not isinstance(value, dict):
         raise ValueError("numeric validation requires pinned target bounds")

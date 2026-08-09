@@ -971,6 +971,7 @@ flowerInitDS <- function(data_symbol) {
   run_config[["dp-track"]] <- track
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
+  run_config <- .normalizeResamplingConfig(run_config, track)
   run_config <- .normalizePinnedTaskType(run_config, track)
   run_config <- .normalizeHookAppParams(run_config, track)
   run_config <- .normalizePublicFeatureBounds(run_config)
@@ -984,6 +985,7 @@ flowerInitDS <- function(data_symbol) {
   run_config[["privacy-policy-sha256"]] <- policy$policy_hash
   run_config[["privacy-epsilon"]] <- policy$per_training_epsilon
   run_config[["privacy-delta"]] <- policy$per_training_delta
+  run_config <- .applyHoldoutPrivacyAllocation(run_config)
   run_config[["privacy-clipping_norm"]] <- as.numeric(.dsf_option("dp_clipping_norm", 1.0))
   # Improved Tier-2 floor policy (sample-and-aggregate): the node may split its private
   # data into a FIXED, administrator-pinned k, run the uploaded black-box update per
@@ -1570,6 +1572,7 @@ flowerGetCapabilitiesDS <- function() {
     declarative_model_ops = runner_caps$declarative_model_ops,
     declarative_losses  = runner_caps$declarative_losses,
     aggregation_strategies = runner_caps$aggregation_strategies,
+    resampling          = runner_caps$resampling,
     native_tree         = native_tree,
     max_rounds          = settings$max_rounds,
     min_samples         = 0L,

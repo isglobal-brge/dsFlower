@@ -28,6 +28,14 @@
   ),
   aggregation_strategies = c(
     "fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm"
+  ),
+  resampling = list(
+    holdout = list(
+      available = TRUE,
+      tracks = "neural",
+      data_kinds = "tabular",
+      assignment = "hmac-sha256-threshold-v1",
+      pooled_only = TRUE)
   )
 )
 

@@ -787,6 +787,10 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
     caps$aggregation_strategies,
     c("fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm")
   )
+  expect_identical(caps$resampling$holdout$tracks, "neural")
+  expect_identical(caps$resampling$holdout$data_kinds, "tabular")
+  expect_true(caps$resampling$holdout$pooled_only)
+  expect_false("cross_validation" %in% names(caps$resampling))
   expect_true("max_rounds" %in% names(caps))
   expect_true("min_samples" %in% names(caps))
   expect_false("secure_aggregation_supported" %in% names(caps))
