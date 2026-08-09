@@ -292,7 +292,7 @@ def _windows_secure_acl(path, *, require_node_owner, parent_chain=False):
             replacement_rights = (
                 0x10000000 | 0x40000000 |  # GENERIC_ALL / GENERIC_WRITE
                 0x00010000 | 0x00040000 | 0x00080000 |  # delete/DACL/owner
-                0x00000040 | 0x00000100  # delete-child/write-attributes
+                0x00000040  # delete-child
             )
             content_write_rights = (
                 0x00000002 | 0x00000004 | 0x00000010
@@ -398,7 +398,12 @@ def _reject_extended_acl(path, *, parent_chain=False):
             names = os.listxattr(path, follow_symlinks=False)
         except (AttributeError, OSError):
             _reject()
-        if any("acl" in name.lower() for name in names):
+        # Linux POSIX ACL write grants are bounded by the group-class mask,
+        # which is reflected in st_mode and checked by _secure_metadata.
+        # Unknown ACL mechanisms are not assumed to share that invariant.
+        posix_acl = {"system.posix_acl_access", "system.posix_acl_default"}
+        if any("acl" in name.lower() and name not in posix_acl
+               for name in names):
             _reject()
     else:
         _reject("unsupported")
