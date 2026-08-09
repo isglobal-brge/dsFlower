@@ -117,7 +117,7 @@ def backend_manifest(request, *, epsilon, delta, unit,
     """Enrich a public request with trusted, non-public node state."""
     request = _exact(request, _REQUEST_FIELDS, "native-tree request")
     if request["contract"] != REQUEST_CONTRACT or \
-            request["engine"] != "xgboost" or \
+            request["engine"] not in ("xgboost", "extra_trees") or \
             request["mode"] != "native-tight" or \
             request["task"] not in ("binary", "regression"):
         raise ValueError("native-tree request is unsupported")
@@ -145,19 +145,45 @@ def backend_manifest(request, *, epsilon, delta, unit,
                 lower, (int, float)) or not isinstance(upper, (int, float)):
             raise ValueError("native-tree target bounds are invalid")
         base_score = float(lower) + (float(upper) - float(lower)) / 2.0
-    parameters["base_score"] = {"type": "float", "value": float(base_score)}
-    parameters["max_bin"] = {
-        "type": "int", "value": max(len(feature) + 1 for feature in cuts),
-    }
+    engine = request["engine"]
+    if engine == "xgboost":
+        parameters["base_score"] = {
+            "type": "float", "value": float(base_score)}
+        parameters["max_bin"] = {
+            "type": "int", "value": max(len(feature) + 1 for feature in cuts),
+        }
+        mechanism = "dp-histogram-v1"
+        mechanism_params = {
+            "gradient_clip": {
+                "type": "float", "value": float(gradient_clip),
+            },
+            "hessian_clip": {"type": "float", "value": 1.0},
+        }
+    else:
+        # Keep request parsing and the local XGBoost predictor stdlib-only.
+        # Forest accounting depends on NumPy through the shared DP harness and
+        # is needed only when enriching an ExtraTrees training request.
+        from . import forest_accounting
+        mechanism = "dp-forest-v1"
+        mechanism_params = {
+            "leaf_release": {
+                "type": "string",
+                "value": forest_accounting.LEAF_RELEASE_PROFILE,
+            },
+            "topology": {
+                "type": "string",
+                "value": forest_accounting.TOPOLOGY_PROFILE,
+            },
+        }
     result = {
         "contract_version": tree_contract.CONTRACT_VERSION,
         "mode": "native-tight",
-        "engine": "xgboost",
+        "engine": engine,
         "task": task,
         "public_schema": schema,
         "engine_params": parameters,
         "privacy": {
-            "mechanism": "dp-histogram-v1",
+            "mechanism": mechanism,
             "epsilon": epsilon,
             "delta": delta,
             "unit": unit,
@@ -165,12 +191,7 @@ def backend_manifest(request, *, epsilon, delta, unit,
             "unit_canonicalization": unit_canonicalization,
             "contribution_strategy": "one-record-per-unit-v1",
             "max_rows_per_unit": 1,
-            "mechanism_params": {
-                "gradient_clip": {
-                    "type": "float", "value": float(gradient_clip),
-                },
-                "hessian_clip": {"type": "float", "value": 1.0},
-            },
+            "mechanism_params": mechanism_params,
         },
         "data_scope": {
             "snapshot_hash": snapshot_hash,

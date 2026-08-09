@@ -49,17 +49,51 @@ test_that("server preserves one-feature arrays in the canonical wire", {
     "version", "features", "lower", "upper", "cuts", "target")]
   manifest$public_schema$sha256 <- digest::digest(
     dsFlower:::.native_tree_json(core), algo = "sha256", serialize = FALSE)
-  manifest$parameters <- list(list(
-    name = "one_element_array", type = "integer_array", value = list(1L)))
+  manifest$parameters <- list(
+    list(name = "depth", type = "integer", value = 2L),
+    list(name = "iterations", type = "integer", value = 3L),
+    list(name = "l2_leaf_reg", type = "number", value = 1),
+    list(name = "learning_rate", type = "number", value = 0.1),
+    list(name = "max_delta_step", type = "number", value = 2))
 
   pinned <- dsFlower:::.validate_native_tree_manifest(manifest)
   expect_match(pinned$json, '"features":\\["x"\\]')
   expect_match(pinned$json, '"lower":\\[0.0\\]')
   expect_match(pinned$json, '"cuts":\\[\\[0.5\\]\\]')
-  expect_match(pinned$json, '"value":\\[1\\]')
+  parameter <- dsFlower:::.native_tree_parameter_record(list(
+    name = "one_element_array", type = "integer_array", value = list(1L)))
+  expect_match(rawToChar(dsFlower:::.native_tree_json(parameter)),
+               '"value":\\[1\\]')
   expect_identical(
     pinned$value$public_schema$sha256,
     "2d7a1f025f798f69165fdbbdd5fa2b19c6e95b5cf5b8ab78d434356a496ab234")
+})
+
+test_that("server pins the exact data-independent ExtraTrees profile", {
+  manifest <- .native_tree_manifest_fixture()
+  manifest$engine <- "extra_trees"
+  manifest$parameters <- list(
+    list(name = "max_depth", type = "integer", value = 4L),
+    list(name = "n_estimators", type = "integer", value = 32L))
+  manifest$resources$max_depth <- 4L
+  manifest$resources$max_trees <- 32L
+
+  pinned <- dsFlower:::.validate_native_tree_manifest(manifest)
+  expect_identical(pinned$value$engine, "extra_trees")
+  expect_identical(
+    vapply(pinned$value$parameters, `[[`, character(1), "name"),
+    c("max_depth", "n_estimators"))
+
+  too_deep <- manifest
+  too_deep$parameters[[1L]]$value <- 13L
+  too_deep$resources$max_depth <- 13L
+  expect_error(dsFlower:::.validate_native_tree_manifest(too_deep),
+               "max_depth.*outside")
+  unknown <- manifest
+  unknown$parameters[[3L]] <- list(
+    name = "criterion", type = "string", value = "gini")
+  expect_error(dsFlower:::.validate_native_tree_manifest(unknown),
+               "Unsupported ExtraTrees parameter")
 })
 
 test_that("server rejects native-tree manifest and schema tampering", {
@@ -225,13 +259,77 @@ test_that("server bounds public cuts and canonical manifest bytes", {
     "16384-cut contract cap")
 
   manifest <- .native_tree_manifest_fixture()
-  manifest$engine <- "catboost"
-  manifest$parameters <- lapply(seq_len(128L), function(i) list(
-    name = sprintf("parameter_%03d", i),
-    type = "string", value = strrep("x", 512L)))
+  features <- vapply(seq_len(400L), function(i) {
+    paste0(sprintf("f%03d_", i), strrep("x", 190L))
+  }, character(1))
+  manifest$public_schema$features <- as.list(features)
+  manifest$public_schema$lower <- as.list(rep(0, length(features)))
+  manifest$public_schema$upper <- as.list(rep(1, length(features)))
+  manifest$public_schema$cuts <- lapply(features, function(...) list(0.5))
+  manifest$resources$max_features <- length(features)
+  core <- manifest$public_schema[c(
+    "version", "features", "lower", "upper", "cuts", "target")]
+  manifest$public_schema$sha256 <- digest::digest(
+    dsFlower:::.native_tree_json(core), algo = "sha256", serialize = FALSE)
   expect_error(
     dsFlower:::.validate_native_tree_manifest(manifest),
     "exceeds 65536 bytes")
+})
+
+.boosting_manifest_fixture <- function(engine) {
+  manifest <- jsonlite::fromJSON(
+    .native_tree_wire_fixture(), simplifyVector = FALSE)
+  manifest$engine <- engine
+  values <- if (identical(engine, "lightgbm")) {
+    list(lambda_l1 = 0, lambda_l2 = 1, learning_rate = 0.1,
+         max_delta_step = 2, max_depth = 2L, min_data_in_leaf = 1L,
+         min_gain_to_split = 0, num_iterations = 3L, num_leaves = 2L)
+  } else {
+    list(depth = 2L, iterations = 3L, l2_leaf_reg = 1,
+         learning_rate = 0.1, max_delta_step = 2)
+  }
+  manifest$parameters <- lapply(names(values), function(name) list(
+    name = name,
+    type = if (is.integer(values[[name]])) "integer" else "number",
+    value = values[[name]]))
+  manifest
+}
+
+test_that("server enforces exact LightGBM-style and CatBoost-style profiles", {
+  for (engine in c("lightgbm", "catboost")) {
+    manifest <- .boosting_manifest_fixture(engine)
+    expect_no_error(dsFlower:::.validate_native_tree_manifest(manifest))
+
+    extra <- manifest
+    extra$parameters[[length(extra$parameters) + 1L]] <- list(
+      name = "subsample", type = "number", value = 0.5)
+    expect_error(
+      dsFlower:::.validate_native_tree_manifest(extra),
+      paste0("Unsupported ", if (engine == "lightgbm") {
+        "LightGBM-style"
+      } else {
+        "CatBoost-style"
+      }, " parameter"))
+
+    wrong <- manifest
+    index <- which(vapply(
+      wrong$parameters, `[[`, character(1), "name") == "learning_rate")
+    wrong$parameters[[index]]$type <- "integer"
+    wrong$parameters[[index]]$value <- 1L
+    expect_error(
+      dsFlower:::.validate_native_tree_manifest(wrong),
+      "learning_rate.*wrong declared type")
+  }
+
+  collapsed <- .boosting_manifest_fixture("catboost")
+  collapsed$public_schema$cuts[[1L]][[2L]] <-
+    collapsed$public_schema$cuts[[1L]][[1L]] + 1e-10
+  core <- collapsed$public_schema[c(
+    "version", "features", "lower", "upper", "cuts", "target")]
+  collapsed$public_schema$sha256 <- digest::digest(
+    dsFlower:::.native_tree_json(core), algo = "sha256", serialize = FALSE)
+  expect_error(
+    dsFlower:::.validate_native_tree_manifest(collapsed), "float32")
 })
 
 test_that("native-tree request wire re-pins exact bytes and digest", {
@@ -326,12 +424,16 @@ test_that("native-tree contract capability reflects the fresh probe", {
   expect_identical(capabilities$modes, "native-tight")
   expect_setequal(
     capabilities$engines,
-    c("xgboost", "lightgbm", "catboost", "random_forest"))
+    c("xgboost", "lightgbm", "catboost", "random_forest", "extra_trees"))
   expect_identical(capabilities$tasks, c("binary", "regression"))
   expect_true(capabilities$native_tight_requires_public_cuts)
   expect_identical(capabilities$max_manifest_bytes, 65536L)
   expect_identical(capabilities$max_total_public_cuts, 16384L)
   expect_false(capabilities$xgboost_native_tight_available)
+  expect_false(capabilities$extra_trees_native_tight_available)
+  expect_setequal(
+    capabilities$extra_trees_required_parameters,
+    c("max_depth", "n_estimators"))
   expect_setequal(
     capabilities$xgboost_required_parameters,
     c("learning_rate", "max_delta_step", "max_depth", "min_child_weight",

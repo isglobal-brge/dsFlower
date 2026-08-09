@@ -165,8 +165,8 @@ _SANITIZATION_FIELDS = frozenset((
 
 _MODEL_FORMATS = {
     "xgboost": "xgboost-json-v1",
-    "lightgbm": "lightgbm-text-v1",
-    "catboost": "catboost-cbm-v1",
+    "lightgbm": "dsflower-lightgbm-model-json-v1",
+    "catboost": "dsflower-catboost-model-json-v1",
     "random_forest": "dsflower-forest-json-v1",
     "extra_trees": "dsflower-forest-json-v1",
 }
@@ -691,24 +691,25 @@ def _json_object_without_duplicate_keys(artifact):
         raise ValueError("artifact encoding is invalid")
 
 
-def _validate_artifact_encoding(artifact_format, artifact):
+def _validate_artifact_encoding(artifact_format, artifact, manifest):
     if artifact_format in (
         "xgboost-json-v1", "dsflower-forest-json-v1",
     ):
         _json_object_without_duplicate_keys(artifact)
         return
-    if artifact_format == "lightgbm-text-v1":
-        try:
-            text = artifact.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("artifact encoding is invalid") from exc
-        if not text.startswith("tree\n") or "\x00" in text or any(
-                ord(char) < 0x20 and char not in "\n\r\t" for char in text):
-            raise ValueError("artifact encoding is invalid")
+    if artifact_format == "dsflower-lightgbm-model-json-v1":
+        from . import lightgbm_artifact
+        sanitized, _digest = lightgbm_artifact.sanitize_model(
+            artifact, manifest)
+        if sanitized != artifact:
+            raise ValueError("artifact is not a canonical safe projection")
         return
-    if artifact_format == "catboost-cbm-v1":
-        if not artifact.startswith(b"CBM1"):
-            raise ValueError("artifact encoding is invalid")
+    if artifact_format == "dsflower-catboost-model-json-v1":
+        from . import catboost_artifact
+        sanitized, _digest = catboost_artifact.sanitize_model(
+            artifact, manifest)
+        if sanitized != artifact:
+            raise ValueError("artifact is not a canonical safe projection")
         return
     raise ValueError("artifact format is unsupported")
 
@@ -779,7 +780,7 @@ def validate_backend_result(result, manifest, *, artifact_bytes):
     artifact = bytes(artifact_bytes)
     if len(artifact) != advertised_size:
         raise ValueError("artifact size does not match returned bytes")
-    _validate_artifact_encoding(expected_format, artifact)
+    _validate_artifact_encoding(expected_format, artifact, canonical)
     advertised_hash = artifact_meta["sha256"]
     actual_hash = hashlib.sha256(artifact).hexdigest()
     if not isinstance(advertised_hash, str) or not _HEX_64_RE.fullmatch(
