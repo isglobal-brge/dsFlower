@@ -2,26 +2,24 @@
 
 The adapter validates and materializes the complete effective training input,
 then derives sticky randomness with the runner's existing stateless PRF.  The
-committed native fork is still a fail-closed scaffold, so this module does not
-load a library or invoke training.  ``train_xgboost_native`` is the single
-explicit activation boundary and rejects every current or unknown status.
+verified node-owned bundle is mandatory.  Public R/Flower routing remains
+disabled until its own release gates pass; this module is only the internal
+execution boundary.
 
 Sanitization is deliberately separate from provenance: parsing native-looking
 JSON cannot prove that its topology and leaves came from privatized histograms.
-Only a future verified implementation of ``train_xgboost_native`` may connect
-native output to the sanitizer and result attestation.
+Only ``train_xgboost_native`` connects native output to the mandatory sanitizer.
 """
 
 import copy
 import hashlib
 import json
 import math
-import re
 
 import numpy as np
 
 from . import native_tree_contract as tree_contract
-from . import seeding, xgboost_accounting
+from . import seeding, xgboost_accounting, xgboost_bundle, xgboost_native
 from .xgboost_sanitizer import sanitize_xgboost_json
 
 
@@ -34,7 +32,6 @@ _ASCII_ID_TRIM = " \t\r\n"
 _MAX_PATIENT_ID_BYTES = 4096
 _NUMERIC_ABS_CAP = tree_contract.MAX_FLOAT_ABS
 _MAX_NATIVE_DEPTH = 30
-_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 _REQUIRED_ENGINE_PARAMETERS = {
     "base_score": "float",
@@ -54,10 +51,6 @@ _MECHANISM_PARAMETERS = {
 }
 
 
-class NativeXGBoostUnavailable(RuntimeError):
-    """Raised while the verified production native capability is absent."""
-
-
 class MaterializedXGBoostData:
     """Effective one-record-per-unit arrays that may cross the native ABI."""
 
@@ -70,31 +63,59 @@ class MaterializedXGBoostData:
         self.privacy_unit = privacy_unit
 
     def __repr__(self):
-        return "MaterializedXGBoostData(rows=%d, features=%d, unit=%s)" % (
-            self.features.shape[0], self.features.shape[1],
-            self.privacy_unit,
-        )
+        return "MaterializedXGBoostData(unit=%s)" % self.privacy_unit
 
 
 class PreparedXGBoostTraining:
     """Validated internal request; repr intentionally excludes data and key."""
 
     __slots__ = (
-        "_manifest", "_native_parameters", "_noise_key", "features",
-        "target", "invocation_id",
-        "num_boost_round", "profile",
+        "_features", "_manifest", "_native_bundle", "_native_bundle_sha256",
+        "_native_parameters", "_noise_key", "_num_boost_round", "_profile",
+        "_request_sha256", "_sealed", "_target", "invocation_id",
     )
 
     def __init__(self, *, manifest, native_parameters, noise_key, materialized,
-                 profile):
-        self._manifest = manifest
-        self._native_parameters = native_parameters
+                 profile, native_bundle):
+        object.__setattr__(self, "_sealed", False)
+        self._manifest = copy.deepcopy(manifest)
+        self._native_bundle = native_bundle
+        self._native_bundle_sha256 = native_bundle.bundle_sha256
+        self._native_parameters = copy.deepcopy(native_parameters)
         self._noise_key = noise_key
-        self.features = materialized.features
-        self.target = materialized.target
-        self.invocation_id = tree_contract.invocation_identity(manifest)
-        self.num_boost_round = profile["num_boost_round"]
-        self.profile = copy.deepcopy(profile)
+        self._features = materialized.features
+        self._target = materialized.target
+        self.invocation_id = tree_contract.invocation_identity(self._manifest)
+        self._num_boost_round = profile["num_boost_round"]
+        self._profile = copy.deepcopy(profile)
+        self._request_sha256 = xgboost_native.request_sha256(
+            self._manifest, self._profile, self._native_parameters)
+        self._sealed = True
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError("prepared native request is frozen")
+        object.__setattr__(self, name, value)
+
+    @property
+    def features(self):
+        result = self._features.view()
+        result.setflags(write=False)
+        return result
+
+    @property
+    def target(self):
+        result = self._target.view()
+        result.setflags(write=False)
+        return result
+
+    @property
+    def num_boost_round(self):
+        return self._num_boost_round
+
+    @property
+    def profile(self):
+        return copy.deepcopy(self._profile)
 
     @property
     def manifest(self):
@@ -105,13 +126,8 @@ class PreparedXGBoostTraining:
         return copy.deepcopy(self._native_parameters)
 
     def __repr__(self):
-        return (
-            "PreparedXGBoostTraining(invocation_id=%r, "
-            "rows=%d, features=%d, trees=%d)"
-        ) % (
-            self.invocation_id, self.features.shape[0], self.features.shape[1],
-            self.num_boost_round,
-        )
+        return "PreparedXGBoostTraining(invocation_id=%r, trees=%d)" % (
+            self.invocation_id, self._num_boost_round)
 
 
 def _typed_value(parameters, name, expected_type):
@@ -300,37 +316,132 @@ def _numeric_array_shape(value, name, ndim):
     return value.shape
 
 
-def _numeric_array(value, name, ndim, *, allow_nan=False):
+def _numeric_array(value, name, ndim):
     _numeric_array_shape(value, name, ndim)
-    with np.errstate(over="ignore", invalid="ignore"):
-        result = np.array(value, dtype=np.float32, order="C", copy=True)
-    valid = ~np.isinf(result) if allow_nan else np.isfinite(result)
-    if not bool(np.all(valid)):
-        raise ValueError("%s must remain finite as float32" % name)
-    return result
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            return np.array(value, dtype=np.float32, order="C", copy=True)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("%s cannot be represented as float32" % name) from exc
 
 
 def _canonical_patient_id(value):
-    if not isinstance(value, (str, np.str_)):
-        return _MISSING_PATIENT_UNIT
     try:
-        text = str(value).strip(_ASCII_ID_TRIM)
-    except (UnicodeError, ValueError):
+        text = ("" if value is None else str(value)).strip(_ASCII_ID_TRIM)
+        encoded = text.encode("utf-8", errors="strict")
+    except Exception:
         return _MISSING_PATIENT_UNIT
-    if not text or (len(text) <= 4 and text.lower() in (
-            "na", "nan", "null", "<na>", "nat")):
+    if not text or text.lower() in ("na", "nan", "null", "<na>", "nat"):
         return _MISSING_PATIENT_UNIT
-    if text.isascii():
-        if len(text) > _MAX_PATIENT_ID_BYTES:
-            return _MISSING_PATIENT_UNIT
-    else:
-        try:
-            if len(text.encode("utf-8", errors="strict")) > \
-                    _MAX_PATIENT_ID_BYTES:
-                return _MISSING_PATIENT_UNIT
-        except UnicodeError:
-            return _MISSING_PATIENT_UNIT
+    if len(encoded) > _MAX_PATIENT_ID_BYTES:
+        return _MISSING_PATIENT_UNIT
     return text
+
+
+def _totalize_features(features, lower, upper):
+    """Map every private feature value into its public float32 domain."""
+    missing = np.isnan(features)
+    np.copyto(features, lower, where=np.isneginf(features))
+    np.copyto(features, upper, where=np.isposinf(features))
+    np.maximum(features, lower, out=features, where=~missing)
+    np.minimum(features, upper, out=features, where=~missing)
+    features[missing] = np.float32(np.nan)
+    features[features == np.float32(0.0)] = np.float32(0.0)
+    return features
+
+
+def _totalize_target(target, task, lower, upper):
+    """Apply the public task mapping without a private-value rejection bit."""
+    if task == "binary_classification":
+        finite = np.isfinite(target)
+        return np.where(
+            finite & (target >= np.float32(0.5)),
+            np.float32(1.0), np.float32(0.0),
+        ).astype(np.float32, copy=False)
+    midpoint = np.float32(
+        float(lower) + (float(upper) - float(lower)) / 2.0)
+    target = np.nan_to_num(
+        target, copy=False, nan=midpoint, posinf=upper, neginf=lower)
+    np.maximum(target, lower, out=target)
+    np.minimum(target, upper, out=target)
+    target[target == np.float32(0.0)] = np.float32(0.0)
+    return target
+
+
+def _patient_unit_tokens(unit_ids, rows):
+    """Return only fixed-size canonical unit tokens; never retain raw IDs."""
+    if unit_ids is None or not isinstance(unit_ids, (list, tuple, np.ndarray)):
+        raise ValueError("patient unit identifiers must align one-to-one with rows")
+    if isinstance(unit_ids, np.ndarray) and unit_ids.ndim != 1:
+        raise ValueError("patient unit identifiers must align one-to-one with rows")
+    if len(unit_ids) != rows:
+        raise ValueError("patient unit identifiers must align one-to-one with rows")
+    tokens = np.empty(rows, dtype="|S32")
+    domain = b"dsflower/xgboost/patient-unit/v1\x00"
+    for index, value in enumerate(unit_ids):
+        unit = _canonical_patient_id(value)
+        tokens[index] = hashlib.sha256(
+            domain + unit.encode("utf-8", errors="strict")).digest()
+    return tokens
+
+
+def _canonical_group_order(tokens, features, target):
+    """Order raw rows by fixed unit token and totalized float32 contents."""
+    rows, columns = features.shape
+    width = 32 + 4 * columns + 4
+    records = np.empty((rows, width), dtype=np.uint8)
+    records[:, :32] = tokens.view(np.uint8).reshape(rows, 32)
+    records[:, 32:32 + 4 * columns] = np.asarray(
+        features, dtype="<f4", order="C").view(np.uint8).reshape(
+            rows, 4 * columns)
+    records[:, 32 + 4 * columns:] = np.asarray(
+        target, dtype="<f4", order="C").view(np.uint8).reshape(rows, 4)
+    keys = records.view(np.dtype((np.void, width))).reshape(rows)
+    return np.argsort(keys, kind="mergesort")
+
+
+def _aggregate_patient_units(features, target, tokens, task, feature_lower,
+                             feature_upper, target_lower, target_upper):
+    """Materialize one deterministic mean/majority record per fixed token."""
+    order = _canonical_group_order(tokens, features, target)
+    features = np.ascontiguousarray(features[order], dtype=np.float32)
+    target = np.ascontiguousarray(target[order], dtype=np.float32)
+    tokens = np.ascontiguousarray(tokens[order])
+
+    starts = np.flatnonzero(np.concatenate((
+        np.asarray([True]), tokens[1:] != tokens[:-1])))
+    group_counts = np.diff(np.append(starts, features.shape[0])).astype(
+        np.int64, copy=False)
+
+    observed = ~np.isnan(features)
+    values = np.where(observed, features, np.float32(0.0))
+    sums = np.add.reduceat(values, starts, axis=0, dtype=np.float64)
+    counts = np.add.reduceat(observed, starts, axis=0, dtype=np.int64)
+    means = np.full(sums.shape, np.nan, dtype=np.float64)
+    np.divide(sums, counts, out=means, where=counts > 0)
+    effective_features = np.asarray(means, dtype=np.float32, order="C")
+    np.maximum(effective_features, feature_lower, out=effective_features,
+               where=~np.isnan(effective_features))
+    np.minimum(effective_features, feature_upper, out=effective_features,
+               where=~np.isnan(effective_features))
+    effective_features[effective_features == np.float32(0.0)] = \
+        np.float32(0.0)
+    effective_features[np.isnan(effective_features)] = np.float32(np.nan)
+
+    target_sums = np.add.reduceat(target, starts, dtype=np.float64)
+    if task == "binary_classification":
+        effective_target = np.where(
+            2.0 * target_sums > group_counts,
+            np.float32(1.0), np.float32(0.0),
+        ).astype(np.float32, copy=False)
+    else:
+        effective_target = np.asarray(
+            target_sums / group_counts, dtype=np.float32)
+        np.maximum(effective_target, target_lower, out=effective_target)
+        np.minimum(effective_target, target_upper, out=effective_target)
+        effective_target[effective_target == np.float32(0.0)] = \
+            np.float32(0.0)
+    return effective_features, effective_target
 
 
 def _public_bin_indices(features, public_cuts):
@@ -348,103 +459,128 @@ def _public_bin_indices(features, public_cuts):
     return binned
 
 
-def _canonical_row_order(binned_features, target):
+def _canonical_row_order(binned_features, target, features):
     """Sort by effective public-bin bytes followed by float32 target bytes."""
     rows, columns = binned_features.shape
     little_features = np.asarray(binned_features, dtype="<u4", order="C")
     little_target = np.asarray(target, dtype="<f4", order="C")
-    width = 4 * columns + 4
+    little_raw_features = np.asarray(features, dtype="<f4", order="C")
+    width = 8 * columns + 4
     records = np.empty((rows, width), dtype=np.uint8)
     records[:, :4 * columns] = little_features.view(
         np.uint8).reshape(rows, 4 * columns)
-    records[:, 4 * columns:] = little_target.view(
+    records[:, 4 * columns:4 * columns + 4] = little_target.view(
         np.uint8).reshape(rows, 4)
+    records[:, 4 * columns + 4:] = little_raw_features.view(
+        np.uint8).reshape(rows, 4 * columns)
     keys = records.view(np.dtype((np.void, width))).reshape(rows)
     return np.argsort(keys, kind="mergesort")
 
 
 def _materialization_peak_bytes(rows, columns, privacy_unit):
     """Conservative peak for canonical copies, masks, sort keys and indices."""
-    per_row = 18 * int(columns) + 20
+    per_row = 32 * int(columns) + 64
     if privacy_unit == "patient":
-        # A fixed SHA-256 token plus Python set/object-table overhead.  Keeping
-        # digests instead of arbitrary-length identifiers bounds this adapter
-        # working set independently of identifier length.
-        per_row += 192
+        # Fixed tokens, canonical group records and worst-case one-row groups.
+        # Raw identifiers are never retained by the materialized object.
+        per_row += 40 * int(columns) + 320
     return int(rows) * per_row
 
 
+def _native_training_peak_bytes(rows, columns, privacy_unit, profile, resources):
+    """Conservative co-resident peak before any private array is copied."""
+    effective_rows = max(1, int(rows))
+    features = int(columns)
+    depth_frontier = 1 << (int(profile["max_depth"]) - 1)
+    cut_count = sum(len(feature) for feature in profile["public_cuts"])
+    bins_per_frontier = sum(
+        len(feature) + 2 for feature in profile["public_cuts"])
+    histogram_cells = depth_frontier * bins_per_frontier
+    private_coordinates = 2 * (histogram_cells + 1)
+    core = (
+        16 * histogram_cells +
+        32 * private_coordinates +
+        64 * depth_frontier +
+        4 * effective_rows +
+        16 * (features + 1) +
+        4 * cut_count +
+        1024 * 1024
+    )
+    materialization = _materialization_peak_bytes(
+        effective_rows, features, privacy_unit)
+    # Retained canonical tensors plus a dense SimpleDMatrix, row offsets,
+    # gradients and predictions.  This deliberately assumes no sparse saving.
+    dataset = effective_rows * (24 * features + 96) + 8 * (
+        effective_rows + 1)
+    # Native buffer, Python copy, parsed sanitizer objects and canonical output.
+    artifact = 8 * int(resources["max_artifact_bytes"])
+    subtotal = core + materialization + dataset + artifact
+    return subtotal + subtotal // 4 + 16 * 1024 * 1024
+
+
 def materialize_xgboost_units(manifest, features, target, *, unit_ids=None):
-    """Copy, validate and freeze exactly one effective row per privacy unit."""
+    """Totalize raw values and freeze one effective row per privacy unit."""
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_xgboost_profile(canonical)
     rows, columns = _numeric_array_shape(features, "features", 2)
     target_rows, = _numeric_array_shape(target, "target", 1)
-    if rows < 1 or target_rows != rows:
-        raise ValueError("target row count must match a non-empty feature matrix")
+    if target_rows != rows:
+        raise ValueError("target row count must match the feature matrix")
     if columns != len(canonical["public_schema"]["features"]):
         raise ValueError("feature count differs from the public schema")
     if rows > canonical["resources"]["max_rows"]:
         raise ValueError("materialized units exceed the row ceiling")
-    xgboost_accounting.validate_fixed_point_unit_geometry(
-        rows, profile["fixed_point_scale"])
     if columns > canonical["resources"]["max_features"]:
         raise ValueError("materialized features exceed the feature ceiling")
     privacy_unit = canonical["privacy"]["unit"]
-    if _materialization_peak_bytes(rows, columns, privacy_unit) > \
+    if _native_training_peak_bytes(
+            rows, columns, privacy_unit, profile, canonical["resources"]) > \
             canonical["resources"]["memory_mib"] * 1024 * 1024:
-        raise ValueError("materialized arrays exceed the memory ceiling")
+        raise ValueError("complete native training exceeds the memory ceiling")
 
-    X = _numeric_array(features, "features", 2, allow_nan=True)
+    X = _numeric_array(features, "features", 2)
     y = _numeric_array(target, "target", 1)
 
     lower = np.asarray(profile["feature_lower"], dtype=np.float32)
     upper = np.asarray(profile["feature_upper"], dtype=np.float32)
-    missing = np.isnan(X)
-    if bool(np.any((X < lower) | (X > upper))):
-        raise ValueError("features exceed their public bounds")
-
     target_lower = np.float32(profile["target_lower"])
     target_upper = np.float32(profile["target_upper"])
-    if bool(np.any(y < target_lower)) or bool(np.any(y > target_upper)):
-        raise ValueError("target exceeds its public bounds")
-    if canonical["task"] == "binary_classification" and not bool(
-            np.all((y == np.float32(0.0)) | (y == np.float32(1.0)))):
-        raise ValueError("binary target must contain exactly zero or one")
+    X = _totalize_features(X, lower, upper)
+    y = _totalize_target(
+        y, canonical["task"], target_lower, target_upper)
 
-    X[X == np.float32(0.0)] = np.float32(0.0)
-    X[missing] = np.float32(np.nan)
-    y[y == np.float32(0.0)] = np.float32(0.0)
+    if rows == 0:
+        X = np.full((1, columns), np.nan, dtype=np.float32)
+        y = np.asarray([
+            np.float32(0.0) if canonical["task"] == "binary_classification"
+            else np.float32(profile["base_score"])
+        ], dtype=np.float32)
 
     if privacy_unit == "row":
         if unit_ids is not None:
             raise ValueError("row-level materialization must not carry unit identifiers")
     else:
-        if unit_ids is None or not isinstance(unit_ids, (list, tuple, np.ndarray)):
-            raise ValueError("patient unit identifiers must align one-to-one with rows")
-        if isinstance(unit_ids, np.ndarray) and unit_ids.ndim != 1:
-            raise ValueError("patient unit identifiers must align one-to-one with rows")
-        if len(unit_ids) != rows:
-            raise ValueError("patient unit identifiers must align one-to-one with rows")
-        seen = set()
-        for value in unit_ids:
-            unit = _canonical_patient_id(value)
-            if unit == _MISSING_PATIENT_UNIT:
-                raise ValueError("patient unit identifier is missing or invalid")
-            token = hashlib.sha256(
-                b"dsflower/xgboost/patient-unit/v1\x00" +
-                unit.encode("utf-8", errors="strict")).digest()
-            if token in seen:
+        if rows == 0:
+            if unit_ids is not None and (
+                    not isinstance(unit_ids, (list, tuple, np.ndarray)) or
+                    (isinstance(unit_ids, np.ndarray) and unit_ids.ndim != 1) or
+                    len(unit_ids) != 0):
                 raise ValueError(
-                    "duplicated patient units violate one-record-per-unit")
-            seen.add(token)
+                    "patient unit identifiers must align one-to-one with rows")
+        else:
+            tokens = _patient_unit_tokens(unit_ids, rows)
+            X, y = _aggregate_patient_units(
+                X, y, tokens, canonical["task"], lower, upper,
+                target_lower, target_upper)
 
-    # Unit labels select contribution groups but are not a model input once the
-    # one-record-per-unit contract is validated.  Canonicalise both row- and
-    # patient-level data by the effective numeric records, so harmless row
-    # permutations or patient relabelling cannot create a fresh noise stream.
+    xgboost_accounting.validate_fixed_point_unit_geometry(
+        X.shape[0], profile["fixed_point_scale"])
+
+    # Unit labels only select contribution groups.  The native matrix and sticky
+    # identity contain the effective bounded records, never identifiers or raw
+    # visit multiplicities.
     binned = _public_bin_indices(X, profile["public_cuts"])
-    order = _canonical_row_order(binned, y)
+    order = _canonical_row_order(binned, y, X)
 
     X = np.ascontiguousarray(X[order], dtype=np.float32)
     y = np.ascontiguousarray(y[order], dtype=np.float32)
@@ -494,12 +630,11 @@ def _native_parameters(canonical, profile):
     return parameters
 
 
-def prepare_xgboost_training(manifest, features, target, *, unit_ids=None,
-                             native_bundle_sha256):
+def prepare_xgboost_training(manifest, features, target, *, native_bundle,
+                             unit_ids=None):
     """Prepare one complete T-tree training and its private-bound sticky key."""
-    if not isinstance(native_bundle_sha256, str) or \
-            _SHA256_RE.fullmatch(native_bundle_sha256) is None:
-        raise ValueError("verified native bundle SHA-256 is missing or invalid")
+    if not xgboost_bundle.is_verified_bundle(native_bundle):
+        raise ValueError("verified native XGBoost bundle is required")
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_xgboost_profile(canonical)
     materialized = materialize_xgboost_units(
@@ -549,7 +684,7 @@ def prepare_xgboost_training(manifest, features, target, *, unit_ids=None,
     ).encode("ascii")
     privacy_policy["policy_hash"] = hashlib.sha256(privacy_wire).hexdigest()
     private_arrays = (materialized._binned_features, materialized.target)
-    master = seeding.master_seed(
+    master = bytearray(seeding.master_seed(
         MECHANISM_PROFILE,
         semantic_config,
         privacy_policy,
@@ -557,52 +692,33 @@ def prepare_xgboost_training(manifest, features, target, *, unit_ids=None,
         private_arrays=private_arrays,
         execution_fingerprint={
             "contract": EXECUTION_PROFILE,
-            "native_bundle_sha256": native_bundle_sha256,
+            "native_bundle_sha256": native_bundle.bundle_sha256,
         },
-    )
-    noise_key = seeding.sub_seed(master, "xgboost/native-fixed-point-noise/v1")
+    ))
+    try:
+        noise_key = bytearray(seeding.sub_seed(
+            master, "xgboost/native-fixed-point-noise/v1"))
+    finally:
+        master[:] = b"\x00" * len(master)
     return PreparedXGBoostTraining(
         manifest=canonical,
         native_parameters=_native_parameters(canonical, profile),
         noise_key=noise_key,
         materialized=materialized,
         profile=profile,
+        native_bundle=native_bundle,
     )
 
 
-def train_xgboost_native(prepared, *, native_status=None):
-    """Fail closed until a reviewed production C ABI replaces the scaffold.
-
-    ``native_status`` is accepted only so deployment probes can feed the status
-    they observed into this fixed boundary.  It is never reflected in the
-    exception because native diagnostics are node-admin-only output.
-    """
-    if not isinstance(prepared, PreparedXGBoostTraining):
+def train_xgboost_native(prepared):
+    """Train once through the verified ABI and return canonical safe bytes."""
+    if type(prepared) is not PreparedXGBoostTraining:
         raise ValueError("native XGBoost request was not prepared by dsFlower")
-    del native_status
-    raise NativeXGBoostUnavailable(
-        "native XGBoost DP training is not a verified production capability")
+    return xgboost_native.train(prepared)
 
 
 def _sanitizer_arguments(canonical, profile):
-    theoretical_nodes = profile["num_boost_round"] * (
-        (1 << (profile["max_depth"] + 1)) - 1)
-    # Every JSON node consumes multiple bytes.  This secondary bound prevents a
-    # nonsensical public depth from turning the parser cap into a giant integer;
-    # it never truncates a model and only rejects output above the byte ceiling.
-    byte_bound_nodes = canonical["resources"]["max_artifact_bytes"]
-    return {
-        "expected_task": canonical["task"],
-        "expected_features": len(canonical["public_schema"]["features"]),
-        "expected_trees": profile["num_boost_round"],
-        "expected_max_depth": profile["max_depth"],
-        "public_cuts": profile["public_cuts"],
-        "expected_base_score": profile["base_score"],
-        "max_total_nodes": min(theoretical_nodes, byte_bound_nodes),
-        "max_artifact_bytes": canonical["resources"]["max_artifact_bytes"],
-        "numeric_abs_cap": _NUMERIC_ABS_CAP,
-        "leaf_abs_cap": profile["leaf_abs_cap"],
-    }
+    return xgboost_native.fixed_sanitizer_arguments(canonical, profile)
 
 
 def sanitize_xgboost_artifact(manifest, artifact):
@@ -661,7 +777,6 @@ __all__ = [
     "EXECUTION_PROFILE",
     "MECHANISM_PROFILE",
     "MaterializedXGBoostData",
-    "NativeXGBoostUnavailable",
     "PreparedXGBoostTraining",
     "build_xgboost_ensemble",
     "canonical_xgboost_profile",
