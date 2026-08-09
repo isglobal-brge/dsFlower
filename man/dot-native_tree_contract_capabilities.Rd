@@ -2,11 +2,16 @@
 % Please edit documentation in R/native_tree_contract.R
 \name{.native_tree_contract_capabilities}
 \alias{.native_tree_contract_capabilities}
-\title{Capability payload for the public request contract (not backend availability)}
+\title{Capability payload for the public request contract and operational probe}
 \usage{
-.native_tree_contract_capabilities()
+.native_tree_contract_capabilities(
+  xgboost_available = .native_tree_xgboost_probe()
+)
+}
+\arguments{
+\item{xgboost_available}{Result of the fresh node-local runtime probe.}
 }
 \description{
-Capability payload for the public request contract (not backend availability)
+Capability payload for the public request contract and operational probe
 }
 \keyword{internal}

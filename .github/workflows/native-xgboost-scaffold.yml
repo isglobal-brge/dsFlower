@@ -4,20 +4,24 @@ on:
   push:
     paths:
       - ".github/workflows/native-xgboost-scaffold.yml"
-      - "inst/flower_app/dsflower_runner/native_tree_contract.py"
+      - "inst/flower_app/dsflower_runner/native_tree_*.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
+      - "inst/flower_app/dsflower_runner/task.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
-      - "inst/python/tests/test_native_tree_contract.py"
+      - "inst/python/tests/test_native_tree_*.py"
+      - "inst/python/tests/test_sitecustomize.py"
       - "inst/python/tests/test_xgboost_*.py"
       - "native/xgboost/**"
       - "native/dp_primitives/**"
   pull_request:
     paths:
       - ".github/workflows/native-xgboost-scaffold.yml"
-      - "inst/flower_app/dsflower_runner/native_tree_contract.py"
+      - "inst/flower_app/dsflower_runner/native_tree_*.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
+      - "inst/flower_app/dsflower_runner/task.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
-      - "inst/python/tests/test_native_tree_contract.py"
+      - "inst/python/tests/test_native_tree_*.py"
+      - "inst/python/tests/test_sitecustomize.py"
       - "inst/python/tests/test_xgboost_*.py"
       - "native/xgboost/**"
       - "native/dp_primitives/**"
@@ -66,9 +70,16 @@ jobs:
           else
             contract_python="$RUNNER_TEMP/xgb-contract-venv/bin/python"
           fi
-          "$contract_python" -m pip install --disable-pip-version-check numpy==2.4.6
+          "$contract_python" -m pip install --disable-pip-version-check \
+            flwr==1.31.0 \
+            numpy==2.4.6 \
+            pandas==3.0.3 \
+            pyarrow==23.0.1 \
+            cryptography==46.0.7
           "$contract_python" -m unittest -v \
             inst/python/tests/test_native_tree_contract.py \
+            inst/python/tests/test_native_tree_flower_app.py \
+            inst/python/tests/test_sitecustomize.py \
             inst/python/tests/test_xgboost_accounting.py \
             inst/python/tests/test_xgboost_adapter.py \
             inst/python/tests/test_xgboost_sanitizer.py \

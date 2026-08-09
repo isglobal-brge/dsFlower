@@ -194,6 +194,39 @@ def load_data(context=None):
     return X, y
 
 
+def load_native_tree_data(context=None, *, manifest=None):
+    """Load one tabular native-tree input without reopening its staged table."""
+    if manifest is None:
+        manifest = _load_manifest(context)
+    if manifest.get("data_type") != "tabular":
+        raise ValueError("native-tree training requires staged tabular data")
+    manifest_dir = _get_manifest_dir(context)
+    data_file = os.path.join(manifest_dir, manifest["data_file"])
+    frame = _read_staged_frame(data_file, manifest)
+
+    target_column = manifest.get("target_column")
+    feature_columns = manifest.get("feature_columns")
+    patient_column = manifest.get("patient_column")
+    if not isinstance(target_column, str) or target_column not in frame.columns:
+        raise ValueError("native-tree manifest target is unavailable")
+    if not isinstance(feature_columns, list) or not feature_columns or \
+            any(not isinstance(column, str) or not column
+                for column in feature_columns) or \
+            len(set(feature_columns)) != len(feature_columns) or \
+            patient_column in feature_columns or \
+            target_column in feature_columns or \
+            any(column not in frame.columns for column in feature_columns):
+        raise ValueError("native-tree manifest features are invalid")
+
+    features = _load_features(frame[feature_columns], manifest)
+    target = _load_target(frame[target_column], manifest)
+    unit_ids = _load_patient_ids(frame, manifest)
+    assert_pinned_unit_count(
+        context, int(features.shape[0]), patient_ids=unit_ids,
+        manifest=manifest)
+    return features, target, unit_ids
+
+
 def is_image_run(context=None):
     """True if the staged manifest is an image collection (data_type=='image')."""
     return _load_manifest(context).get("data_type") == "image"
@@ -232,9 +265,11 @@ def _load_patient_ids(df, manifest):
         [_canonical_patient_id(value) for value in values], dtype=str)
 
 
-def assert_pinned_unit_count(context, n_rows, patient_ids=None):
+def assert_pinned_unit_count(context, n_rows, patient_ids=None, *,
+                             manifest=None):
     """Fail closed on a structurally changed staged privacy-unit roster."""
-    manifest = _load_manifest(context)
+    if manifest is None:
+        manifest = _load_manifest(context)
     if "n_units" not in manifest:
         return
     raw = manifest["n_units"]

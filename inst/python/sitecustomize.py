@@ -61,11 +61,31 @@ def _load_user_module_name():
 # treated as "foreign" application code even if their path looks unusual.
 _RUNTIME_PKGS = {"flwr", "flwr_serverapp", "flwr_clientapp"}
 
-# The node may execute exactly this node-installed, hash-pinned ClientApp.  The
-# FAB controls pyproject.toml, so package hashing alone is insufficient: without
-# this object-reference gate it could point Flower at a trusted stdlib or
-# site-packages callable and avoid importing dsflower_runner altogether.
-_CANONICAL_CLIENTAPP_REF = "dsflower_runner.client_app:app"
+# The node may execute exactly the node-installed, hash-pinned ClientApp selected
+# by its own manifest.  The FAB controls pyproject.toml, so package hashing alone
+# is insufficient: without this gate it could point Flower at another callable.
+_UNIFIED_CLIENTAPP_REF = "dsflower_runner.client_app:app"
+_NATIVE_TREE_CLIENTAPP_REF = "dsflower_runner.native_tree_client_app:app"
+
+
+def _load_canonical_clientapp_ref():
+    if not MANIFEST_FILE or not os.path.exists(MANIFEST_FILE):
+        return ""
+    try:
+        import json
+        with open(MANIFEST_FILE, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        track = manifest.get("dp-track") if isinstance(manifest, dict) else None
+    except Exception:
+        return ""
+    if track == "native_tree":
+        return _NATIVE_TREE_CLIENTAPP_REF
+    if track in ("neural", "egress", "validation"):
+        return _UNIFIED_CLIENTAPP_REF
+    return ""
+
+
+_CANONICAL_CLIENTAPP_REF = _load_canonical_clientapp_ref()
 
 _verified_packages = set()
 
@@ -174,7 +194,8 @@ def _install_clientapp_load_guard(module):
         return
 
     def guarded_load_app(module_attribute_str, *args, **kwargs):
-        if (not isinstance(module_attribute_str, str) or
+        if (not _CANONICAL_CLIENTAPP_REF or
+                not isinstance(module_attribute_str, str) or
                 module_attribute_str != _CANONICAL_CLIENTAPP_REF):
             _abort("unexpected ClientApp entrypoint '%s' (node pinned '%s')."
                    % (module_attribute_str, _CANONICAL_CLIENTAPP_REF))

@@ -747,6 +747,9 @@ test_that("flowerCleanupRunDS stops associated SuperNode before reset", {
 })
 
 test_that("flowerGetCapabilitiesDS returns expected structure", {
+  local_mocked_bindings(
+    .native_tree_xgboost_probe = function(...) FALSE,
+    .package = "dsFlower")
   caps <- flowerGetCapabilitiesDS()
   expect_type(caps, "list")
   expect_true("dsflower_version" %in% names(caps))
@@ -777,6 +780,9 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
       "huber", "quantile")
   )
   expect_false("tree_objectives" %in% names(caps))
+  expect_identical(caps$native_tree$contract,
+                   "dsflower-native-tree-request-v1")
+  expect_false(caps$native_tree$xgboost_native_tight_available)
   expect_setequal(
     caps$aggregation_strategies,
     c("fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm")
