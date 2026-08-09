@@ -25,11 +25,18 @@ def _typed(kind, value):
 
 def _public_schema(cuts=True, task="binary_classification"):
     target = (
-        {"name": "outcome", "kind": "binary", "lower": 0.0, "upper": 1.0}
+        {
+            "name": "outcome", "kind": "binary",
+            "levels": [
+                {"type": "string", "value": "control"},
+                {"type": "string", "value": "case"},
+            ],
+            "lower": 0.0, "upper": 1.0,
+        }
         if task == "binary_classification"
         else {
             "name": "outcome", "kind": "continuous",
-            "lower": -10.0, "upper": 10.0,
+            "levels": None, "lower": -10.0, "upper": 10.0,
         }
     )
     core = {
@@ -46,20 +53,17 @@ def _public_schema(cuts=True, task="binary_classification"):
     return dict(core, sha256=hashlib.sha256(wire).hexdigest())
 
 
-def _manifest(mode="native-tight", engine="xgboost",
-              task="binary_classification"):
-    mechanism = "dp-synopsis-v1" if mode == "synopsis-flex" else (
+def _manifest(engine="xgboost", task="binary_classification"):
+    mechanism = (
         "dp-forest-v1" if engine in ("random_forest", "extra_trees")
         else "dp-histogram-v1"
     )
     return {
         "contract_version": 1,
-        "mode": mode,
+        "mode": "native-tight",
         "engine": engine,
         "task": task,
-        "public_schema": _public_schema(
-            cuts=mode == "native-tight", task=task
-        ),
+        "public_schema": _public_schema(task=task),
         "engine_params": {
             "learning_rate": _typed("float", 0.1),
             "max_depth": _typed("int", 6),
@@ -82,9 +86,7 @@ def _manifest(mode="native-tight", engine="xgboost",
         "data_scope": {
             "snapshot_hash": "a" * 64,
             "cohort_hash": "b" * 64,
-            "schema_hash": _public_schema(
-                cuts=mode == "native-tight", task=task
-            )["sha256"],
+            "schema_hash": _public_schema(task=task)["sha256"],
         },
         "resources": {
             "threads": 4,
@@ -143,6 +145,7 @@ class ManifestTests(unittest.TestCase):
             "seed", "nthread", "device", "updater", "objective",
             "model_file", "snapshot_path", "callbacks", "machine_list_file",
             "max_rows_per_unit", "unit_canonicalization", "privacy_epsilon",
+            "eval_metric", "early_stopping_rounds", "custom_objective_fn",
         ):
             with self.subTest(name=name):
                 manifest = _manifest()
@@ -150,33 +153,16 @@ class ManifestTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "reserved"):
                     contract.canonical_engine_manifest(manifest)
 
-        synopsis = _manifest(mode="synopsis-flex")
-        synopsis["engine_params"] = {
-            "objective": _typed("string", "binary:logistic"),
-            "eval_metric": _typed("string", "auc"),
-            "early_stopping_rounds": _typed("int", 10),
-            "seed": _typed("int", 7),
-        }
-        self.assertEqual(
-            len(contract.canonical_engine_manifest(synopsis)["engine_params"]),
-            4,
-        )
-        synopsis["engine_params"] = {"callbacks": _typed("string", "unsafe")}
+        manifest = _manifest()
+        manifest["privacy"]["mechanism_params"] = {"seed": _typed("int", 7)}
         with self.assertRaisesRegex(ValueError, "reserved"):
-            contract.canonical_engine_manifest(synopsis)
-
-        synopsis["engine_params"] = {
-            "custom_objective_fn": _typed("string", "unsafe")
-        }
-        with self.assertRaisesRegex(ValueError, "reserved"):
-            contract.canonical_engine_manifest(synopsis)
-
-        synopsis = _manifest(mode="synopsis-flex")
-        synopsis["privacy"]["mechanism_params"] = {"seed": _typed("int", 7)}
-        with self.assertRaisesRegex(ValueError, "reserved"):
-            contract.canonical_engine_manifest(synopsis)
+            contract.canonical_engine_manifest(manifest)
 
     def test_manifest_and_resource_caps_are_strict(self):
+        self.assertEqual(
+            contract.RESOURCE_HARD_CAPS["max_artifact_bytes"],
+            64 * 1024 * 1024,
+        )
         for name, limit in contract.RESOURCE_HARD_CAPS.items():
             manifest = _manifest()
             manifest["resources"][name] = limit + 1
@@ -200,9 +186,14 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "resource limit"):
             contract.canonical_engine_manifest(manifest)
 
-    def test_mode_engine_and_mechanism_combinations_are_pinned(self):
-        manifest = _manifest(mode="synopsis-flex")
-        manifest["privacy"]["mechanism"] = "dp-histogram-v1"
+    def test_mode_and_mechanism_are_pinned(self):
+        manifest = _manifest()
+        manifest["mode"] = "unsupported"
+        with self.assertRaisesRegex(ValueError, "mode"):
+            contract.canonical_engine_manifest(manifest)
+
+        manifest = _manifest()
+        manifest["privacy"]["mechanism"] = "dp-forest-v1"
         with self.assertRaisesRegex(ValueError, "mechanism"):
             contract.canonical_engine_manifest(manifest)
 
@@ -211,7 +202,7 @@ class ManifestTests(unittest.TestCase):
         canonical = contract.canonical_engine_manifest(manifest)
         self.assertEqual(
             canonical["public_schema"]["sha256"],
-            "a24299d5ccba8a1af70f0c2d5afa06937d9632a75bc69d20d3e1520ec96d5733",
+            "77a6e8d46a174381b8b4da168b833b2ee75f09f8ca8ac55f2c954be642ba9073",
         )
 
         tampered = copy.deepcopy(manifest)
@@ -226,11 +217,6 @@ class ManifestTests(unittest.TestCase):
         ]["sha256"]
         with self.assertRaisesRegex(ValueError, "public cuts"):
             contract.canonical_engine_manifest(missing_cuts)
-
-        synopsis = _manifest(mode="synopsis-flex")
-        self.assertIsNone(
-            contract.canonical_engine_manifest(synopsis)["public_schema"]["cuts"]
-        )
 
         mismatch = _manifest()
         mismatch["data_scope"]["schema_hash"] = "0" * 64
@@ -258,6 +244,38 @@ class ManifestTests(unittest.TestCase):
         duplicate_target["public_schema"]["target"]["name"] = "age"
         with self.assertRaisesRegex(ValueError, "target name"):
             contract.canonical_engine_manifest(duplicate_target)
+
+    def test_binary_target_levels_are_ordered_typed_and_schema_bound(self):
+        base = _manifest()
+        canonical = contract.canonical_engine_manifest(base)
+        self.assertEqual(canonical["public_schema"]["target"]["levels"], [
+            {"type": "string", "value": "control"},
+            {"type": "string", "value": "case"},
+        ])
+
+        for levels in (
+                None,
+                [{"type": "string", "value": "case"}],
+                [
+                    {"type": "string", "value": "case"},
+                    {"type": "string", "value": "case"},
+                ],
+                [
+                    {"type": "number", "value": True},
+                    {"type": "number", "value": 1.0},
+                ]):
+            changed = _manifest()
+            changed["public_schema"]["target"]["levels"] = levels
+            with self.subTest(levels=levels), self.assertRaises(ValueError):
+                contract.canonical_engine_manifest(changed)
+
+        regression = _manifest(task="regression")
+        regression["public_schema"]["target"]["levels"] = [
+            {"type": "number", "value": 0.0},
+            {"type": "number", "value": 1.0},
+        ]
+        with self.assertRaisesRegex(ValueError, "must be null"):
+            contract.canonical_engine_manifest(regression)
 
     def test_privacy_unit_is_server_pinned_but_supports_rows_and_patients(self):
         manifest = _manifest()
@@ -292,123 +310,23 @@ class ManifestTests(unittest.TestCase):
             contract.canonical_engine_manifest(manifest)
 
 
-class IdentityTests(unittest.TestCase):
-    def setUp(self):
-        self.root = bytes(range(32))
-
-    def test_synopsis_identity_shares_engines_and_hpo_but_not_tasks(self):
-        base = _manifest(mode="synopsis-flex")
-        query_id = contract.semantic_query_identity(self.root, base)
-
-        changed_params = copy.deepcopy(base)
-        changed_params["engine_params"]["learning_rate"]["value"] = 0.9
-        self.assertEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_params),
-        )
-
-        changed_resources = copy.deepcopy(base)
-        changed_resources["resources"]["threads"] = 1
-        self.assertEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_resources),
-        )
-
-        changed_engine = copy.deepcopy(base)
-        changed_engine["engine"] = "lightgbm"
-        self.assertEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_engine),
-        )
-
-        changed_task = _manifest(mode="synopsis-flex", task="regression")
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_task),
-        )
-
-        changed_mechanism = copy.deepcopy(base)
-        changed_mechanism["privacy"]["mechanism_params"]["gradient_clip"]["value"] = 2.0
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_mechanism),
-        )
-
-        changed_scope = copy.deepcopy(base)
-        changed_scope["data_scope"]["snapshot_hash"] = "e" * 64
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_scope),
-        )
-
-    def test_native_tight_identity_includes_engine_task_and_mechanism_parameters(self):
-        base = _manifest()
-        query_id = contract.semantic_query_identity(self.root, base)
-
-        changed_engine = copy.deepcopy(base)
-        changed_engine["engine_params"]["max_depth"]["value"] = 7
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_engine),
-        )
-
-        changed_mechanism = copy.deepcopy(base)
-        changed_mechanism["privacy"]["mechanism_params"]["hessian_clip"]["value"] = 2.0
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_mechanism),
-        )
-
-        changed_unit = copy.deepcopy(base)
-        changed_unit["privacy"]["unit"] = "row"
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_unit),
-        )
-
-        changed_task = _manifest(task="regression")
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_task),
-        )
-
-        changed_allocation = copy.deepcopy(base)
-        changed_allocation["privacy"]["epsilon"] = 2.0
-        changed_allocation["privacy"]["delta"] = 2e-6
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(self.root, changed_allocation),
-        )
-        self.assertNotEqual(
-            contract.invocation_identity(base),
-            contract.invocation_identity(changed_allocation),
-        )
-
-    def test_identity_is_keyed_and_invocation_binds_every_field(self):
-        manifest = _manifest(mode="synopsis-flex")
-        query_id = contract.semantic_query_identity(self.root, manifest)
-        self.assertRegex(query_id, r"^sq1s_[0-9a-f]{64}$")
-        self.assertNotIn(self.root.hex(), query_id)
-        self.assertNotEqual(
-            query_id,
-            contract.semantic_query_identity(b"x" * 32, manifest),
-        )
-        with self.assertRaisesRegex(ValueError, "exactly 32 bytes"):
-            contract.semantic_query_identity(b"short", manifest)
+class InvocationIdentityTests(unittest.TestCase):
+    def test_invocation_identity_binds_every_public_field(self):
+        manifest = _manifest()
+        invocation_id = contract.invocation_identity(manifest)
+        self.assertRegex(invocation_id, r"^inv1_[0-9a-f]{64}$")
 
         changed = copy.deepcopy(manifest)
         changed["engine_params"]["max_depth"]["value"] = 9
         self.assertNotEqual(
-            contract.invocation_identity(manifest),
+            invocation_id,
             contract.invocation_identity(changed),
         )
 
-        native_id = contract.semantic_query_identity(self.root, _manifest())
-        self.assertRegex(native_id, r"^sq1n_[0-9a-f]{64}$")
         changed = copy.deepcopy(manifest)
         changed["resources"]["threads"] = 2
         self.assertNotEqual(
-            contract.invocation_identity(manifest),
+            invocation_id,
             contract.invocation_identity(changed),
         )
 
@@ -416,17 +334,15 @@ class IdentityTests(unittest.TestCase):
 class ResultTests(unittest.TestCase):
     def setUp(self):
         self.manifest = _manifest()
-        self.query_id = contract.semantic_query_identity(b"q" * 32, self.manifest)
         self.invocation_id = contract.invocation_identity(self.manifest)
         self.artifact = b'{"learner":{"attributes":{}}}'
         self.metadata = contract.artifact_sanitization_metadata(
-            self.manifest, self.query_id, "model"
+            self.manifest, "model"
         )
         self.result = {
             "contract_version": 1,
             "status": "ok",
             "invocation_id": self.invocation_id,
-            "semantic_query_id": self.query_id,
             "engine": "xgboost",
             "mode": "native-tight",
             "artifact": {
@@ -442,10 +358,11 @@ class ResultTests(unittest.TestCase):
         validated = contract.validate_backend_result(
             self.result,
             self.manifest,
-            expected_query_id=self.query_id,
             artifact_bytes=self.artifact,
         )
         self.assertEqual(validated, self.result)
+        self.assertNotIn("semantic_query_id", validated)
+        self.assertNotIn("semantic_query_id", validated["sanitization"])
 
         for field, value in (("size_bytes", 1), ("sha256", "0" * 64)):
             result = copy.deepcopy(self.result)
@@ -455,13 +372,13 @@ class ResultTests(unittest.TestCase):
                     contract.validate_backend_result(
                         result,
                         self.manifest,
-                        expected_query_id=self.query_id,
                         artifact_bytes=self.artifact,
                     )
 
     def test_result_rejects_logs_paths_extra_fields_and_bad_attestation(self):
         for location, name, value in (
             ((), "logs", "raw row: secret"),
+            ((), "semantic_query_id", "sq1n_" + "0" * 64),
             (("artifact",), "path", "/private/data/model"),
             (("sanitization",), "debug", "secret"),
         ):
@@ -475,7 +392,6 @@ class ResultTests(unittest.TestCase):
                     contract.validate_backend_result(
                         result,
                         self.manifest,
-                        expected_query_id=self.query_id,
                         artifact_bytes=self.artifact,
                     )
 
@@ -485,7 +401,6 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 result,
                 self.manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=self.artifact,
             )
 
@@ -496,7 +411,6 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 result,
                 self.manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=self.artifact,
             )
 
@@ -506,7 +420,6 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 result,
                 self.manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=self.artifact,
             )
 
@@ -518,7 +431,6 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 result,
                 self.manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=malformed,
             )
 
@@ -530,7 +442,6 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 result,
                 manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=self.artifact,
             )
 
@@ -545,7 +456,6 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 result,
                 self.manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=None,
             ),
             result,
@@ -555,7 +465,6 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 result,
                 self.manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=None,
             )
 
@@ -569,26 +478,24 @@ class ResultTests(unittest.TestCase):
             contract.validate_backend_result(
                 version,
                 self.manifest,
-                expected_query_id=self.query_id,
                 artifact_bytes=None,
             )
 
-    def test_synopsis_metadata_distinguishes_dp_artifact_and_postprocessing(self):
-        manifest = _manifest(mode="synopsis-flex")
-        query_id = contract.semantic_query_identity(b"s" * 32, manifest)
-        synopsis = contract.artifact_sanitization_metadata(
-            manifest, query_id, "synopsis"
+    def test_only_direct_dp_model_artifacts_are_supported(self):
+        metadata = contract.artifact_sanitization_metadata(
+            self.manifest, "model"
         )
-        model = contract.artifact_sanitization_metadata(
-            manifest, query_id, "model"
-        )
-        self.assertEqual(synopsis["privacy_basis"], "dp-synopsis")
-        self.assertEqual(model["privacy_basis"], "dp-synopsis-postprocessing")
-        for metadata in (synopsis, model):
-            self.assertFalse(metadata["contains_raw_records"])
-            self.assertFalse(metadata["contains_unnoised_statistics"])
-            self.assertFalse(metadata["contains_backend_logs"])
-            self.assertFalse(metadata["contains_target_name"])
+        self.assertEqual(metadata["privacy_basis"], "direct-dp-training")
+        self.assertFalse(metadata["contains_raw_records"])
+        self.assertFalse(metadata["contains_unnoised_statistics"])
+        self.assertFalse(metadata["contains_backend_logs"])
+        self.assertFalse(metadata["contains_target_name"])
+        with self.assertRaisesRegex(ValueError, "model artifacts"):
+            contract.artifact_sanitization_metadata(
+                self.manifest, "statistics"
+            )
+        with self.assertRaisesRegex(ValueError, "artifact kind"):
+            contract.expected_artifact_format(self.manifest, "statistics")
 
 
 if __name__ == "__main__":

@@ -345,7 +345,8 @@ def _update_unit_ids(hasher, unit_ids):
 
 
 def _semantic_digest(mechanism, config, privacy, round_index,
-                     public_arrays=(), private_arrays=(), unit_ids=None):
+                     public_arrays=(), private_arrays=(), unit_ids=None,
+                     execution_fingerprint=None):
     if (not isinstance(mechanism, str) or not mechanism
             or len(mechanism.encode("utf-8", errors="strict")) > 128):
         raise RuntimeError("semantic mechanism identifier is invalid")
@@ -360,7 +361,9 @@ def _semantic_digest(mechanism, config, privacy, round_index,
     digest = hashlib.sha256()
     _frame(digest, "contract", b"dsflower-semantic-randomness-v1")
     _frame(digest, "mechanism", mechanism.encode("utf-8"))
-    _frame(digest, "runtime", _canonical_json(_runtime_fingerprint()))
+    runtime = (_runtime_fingerprint() if execution_fingerprint is None
+               else execution_fingerprint)
+    _frame(digest, "runtime", _canonical_json(runtime))
     _frame(digest, "server-round", round_index.to_bytes(8, "big"))
     _frame(digest, "public-config", _canonical_json(config))
     _frame(digest, "privacy-policy", _canonical_json(privacy))
@@ -371,12 +374,13 @@ def _semantic_digest(mechanism, config, privacy, round_index,
 
 
 def master_seed(mechanism, config, privacy, round_index, *,
-                public_arrays=(), private_arrays=(), unit_ids=None):
+                public_arrays=(), private_arrays=(), unit_ids=None,
+                execution_fingerprint=None):
     """Derive one stateless 256-bit key from the effective release semantics."""
     digest = _semantic_digest(
         mechanism, config, privacy, round_index,
         public_arrays=public_arrays, private_arrays=private_arrays,
-        unit_ids=unit_ids)
+        unit_ids=unit_ids, execution_fingerprint=execution_fingerprint)
     return hmac.new(
         _node_secret(), b"dsflower/semantic-prf/v1\x00" + digest,
         hashlib.sha256).digest()

@@ -1,0 +1,1093 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0bcd975b11360bb03203343358041494aee5c4d6..6aa7b31f28f1fe28f996a4242ae79b21d458fc18 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -115,4 +115,6 @@ option(PLUGIN_RMM "Build with RAPIDS Memory Manager (RMM)" OFF)
+ option(PLUGIN_FEDERATED "Build with Federated Learning" OFF)
+ option(PLUGIN_DSFLOWER_DP "Build the fail-closed dsFlower DP histogram scaffold" OFF)
++option(DSFLOWER_DP_CORE_TESTING
++       "Compile the unreviewed dsFlower DP histogram core for isolated tests" OFF)
+ ## TODO: 1. Add check if DPC++ compiler is used for building
+ option(PLUGIN_SYCL "SYCL plugin" OFF)
+diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
+index 37d1f88a46c16e049c92599a700fac167d227c1d..39c3734d77ec2eff82c25ce7119f2a3d5573d3d2 100644
+--- a/include/xgboost/c_api.h
++++ b/include/xgboost/c_api.h
+@@ -96,5 +96,5 @@ XGB_DLL const char *XGBGetLastError();
+  * not make XGBoost training differentially private.
+  */
+-#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 2U
++#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 3U
+
+ /**
+@@ -108,8 +108,9 @@ XGB_DLL const char *XGBGetLastError();
+  * semantic training identity.  Native mechanism coordinates must consume it
+  * only through deterministic, domain-separated PRF derivation.
+- * ABI v2 binds the context to exactly one DMatrixHandle and copies its shared
++ * ABI v3 binds the context to exactly one DMatrixHandle and copies its shared
+  * ownership.  It also copies a complete public numeric feature schema and
+- * public split cuts.  The caller may release all borrowed pointers, including
+- * the DMatrixHandle wrapper, after this function returns successfully.
++ * public split cuts, plus server-pinned fixed-point and exact-noise scales.
++ * The caller may release all borrowed pointers, including the DMatrixHandle
++ * wrapper, after this function returns successfully.
+  *
+  * The bound DMatrix must already contain exactly one row per declared privacy
+@@ -145,4 +146,7 @@ typedef struct XGBDsFlowerPrivacyContext {
+   const double *cut_values;
+   size_t cut_values_size;
++  uint64_t fixed_point_scale;
++  uint64_t root_noise_scale;
++  uint64_t level_noise_scale;
+ } XGBDsFlowerPrivacyContext;
+
+diff --git a/plugin/dsflower/CMakeLists.txt b/plugin/dsflower/CMakeLists.txt
+index 3ff2eb344a3a45aad8a3cee6aab6129b604eff03..f6fb85b645776fdf124001445ba738d826c313bd 100644
+--- a/plugin/dsflower/CMakeLists.txt
++++ b/plugin/dsflower/CMakeLists.txt
+@@ -7,2 +7,37 @@ target_sources(objxgboost PRIVATE
+
+ target_compile_definitions(objxgboost PUBLIC XGBOOST_USE_DSFLOWER_DP=1)
++
++if(USE_DEBUG_OUTPUT)
++  message(FATAL_ERROR
++          "dsFlower forbids XGBoost debug output because it exposes raw training state")
++endif()
++
++if(DSFLOWER_DP_CORE_TESTING)
++  set(DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR "" CACHE PATH
++      "Directory containing dsflower_dp_primitives.h")
++  set(DSFLOWER_DP_PRIMITIVES_LIBRARY "" CACHE FILEPATH
++      "Exact dsFlower DP primitives import/shared library")
++  if(NOT IS_DIRECTORY "${DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR}")
++    message(FATAL_ERROR
++            "DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR is required for core testing")
++  endif()
++  if(NOT EXISTS "${DSFLOWER_DP_PRIMITIVES_LIBRARY}")
++    message(FATAL_ERROR
++            "DSFLOWER_DP_PRIMITIVES_LIBRARY is required for core testing")
++  endif()
++
++  target_sources(objxgboost PRIVATE
++    ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_dp_hist.cc)
++  set_source_files_properties(
++    ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_dp_hist.cc
++    TARGET_DIRECTORY objxgboost
++    PROPERTIES INCLUDE_DIRECTORIES "${DSFLOWER_DP_PRIMITIVES_INCLUDE_DIR}")
++  target_link_libraries(objxgboost PRIVATE
++    "${DSFLOWER_DP_PRIMITIVES_LIBRARY}")
++  set_source_files_properties(
++    ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_context.cc
++    ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_updater.cc
++    ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_dp_hist.cc
++    TARGET_DIRECTORY objxgboost
++    PROPERTIES COMPILE_DEFINITIONS XGBOOST_DSFLOWER_DP_CORE_TESTING=1)
++endif()
+diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
+index 5d9216dff4e1deb3697983b6efd6c0a198109b58..f998ca6e6c3f263807e9e3e0be328f1e3a42ae1e 100644
+--- a/plugin/dsflower/README.md
++++ b/plugin/dsflower/README.md
+@@ -1,10 +1,10 @@
+ # dsFlower DP histogram updater scaffold
+
+-This opt-in plugin is deliberately **not a DP implementation**.  It reserves a
+-TreeUpdater name and a C ABI for server-authoritative privacy context.  It
+-validates all required context pins, keeps the noise key out of serialized
+-XGBoost configuration, and then rejects every training update.
++This opt-in plugin is deliberately **not a production DP capability**.  It
++reserves a TreeUpdater name and a C ABI for server-authoritative privacy
++context.  A normal build validates the context, keeps its derived noise key out
++of serialized XGBoost state, and rejects every training update.
+
+-The v2 adapter boundary accepts only `privacy_unit=row|patient`,
++The v3 adapter boundary accepts only `privacy_unit=row|patient`,
+ `adjacency=replace_one`, `unit_canonicalization=trim-utf8-v2`,
+ `contribution_strategy=one-record-per-unit-v1`, and `max_rows_per_unit=1`.
+@@ -23,14 +23,16 @@ The label vector is sealed at context installation and checked again at Update,
+ and an updater cannot survive a clear/set context rotation, even across
+ threads, because generations are process-unique.  The context also
+-requires CPU, one output, one tree per round, one exclusive updater, and
+-`boost_from_average=0` when specified.  Since every Update is still rejected,
+-v2 records but does not yet consume/enforce the total `max_trees`; the training
+-patch must add the successful-round counter before capability activation.
++requires CPU, one output, one tree per round, one exclusive updater, and an
++explicit `boost_from_average=0`.  The isolated core described below counts
++successful trees across every Booster sharing one installed context and rejects
++tree index `max_trees`; a normal build still rejects before this path.
+
+ The server derives the required `noise_key` from its custodial root and the
+ complete canonical semantic training identity.  Every sampler and mechanism
+-coordinate must consume only a deterministic, domain-separated PRF stream from
+-that key; operating-system randomness and persisted reply artifacts are not
+-valid alternatives.
++coordinate consumes only a deterministic, domain-separated PRF stream from
++that key. The core domain is `label-with-NUL || release-kind-u8 ||
++tree-index-u64be || depth-u32be`. Operating-system
++randomness, query history, and persisted reply artifacts are not part of this
++contract.
+
+ The updater must remain unavailable to production integration until a later
+@@ -40,6 +42,6 @@ process:
+
+ - patient-level contribution bounding;
+-- public or privately selected bins (v2 validates public cuts but does not use
+-  them for training yet);
++- public or privately selected bins (v3 validates public cuts and the isolated
++  core consumes them directly);
+ - a separately reviewed sampler consuming only the server-derived,
+   domain-separated semantic PRF stream;
+@@ -49,3 +51,33 @@ process:
+
+ Build only for scaffold verification with `-DPLUGIN_DSFLOWER_DP=ON`.  Selecting
+-`grow_dsflower_dp_hist` always fails closed in this patch.
++`grow_dsflower_dp_hist` always fails closed in a normal build.
++
++## Isolated fixed-point core
++
++`DSFLOWER_DP_CORE_TESTING=ON` compiles a CPU-only test core and is off by
++default.  Test builds must explicitly provide the ABI-v2 deterministic
++`dsflower_dp_primitives` header and shared/import library.  This switch is not a
++capability switch and is never set by the production build script.
++
++The core clips and fixed-point quantizes one gradient/Hessian contribution per
++row, builds each active node histogram from its own rows, and sends the complete
++level vector through the exact discrete-Gaussian ABI before any split, missing
++direction, topology, leaf, gain, or cover is chosen.  The root total is included
++in the first joint release; later child totals are computed only from already
++privatized bins.  Binary logistic and bounded squared-error objectives use the
++same construction.  Raw histograms and the derived key are neither serialized
++nor copied into model configuration.
++
++ABI v3 also requires server-owned integer `fixed_point_scale`,
++`root_noise_scale`, and `level_noise_scale` values.  The core validates machine
++bounds but does not independently prove that they match the requested
++per-training privacy parameters, public geometry, and the
++`max_trees * max_depth` schedule.  The trusted adapter must calculate them with
++the checked reference accountant and bind them into the semantic key identity.
++
++Patient materialization, adapter calibration, interruption semantics, private
++evaluation exclusion, timing isolation, and model-egress sanitization remain
++release gates outside this core.  The process-local tree counter is defense in
++depth for one installed training context, not lifetime state.  A failed update
++reuses the same tree index and therefore the same PRF domain rather than
++creating a reroll.
+diff --git a/plugin/dsflower/dsflower_context.cc b/plugin/dsflower/dsflower_context.cc
+index ba98cd2a8b01c2e31d5314c2d931510d9b681013..5d69784d5c2acea7b76445ea4b729334c229b2f3 100644
+--- a/plugin/dsflower/dsflower_context.cc
++++ b/plugin/dsflower/dsflower_context.cc
+@@ -25,4 +25,5 @@ struct ContextSlot {
+   PrivacyContext value;
+   bool ready{false};
++  std::uint64_t successful_trees{0};
+
+   ~ContextSlot() { Reset(); }
+@@ -31,4 +32,5 @@ struct ContextSlot {
+     value = PrivacyContext{};
+     ready = false;
++    successful_trees = 0;
+   }
+ };
+@@ -209,4 +211,7 @@ bool ValidateDMatrix(std::shared_ptr<DMatrix> const& dmatrix, PrivacyContext con
+     return Reject("dsFlower requires numeric, non-categorical features", error);
+   }
++  if (!info.feature_names.empty()) {
++    return Reject("dsFlower does not accept feature names at the native privacy boundary", error);
++  }
+   if (!info.group_ptr_.empty() || !info.weights_.Empty() || !info.feature_weights.Empty() ||
+       !info.base_margin_.Empty() || !info.labels_lower_bound_.Empty() ||
+@@ -252,4 +257,7 @@ PrivacyContext CloneContext(PrivacyContext const& source) {
+   out.max_trees = source.max_trees;
+   out.max_depth = source.max_depth;
++  out.fixed_point_scale = source.fixed_point_scale;
++  out.root_noise_scale = source.root_noise_scale;
++  out.level_noise_scale = source.level_noise_scale;
+   out.generation = source.generation;
+   out.feature_lower_bounds = source.feature_lower_bounds;
+@@ -257,5 +265,4 @@ PrivacyContext CloneContext(PrivacyContext const& source) {
+   out.cut_ptrs = source.cut_ptrs;
+   out.cut_values = source.cut_values;
+-  out.sealed_labels = source.sealed_labels;
+   return out;
+ }
+@@ -336,7 +343,10 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
+     return Reject("dsFlower contribution_strategy must be one-record-per-unit-v1", error);
+   }
+-  if (!std::isfinite(input.gradient_clip) || input.gradient_clip <= 0.0 ||
+-      !std::isfinite(input.hessian_clip) || input.hessian_clip <= 0.0) {
+-    return Reject("dsFlower gradient and hessian clips must be finite and positive", error);
++  float gradient_clip{0.0f};
++  float hessian_clip{0.0f};
++  if (!ToFiniteFloat(input.gradient_clip, &gradient_clip) || gradient_clip <= 0.0f ||
++      !ToFiniteFloat(input.hessian_clip, &hessian_clip) || hessian_clip <= 0.0f) {
++    return Reject("dsFlower gradient and hessian clips must be positive finite float values",
++                  error);
+   }
+   if (input.max_rows_per_unit != 1) {
+@@ -349,4 +359,12 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
+     return Reject("dsFlower max_depth must be between one and 30", error);
+   }
++  if (input.fixed_point_scale == 0 || input.fixed_point_scale > kMaxFixedPointScale ||
++      (input.fixed_point_scale & (input.fixed_point_scale - 1)) != 0) {
++    return Reject("dsFlower fixed_point_scale must be a power of two in [1, 2^31]", error);
++  }
++  if (input.root_noise_scale == 0 || input.root_noise_scale > kMaxExactSamplerScale ||
++      input.level_noise_scale == 0 || input.level_noise_scale > kMaxExactSamplerScale) {
++    return Reject("dsFlower exact noise scales must be in [1, 2^53]", error);
++  }
+
+   PrivacyContext next;
+@@ -360,4 +378,7 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
+   next.max_trees = input.max_trees;
+   next.max_depth = input.max_depth;
++  next.fixed_point_scale = input.fixed_point_scale;
++  next.root_noise_scale = input.root_noise_scale;
++  next.level_noise_scale = input.level_noise_scale;
+   if (!ValidateDMatrix(next.dmatrix, next, error)) {
+     return false;
+@@ -370,6 +391,6 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
+   next.unit_canonicalization = input.unit_canonicalization;
+   next.contribution_strategy = input.contribution_strategy;
+-  next.gradient_clip = input.gradient_clip;
+-  next.hessian_clip = input.hessian_clip;
++  next.gradient_clip = gradient_clip;
++  next.hessian_clip = hessian_clip;
+   next.max_rows_per_unit = input.max_rows_per_unit;
+   if (!NextContextGeneration(&next.generation, error)) {
+@@ -387,4 +408,29 @@ void ClearPrivacyContext() { g_context.Reset(); }
+ bool PrivacyContextReady() { return g_context.ready; }
+
++bool TryGetNextTreeIndex(std::uint64_t generation, std::uint64_t* out_tree_index,
++                         std::string* error) {
++  if (!g_context.ready || generation != g_context.value.generation) {
++    return Reject("dsFlower privacy context changed before the private tree update", error);
++  }
++  if (out_tree_index == nullptr) {
++    return Reject("dsFlower private tree index output is required", error);
++  }
++  if (g_context.successful_trees >= g_context.value.max_trees) {
++    return Reject("dsFlower reached the context-bound total tree count", error);
++  }
++  *out_tree_index = g_context.successful_trees;
++  return true;
++}
++
++void RecordSuccessfulTree(std::uint64_t generation, std::uint64_t tree_index) {
++  CHECK(g_context.ready && generation == g_context.value.generation)
++      << "dsFlower privacy context changed during the private tree update";
++  CHECK_EQ(tree_index, g_context.successful_trees)
++      << "dsFlower private tree updates must commit in their deterministic order";
++  CHECK_LT(g_context.successful_trees, g_context.value.max_trees)
++      << "dsFlower context-bound tree counter was exhausted during an update";
++  ++g_context.successful_trees;
++}
++
+ bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
+                                      std::uint64_t* out_generation, std::string* error) {
+@@ -415,10 +461,14 @@ bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
+   }
+   std::string value;
+-  if (FindArgument(args, "boost_from_average", &value) && value != "0" && value != "false") {
+-    return Reject("dsFlower XGBoost boost_from_average must remain disabled", error);
++  if (!FindArgument(args, "boost_from_average", &value) ||
++      (value != "0" && value != "false")) {
++    return Reject("dsFlower XGBoost boost_from_average must be explicitly disabled", error);
+   }
+   if (!FindArgument(args, "updater", &value) || value != "grow_dsflower_dp_hist") {
+     return Reject("dsFlower XGBoost requires the exclusive trusted updater", error);
+   }
++  if (FindArgument(args, "booster", &value) && value != "gbtree") {
++    return Reject("dsFlower XGBoost requires the gbtree booster", error);
++  }
+   for (auto const& pin : {std::pair<std::string_view, std::uint64_t>{"num_class", 0},
+                           {"num_target", 1}, {"num_parallel_tree", 1}}) {
+@@ -477,5 +527,9 @@ XGB_DLL int XGBDsFlowerPrivacyScaffoldStatus(const char** out_status) {
+   API_BEGIN();
+   xgboost_CHECK_C_ARG_PTR(out_status);
++#if defined(XGBOOST_DSFLOWER_DP_CORE_TESTING)
++  *out_status = "test-only:fixed-point-core:no-production-capability";
++#else
+   *out_status = "scaffold-only:no-dp-histogram-privatization";
++#endif
+   API_END();
+ }
+diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_context.h
+index 3d5fe651153fd78b97ef9566a724d77a97e4dbb9..740b41805b769ea2101915a369c046e7e34c7c76 100644
+--- a/plugin/dsflower/dsflower_context.h
++++ b/plugin/dsflower/dsflower_context.h
+@@ -28,4 +28,6 @@ inline constexpr std::size_t kMaxTotalCuts = 16384;
+ inline constexpr std::uint64_t kMaxTrees = 10000;
+ inline constexpr std::uint64_t kMaxDepth = 30;
++inline constexpr std::uint64_t kMaxFixedPointScale = UINT64_C(1) << 31;
++inline constexpr std::uint64_t kMaxExactSamplerScale = UINT64_C(1) << 53;
+
+ class SensitiveKey {
+@@ -86,4 +88,7 @@ struct PrivacyContext {
+   std::uint64_t max_trees{0};
+   std::uint64_t max_depth{0};
++  std::uint64_t fixed_point_scale{0};
++  std::uint64_t root_noise_scale{0};
++  std::uint64_t level_noise_scale{0};
+   std::uint64_t generation{0};
+   std::vector<float> feature_lower_bounds;
+@@ -121,4 +126,7 @@ bool PrivacyContextReady();
+ bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
+                                      std::uint64_t* out_generation, std::string* error);
++bool TryGetNextTreeIndex(std::uint64_t generation, std::uint64_t* out_tree_index,
++                         std::string* error);
++void RecordSuccessfulTree(std::uint64_t generation, std::uint64_t tree_index);
+ PrivacyContextSnapshot SnapshotPrivacyContextForDMatrix(DMatrix* dmatrix);
+
+diff --git a/plugin/dsflower/dsflower_dp_hist.cc b/plugin/dsflower/dsflower_dp_hist.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..1369f675cf1d858147191e8fe27383046fb7bb66
+--- /dev/null
++++ b/plugin/dsflower/dsflower_dp_hist.cc
+@@ -0,0 +1,676 @@
++/**
++ * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#include "dsflower_dp_hist.h"
++
++#include <dsflower_dp_primitives.h>
++#include <xgboost/json.h>
++#include <xgboost/logging.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <limits>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace xgboost::tree::dsflower {
++namespace {
++
++constexpr char kReleaseDomainLabel[] = "dsflower/xgboost/dp-hist/release/v1";
++constexpr char kExpectedPrimitiveMechanism[] =
++    "cks20-discrete-gaussian-i64-hmac-sha256-v1";
++constexpr std::uint8_t kJointHistogramRelease = 1;
++
++static_assert(DSFLOWER_DP_PRIMITIVES_ABI_VERSION == 2U,
++              "dsFlower XGBoost requires deterministic DP primitives ABI v2");
++
++std::vector<std::uint8_t> MakeReleaseDomain(std::uint64_t tree_index, std::uint32_t depth) {
++  std::vector<std::uint8_t> domain;
++  domain.reserve(sizeof(kReleaseDomainLabel) + sizeof(tree_index) + sizeof(depth) + 1);
++  for (char value : kReleaseDomainLabel) {
++    domain.push_back(static_cast<std::uint8_t>(value));
++  }
++  domain.push_back(kJointHistogramRelease);
++  for (int shift = 56; shift >= 0; shift -= 8) {
++    domain.push_back(static_cast<std::uint8_t>(tree_index >> shift));
++  }
++  for (int shift = 24; shift >= 0; shift -= 8) {
++    domain.push_back(static_cast<std::uint8_t>(depth >> shift));
++  }
++  return domain;
++}
++
++std::size_t CheckedAddSize(std::size_t left, std::size_t right) {
++  CHECK_LE(right, std::numeric_limits<std::size_t>::max() - left)
++      << "dsFlower public histogram geometry overflows size_t";
++  return left + right;
++}
++
++std::size_t CheckedMultiplySize(std::size_t left, std::size_t right) {
++  if (left == 0 || right == 0) {
++    return 0;
++  }
++  CHECK_LE(left, std::numeric_limits<std::size_t>::max() / right)
++      << "dsFlower public histogram geometry overflows size_t";
++  return left * right;
++}
++
++std::int64_t CheckedAdd(std::int64_t left, std::int64_t right) {
++  if (right > 0) {
++    CHECK_LE(left, std::numeric_limits<std::int64_t>::max() - right)
++        << "dsFlower fixed-point accumulator overflow";
++  } else if (right < 0) {
++    CHECK_GE(left, std::numeric_limits<std::int64_t>::min() - right)
++        << "dsFlower fixed-point accumulator overflow";
++  }
++  return left + right;
++}
++
++std::int64_t CheckedSubtract(std::int64_t left, std::int64_t right) {
++  if (right > 0) {
++    CHECK_GE(left, std::numeric_limits<std::int64_t>::min() + right)
++        << "dsFlower fixed-point accumulator overflow";
++  } else if (right < 0) {
++    CHECK_LE(left, std::numeric_limits<std::int64_t>::max() + right)
++        << "dsFlower fixed-point accumulator overflow";
++  }
++  return left - right;
++}
++
++void SecureZero(std::int64_t* values, std::size_t size) {
++  volatile std::int64_t* out = values;
++  for (std::size_t i = 0; i < size; ++i) {
++    out[i] = 0;
++  }
++}
++
++struct IntegerStatistic {
++  std::int64_t gradient{0};
++  std::int64_t hessian{0};
++
++  void Add(IntegerStatistic const& other) {
++    gradient = CheckedAdd(gradient, other.gradient);
++    hessian = CheckedAdd(hessian, other.hessian);
++  }
++};
++
++static_assert(sizeof(IntegerStatistic) == 2 * sizeof(std::int64_t));
++
++class PublicHistogramSchema {
++ public:
++  explicit PublicHistogramSchema(PrivacyContext const& context)
++      : cut_ptrs_{context.cut_ptrs}, cuts_{context.cut_values} {
++    offsets_.reserve(this->Features() + 1);
++    offsets_.push_back(0);
++    for (std::size_t feature = 0; feature < this->Features(); ++feature) {
++      auto cuts = this->CutCount(feature);
++      offsets_.push_back(CheckedAddSize(offsets_.back(), CheckedAddSize(cuts, 2)));
++    }
++  }
++
++  [[nodiscard]] std::size_t Features() const { return cut_ptrs_.size() - 1; }
++  [[nodiscard]] std::size_t TotalBins() const { return offsets_.back(); }
++  [[nodiscard]] std::size_t CutCount(std::size_t feature) const {
++    return static_cast<std::size_t>(cut_ptrs_.at(feature + 1) - cut_ptrs_.at(feature));
++  }
++  [[nodiscard]] std::size_t FeatureOffset(std::size_t feature) const {
++    return offsets_.at(feature);
++  }
++  [[nodiscard]] std::size_t MissingBin(std::size_t feature) const {
++    return this->FeatureOffset(feature) + this->CutCount(feature) + 1;
++  }
++  [[nodiscard]] std::size_t PresentBin(std::size_t feature, float value) const {
++    auto first = cuts_.cbegin() + static_cast<std::ptrdiff_t>(cut_ptrs_.at(feature));
++    auto last = cuts_.cbegin() + static_cast<std::ptrdiff_t>(cut_ptrs_.at(feature + 1));
++    auto local = static_cast<std::size_t>(std::lower_bound(first, last, value) - first);
++    return this->FeatureOffset(feature) + local;
++  }
++  [[nodiscard]] float SplitValue(std::size_t feature, std::size_t cut) const {
++    auto value = cuts_.at(static_cast<std::size_t>(cut_ptrs_.at(feature)) + cut);
++    auto split = std::nextafter(value, std::numeric_limits<float>::infinity());
++    CHECK(std::isfinite(split)) << "dsFlower public split cannot be represented as a float";
++    return split;
++  }
++
++ private:
++  std::vector<std::uint64_t> cut_ptrs_;
++  std::vector<float> cuts_;
++  std::vector<std::size_t> offsets_;
++};
++
++std::int64_t QuantizeSigned(float value, double clip, std::uint64_t scale) {
++  double bounded{0.0};
++  if (std::isnan(value)) {
++    bounded = 0.0;
++  } else if (std::isinf(value)) {
++    bounded = std::signbit(value) ? -clip : clip;
++  } else {
++    bounded = std::max(-clip, std::min(clip, static_cast<double>(value)));
++  }
++  volatile double normalized = bounded / clip;
++  volatile double scaled = normalized * static_cast<double>(scale);
++  auto magnitude = std::floor(std::abs(static_cast<double>(scaled)) + 0.5);
++  auto quantized = std::copysign(magnitude, static_cast<double>(scaled));
++  CHECK_LE(std::abs(quantized), static_cast<double>(scale));
++  return static_cast<std::int64_t>(quantized);
++}
++
++std::int64_t QuantizeNonnegative(float value, double clip, std::uint64_t scale) {
++  double bounded{0.0};
++  if (std::isnan(value) || value <= 0.0f) {
++    bounded = 0.0;
++  } else if (std::isinf(value)) {
++    bounded = clip;
++  } else {
++    bounded = std::min(clip, static_cast<double>(value));
++  }
++  volatile double normalized = bounded / clip;
++  volatile double scaled = normalized * static_cast<double>(scale);
++  auto quantized = std::floor(static_cast<double>(scaled) + 0.5);
++  CHECK_GE(quantized, 0.0);
++  CHECK_LE(quantized, static_cast<double>(scale));
++  return static_cast<std::int64_t>(quantized);
++}
++
++IntegerStatistic QuantizeGradient(GradientPair const& pair, PrivacyContext const& privacy,
++                                  std::uint64_t scale) {
++  IntegerStatistic out;
++  out.gradient = QuantizeSigned(pair.GetGrad(), privacy.gradient_clip, scale);
++  if (privacy.task_id == "regression") {
++    out.hessian = static_cast<std::int64_t>(scale);
++  } else {
++    out.hessian = QuantizeNonnegative(pair.GetHess(), privacy.hessian_clip, scale);
++  }
++  return out;
++}
++
++class PrivateLevelHistogram;
++
++class RawLevelHistogram {
++ public:
++  RawLevelHistogram(std::size_t nodes, std::size_t bins)
++      : totals_(nodes), cells_(CheckedMultiplySize(nodes, bins)), bins_{bins} {}
++  RawLevelHistogram(RawLevelHistogram const&) = delete;
++  RawLevelHistogram& operator=(RawLevelHistogram const&) = delete;
++  RawLevelHistogram(RawLevelHistogram&&) noexcept = default;
++  RawLevelHistogram& operator=(RawLevelHistogram&&) noexcept = default;
++  ~RawLevelHistogram() {
++    for (auto& value : totals_) {
++      SecureZero(&value.gradient, 1);
++      SecureZero(&value.hessian, 1);
++    }
++    for (auto& value : cells_) {
++      SecureZero(&value.gradient, 1);
++      SecureZero(&value.hessian, 1);
++    }
++  }
++
++ private:
++  [[nodiscard]] IntegerStatistic& Total(std::size_t node) { return totals_.at(node); }
++  [[nodiscard]] IntegerStatistic& Cell(std::size_t node, std::size_t bin) {
++    return cells_.at(CheckedAddSize(CheckedMultiplySize(node, bins_), bin));
++  }
++
++  std::vector<IntegerStatistic> totals_;
++  std::vector<IntegerStatistic> cells_;
++  std::size_t bins_{0};
++
++  friend class PrivateLevelHistogram;
++  friend PrivateLevelHistogram PrivatizeLevel(RawLevelHistogram&&, bool, std::uint64_t,
++                                              PrivacyContext const&, std::uint64_t,
++                                              std::uint64_t, std::uint32_t);
++  friend RawLevelHistogram BuildRawLevel(HostSparsePageView, common::Span<GradientPair const>,
++                                         std::vector<bst_node_t> const&,
++                                         std::vector<bst_node_t> const&,
++                                         PublicHistogramSchema const&, PrivacyContext const&,
++                                         std::uint64_t);
++};
++
++struct PrivateStatistic {
++  double gradient{0.0};
++  double hessian{0.0};
++
++  void Add(PrivateStatistic const& other) {
++    gradient += other.gradient;
++    hessian += other.hessian;
++  }
++};
++
++class PrivateLevelHistogram {
++ public:
++  [[nodiscard]] PrivateStatistic const& RootTotal() const {
++    CHECK(has_root_total_);
++    return root_total_;
++  }
++  [[nodiscard]] PrivateStatistic const& Cell(std::size_t node, std::size_t bin) const {
++    return cells_.at(CheckedAddSize(CheckedMultiplySize(node, bins_), bin));
++  }
++  [[nodiscard]] PrivateStatistic& Cell(std::size_t node, std::size_t bin) {
++    return cells_.at(CheckedAddSize(CheckedMultiplySize(node, bins_), bin));
++  }
++
++ private:
++  bool has_root_total_{false};
++  PrivateStatistic root_total_;
++  std::vector<PrivateStatistic> cells_;
++  std::size_t bins_{0};
++
++  friend PrivateLevelHistogram PrivatizeLevel(RawLevelHistogram&&, bool, std::uint64_t,
++                                              PrivacyContext const&, std::uint64_t,
++                                              std::uint64_t, std::uint32_t);
++};
++
++RawLevelHistogram BuildRawLevel(HostSparsePageView page, common::Span<GradientPair const> gradients,
++                                std::vector<bst_node_t> const& row_nodes,
++                                std::vector<bst_node_t> const& active_nodes,
++                                PublicHistogramSchema const& schema, PrivacyContext const& privacy,
++                                std::uint64_t scale) {
++  CHECK_EQ(page.Size(), gradients.size());
++  CHECK_EQ(page.Size(), row_nodes.size());
++
++  std::vector<std::int64_t> active_index;
++  auto max_node = active_nodes.empty()
++                      ? bst_node_t{0}
++                      : *std::max_element(active_nodes.cbegin(), active_nodes.cend());
++  active_index.resize(static_cast<std::size_t>(max_node) + 1, -1);
++  for (std::size_t i = 0; i < active_nodes.size(); ++i) {
++    CHECK_GE(active_nodes[i], 0);
++    active_index.at(static_cast<std::size_t>(active_nodes[i])) = static_cast<std::int64_t>(i);
++  }
++
++  RawLevelHistogram raw{active_nodes.size(), schema.TotalBins()};
++  auto const unseen = std::numeric_limits<std::size_t>::max();
++  std::vector<std::size_t> selected_bins(schema.Features(), unseen);
++  std::vector<std::size_t> touched_features;
++  touched_features.reserve(schema.Features());
++  for (std::size_t row = 0; row < page.Size(); ++row) {
++    auto node = row_nodes[row];
++    if (node < 0 || static_cast<std::size_t>(node) >= active_index.size() ||
++        active_index[static_cast<std::size_t>(node)] < 0) {
++      continue;
++    }
++    auto slot = static_cast<std::size_t>(active_index[static_cast<std::size_t>(node)]);
++    auto statistic = QuantizeGradient(gradients[row], privacy, scale);
++    raw.Total(slot).Add(statistic);
++
++    touched_features.clear();
++    for (auto const& entry : page[row]) {
++      auto feature = static_cast<std::size_t>(entry.index);
++      if (feature >= schema.Features() || std::isnan(entry.fvalue)) {
++        continue;
++      }
++      if (selected_bins[feature] == unseen) {
++        touched_features.push_back(feature);
++      }
++      selected_bins[feature] = schema.PresentBin(feature, entry.fvalue);
++    }
++    for (auto feature : touched_features) {
++      raw.Cell(slot, selected_bins[feature]).Add(statistic);
++      selected_bins[feature] = unseen;
++    }
++  }
++
++  for (std::size_t node = 0; node < active_nodes.size(); ++node) {
++    for (std::size_t feature = 0; feature < schema.Features(); ++feature) {
++      IntegerStatistic observed;
++      auto begin = schema.FeatureOffset(feature);
++      auto present_end = schema.MissingBin(feature);
++      for (auto bin = begin; bin < present_end; ++bin) {
++        observed.Add(raw.Cell(node, bin));
++      }
++      auto& missing = raw.Cell(node, schema.MissingBin(feature));
++      missing.gradient = CheckedSubtract(raw.Total(node).gradient, observed.gradient);
++      missing.hessian = CheckedSubtract(raw.Total(node).hessian, observed.hessian);
++    }
++  }
++  return raw;
++}
++
++PrivateStatistic Decode(IntegerStatistic const& value, PrivacyContext const& privacy,
++                        std::uint64_t fixed_point_scale) {
++  auto denominator = static_cast<double>(fixed_point_scale);
++  PrivateStatistic out;
++  out.gradient = static_cast<double>(value.gradient) / denominator * privacy.gradient_clip;
++  auto hessian_clip = privacy.task_id == "regression" ? 1.0 : privacy.hessian_clip;
++  out.hessian = std::max(0.0, static_cast<double>(value.hessian) / denominator * hessian_clip);
++  CHECK(std::isfinite(out.gradient) && std::isfinite(out.hessian))
++      << "dsFlower privatized statistics must remain finite";
++  return out;
++}
++
++PrivateLevelHistogram PrivatizeLevel(RawLevelHistogram&& raw, bool include_root_total,
++                                     std::uint64_t noise_scale, PrivacyContext const& privacy,
++                                     std::uint64_t fixed_point_scale,
++                                     std::uint64_t tree_index, std::uint32_t depth) {
++  auto pairs = CheckedAddSize(raw.cells_.size(), include_root_total ? 1 : 0);
++  auto coordinates = CheckedMultiplySize(pairs, 2);
++  CHECK_LE(coordinates, static_cast<std::size_t>(DSFLOWER_DP_MAX_VECTOR_LENGTH))
++      << "dsFlower public histogram geometry exceeds the reviewed sampler call bound";
++
++  std::vector<std::int64_t> input(coordinates);
++  std::size_t cursor{0};
++  if (include_root_total) {
++    CHECK_EQ(raw.totals_.size(), 1);
++    input[cursor++] = raw.totals_.front().gradient;
++    input[cursor++] = raw.totals_.front().hessian;
++  }
++  for (auto const& cell : raw.cells_) {
++    input[cursor++] = cell.gradient;
++    input[cursor++] = cell.hessian;
++  }
++  CHECK_EQ(cursor, input.size());
++
++  std::vector<std::int64_t> output(input.size());
++  auto domain = MakeReleaseDomain(tree_index, depth);
++  auto const& key = privacy.noise_key.Get();
++  auto status = dsflower_dp_add_discrete_gaussian_i64(
++      input.data(), input.size(), noise_scale, key.data(), key.size(), domain.data(),
++      domain.size(), output.data());
++  SecureZero(input.data(), input.size());
++  CHECK_EQ(status, DSFLOWER_DP_OK) << "dsFlower exact discrete-Gaussian primitive failed closed";
++
++  PrivateLevelHistogram result;
++  result.has_root_total_ = include_root_total;
++  result.bins_ = raw.bins_;
++  cursor = 0;
++  if (include_root_total) {
++    result.root_total_ = Decode({output[cursor], output[cursor + 1]}, privacy, fixed_point_scale);
++    cursor += 2;
++  }
++  result.cells_.reserve(raw.cells_.size());
++  for (std::size_t i = 0; i < raw.cells_.size(); ++i) {
++    result.cells_.push_back(
++        Decode({output[cursor], output[cursor + 1]}, privacy, fixed_point_scale));
++    cursor += 2;
++  }
++  SecureZero(output.data(), output.size());
++  return result;
++}
++
++void ProjectHessians(PrivateLevelHistogram* level, std::size_t node,
++                     PublicHistogramSchema const& schema, double parent_hessian) {
++  auto cap = std::max(0.0, parent_hessian);
++  for (std::size_t feature = 0; feature < schema.Features(); ++feature) {
++    auto begin = schema.FeatureOffset(feature);
++    auto end = schema.MissingBin(feature) + 1;
++    std::vector<double> sorted;
++    sorted.reserve(end - begin);
++    double sum{0.0};
++    for (auto bin = begin; bin < end; ++bin) {
++      auto& hessian = level->Cell(node, bin).hessian;
++      hessian = std::max(0.0, hessian);
++      sorted.push_back(hessian);
++      sum += hessian;
++    }
++    if (sum <= cap) {
++      continue;
++    }
++    std::sort(sorted.begin(), sorted.end(), std::greater<double>());
++    double prefix{0.0};
++    double theta{0.0};
++    for (std::size_t i = 0; i < sorted.size(); ++i) {
++      prefix += sorted[i];
++      auto candidate = (prefix - cap) / static_cast<double>(i + 1);
++      if (i + 1 == sorted.size() || sorted[i + 1] <= candidate) {
++        theta = candidate;
++        break;
++      }
++    }
++    for (auto bin = begin; bin < end; ++bin) {
++      auto& hessian = level->Cell(node, bin).hessian;
++      hessian = std::max(0.0, hessian - theta);
++    }
++  }
++}
++
++float FiniteFloat(double value) {
++  if (std::isnan(value)) {
++    return 0.0f;
++  }
++  auto maximum = static_cast<double>(std::numeric_limits<float>::max());
++  return static_cast<float>(std::max(-maximum, std::min(maximum, value)));
++}
++
++double NodeWeight(TrainParam const& train, PrivateStatistic const& statistic) {
++  auto weight = CalcWeight(train, statistic.gradient, statistic.hessian);
++  CHECK(std::isfinite(weight)) << "dsFlower DP leaf weight must remain finite";
++  return weight;
++}
++
++double NodeGain(TrainParam const& train, PrivateStatistic const& statistic) {
++  auto gain = CalcGain(train, statistic.gradient, statistic.hessian);
++  return std::isfinite(gain) ? gain : static_cast<double>(std::numeric_limits<float>::max());
++}
++
++struct SplitCandidate {
++  bool valid{false};
++  std::size_t feature{0};
++  std::size_t cut{0};
++  bool default_left{false};
++  double gain{0.0};
++  PrivateStatistic left;
++  PrivateStatistic right;
++};
++
++void ConsiderCandidate(TrainParam const& train, std::size_t feature, std::size_t cut,
++                       bool default_left, PrivateStatistic const& left,
++                       PrivateStatistic const& right, double parent_gain, SplitCandidate* best) {
++  if (!IsValidSplit(train, left.hessian, right.hessian)) {
++    return;
++  }
++  auto gain = NodeGain(train, left) + NodeGain(train, right) - parent_gain;
++  if (!std::isfinite(gain)) {
++    gain = static_cast<double>(std::numeric_limits<float>::max());
++  }
++  if (!best->valid || gain > best->gain) {
++    *best = {true, feature, cut, default_left, gain, left, right};
++  }
++}
++
++SplitCandidate BestSplit(TrainParam const& train, PrivateLevelHistogram const& level,
++                         std::size_t node, PublicHistogramSchema const& schema,
++                         PrivateStatistic const& parent) {
++  SplitCandidate best;
++  auto parent_gain = NodeGain(train, parent);
++  for (std::size_t feature = 0; feature < schema.Features(); ++feature) {
++    auto begin = schema.FeatureOffset(feature);
++    auto missing_bin = schema.MissingBin(feature);
++    auto present_bins = missing_bin - begin;
++    std::vector<PrivateStatistic> suffix(present_bins + 1);
++    for (std::size_t i = present_bins; i > 0; --i) {
++      suffix[i - 1] = suffix[i];
++      suffix[i - 1].Add(level.Cell(node, begin + i - 1));
++    }
++    auto const& missing = level.Cell(node, missing_bin);
++    PrivateStatistic prefix;
++    for (std::size_t cut = 0; cut < schema.CutCount(feature); ++cut) {
++      prefix.Add(level.Cell(node, begin + cut));
++      auto left_missing = prefix;
++      left_missing.Add(missing);
++      ConsiderCandidate(train, feature, cut, true, left_missing, suffix[cut + 1], parent_gain,
++                        &best);
++
++      auto right_missing = suffix[cut + 1];
++      right_missing.Add(missing);
++      ConsiderCandidate(train, feature, cut, false, prefix, right_missing, parent_gain, &best);
++    }
++  }
++  return best;
++}
++
++struct ActiveNode {
++  bst_node_t node{RegTree::kRoot};
++  PrivateStatistic total;
++};
++
++void ValidatePublicGeometry(PublicHistogramSchema const& schema, std::uint64_t max_depth) {
++  CHECK_GT(max_depth, 0);
++  CHECK_LE(max_depth, 30) << "dsFlower DP core supports XGBoost depths from one to 30";
++  auto active = static_cast<std::size_t>(UINT64_C(1) << (max_depth - 1));
++  auto cells = CheckedMultiplySize(active, schema.TotalBins());
++  auto coordinates = CheckedMultiplySize(CheckedAddSize(cells, 1), 2);
++  CHECK_LE(coordinates, static_cast<std::size_t>(DSFLOWER_DP_MAX_VECTOR_LENGTH))
++      << "dsFlower worst-case public tree geometry exceeds one exact-sampler vector";
++}
++
++void ValidatePrimitive() {
++  CHECK_EQ(dsflower_dp_primitives_abi_version(), DSFLOWER_DP_PRIMITIVES_ABI_VERSION)
++      << "dsFlower DP primitives ABI mismatch";
++  auto mechanism = dsflower_dp_primitives_mechanism_id();
++  CHECK(std::string_view{DSFLOWER_DP_MECHANISM_ID} == kExpectedPrimitiveMechanism &&
++        mechanism != nullptr && std::string_view{mechanism} == kExpectedPrimitiveMechanism)
++      << "dsFlower DP primitives mechanism mismatch";
++}
++
++void ValidateTraining(TrainParam const& train, PrivacyContext const& privacy, std::size_t rows,
++                      PublicHistogramSchema const& schema) {
++  CHECK_EQ(static_cast<std::uint64_t>(train.max_depth), privacy.max_depth)
++      << "dsFlower max_depth changed after privacy-context binding";
++  CHECK_EQ(train.max_leaves, 0) << "dsFlower DP core requires depthwise max_depth growth";
++  CHECK_EQ(train.grow_policy, TrainParam::kDepthWise)
++      << "dsFlower DP core requires depthwise growth";
++  CHECK_EQ(train.subsample, 1.0f);
++  CHECK_EQ(train.sampling_method, TrainParam::kUniform);
++  CHECK_EQ(train.colsample_bynode, 1.0f);
++  CHECK_EQ(train.colsample_bylevel, 1.0f);
++  CHECK_EQ(train.colsample_bytree, 1.0f);
++  CHECK(train.monotone_constraints.empty() && train.interaction_constraints.empty())
++      << "dsFlower DP core does not yet support tree constraints";
++  CHECK(std::isfinite(train.learning_rate) && train.learning_rate > 0.0f &&
++        train.learning_rate <= 1.0f)
++      << "dsFlower DP core requires a finite learning rate in (0, 1]";
++  CHECK(std::isfinite(train.max_delta_step) && train.max_delta_step > 0.0f)
++      << "dsFlower DP core requires an explicit positive leaf-weight clip";
++  CHECK(std::isfinite(train.reg_lambda) && train.reg_lambda > 0.0f)
++      << "dsFlower DP core requires positive L2 denominator protection";
++  CHECK(privacy.fixed_point_scale > 0 && privacy.fixed_point_scale <= kMaxFixedPointScale);
++  CHECK(privacy.root_noise_scale > 0 && privacy.root_noise_scale <= DSFLOWER_DP_MAX_EXACT_INTEGER);
++  CHECK(privacy.level_noise_scale > 0 &&
++        privacy.level_noise_scale <= DSFLOWER_DP_MAX_EXACT_INTEGER);
++  CHECK_LE(rows, static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max() /
++                                          static_cast<std::int64_t>(privacy.fixed_point_scale)))
++      << "dsFlower row count and fixed-point scale exceed checked accumulator capacity";
++  ValidatePublicGeometry(schema, privacy.max_depth);
++  ValidatePrimitive();
++}
++
++}  // namespace
++
++void BuildFixedPointDpTree(Context const* runtime, TrainParam const& train,
++                           GradientContainer* gradients, DMatrix* dmatrix,
++                           PrivacyContext const& privacy,
++                           std::uint64_t tree_index,
++                           HostDeviceVector<bst_node_t>* out_position, RegTree* out_tree) {
++  CHECK(runtime != nullptr && runtime->IsCPU());
++  CHECK(gradients != nullptr && dmatrix != nullptr && out_position != nullptr &&
++        out_tree != nullptr);
++  CHECK_EQ(gradients->NumSplitTargets(), 1);
++  CHECK(!gradients->HasValueGrad());
++
++  PublicHistogramSchema schema{privacy};
++  auto const rows = static_cast<std::size_t>(dmatrix->Info().num_row_);
++  CHECK_LT(tree_index, privacy.max_trees);
++  ValidateTraining(train, privacy, rows, schema);
++
++  auto batches = dmatrix->GetBatches<SparsePage>(runtime);
++  auto iterator = batches.begin();
++  CHECK(iterator != batches.end());
++  auto const& page = *iterator;
++  ++iterator;
++  CHECK(iterator.AtEnd());
++  CHECK_EQ(page.base_rowid, 0);
++  auto view = page.GetView();
++  auto gradient_view = gradients->Grad()->HostView().Slice(linalg::All(), 0).Values();
++  CHECK_EQ(gradient_view.size(), rows);
++
++  RegTree planned{1, static_cast<bst_feature_t>(schema.Features())};
++  std::vector<bst_node_t> row_nodes(rows, RegTree::kRoot);
++  std::vector<ActiveNode> active{{RegTree::kRoot, {}}};
++
++  for (std::uint64_t depth = 0; depth < privacy.max_depth && !active.empty(); ++depth) {
++    std::vector<bst_node_t> active_ids;
++    active_ids.reserve(active.size());
++    for (auto const& node : active) {
++      active_ids.push_back(node.node);
++    }
++    auto raw = BuildRawLevel(view, gradient_view, row_nodes, active_ids, schema, privacy,
++                             privacy.fixed_point_scale);
++    auto level = PrivatizeLevel(std::move(raw), depth == 0,
++                                depth == 0 ? privacy.root_noise_scale : privacy.level_noise_scale,
++                                privacy, privacy.fixed_point_scale, tree_index,
++                                static_cast<std::uint32_t>(depth));
++    if (depth == 0) {
++      active.front().total = level.RootTotal();
++    }
++
++    std::vector<ActiveNode> next_active;
++    std::vector<SplitCandidate> selected(active.size());
++    for (std::size_t i = 0; i < active.size(); ++i) {
++      ProjectHessians(&level, i, schema, active[i].total.hessian);
++      auto weight = NodeWeight(train, active[i].total);
++      planned[active[i].node].SetLeaf(FiniteFloat(train.learning_rate * weight));
++      planned.Stat(active[i].node).base_weight = FiniteFloat(weight);
++      planned.Stat(active[i].node).sum_hess = FiniteFloat(active[i].total.hessian);
++      auto best = BestSplit(train, level, i, schema, active[i].total);
++      if (!best.valid || best.gain <= static_cast<double>(train.min_split_loss)) {
++        continue;
++      }
++      auto left_weight = NodeWeight(train, best.left);
++      auto right_weight = NodeWeight(train, best.right);
++      auto split_value = schema.SplitValue(best.feature, best.cut);
++      planned.ExpandNode(active[i].node, static_cast<unsigned>(best.feature), split_value,
++                         best.default_left, FiniteFloat(weight),
++                         FiniteFloat(train.learning_rate * left_weight),
++                         FiniteFloat(train.learning_rate * right_weight), FiniteFloat(best.gain),
++                         FiniteFloat(active[i].total.hessian), FiniteFloat(best.left.hessian),
++                         FiniteFloat(best.right.hessian));
++      selected[i] = best;
++      auto const& expanded = planned[active[i].node];
++      next_active.push_back({expanded.LeftChild(), best.left});
++      next_active.push_back({expanded.RightChild(), best.right});
++    }
++
++    if (!next_active.empty()) {
++      std::vector<std::int64_t> active_index(static_cast<std::size_t>(planned.NumNodes()), -1);
++      for (std::size_t i = 0; i < active.size(); ++i) {
++        active_index.at(static_cast<std::size_t>(active[i].node)) = static_cast<std::int64_t>(i);
++      }
++      for (std::size_t row = 0; row < rows; ++row) {
++        auto node = row_nodes[row];
++        if (node < 0 || static_cast<std::size_t>(node) >= active_index.size()) {
++          continue;
++        }
++        auto slot = active_index[static_cast<std::size_t>(node)];
++        if (slot < 0 || !selected[static_cast<std::size_t>(slot)].valid) {
++          continue;
++        }
++        auto const& split = selected[static_cast<std::size_t>(slot)];
++        bool missing{true};
++        float value{0.0f};
++        for (auto const& entry : view[row]) {
++          if (entry.index == split.feature && !std::isnan(entry.fvalue)) {
++            missing = false;
++            value = entry.fvalue;
++          }
++        }
++        auto const& tree_node = planned[node];
++        bool go_left = missing ? split.default_left : value < tree_node.SplitCond();
++        row_nodes[row] = go_left ? tree_node.LeftChild() : tree_node.RightChild();
++      }
++    }
++    active = std::move(next_active);
++  }
++
++  Json serialized{Object{}};
++  planned.SaveModel(&serialized);
++  out_tree->LoadModel(serialized);
++  auto& positions = out_position->HostVector();
++  positions.assign(row_nodes.cbegin(), row_nodes.cend());
++}
++
++}  // namespace xgboost::tree::dsflower
+diff --git a/plugin/dsflower/dsflower_dp_hist.h b/plugin/dsflower/dsflower_dp_hist.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..be4c4f6077d5cadccdda5f180f6e071d395e05a6
+--- /dev/null
++++ b/plugin/dsflower/dsflower_dp_hist.h
+@@ -0,0 +1,30 @@
++/**
++ * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#ifndef XGBOOST_PLUGIN_DSFLOWER_DP_HIST_H_
++#define XGBOOST_PLUGIN_DSFLOWER_DP_HIST_H_
++
++#include <xgboost/base.h>
++#include <xgboost/data.h>
++#include <xgboost/gradient.h>
++#include <xgboost/host_device_vector.h>
++#include <xgboost/span.h>
++#include <xgboost/tree_model.h>
++
++#include <cstdint>
++
++#include "../../src/tree/param.h"
++#include "dsflower_context.h"
++
++namespace xgboost::tree::dsflower {
++
++void BuildFixedPointDpTree(Context const* runtime, TrainParam const& train,
++                           GradientContainer* gradients, DMatrix* dmatrix,
++                           PrivacyContext const& privacy,
++                           std::uint64_t tree_index,
++                           HostDeviceVector<bst_node_t>* out_position, RegTree* out_tree);
++
++}  // namespace xgboost::tree::dsflower
++
++#endif  // XGBOOST_PLUGIN_DSFLOWER_DP_HIST_H_
+diff --git a/plugin/dsflower/dsflower_updater.cc b/plugin/dsflower/dsflower_updater.cc
+index 39f53801464de1ad2db744ed50ebdabee0e716ff..e9ee27c0a8f75781cfe70b9a575dabb4d0755182 100644
+--- a/plugin/dsflower/dsflower_updater.cc
++++ b/plugin/dsflower/dsflower_updater.cc
+@@ -4,4 +4,7 @@
+  */
+ #include "dsflower_context.h"
++#if defined(XGBOOST_DSFLOWER_DP_CORE_TESTING)
++#include "dsflower_dp_hist.h"
++#endif
+
+ #include <algorithm>
+@@ -44,5 +47,5 @@ class DsFlowerDpHistUpdater final : public TreeUpdater {
+
+   void Update(TrainParam const* param, GradientContainer* gpair, DMatrix* dmatrix,
+-              common::Span<HostDeviceVector<bst_node_t>>,
++              common::Span<HostDeviceVector<bst_node_t>> out_position,
+               std::vector<RegTree*> const& trees) override {
+     CHECK(configured_ && dsflower::PrivacyContextReady())
+@@ -64,5 +67,16 @@ class DsFlowerDpHistUpdater final : public TreeUpdater {
+         << "dsFlower XGBoost max_depth does not match the context-bound exact depth";
+     CHECK_EQ(trees.size(), 1) << "dsFlower XGBoost requires one tree per boosting round";
++#if defined(XGBOOST_DSFLOWER_DP_CORE_TESTING)
++    CHECK_EQ(out_position.size(), 1)
++        << "dsFlower XGBoost requires one output-position vector per tree";
++    std::string error;
++    std::uint64_t tree_index{0};
++    CHECK(dsflower::TryGetNextTreeIndex(context.Get().generation, &tree_index, &error)) << error;
++    dsflower::BuildFixedPointDpTree(ctx_, *param, gpair, dmatrix, context.Get(),
++                                    tree_index, &out_position.front(), trees.front());
++    dsflower::RecordSuccessfulTree(context.Get().generation, tree_index);
++#else
+     LOG(FATAL) << "grow_dsflower_dp_hist is a fail-closed scaffold: histogram "
+                   "privatization has not been implemented or proven";
++#endif
+   }

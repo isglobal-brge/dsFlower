@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise ABI v2 and prove that native training remains fail closed."""
+"""Exercise ABI v3 and prove that native training remains fail closed."""
 
 from __future__ import annotations
 
@@ -17,19 +17,10 @@ class PrivacyContext(ct.Structure):
         ("noise_key", ct.POINTER(ct.c_ubyte)),
         ("noise_key_size", ct.c_size_t),
         ("mechanism_id", ct.c_char_p),
-        ("noise_key_id", ct.c_char_p),
-        ("node_id_hash", ct.c_char_p),
-        ("dataset_snapshot_hash", ct.c_char_p),
-        ("cohort_hash", ct.c_char_p),
-        ("query_hash", ct.c_char_p),
-        ("mechanism_config_hash", ct.c_char_p),
-        ("allocation_hash", ct.c_char_p),
         ("privacy_unit", ct.c_char_p),
         ("adjacency", ct.c_char_p),
         ("unit_canonicalization", ct.c_char_p),
         ("contribution_strategy", ct.c_char_p),
-        ("epsilon", ct.c_double),
-        ("delta", ct.c_double),
         ("gradient_clip", ct.c_double),
         ("hessian_clip", ct.c_double),
         ("max_rows_per_unit", ct.c_uint64),
@@ -49,6 +40,9 @@ class PrivacyContext(ct.Structure):
         ("cut_ptrs_size", ct.c_size_t),
         ("cut_values", ct.POINTER(ct.c_double)),
         ("cut_values_size", ct.c_size_t),
+        ("fixed_point_scale", ct.c_uint64),
+        ("root_noise_scale", ct.c_uint64),
+        ("level_noise_scale", ct.c_uint64),
     ]
 
 
@@ -69,6 +63,12 @@ def configure_api(lib: ct.CDLL) -> None:
         ct.c_void_p,
         ct.c_char_p,
         ct.POINTER(ct.c_float),
+        ct.c_uint64,
+    ]
+    lib.XGDMatrixSetStrFeatureInfo.argtypes = [
+        ct.c_void_p,
+        ct.c_char_p,
+        ct.POINTER(ct.c_char_p),
         ct.c_uint64,
     ]
     lib.XGBoosterCreate.argtypes = [
@@ -119,26 +119,16 @@ def valid_context(
     cuts = (ct.c_double * 3)(0.5, 1.5, 2.5)
     task_buffer = ct.create_string_buffer(task)
     objective_buffer = ct.create_string_buffer(objective)
-    digest = b"a" * 64
     context = PrivacyContext(
         ct.sizeof(PrivacyContext),
-        2,
+        3,
         key,
         32,
         b"dsflower.xgboost.dp_hist.v0-scaffold",
-        digest,
-        digest,
-        digest,
-        digest,
-        digest,
-        digest,
-        digest,
         b"patient",
         b"replace_one",
         b"trim-utf8-v2",
         b"one-record-per-unit-v1",
-        1.0,
-        1e-6,
         1.0,
         1.0,
         1,
@@ -158,6 +148,9 @@ def valid_context(
         2,
         cuts,
         3,
+        1024,
+        1,
+        1,
     )
     keepalive: dict[str, object] = {
         "key": key,
@@ -207,6 +200,7 @@ def assert_update_rejected(
         assert lib.XGBoosterSetParam(booster, b"objective", objective) == 0
         assert lib.XGBoosterSetParam(booster, b"base_score", base_score) == 0
         assert lib.XGBoosterSetParam(booster, b"max_depth", max_depth) == 0
+        assert lib.XGBoosterSetParam(booster, b"boost_from_average", b"0") == 0
         assert lib.XGBoosterSetParam(
             booster, b"updater", b"grow_dsflower_dp_hist"
         ) == 0
@@ -229,6 +223,7 @@ def assert_external_gradient_rejected(lib: ct.CDLL, matrix: ct.c_void_p) -> None
             (b"objective", b"reg:squarederror"),
             (b"base_score", b"0.5"),
             (b"max_depth", b"3"),
+            (b"boost_from_average", b"0"),
             (b"updater", b"grow_dsflower_dp_hist"),
         ):
             assert lib.XGBoosterSetParam(booster, name, value) == 0
@@ -252,6 +247,7 @@ def assert_context_swap_rejected(lib: ct.CDLL, matrix: ct.c_void_p) -> None:
             (b"objective", b"reg:squarederror"),
             (b"base_score", b"0.5"),
             (b"max_depth", b"3"),
+            (b"boost_from_average", b"0"),
             (b"updater", b"grow_dsflower_dp_hist"),
         ):
             assert lib.XGBoosterSetParam(booster, name, value) == 0
@@ -283,6 +279,7 @@ def assert_cross_thread_context_swap_rejected(
             (b"objective", b"reg:squarederror"),
             (b"base_score", b"0.5"),
             (b"max_depth", b"3"),
+            (b"boost_from_average", b"0"),
             (b"updater", b"grow_dsflower_dp_hist"),
         ):
             assert lib.XGBoosterSetParam(booster, name, value) == 0
@@ -328,12 +325,6 @@ def main(library: str) -> None:
         zero_keepalive["key"][:] = bytes(32)  # type: ignore[index]
         assert_set_rejected(lib, zero_key_context, zero_keepalive, b"must not be all zero")
 
-        invalid_hash, invalid_hash_keepalive = valid_context(matrix)
-        invalid_hash.query_hash = b"A" * 64
-        assert_set_rejected(
-            lib, invalid_hash, invalid_hash_keepalive, b"lowercase SHA-256"
-        )
-
         malformed_pins = (
             ("privacy_unit", b"household", b"privacy_unit must be row or patient"),
             ("adjacency", b"add_remove", b"adjacency must be replace_one"),
@@ -357,8 +348,16 @@ def main(library: str) -> None:
         for field, value, expected_error in (
             ("max_trees", 0, b"max_trees must be between one and 10000"),
             ("max_trees", 10001, b"max_trees must be between one and 10000"),
-            ("max_depth", 0, b"max_depth must be between one and 32"),
-            ("max_depth", 33, b"max_depth must be between one and 32"),
+            ("max_depth", 0, b"max_depth must be between one and 30"),
+            ("max_depth", 31, b"max_depth must be between one and 30"),
+            ("fixed_point_scale", 0, b"fixed_point_scale must be a power of two"),
+            ("fixed_point_scale", 3, b"fixed_point_scale must be a power of two"),
+            ("fixed_point_scale", 2**32, b"fixed_point_scale must be a power of two"),
+            ("root_noise_scale", 0, b"exact noise scales must be"),
+            ("level_noise_scale", 2**53 + 1, b"exact noise scales must be"),
+            ("gradient_clip", math.inf, b"positive finite float values"),
+            ("gradient_clip", 1e300, b"positive finite float values"),
+            ("hessian_clip", 0.0, b"positive finite float values"),
         ):
             malformed, malformed_keepalive = valid_context(matrix)
             setattr(malformed, field, value)
@@ -455,6 +454,19 @@ def main(library: str) -> None:
         finally:
             assert lib.XGDMatrixFree(weighted_matrix) == 0
 
+        named_matrix = make_matrix(lib)
+        try:
+            names = (ct.c_char_p * 1)(b"private_feature_name")
+            assert lib.XGDMatrixSetStrFeatureInfo(
+                named_matrix, b"feature_name", names, 1
+            ) == 0
+            named_context, named_keepalive = valid_context(named_matrix)
+            assert_set_rejected(
+                lib, named_context, named_keepalive, b"does not accept feature names"
+            )
+        finally:
+            assert lib.XGDMatrixFree(named_matrix) == 0
+
         context, keepalive = valid_context(matrix)
         assert lib.XGBDsFlowerSetPrivacyContext(ct.byref(context)) == 0
         assert_ready(lib, 1)
@@ -511,7 +523,7 @@ def main(library: str) -> None:
         assert lib.XGBDsFlowerClearPrivacyContext() == 0
 
         for parameter, expected_error in (
-            ((b"boost_from_average", b"1"), b"must remain disabled"),
+            ((b"boost_from_average", b"1"), b"must be explicitly disabled"),
             ((b"num_parallel_tree", b"2"), b"single-output, one-tree"),
             ((b"num_target", b"2"), b"single-output, one-tree"),
         ):
@@ -556,9 +568,9 @@ def main(library: str) -> None:
         assert lib.XGBDsFlowerClearPrivacyContext() == 0
 
         temporary_matrix = make_matrix(lib)
-        lifetime_context, lifetime_keepalive = valid_context(temporary_matrix)
-        assert lifetime_keepalive
-        assert lib.XGBDsFlowerSetPrivacyContext(ct.byref(lifetime_context)) == 0
+        owned_context, owned_keepalive = valid_context(temporary_matrix)
+        assert owned_keepalive
+        assert lib.XGBDsFlowerSetPrivacyContext(ct.byref(owned_context)) == 0
         assert lib.XGDMatrixFree(temporary_matrix) == 0
         temporary_matrix = ct.c_void_p()
         gc.collect()
@@ -570,7 +582,7 @@ def main(library: str) -> None:
         assert lib.XGDMatrixFree(other_matrix) == 0
         assert lib.XGDMatrixFree(matrix) == 0
 
-    print("XGBoost dsFlower ABI v2 context/updater fail-closed smoke: ok")
+    print("XGBoost dsFlower ABI v3 context/updater fail-closed smoke: ok")
 
 
 if __name__ == "__main__":

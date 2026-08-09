@@ -1,22 +1,20 @@
 diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
-index 6a73dbad92b5e0a1f30ca4d912201f3ae5dc2115..9e074095d796c0010714ea992cbc292245ade5e1 100644
+index d74051dcadd9b364ee894d5e3249fd134d878abf..37d1f88a46c16e049c92599a700fac167d227c1d 100644
 --- a/include/xgboost/c_api.h
 +++ b/include/xgboost/c_api.h
-@@ -95,7 +95,7 @@ XGB_DLL const char *XGBGetLastError();
-  * @warning This ABI belongs to a fail-closed development scaffold.  It does
+@@ -96,5 +96,5 @@ XGB_DLL const char *XGBGetLastError();
   * not make XGBoost training differentially private.
   */
 -#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 1U
 +#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 2U
 
  /**
-  * @brief Server-authoritative pins required by the dsFlower updater scaffold.
-@@ -104,8 +104,16 @@ XGB_DLL const char *XGBGetLastError();
-  * XGBDsFlowerSetPrivacyContext.  The implementation copies validated values
+@@ -105,7 +105,14 @@ XGB_DLL const char *XGBGetLastError();
   * and never serializes noise_key into a model or XGBoost configuration.  The
   * caller must pass a context-derived key, never its durable noise root.
-- * ABI v1 also requires a DMatrix already materialized as exactly one row per
-- * declared privacy unit; the updater never performs patient canonicalization.
+- * ABI v1 carries the basic contribution contract only. The adapter must
+- * materialize exactly one row per declared privacy unit before training; the
+- * updater never performs patient canonicalization.
 + * The server derives this key from its custodial root and the complete canonical
 + * semantic training identity.  Native mechanism coordinates must consume it
 + * only through deterministic, domain-separated PRF derivation.
@@ -29,9 +27,7 @@ index 6a73dbad92b5e0a1f30ca4d912201f3ae5dc2115..9e074095d796c0010714ea992cbc2922
 + * unit; the updater never performs patient canonicalization.
   */
  typedef struct XGBDsFlowerPrivacyContext {
-   uint32_t struct_size;
-@@ -129,6 +137,22 @@ typedef struct XGBDsFlowerPrivacyContext {
-   double gradient_clip;
+@@ -122,4 +129,20 @@ typedef struct XGBDsFlowerPrivacyContext {
    double hessian_clip;
    uint64_t max_rows_per_unit;
 +  DMatrixHandle dmatrix;
@@ -52,13 +48,11 @@ index 6a73dbad92b5e0a1f30ca4d912201f3ae5dc2115..9e074095d796c0010714ea992cbc2922
 +  size_t cut_values_size;
  } XGBDsFlowerPrivacyContext;
 
- /**
 diff --git a/include/xgboost/gradient.h b/include/xgboost/gradient.h
 index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93b191dd01 100644
 --- a/include/xgboost/gradient.h
 +++ b/include/xgboost/gradient.h
-@@ -8,12 +8,22 @@
- #include <xgboost/logging.h>
+@@ -9,10 +9,20 @@
 
  #include <cstddef>  // for size_t
 +#include <cstdint>  // for uint8_t
@@ -79,9 +73,7 @@ index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93
 +
    /** @brief Gradient used for multi-target tree split and linear model. */
    linalg::Matrix<GradientPair> gpair;
-   /** @brief Gradient used for tree leaf value, optional. */
-@@ -21,6 +31,9 @@ struct GradientContainer {
-
+@@ -22,4 +32,7 @@ struct GradientContainer {
    [[nodiscard]] bool HasValueGrad() const noexcept { return !value_gpair.Empty(); }
 
 +  /** @brief Provenance assigned only by Learner's built-in objective path. */
@@ -89,9 +81,7 @@ index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93
 +
    [[nodiscard]] std::size_t NumSplitTargets() const noexcept { return gpair.Shape(1); }
    [[nodiscard]] std::size_t NumTargets() const noexcept {
-     return HasValueGrad() ? value_gpair.Shape(1) : this->gpair.Shape(1);
-@@ -48,5 +61,11 @@ struct GradientContainer {
-     }
+@@ -49,4 +62,10 @@ struct GradientContainer {
      return this->Grad();
    }
 +
@@ -103,19 +93,20 @@ index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93
  };
  }  // namespace xgboost
 diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
-index fb265eb2a7c788270ee76030be51a8800618796b..5d9216dff4e1deb3697983b6efd6c0a198109b58 100644
+index c066066c8fcb8ac33b72b390ca9d713c48b520b3..5d9216dff4e1deb3697983b6efd6c0a198109b58 100644
 --- a/plugin/dsflower/README.md
 +++ b/plugin/dsflower/README.md
-@@ -5,11 +5,33 @@ TreeUpdater name and a C ABI for server-authoritative privacy context.  It
- validates all required context pins, keeps the noise key out of serialized
+@@ -6,9 +6,31 @@ validates all required context pins, keeps the noise key out of serialized
  XGBoost configuration, and then rejects every training update.
 
 -The v1 adapter boundary accepts only `privacy_unit=row|patient`,
 +The v2 adapter boundary accepts only `privacy_unit=row|patient`,
  `adjacency=replace_one`, `unit_canonicalization=trim-utf8-v2`,
  `contribution_strategy=one-record-per-unit-v1`, and `max_rows_per_unit=1`.
- The server must materialize the DMatrix as one row per privacy unit before it
- crosses this ABI; this scaffold does not canonicalize or pool patients itself.
+-The adapter must materialize exactly one row per privacy unit before training;
+-this scaffold does not canonicalize or pool patients itself.
++The server must materialize the DMatrix as one row per privacy unit before it
++crosses this ABI; this scaffold does not canonicalize or pool patients itself.
 +The context takes shared ownership of exactly one in-memory CPU DMatrix and
 +copies public float-safe feature bounds and split cuts.  It accepts only numeric
 +single-output binary-logistic or squared-error tasks, with explicit public
@@ -140,9 +131,7 @@ index fb265eb2a7c788270ee76030be51a8800618796b..5d9216dff4e1deb3697983b6efd6c0a1
 +valid alternatives.
 
  The updater must remain unavailable to production integration until a later
- patch implements and proves all of the following before any data-dependent
-@@ -17,8 +39,10 @@ split, topology, leaf, metric, log, or model artifact can leave the trusted
- process:
+@@ -18,6 +40,8 @@ process:
 
  - patient-level contribution bounding;
 -- public or privately selected bins;
@@ -153,13 +142,11 @@ index fb265eb2a7c788270ee76030be51a8800618796b..5d9216dff4e1deb3697983b6efd6c0a1
 +  domain-separated semantic PRF stream;
  - privatized gradient/hessian histograms before split selection;
  - per-training composition accounting and deterministic semantic PRF identity;
- - tests covering every egress and failure path.
 diff --git a/plugin/dsflower/dsflower_context.cc b/plugin/dsflower/dsflower_context.cc
-index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf5619871b 100644
+index 2c850beada9e8963cee36efe0e4d70170a8c051d..ba98cd2a8b01c2e31d5314c2d931510d9b681013 100644
 --- a/plugin/dsflower/dsflower_context.cc
 +++ b/plugin/dsflower/dsflower_context.cc
-@@ -5,11 +5,17 @@
- #include "dsflower_context.h"
+@@ -6,9 +6,15 @@
 
  #include <algorithm>
 +#include <atomic>
@@ -175,10 +162,8 @@ index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf
 +#include "../../src/data/simple_dmatrix.h"
  #include "xgboost/logging.h"
 
- namespace xgboost::tree::dsflower {
-@@ -17,13 +23,6 @@ namespace {
-
- constexpr std::size_t kHashSize = 64;
+@@ -16,11 +22,4 @@ namespace xgboost::tree::dsflower {
+ namespace {
 
 -void SecureZero(unsigned char* ptr, std::size_t size) {
 -  volatile unsigned char* out = ptr;
@@ -189,24 +174,19 @@ index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf
 -
  struct ContextSlot {
    PrivacyContext value;
-   bool ready{false};
-@@ -31,13 +30,13 @@ struct ContextSlot {
-   ~ContextSlot() { Reset(); }
+@@ -30,5 +29,4 @@ struct ContextSlot {
 
    void Reset() {
 -    SecureZero(value.noise_key.data(), value.noise_key.size());
      value = PrivacyContext{};
      ready = false;
-   }
- };
+@@ -37,4 +35,5 @@ struct ContextSlot {
 
  thread_local ContextSlot g_context;
 +std::atomic<std::uint64_t> g_context_generation{0};
 
- bool IsLowerHexHash(const char* value) {
-   if (value == nullptr) {
-@@ -57,6 +56,268 @@ bool Reject(std::string message, std::string* error) {
-   return false;
+ bool Reject(std::string message, std::string* error) {
+@@ -45,4 +44,257 @@ bool Reject(std::string message, std::string* error) {
  }
 
 +bool NextContextGeneration(std::uint64_t* out, std::string* error) {
@@ -402,19 +382,10 @@ index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf
 +PrivacyContext CloneContext(PrivacyContext const& source) {
 +  PrivacyContext out;
 +  out.noise_key.Assign(source.noise_key.Get().data());
-+  out.noise_key_id = source.noise_key_id;
-+  out.node_id_hash = source.node_id_hash;
-+  out.dataset_snapshot_hash = source.dataset_snapshot_hash;
-+  out.cohort_hash = source.cohort_hash;
-+  out.query_hash = source.query_hash;
-+  out.mechanism_config_hash = source.mechanism_config_hash;
-+  out.allocation_hash = source.allocation_hash;
 +  out.privacy_unit = source.privacy_unit;
 +  out.adjacency = source.adjacency;
 +  out.unit_canonicalization = source.unit_canonicalization;
 +  out.contribution_strategy = source.contribution_strategy;
-+  out.epsilon = source.epsilon;
-+  out.delta = source.delta;
 +  out.gradient_clip = source.gradient_clip;
 +  out.hessian_clip = source.hessian_clip;
 +  out.max_rows_per_unit = source.max_rows_per_unit;
@@ -473,16 +444,14 @@ index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf
 +
  }  // namespace
 
- bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error) {
-@@ -116,8 +377,29 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
-   if (input.max_rows_per_unit != 1) {
+@@ -91,6 +343,27 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
      return Reject("dsFlower max_rows_per_unit must equal one", error);
    }
 +  if (input.max_trees == 0 || input.max_trees > kMaxTrees) {
 +    return Reject("dsFlower max_trees must be between one and 10000", error);
 +  }
 +  if (input.max_depth == 0 || input.max_depth > kMaxDepth) {
-+    return Reject("dsFlower max_depth must be between one and 32", error);
++    return Reject("dsFlower max_depth must be between one and 30", error);
 +  }
 
    PrivacyContext next;
@@ -501,11 +470,9 @@ index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf
 +  auto labels = next.dmatrix->Info().labels.Data()->ConstHostSpan();
 +  next.sealed_labels.assign(labels.cbegin(), labels.cend());
 +
-   next.noise_key_id = input.noise_key_id;
-   next.node_id_hash = input.node_id_hash;
-   next.dataset_snapshot_hash = input.dataset_snapshot_hash;
-@@ -134,8 +416,12 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
-   next.gradient_clip = input.gradient_clip;
+   next.privacy_unit = input.privacy_unit;
+   next.adjacency = input.adjacency;
+@@ -100,6 +373,10 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
    next.hessian_clip = input.hessian_clip;
    next.max_rows_per_unit = input.max_rows_per_unit;
 +  if (!NextContextGeneration(&next.generation, error)) {
@@ -517,9 +484,7 @@ index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf
 -  std::copy_n(input.noise_key, kNoiseKeySize, g_context.value.noise_key.begin());
    g_context.ready = true;
    return true;
- }
-@@ -144,6 +430,70 @@ void ClearPrivacyContext() { g_context.Reset(); }
-
+@@ -110,4 +387,68 @@ void ClearPrivacyContext() { g_context.Reset(); }
  bool PrivacyContextReady() { return g_context.ready; }
 
 +bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
@@ -588,13 +553,11 @@ index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf
 +
  }  // namespace xgboost::tree::dsflower
 
- XGB_DLL int XGBDsFlowerSetPrivacyContext(const XGBDsFlowerPrivacyContext* context) {
 diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_context.h
-index 1b99a79a7ae622e36f2aa7ac106439cfcc0722bc..97ba97b876c4c9fc9cd8de92732ee74e4a6b8015 100644
+index ef9fff81cbf196a6bab8aafeb67714ad5c42c65d..3d5fe651153fd78b97ef9566a724d77a97e4dbb9 100644
 --- a/plugin/dsflower/dsflower_context.h
 +++ b/plugin/dsflower/dsflower_context.h
-@@ -5,21 +5,71 @@
- #ifndef XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
+@@ -6,10 +6,16 @@
  #define XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
 
 +#include <algorithm>
@@ -611,14 +574,13 @@ index 1b99a79a7ae622e36f2aa7ac106439cfcc0722bc..97ba97b876c4c9fc9cd8de92732ee74e
 +#include "xgboost/task.h"
 
  namespace xgboost::tree::dsflower {
-
- inline constexpr char kScaffoldMechanismId[] =
+@@ -18,7 +24,51 @@ inline constexpr char kScaffoldMechanismId[] =
      "dsflower.xgboost.dp_hist.v0-scaffold";
  inline constexpr std::size_t kNoiseKeySize = 32;
 +inline constexpr std::size_t kMaxFeatures = 8192;
 +inline constexpr std::size_t kMaxTotalCuts = 16384;
 +inline constexpr std::uint64_t kMaxTrees = 10000;
-+inline constexpr std::uint64_t kMaxDepth = 32;
++inline constexpr std::uint64_t kMaxDepth = 30;
 +
 +class SensitiveKey {
 + public:
@@ -663,11 +625,9 @@ index 1b99a79a7ae622e36f2aa7ac106439cfcc0722bc..97ba97b876c4c9fc9cd8de92732ee74e
  struct PrivacyContext {
 -  std::array<unsigned char, kNoiseKeySize> noise_key{};
 +  SensitiveKey noise_key;
-   std::string noise_key_id;
-   std::string node_id_hash;
-   std::string dataset_snapshot_hash;
-@@ -36,11 +86,50 @@ struct PrivacyContext {
-   double gradient_clip{0.0};
+   std::string privacy_unit;
+   std::string adjacency;
+@@ -28,4 +78,40 @@ struct PrivacyContext {
    double hessian_clip{0.0};
    std::uint64_t max_rows_per_unit{0};
 +  std::shared_ptr<DMatrix> dmatrix;
@@ -708,7 +668,7 @@ index 1b99a79a7ae622e36f2aa7ac106439cfcc0722bc..97ba97b876c4c9fc9cd8de92732ee74e
 +  PrivacyContext value_;
  };
 
- bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error);
+@@ -33,4 +119,7 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
  void ClearPrivacyContext();
  bool PrivacyContextReady();
 +bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
@@ -716,13 +676,11 @@ index 1b99a79a7ae622e36f2aa7ac106439cfcc0722bc..97ba97b876c4c9fc9cd8de92732ee74e
 +PrivacyContextSnapshot SnapshotPrivacyContextForDMatrix(DMatrix* dmatrix);
 
  }  // namespace xgboost::tree::dsflower
-
 diff --git a/plugin/dsflower/dsflower_updater.cc b/plugin/dsflower/dsflower_updater.cc
 index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabee0e716ff 100644
 --- a/plugin/dsflower/dsflower_updater.cc
 +++ b/plugin/dsflower/dsflower_updater.cc
-@@ -4,8 +4,11 @@
-  */
+@@ -5,6 +5,9 @@
  #include "dsflower_context.h"
 
 +#include <algorithm>
@@ -732,9 +690,7 @@ index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabe
 +#include "../../src/tree/param.h"
  #include "xgboost/gradient.h"
  #include "xgboost/json.h"
- #include "xgboost/logging.h"
-@@ -17,12 +20,13 @@ DMLC_REGISTRY_FILE_TAG(dsflower_dp_hist_scaffold);
-
+@@ -18,10 +21,11 @@ DMLC_REGISTRY_FILE_TAG(dsflower_dp_hist_scaffold);
  class DsFlowerDpHistUpdater final : public TreeUpdater {
   public:
 -  explicit DsFlowerDpHistUpdater(Context const* ctx) : TreeUpdater{ctx} {}
@@ -751,9 +707,7 @@ index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabe
 +        << error;
      configured_ = true;
    }
-
-@@ -38,23 +42,41 @@ class DsFlowerDpHistUpdater final : public TreeUpdater {
-
+@@ -39,9 +43,25 @@ class DsFlowerDpHistUpdater final : public TreeUpdater {
    [[nodiscard]] char const* Name() const override { return "grow_dsflower_dp_hist"; }
 
 -  void Update(TrainParam const*, GradientContainer*, DMatrix*,
@@ -781,8 +735,7 @@ index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabe
 +    CHECK_EQ(trees.size(), 1) << "dsFlower XGBoost requires one tree per boosting round";
      LOG(FATAL) << "grow_dsflower_dp_hist is a fail-closed scaffold: histogram "
                    "privatization has not been implemented or proven";
-   }
-
+@@ -50,10 +70,12 @@ class DsFlowerDpHistUpdater final : public TreeUpdater {
   private:
    bool configured_{false};
 +  std::uint64_t configured_generation_{0};
@@ -797,13 +750,11 @@ index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabe
 +      return new DsFlowerDpHistUpdater{ctx, task};
      });
 
- }  // namespace xgboost::tree
 diff --git a/src/learner.cc b/src/learner.cc
 index d1a5e1de479543550a9f3a2b19261e0e253ebc5e..b7f72fe497dd8a6246e17244d8a588dc4789731a 100644
 --- a/src/learner.cc
 +++ b/src/learner.cc
-@@ -1126,5 +1126,12 @@ class LearnerImpl : public LearnerIO {
-
+@@ -1127,4 +1127,11 @@ class LearnerImpl : public LearnerIO {
      monitor_.Start("GetGradient");
      GetGradient(predt->predictions, train->Info(), iter, &gpair_.gpair);
 +    auto gradient_source = GradientContainer::ObjectiveSource::kOtherBuiltIn;

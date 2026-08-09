@@ -11,7 +11,7 @@ future node-owned adapter must satisfy before it can touch private data:
 * the sole persistent noise root keys a semantic identity, so equivalent work
   can be recomputed with identical randomness without a query database; and
 * the result channel contains only fixed metadata and a digest of a separately
-  transported, non-executable model/synopsis artifact.  It has no free-form log,
+  transported, non-executable model artifact.  It has no free-form log,
   path or exception field.
 
 This is the server-enriched backend ABI, not the analyst-facing R request ABI.
@@ -55,7 +55,7 @@ RESOURCE_HARD_CAPS = {
     "max_trees": 10_000,
     "max_depth": 32,
     "max_bins": 65_536,
-    "max_artifact_bytes": 512 * 1024 * 1024,
+    "max_artifact_bytes": 64 * 1024 * 1024,
 }
 
 _RESOURCE_MINIMUMS = {
@@ -70,7 +70,7 @@ _RESOURCE_MINIMUMS = {
     "max_artifact_bytes": 1,
 }
 
-_MODES = frozenset(("native-tight", "synopsis-flex"))
+_MODES = frozenset(("native-tight",))
 _ENGINES = frozenset((
     "xgboost", "lightgbm", "catboost", "random_forest", "extra_trees",
 ))
@@ -87,7 +87,6 @@ _PARAMETER_TYPES = frozenset((
 _PARAMETER_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 _INVOCATION_ID_RE = re.compile(r"^inv1_[0-9a-f]{64}$")
-_QUERY_ID_RE = re.compile(r"^sq1[ns]_[0-9a-f]{64}$")
 
 # These controls are node-owned.  Passing them through an engine's generic
 # parameter interface could bypass a DP updater, load data/models, execute a
@@ -139,8 +138,8 @@ _RESERVED_PARAMETER_PARTS = frozenset((
 _RESERVED_PARAMETER_SUFFIXES = ("_dir", "_file", "_filename", "_path")
 
 _SUCCESS_FIELDS = frozenset((
-    "contract_version", "status", "invocation_id", "semantic_query_id",
-    "engine", "mode", "artifact", "sanitization",
+    "contract_version", "status", "invocation_id", "engine", "mode",
+    "artifact", "sanitization",
 ))
 _ERROR_FIELDS = frozenset((
     "contract_version", "status", "invocation_id", "error_code",
@@ -154,7 +153,6 @@ _ARTIFACT_FIELDS = frozenset((
 _SANITIZATION_FIELDS = frozenset((
     "profile",
     "privacy_basis",
-    "semantic_query_id",
     "contains_raw_records",
     "contains_unnoised_statistics",
     "contains_feature_names",
@@ -172,7 +170,6 @@ _MODEL_FORMATS = {
     "random_forest": "dsflower-forest-json-v1",
     "extra_trees": "dsflower-forest-json-v1",
 }
-_SYNOPSIS_FORMAT = "dsflower-synopsis-json-v1"
 _RESOURCE_PARAMETER_ALIASES = {
     "max_trees": frozenset((
         "iterations", "n_estimators", "num_boost_round", "num_iterations",
@@ -257,7 +254,7 @@ def _typed_scalar(kind, value, where):
     raise ValueError("parameter has an unsupported declared type")
 
 
-def _reserved_parameter(name, mode):
+def _reserved_parameter(name):
     if name in _RESERVED_PARAMETER_NAMES or name.endswith(
             _RESERVED_PARAMETER_SUFFIXES):
         return True
@@ -265,12 +262,12 @@ def _reserved_parameter(name, mode):
         return True
     if name.startswith(("contribution_", "dp_", "privacy_", "unit_")):
         return True
-    if mode == "native-tight" and name in _TIGHT_RESERVED_PARAMETER_NAMES:
+    if name in _TIGHT_RESERVED_PARAMETER_NAMES:
         return True
     return bool(_RESERVED_PARAMETER_PARTS.intersection(name.split("_")))
 
 
-def _typed_parameters(value, where, max_count, mode):
+def _typed_parameters(value, where, max_count):
     params = _mapping(value, where)
     if len(params) > max_count:
         raise ValueError("%s exceeds the parameter-count cap" % where)
@@ -281,7 +278,7 @@ def _typed_parameters(value, where, max_count, mode):
     for name in sorted(params):
         if len(name.encode("ascii")) > MAX_PARAMETER_NAME_BYTES:
             raise ValueError("parameter name is invalid")
-        if _reserved_parameter(name, mode):
+        if _reserved_parameter(name):
             raise ValueError("parameter name is reserved for the trusted backend")
         item = _mapping(params[name], "typed parameter")
         _exact_fields(item, frozenset(("type", "value")), "typed parameter")
@@ -303,7 +300,7 @@ def _typed_parameters(value, where, max_count, mode):
     return canonical
 
 
-def _canonical_privacy(value, mode, engine):
+def _canonical_privacy(value, engine):
     privacy = _mapping(value, "privacy contract")
     fields = frozenset((
         "mechanism", "epsilon", "delta", "unit", "adjacency",
@@ -312,9 +309,7 @@ def _canonical_privacy(value, mode, engine):
     ))
     _exact_fields(privacy, fields, "privacy contract")
     mechanism = privacy["mechanism"]
-    if mode == "synopsis-flex":
-        expected = "dp-synopsis-v1"
-    elif engine in _FOREST_ENGINES:
+    if engine in _FOREST_ENGINES:
         expected = "dp-forest-v1"
     else:
         expected = "dp-histogram-v1"
@@ -348,7 +343,6 @@ def _canonical_privacy(value, mode, engine):
             privacy["mechanism_params"],
             "mechanism parameters",
             MAX_MECHANISM_PARAMETERS,
-            "native-tight",
         ),
     }
 
@@ -391,9 +385,42 @@ def _public_schema_json(core):
     ).encode("utf-8")
 
 
+def _canonical_target_level(value):
+    record = _mapping(value, "public target level")
+    _exact_fields(
+        record, frozenset(("type", "value")), "public target level")
+    level_type = record["type"]
+    raw_value = record["value"]
+    if level_type == "string":
+        if not isinstance(raw_value, str) or not raw_value:
+            raise ValueError("string target level must be non-empty UTF-8")
+        try:
+            encoded = raw_value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("string target level must be non-empty UTF-8") from exc
+        if len(encoded) > 512 or any(
+                ord(char) < 0x20 or ord(char) == 0x7f
+                for char in raw_value):
+            raise ValueError("string target level is not a safe bounded string")
+        normalized = raw_value
+    elif level_type == "boolean":
+        if not isinstance(raw_value, bool):
+            raise ValueError("boolean target level has the wrong scalar type")
+        normalized = raw_value
+    elif level_type == "number":
+        normalized = _bounded_float(
+            raw_value, "number target level",
+            lower=-MAX_FLOAT_ABS, upper=MAX_FLOAT_ABS,
+        )
+        normalized = 0.0 if normalized == 0.0 else normalized
+    else:
+        raise ValueError("public target level has an unsupported tagged type")
+    return {"type": level_type, "value": normalized}
+
+
 def _canonical_target(value, task, features):
     target = _mapping(value, "public target")
-    fields = frozenset(("name", "kind", "lower", "upper"))
+    fields = frozenset(("name", "kind", "levels", "lower", "upper"))
     _exact_fields(target, fields, "public target")
     name = _public_feature_name(target["name"])
     if name in features:
@@ -414,17 +441,31 @@ def _canonical_target(value, task, features):
     if task == "binary_classification":
         if kind != "binary" or lower != 0.0 or upper != 1.0:
             raise ValueError("binary task requires target bounds [0, 1]")
-    elif kind != "continuous" or lower >= upper:
-        raise ValueError("regression task requires finite increasing target bounds")
+        raw_levels = target["levels"]
+        if not isinstance(raw_levels, list) or len(raw_levels) != 2:
+            raise ValueError(
+                "binary task requires exactly two ordered tagged target levels")
+        levels = [_canonical_target_level(level) for level in raw_levels]
+        identities = [_public_schema_json(level) for level in levels]
+        if len(set(identities)) != 2:
+            raise ValueError("binary target levels must be distinct and ordered")
+    else:
+        if kind != "continuous" or lower >= upper:
+            raise ValueError(
+                "regression task requires finite increasing target bounds")
+        if target["levels"] is not None:
+            raise ValueError("regression target levels must be null")
+        levels = None
     return {
         "name": name,
         "kind": kind,
+        "levels": levels,
         "lower": lower,
         "upper": upper,
     }
 
 
-def _canonical_public_schema(value, mode, task, resources):
+def _canonical_public_schema(value, task, resources):
     schema = _mapping(value, "public schema")
     fields = frozenset((
         "version", "features", "lower", "upper", "cuts", "target", "sha256",
@@ -451,9 +492,7 @@ def _canonical_public_schema(value, mode, task, resources):
 
     raw_cuts = schema["cuts"]
     if raw_cuts is None:
-        if mode == "native-tight":
-            raise ValueError("native-tight requires complete public cuts")
-        cuts = None
+        raise ValueError("native-tight requires complete public cuts")
     else:
         if not isinstance(raw_cuts, list) or len(raw_cuts) != len(features):
             raise ValueError("public cuts must contain one array per feature")
@@ -562,7 +601,7 @@ def canonical_engine_manifest(value):
         raise ValueError("unsupported native-tree task")
     resources = _canonical_resources(manifest["resources"])
     public_schema = _canonical_public_schema(
-        manifest["public_schema"], mode, task, resources
+        manifest["public_schema"], task, resources
     )
     data_scope = _canonical_data_scope(manifest["data_scope"])
     if not hmac.compare_digest(
@@ -572,7 +611,6 @@ def canonical_engine_manifest(value):
         manifest["engine_params"],
         "engine parameters",
         MAX_PUBLIC_PARAMETERS,
-        mode,
     )
     _validate_parameter_resource_caps(engine_params, resources)
     canonical = {
@@ -582,7 +620,7 @@ def canonical_engine_manifest(value):
         "task": task,
         "public_schema": public_schema,
         "engine_params": engine_params,
-        "privacy": _canonical_privacy(manifest["privacy"], mode, engine),
+        "privacy": _canonical_privacy(manifest["privacy"], engine),
         "data_scope": data_scope,
         "resources": resources,
     }
@@ -602,74 +640,14 @@ def invocation_identity(value):
     return "inv1_" + digest
 
 
-def semantic_query_identity(noise_root, value):
-    """Return a domain-separated HMAC identity for sticky DP randomness.
-
-    A native-tight identity includes every engine parameter because it can change
-    the sequence/sensitivity of private accesses.  In synopsis-flex mode only
-    the task, schema, dataset scope and synopsis/privacy mechanism remain bound.
-    The engine and ``engine_params`` are downstream postprocessing and are
-    omitted so one deterministic DP synopsis can serve XGBoost, LightGBM,
-    CatBoost and local HPO for that task. Resource ceilings are non-semantic:
-    implementations must reject at a ceiling and never silently clip work to it.
-
-    ``noise_root`` is the sole persistent node-internal HMAC key. The returned
-    identifier must never be exposed through the analyst-facing protocol.
-    Epsilon, delta and every mechanism pin are part of the identity.
-    """
-    if not isinstance(noise_root, (bytes, bytearray, memoryview)) or \
-            len(noise_root) != 32:
-        raise ValueError("noise root must be exactly 32 bytes")
-    manifest = canonical_engine_manifest(value)
-    material = {
-        "identity_version": 1,
-        "contract_version": manifest["contract_version"],
-        "mode": manifest["mode"],
-        "task": manifest["task"],
-        "public_schema": manifest["public_schema"],
-        "privacy": manifest["privacy"],
-        "data_scope": manifest["data_scope"],
-    }
-    if manifest["mode"] == "native-tight":
-        material["engine"] = manifest["engine"]
-        material["engine_params"] = manifest["engine_params"]
-        prefix = "sq1n_"
-    else:
-        prefix = "sq1s_"
-    digest = hmac.new(
-        bytes(noise_root),
-        b"dsflower/native-tree/semantic-query/v1\x00" + _canonical_json(material),
-        hashlib.sha256,
-    ).hexdigest()
-    return prefix + digest
-
-
-def _validate_query_id(value, mode):
-    prefix = "sq1n_" if mode == "native-tight" else "sq1s_"
-    if not isinstance(value, str) or not _QUERY_ID_RE.fullmatch(value) or \
-            not value.startswith(prefix):
-        raise ValueError("semantic query identity is invalid for this mode")
-    return value
-
-
-def artifact_sanitization_metadata(manifest, semantic_query_id, artifact_kind):
+def artifact_sanitization_metadata(manifest, artifact_kind):
     """Create the only attestation shape accepted from a trusted sanitizer."""
-    canonical = canonical_engine_manifest(manifest)
-    query_id = _validate_query_id(semantic_query_id, canonical["mode"])
-    if canonical["mode"] == "native-tight":
-        if artifact_kind != "model":
-            raise ValueError("native-tight backends may only release model artifacts")
-        basis = "direct-dp-training"
-    elif artifact_kind == "synopsis":
-        basis = "dp-synopsis"
-    elif artifact_kind == "model":
-        basis = "dp-synopsis-postprocessing"
-    else:
-        raise ValueError("unsupported artifact kind")
+    canonical_engine_manifest(manifest)
+    if artifact_kind != "model":
+        raise ValueError("native-tight backends may only release model artifacts")
     return {
         "profile": "dsflower-tree-artifact-v1",
-        "privacy_basis": basis,
-        "semantic_query_id": query_id,
+        "privacy_basis": "direct-dp-training",
         "contains_raw_records": False,
         "contains_unnoised_statistics": False,
         "contains_feature_names": False,
@@ -684,10 +662,6 @@ def artifact_sanitization_metadata(manifest, semantic_query_id, artifact_kind):
 def expected_artifact_format(manifest, artifact_kind):
     """Return the single non-Pickle artifact encoding allowed by the ABI."""
     canonical = canonical_engine_manifest(manifest)
-    if artifact_kind == "synopsis":
-        if canonical["mode"] != "synopsis-flex":
-            raise ValueError("native-tight backends cannot release a synopsis")
-        return _SYNOPSIS_FORMAT
     if artifact_kind != "model":
         raise ValueError("unsupported artifact kind")
     return _MODEL_FORMATS[canonical["engine"]]
@@ -720,7 +694,6 @@ def _json_object_without_duplicate_keys(artifact):
 def _validate_artifact_encoding(artifact_format, artifact):
     if artifact_format in (
         "xgboost-json-v1", "dsflower-forest-json-v1",
-        "dsflower-synopsis-json-v1",
     ):
         _json_object_without_duplicate_keys(artifact)
         return
@@ -740,8 +713,7 @@ def _validate_artifact_encoding(artifact_format, artifact):
     raise ValueError("artifact format is unsupported")
 
 
-def validate_backend_result(result, manifest, *, expected_query_id,
-                            artifact_bytes):
+def validate_backend_result(result, manifest, *, artifact_bytes):
     """Validate a backend response and bind it to the separately returned bytes.
 
     Failure responses intentionally carry a bounded code only.  Detailed native
@@ -782,11 +754,6 @@ def validate_backend_result(result, manifest, *, expected_query_id,
                 invocation_id, expected_invocation):
         raise ValueError("backend result invocation identity mismatch")
 
-    query_id = _validate_query_id(expected_query_id, canonical["mode"])
-    returned_query_id = response["semantic_query_id"]
-    if not isinstance(returned_query_id, str) or not hmac.compare_digest(
-            returned_query_id, query_id):
-        raise ValueError("backend result semantic query identity mismatch")
     if response["engine"] != canonical["engine"] or \
             response["mode"] != canonical["mode"]:
         raise ValueError("backend result engine or mode mismatch")
@@ -809,9 +776,9 @@ def validate_backend_result(result, manifest, *, expected_query_id,
         raise ValueError("artifact size exceeds its resource cap")
     if not isinstance(artifact_bytes, (bytes, bytearray, memoryview)):
         raise ValueError("successful backend result is missing artifact bytes")
-    if len(artifact_bytes) != advertised_size:
-        raise ValueError("artifact size does not match returned bytes")
     artifact = bytes(artifact_bytes)
+    if len(artifact) != advertised_size:
+        raise ValueError("artifact size does not match returned bytes")
     _validate_artifact_encoding(expected_format, artifact)
     advertised_hash = artifact_meta["sha256"]
     actual_hash = hashlib.sha256(artifact).hexdigest()
@@ -822,7 +789,7 @@ def validate_backend_result(result, manifest, *, expected_query_id,
     sanitization = _mapping(response["sanitization"], "sanitization metadata")
     _exact_fields(sanitization, _SANITIZATION_FIELDS, "sanitization metadata")
     expected_sanitization = artifact_sanitization_metadata(
-        canonical, query_id, kind
+        canonical, kind
     )
     if sanitization != expected_sanitization:
         raise ValueError("artifact sanitization attestation is invalid")
@@ -830,7 +797,6 @@ def validate_backend_result(result, manifest, *, expected_query_id,
         "contract_version": CONTRACT_VERSION,
         "status": "ok",
         "invocation_id": invocation_id,
-        "semantic_query_id": returned_query_id,
         "engine": canonical["engine"],
         "mode": canonical["mode"],
         "artifact": dict(artifact_meta),
@@ -847,6 +813,5 @@ __all__ = [
     "canonical_manifest_bytes",
     "expected_artifact_format",
     "invocation_identity",
-    "semantic_query_identity",
     "validate_backend_result",
 ]
