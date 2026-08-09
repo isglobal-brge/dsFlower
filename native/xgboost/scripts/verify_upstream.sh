@@ -24,11 +24,19 @@ ACTUAL_TREE=$(git -C "$SOURCE" rev-parse "$DSFLOWER_XGB_UPSTREAM_COMMIT^{tree}")
 [ "$ACTUAL_TREE" = "$DSFLOWER_XGB_UPSTREAM_TREE" ] ||
   die "tree mismatch: expected $DSFLOWER_XGB_UPSTREAM_TREE, got $ACTUAL_TREE"
 
-ACTUAL_ARCHIVE_SHA=$(
-  git -C "$SOURCE" archive --format=tar "$DSFLOWER_XGB_UPSTREAM_COMMIT" | sha256_stream
-)
+ARCHIVE_FILE=$(mktemp "${TMPDIR:-/tmp}/dsflower-xgb-archive.XXXXXX.tar")
+cleanup_archive() {
+  [ ! -e "$ARCHIVE_FILE" ] || unlink "$ARCHIVE_FILE"
+}
+trap cleanup_archive EXIT HUP INT TERM
+git -C "$SOURCE" archive --format=tar --output="$ARCHIVE_FILE" \
+  "$DSFLOWER_XGB_UPSTREAM_COMMIT"
+ACTUAL_ARCHIVE_SHA=$(sha256_file "$ARCHIVE_FILE")
+cleanup_archive
+trap - EXIT HUP INT TERM
 [ "$ACTUAL_ARCHIVE_SHA" = "$DSFLOWER_XGB_UPSTREAM_ARCHIVE_SHA256" ] ||
-  die "upstream archive SHA-256 mismatch"
+  die "upstream archive SHA-256 mismatch:" \
+    "expected $DSFLOWER_XGB_UPSTREAM_ARCHIVE_SHA256, got $ACTUAL_ARCHIVE_SHA"
 
 [ -d "$SOURCE/dmlc-core/.git" ] || [ -f "$SOURCE/dmlc-core/.git" ] ||
   die "dmlc-core submodule is not initialized"
