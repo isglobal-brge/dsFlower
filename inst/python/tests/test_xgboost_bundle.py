@@ -103,10 +103,9 @@ def _canonical(value):
 
 class _BundleDirectory:
     def __init__(self):
-        # The loader deliberately rejects /tmp-style world-writable parents.
-        # Place the positive fixture under the checked-out, runner-owned tree.
-        self.temporary = tempfile.TemporaryDirectory(
-            dir=None if os.name == "nt" else Path.cwd())
+        # The loader deliberately rejects shared temp/workspace ACLs.  A child
+        # of the service account's home models the node-owned deployment root.
+        self.temporary = tempfile.TemporaryDirectory(dir=Path.home())
         self.root = Path(self.temporary.name).resolve()
         self.xgboost_bytes = b"real-xgboost-binary"
         self.primitive_bytes = b"real-dp-primitive"
