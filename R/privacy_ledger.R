@@ -4,8 +4,9 @@
 # adaptive composition then bounds every finite prefix (and the infinite
 # transcript) by the server-owned lifetime policy.  The schedule never rejects a
 # run because a budget was "exhausted": allocations decrease towards zero.  Once
-# a per-release allocation is too small to calibrate robustly, the runner returns
-# the incoming public model unchanged while the exact allocation remains recorded.
+# a per-release allocation is too small to calibrate robustly, the runner emits a
+# public no-release record that the coordinator reports as unavailable; the exact
+# allocation remains recorded and no fallback is accepted as a trained model.
 
 .privacy_allocation_slack <- 1 - 1e-12
 

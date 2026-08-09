@@ -1,5 +1,6 @@
 """Focused regressions for exact DP-SGD accounting and finite release gates."""
 
+import base64
 import io
 import math
 import hashlib
@@ -25,7 +26,23 @@ sys.path.insert(0, FLOWER_APP)
 
 from dsflower_runner import (client_app, dp_gbdt, dp_harness, egress_child,
                              model_spec, params, seeding, task, tier2_lib,
-                             vision)  # noqa: E402
+                             vision, server_app)  # noqa: E402
+
+
+def _hook_wire(app_params=None, rounds=2, task_type="classification",
+               num_classes=2):
+    raw = json.dumps(
+        {} if app_params is None else app_params,
+        ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "app-params-b64": base64.b64encode(raw).decode("ascii"),
+        "app-params-sha256": hashlib.sha256(raw).hexdigest(),
+        "num-server-rounds": rounds,
+        "task-type": task_type,
+        "num-classes": num_classes,
+    }
 
 
 def _package_hash(package_dir):
@@ -109,7 +126,10 @@ class ManifestPrivacyContractTests(unittest.TestCase):
                 mock.patch.object(tier2_lib, "_killpg"):
             result = tier2_lib._run_isolated(
                 "example_hook", "/unused/__init__.py",
-                [np.zeros(2)], np.zeros((1, 1)), np.zeros(1), {}, pcfg,
+                [np.zeros(2)], np.zeros((1, 1)), np.zeros(1), {
+                    "app_params": {}, "round_index": 1, "num_rounds": 1,
+                    "task": "classification", "num_classes": 2,
+                }, pcfg,
                 {}, timeout=7)
 
         self.assertIsNone(result)
@@ -121,7 +141,7 @@ class ManifestPrivacyContractTests(unittest.TestCase):
     def test_hook_requires_independent_resource_isolation_attestation(self):
         pcfg = {
             "hook_enabled": True, "egress_timeout": 30,
-            "egress_time_pad": 35,
+            "egress_time_pad": 35, "sample_aggregate": False,
         }
         caps = {
             "subprocess": True, "net_lock": True,
@@ -694,7 +714,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         load_data.assert_not_called()
         load_images.assert_not_called()
         self.assertFalse(reply.has_error())
-        self.assertEqual(dict(reply.content["metrics"]), {"num-examples": 1})
+        self.assertEqual(dict(reply.content["metrics"]), {
+            "num-examples": 1, "public-preflight-unavailable": 1})
         fallback = reply.content["arrays"].to_numpy_ndarrays()
         self.assertEqual(len(fallback), 1)
         np.testing.assert_array_equal(fallback[0], np.zeros(1, dtype=np.float32))
@@ -733,7 +754,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
 
         prepare.assert_not_called()
         self.assertFalse(reply.has_error())
-        self.assertEqual(dict(reply.content["metrics"]), {"num-examples": 1})
+        self.assertEqual(dict(reply.content["metrics"]), {
+            "num-examples": 1, "public-preflight-unavailable": 1})
 
     def test_private_values_are_never_used_by_architecture_probe(self):
         X = np.zeros((2, 1), dtype=np.float32)
@@ -793,6 +815,17 @@ class SecureGbdtRngTests(unittest.TestCase):
 
 
 class RunPinBoundsTests(unittest.TestCase):
+    def test_empty_pinned_privacy_unit_roster_is_structurally_valid(self):
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({"n_units": 0}, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir}, run_config={})
+            task.assert_pinned_unit_count(context, 0)
+            with self.assertRaisesRegex(RuntimeError, "roster changed"):
+                task.assert_pinned_unit_count(context, 1)
+
     def test_training_horizon_pins_have_strict_absolute_bounds(self):
         base = {
             "loss-name": "mse", "batch-size": 32, "local-epochs": 2,
@@ -839,6 +872,21 @@ class RunPinBoundsTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         task.load_run_pins(context)
 
+    def test_bce_logits_is_restricted_to_binary_heads(self):
+        manifest = {
+            "loss-name": "bce_logits", "batch-size": 32,
+            "local-epochs": 1, "num-server-rounds": 1,
+            "num-classes": 3,
+        }
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir}, run_config={})
+            with self.assertRaisesRegex(ValueError, "binary only"):
+                task.load_run_pins(context)
+
     def test_gbdt_learning_rate_uses_the_same_absolute_ceiling(self):
         manifest = {
             "gbdt-spec": {
@@ -870,6 +918,313 @@ class RunPinBoundsTests(unittest.TestCase):
             cfg = task.load_pinned_run_config(context)
             self.assertEqual(cfg["image-size"], 224)
             self.assertEqual(cfg["backbone"], "resnet18")
+
+    def test_optimizer_and_scheduler_are_manifest_pinned_and_applied(self):
+        manifest = {
+            "dp-track": "neural", "loss-name": "mse", "batch-size": 32,
+            "local-epochs": 3, "num-server-rounds": 2, "num-classes": 2,
+            "learning-rate": 0.02, "weight-decay": 0.03,
+            "l1-penalty": 0.04, "optimizer-name": "adamw",
+            "optimizer-beta1": 0.8, "optimizer-beta2": 0.95,
+            "optimizer-eps": 1e-7, "optimizer-amsgrad": True,
+            "scheduler-name": "cosine", "scheduler-min-lr": 0.001,
+        }
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir},
+                run_config=dict(manifest))
+            pins = task.load_run_pins(context)
+            model = torch.nn.Linear(2, 1)
+            optimizer = client_app._build_optimizer(model, pins)
+            self.assertIsInstance(optimizer, torch.optim.AdamW)
+            self.assertEqual(optimizer.param_groups[0]["betas"], (0.8, 0.95))
+            self.assertEqual(optimizer.param_groups[0]["eps"], 1e-7)
+            self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.03)
+            self.assertTrue(optimizer.param_groups[0]["amsgrad"])
+            self.assertAlmostEqual(
+                client_app._scheduled_learning_rate(pins, 0), 0.02)
+            self.assertAlmostEqual(
+                client_app._scheduled_learning_rate(pins, 5), 0.001)
+
+            growing = dict(manifest)
+            growing["scheduler-name"] = "exponential"
+            growing["scheduler-gamma"] = 1.1
+            growing.pop("scheduler-min-lr")
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(growing, handle)
+            context.run_config = dict(growing)
+            growing_pins = task.load_run_pins(context)
+            self.assertAlmostEqual(
+                client_app._scheduled_learning_rate(growing_pins, 1), 0.022)
+
+    def test_incompatible_or_mismatched_optimizer_fields_fail_closed(self):
+        manifest = {
+            "dp-track": "neural", "loss-name": "mse", "batch-size": 32,
+            "local-epochs": 1, "num-server-rounds": 1, "num-classes": 2,
+            "learning-rate": 0.01, "optimizer-name": "sgd",
+            "optimizer-momentum": 0.1, "optimizer-nesterov": False,
+            "optimizer-beta1": 0.8, "scheduler-name": "none",
+        }
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir}, run_config={})
+            with self.assertRaisesRegex(ValueError, "incompatible"):
+                task.load_run_pins(context)
+
+            manifest.pop("optimizer-beta1")
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context.run_config = dict(manifest, **{"optimizer-momentum": 0.9})
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                task.load_pinned_run_config(context)
+
+    def test_only_the_selected_loss_parameter_is_accepted(self):
+        base = {
+            "dp-track": "neural", "loss-name": "huber", "batch-size": 32,
+            "local-epochs": 1, "num-server-rounds": 1, "num-classes": 2,
+            "learning-rate": 0.01, "optimizer-name": "sgd",
+            "optimizer-momentum": 0.0, "optimizer-nesterov": False,
+            "scheduler-name": "none", "huber-delta": 2.5,
+        }
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            path = os.path.join(manifest_dir, "manifest.json")
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir}, run_config={})
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(base, handle)
+            pins = task.load_run_pins(context)
+            self.assertEqual(pins["loss_name"], "huber")
+
+            invalid = dict(base, **{"gamma-shape": 3.0})
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(invalid, handle)
+            with self.assertRaisesRegex(ValueError, "incompatible"):
+                task.load_run_pins(context)
+
+            missing = dict(base)
+            missing.pop("huber-delta")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(missing, handle)
+            with self.assertRaisesRegex(ValueError, "missing selected"):
+                task.load_run_pins(context)
+
+
+class HookAppPublicConfigTests(unittest.TestCase):
+    @staticmethod
+    def _wire_bytes(raw):
+        return {
+            "app-params-b64": base64.b64encode(raw).decode("ascii"),
+            "app-params-sha256": hashlib.sha256(raw).hexdigest(),
+            "num-server-rounds": 3,
+            "task-type": "regression",
+            "num-classes": 2,
+        }
+
+    def test_recursive_params_and_server_round_metadata_are_exact(self):
+        params_value = {
+            "alpha": 0.125,
+            "enabled": True,
+            "labels": ["a", None, 3],
+            "optimizer": {"momentum": 0.9, "name": "adam"},
+        }
+        cfg = _hook_wire(
+            params_value, rounds=3, task_type="regression", num_classes=2)
+        cfg.update({"round_index": 999, "privacy-epsilon": 1e9})
+
+        public = tier2_lib.public_hook_config(cfg, round_index=2)
+
+        self.assertEqual(public, {
+            "app_params": params_value,
+            "round_index": 2,
+            "num_rounds": 3,
+            "task": "regression",
+            "num_classes": 2,
+        })
+        self.assertEqual(tier2_lib._sanitize_cfg(public), public)
+        with self.assertRaisesRegex(ValueError, "unknown or missing"):
+            tier2_lib._sanitize_cfg(dict(public, epsilon=1000))
+
+    def test_malformed_reserved_nonfinite_and_oversized_params_fail_closed(self):
+        cases = []
+        good = _hook_wire({"alpha": 1})
+        cases.append(("hash", dict(good, **{"app-params-sha256": "0" * 64})))
+        cases.append(("duplicate", self._wire_bytes(b'{"a":1,"a":2}')))
+        cases.append(("top-array", self._wire_bytes(b"[]")))
+        cases.append(("nonfinite", self._wire_bytes(b'{"value":NaN}')))
+        cases.append(("utf8", self._wire_bytes(b'{"value":"\xff"}')))
+        for key in ("epsilon", "training_epsilon", "noiseMultiplier", "apiToken",
+                    "model_path", "requirements", "round_index", "dp-noise"):
+            cases.append(("reserved-" + key, _hook_wire({key: 1})))
+        cases.append(("path-value", _hook_wire({"model": "folder/model.bin"})))
+        nested = {"leaf": 1}
+        for _ in range(9):
+            nested = {"nested": nested}
+        cases.append(("depth", _hook_wire(nested)))
+        cases.append(("items", _hook_wire({"values": [0] * 2048})))
+        cases.append(("string", _hook_wire({"value": "x" * 4097})))
+        cases.append(("bytes", _hook_wire({
+            "field%02d" % index: "x" * 4000 for index in range(20)
+        })))
+
+        for label, cfg in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    tier2_lib.public_hook_config(cfg, round_index=1)
+
+    def test_manifest_pin_mismatch_is_rejected(self):
+        pins = _hook_wire({"alpha": 1})
+        pins["num-features"] = 4
+        manifest = dict(pins, **{
+            "dp-track": "egress", "user-module": "server_pkg",
+        })
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir},
+                run_config=dict(pins, **{"user-module": "analyst_pkg"}),
+            )
+            exact = task.load_pinned_run_config(context)
+            self.assertEqual(exact["user-module"], "server_pkg")
+            tampering = {
+                "app-params-b64": _hook_wire({"alpha": 2})["app-params-b64"],
+                "app-params-sha256": "0" * 64,
+                "num-server-rounds": 4,
+                "task-type": "count",
+                "num-classes": 3,
+                "num-features": 5,
+            }
+            for key, value in tampering.items():
+                with self.subTest(key=key):
+                    context.run_config = dict(pins, **{
+                        "user-module": "analyst_pkg", key: value,
+                    })
+                    with self.assertRaisesRegex(ValueError, "manifest pin"):
+                        task.load_pinned_run_config(context)
+
+    def test_invalid_params_fail_before_hook_import_or_private_read(self):
+        cfg = _hook_wire({"alpha": 1}, rounds=1)
+        cfg.update({
+            "app-params-sha256": "0" * 64,
+            "user-module": "hookpkg", "num-features": 2,
+        })
+        with mock.patch.object(
+                tier2_lib, "load_user_module",
+                side_effect=AssertionError("hook import")) as load_module:
+            with self.assertRaisesRegex(ValueError, "pinned hash"):
+                server_app._initial_arrays(cfg, "egress")
+        load_module.assert_not_called()
+
+        msg = Message(
+            content=RecordDict({
+                "arrays": ArrayRecord(
+                    numpy_ndarrays=[np.zeros(2, dtype=np.float64)])
+            }),
+            dst_node_id=1,
+            message_type="train",
+        )
+        context = SimpleNamespace(state=RecordDict())
+        claim = {
+            "status": "new", "message_id": "m1", "release_index": 1,
+            "max_releases": 1, "run_token": "run_" + "a" * 32,
+            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+        }
+        with (mock.patch.object(client_app.release_guard, "claim_release",
+                                return_value=claim),
+              mock.patch.object(client_app, "load_pinned_run_config",
+                                return_value=cfg),
+              mock.patch.object(client_app, "load_dp_track", return_value="egress"),
+              mock.patch.object(client_app, "load_privacy_config", return_value={}),
+              mock.patch.object(client_app, "load_data",
+                                side_effect=AssertionError("private read")) as load_data,
+              mock.patch.object(tier2_lib, "hook_execution_caps",
+                                side_effect=AssertionError("sandbox gate")) as caps):
+            reply = client_app.train(msg, context)
+        load_data.assert_not_called()
+        caps.assert_not_called()
+        self.assertFalse(reply.has_error())
+
+    def test_initial_and_local_hooks_receive_same_params_and_owned_rounds(self):
+        params_value = {
+            "learning_rate": 0.05,
+            "layers": [16, 8],
+            "optimizer": {"name": "adam", "amsgrad": False},
+        }
+        cfg = _hook_wire(params_value, rounds=2)
+        cfg.update({"user-module": "hookpkg", "num-features": 3})
+        seen = {}
+
+        class Hook:
+            @staticmethod
+            def initial_arrays(public_cfg, input_dim):
+                seen["initial"] = public_cfg
+                return [np.zeros(input_dim, dtype=np.float64)]
+
+        with mock.patch.object(tier2_lib, "load_user_module", return_value=Hook):
+            _model, record = server_app._initial_arrays(cfg, "egress")
+        self.assertEqual(record.to_numpy_ndarrays()[0].shape, (3,))
+
+        msg = Message(
+            content=RecordDict({
+                "arrays": ArrayRecord(
+                    numpy_ndarrays=[np.zeros(3, dtype=np.float64)])
+            }),
+            dst_node_id=1,
+            message_type="train",
+        )
+        context = SimpleNamespace(state=RecordDict())
+        claim = {
+            "status": "new", "message_id": "m1", "release_index": 1,
+            "max_releases": 2, "run_token": "run_" + "a" * 32,
+            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+        }
+        pcfg = {
+            "epsilon": 1.0, "delta": 1e-5, "hook_enabled": True,
+            "egress_timeout": 30, "egress_time_pad": 35.0,
+        }
+
+        def capture_update(_module, old, _X, _y, public_cfg, _pcfg, **_kwargs):
+            seen["local"] = public_cfg
+            return old
+
+        with (mock.patch.object(client_app.release_guard, "claim_release",
+                                return_value=claim),
+              mock.patch.object(client_app.release_guard, "release_id",
+                                return_value="release:1"),
+              mock.patch.object(client_app, "load_pinned_run_config",
+                                return_value=cfg),
+              mock.patch.object(client_app, "load_dp_track", return_value="egress"),
+              mock.patch.object(client_app, "load_privacy_config", return_value=pcfg),
+              mock.patch.object(tier2_lib, "hook_execution_caps",
+                                return_value={"sandbox": True}),
+              mock.patch.object(client_app, "load_data", return_value=(
+                  np.zeros((2, 3), dtype=np.float32),
+                  np.zeros(2, dtype=np.float32))),
+              mock.patch.object(client_app, "load_tabular_patient_ids",
+                                return_value=None),
+              mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
+              mock.patch.object(client_app.seeding, "master_seed",
+                                return_value=b"m" * 32),
+              mock.patch.object(tier2_lib, "pad_hook_release"),
+              mock.patch.object(tier2_lib, "gated_local_update",
+                                side_effect=capture_update)):
+            reply = client_app.train(msg, context)
+
+        self.assertFalse(reply.has_error())
+        self.assertEqual(seen["initial"]["app_params"], seen["local"]["app_params"])
+        self.assertEqual(seen["initial"]["round_index"], 0)
+        self.assertEqual(seen["local"]["round_index"], 1)
+        for field in ("num_rounds", "task", "num_classes"):
+            self.assertEqual(seen["initial"][field], seen["local"][field])
 
 
 class Tier2PinTests(unittest.TestCase):
@@ -955,7 +1310,9 @@ class Tier2PinTests(unittest.TestCase):
 
         load_data.assert_not_called()
         self.assertFalse(reply.has_error())
-        self.assertEqual(dict(reply.content["metrics"]), {"num-examples": 1})
+        self.assertEqual(dict(reply.content["metrics"]), {
+            "num-examples": 1, "hook-executed": 0,
+            "public-preflight-unavailable": 1})
         np.testing.assert_array_equal(
             reply.content["arrays"].to_numpy_ndarrays()[0],
             np.zeros(2, dtype=np.float32),
@@ -992,7 +1349,9 @@ class Tier2PinTests(unittest.TestCase):
 
         load_data.assert_not_called()
         self.assertFalse(reply.has_error())
-        self.assertEqual(dict(reply.content["metrics"]), {"num-examples": 1})
+        self.assertEqual(dict(reply.content["metrics"]), {
+            "num-examples": 1, "hook-executed": 0,
+            "public-preflight-unavailable": 1})
         fallback = reply.content["arrays"].to_numpy_ndarrays()
         self.assertEqual(len(fallback), 1)
         np.testing.assert_array_equal(fallback[0], np.zeros(1, dtype=np.float32))
@@ -1022,7 +1381,10 @@ class ClientAppExceptionBoundaryTests(unittest.TestCase):
             "run_token": "run_" + "a" * 32,
         }
 
-        def fail_on_private_conversion(*_args, **_kwargs):
+        def fail_on_private_conversion(*_args, **kwargs):
+            callback = kwargs.get("on_private_start")
+            if callback is not None:
+                callback()
             pd.DataFrame({"private_feature": [sentinel]}).to_numpy(
                 dtype=np.float32)
 
@@ -1049,7 +1411,8 @@ class ClientAppExceptionBoundaryTests(unittest.TestCase):
 
         train_trees.assert_called_once()
         self.assertFalse(reply.has_error())
-        self.assertEqual(dict(reply.content["metrics"]), {"num-examples": 1})
+        self.assertEqual(dict(reply.content["metrics"]), {
+            "num-examples": 1, "execution-unavailable": 1})
         arrays = reply.content["arrays"].to_numpy_ndarrays()
         booster = json.loads(bytes(np.asarray(arrays[0], dtype=np.uint8)).decode("utf-8"))
         self.assertEqual(len(booster["trees"]), spec["n_trees"])

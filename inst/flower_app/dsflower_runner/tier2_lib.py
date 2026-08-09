@@ -23,10 +23,13 @@ min(2C,4C/k) floor when (a) the platform provides a sandbox strong enough to GUA
 independence and (b) the custodian enables a fixed public block count.
 """
 
+import base64
 import json
 import hashlib
 import hmac
+import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -70,9 +73,30 @@ _REQUIRED_HOOKS = ("initial_arrays", "local_update")
 _CHILD = os.path.join(_HERE, "egress_child.py")
 _DEFAULT_TIMEOUT = 900                 # wall-clock seconds per child run
 _NPY_HEADER_SLACK = 4096               # bytes of .npy header allowed above the array payload
-_PAD_GUARD = 5.0                       # required policy margin above one child timeout
+_PAD_GUARD = 5.0                       # public setup/cleanup margin after all child timeouts
 _MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
 _ASCII_ID_TRIM = " \t\r\n"
+_APP_PARAMS_MAX_DEPTH = 8
+_APP_PARAMS_MAX_ITEMS = 2048
+_APP_PARAMS_MAX_BYTES = 65536
+_APP_PARAMS_MAX_KEY_BYTES = 128
+_APP_PARAMS_MAX_STRING_BYTES = 4096
+_PUBLIC_HOOK_CONFIG_KEYS = frozenset({
+    "app_params", "round_index", "num_rounds", "task", "num_classes",
+})
+_RESERVED_APP_PARAM_KEYS = frozenset({
+    "privacy", "dp", "epsilon", "delta", "clipping_norm",
+    "user_module", "app_params", "app_params_b64", "app_params_sha256",
+    "round", "round_index", "server_round", "num_rounds",
+    "num_server_rounds", "task", "task_type", "num_classes",
+    "runtime_profile", "backend", "requirements", "requirement",
+    "dependencies", "dependency", "pip", "pythonpath", "python_path",
+})
+_PATH_SECURITY_KEY = re.compile(
+    r"(^|_)(path|dir|directory|file|filename|secret|token|password|credential|"
+    r"requirements?|dependencies?)($|_)")
+_DP_KEY = re.compile(
+    r"(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping)($|_)")
 
 
 def load_user_module(module_name):
@@ -149,20 +173,173 @@ def _take_rows(D, idx):
     return np.asarray(D)[idx]
 
 
+def _reserved_app_param_key(key):
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    normalized = normalized.lower().replace("-", "_").replace(".", "_")
+    return (normalized.startswith(("privacy", "dp"))
+            or normalized in _RESERVED_APP_PARAM_KEYS
+            or bool(_PATH_SECURITY_KEY.search(normalized))
+            or bool(_DP_KEY.search(normalized)))
+
+
+def _safe_utf8(value, label, max_bytes, allow_empty=False):
+    if not isinstance(value, str):
+        raise ValueError("%s must be a string" % label)
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeError as exc:
+        raise ValueError("%s must be valid UTF-8" % label) from exc
+    if (not encoded and not allow_empty) or len(encoded) > int(max_bytes):
+        raise ValueError("%s has an invalid byte length" % label)
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("%s contains control characters" % label)
+    return value
+
+
+def _validate_app_params_value(value, depth, state, top=False):
+    if depth > _APP_PARAMS_MAX_DEPTH:
+        raise ValueError("app_params exceeds the maximum nesting depth")
+    state[0] += 1
+    if state[0] > _APP_PARAMS_MAX_ITEMS:
+        raise ValueError("app_params exceeds the maximum item count")
+
+    if value is None or type(value) is bool or type(value) is int:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("app_params numeric values must be finite")
+        return value
+    if type(value) is str:
+        text = _safe_utf8(
+            value, "app_params string", _APP_PARAMS_MAX_STRING_BYTES,
+            allow_empty=True)
+        if ("/" in text or "\\" in text
+                or re.match(r"^[A-Za-z]:", text)
+                or text.startswith(("~/", "~\\"))):
+            raise ValueError("app_params strings cannot contain filesystem paths")
+        return text
+    if type(value) is list:
+        if top:
+            raise ValueError("app_params must be a JSON object")
+        return [
+            _validate_app_params_value(item, depth + 1, state)
+            for item in value
+        ]
+    if type(value) is dict:
+        out = {}
+        for key in sorted(value):
+            safe_key = _safe_utf8(
+                key, "app_params object key", _APP_PARAMS_MAX_KEY_BYTES)
+            if "/" in safe_key or "\\" in safe_key:
+                raise ValueError("app_params object keys cannot contain paths")
+            if _reserved_app_param_key(safe_key):
+                raise ValueError("app_params contains a reserved key")
+            out[safe_key] = _validate_app_params_value(
+                value[key], depth + 1, state)
+        return out
+    raise ValueError("app_params contains a non-JSON value")
+
+
+def _decode_app_params(cfg):
+    """Decode the exact server-pinned canonical public HookApp payload."""
+    if not isinstance(cfg, dict):
+        raise ValueError("HookApp run config must be an object")
+    encoded = cfg.get("app-params-b64")
+    expected_hash = cfg.get("app-params-sha256")
+    max_b64 = 4 * ((_APP_PARAMS_MAX_BYTES + 2) // 3)
+    if (not isinstance(encoded, str) or not encoded
+            or len(encoded.encode("ascii", errors="ignore")) != len(encoded)
+            or len(encoded) > max_b64):
+        raise ValueError("missing or oversized canonical app-params-b64")
+    if (not isinstance(expected_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None):
+        raise ValueError("missing canonical app-params-sha256")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError("app-params-b64 is not canonical base64") from exc
+    if (len(raw) > _APP_PARAMS_MAX_BYTES
+            or base64.b64encode(raw).decode("ascii") != encoded):
+        raise ValueError("app-params-b64 is not canonical bounded base64")
+    actual_hash = hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(actual_hash, expected_hash):
+        raise ValueError("app_params does not match the server-pinned hash")
+
+    def reject_constant(value):
+        raise ValueError("app_params numeric values must be finite: %s" % value)
+
+    def unique_object(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError("app_params object keys must be unique")
+            out[key] = value
+        return out
+
+    try:
+        parsed = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            parse_constant=reject_constant,
+            object_pairs_hook=unique_object,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("app_params must be valid UTF-8 JSON") from exc
+    if type(parsed) is not dict:
+        raise ValueError("app_params must be a JSON object")
+    return _validate_app_params_value(parsed, 0, [0], top=True)
+
+
+def _public_int(value, label, lower, upper):
+    if type(value) is not int or value < lower or value > upper:
+        raise ValueError("%s must be an integer in [%d, %d]" % (
+            label, lower, upper))
+    return value
+
+
+def public_hook_config(cfg, round_index):
+    """Build the only configuration visible to uploaded hooks.
+
+    ``round_index`` is supplied by the trusted release claim (zero is reserved
+    for researcher-side initialisation); no analyst field can override it.
+    """
+    num_rounds = _public_int(
+        cfg.get("num-server-rounds"), "num_rounds", 1, 500)
+    round_value = _public_int(
+        round_index, "round_index", 0, num_rounds)
+    task = cfg.get("task-type")
+    if task not in ("classification", "regression", "count"):
+        raise ValueError("task must be classification, regression, or count")
+    num_classes = _public_int(
+        cfg.get("num-classes"), "num_classes", 2, 1024)
+    return {
+        "app_params": _decode_app_params(cfg),
+        "round_index": round_value,
+        "num_rounds": num_rounds,
+        "task": task,
+        "num_classes": num_classes,
+    }
+
+
 def _sanitize_cfg(cfg):
-    """Hand the untrusted child only inert scalar cfg values; strip DP params, the module
-    pointer, non-scalars, and any string that looks like a path/secret/blob (so a config key
-    can't smuggle a filesystem path or token to the child)."""
-    out = {}
-    for k, v in dict(cfg or {}).items():
-        ks = str(k)
-        if ks == "user-module" or ks.startswith(("privacy-", "dp_", "dp-")):
-            continue
-        if v is None or isinstance(v, (bool, int, float)):
-            out[ks] = v
-        elif isinstance(v, str) and len(v) <= 128 and not any(c in v for c in "/\\\x00"):
-            out[ks] = v
-    return out
+    """Revalidate and copy the exact public payload before crossing the child boundary."""
+    if type(cfg) is not dict or set(cfg) != _PUBLIC_HOOK_CONFIG_KEYS:
+        raise ValueError("HookApp child config has unknown or missing fields")
+    rounds = _public_int(cfg["num_rounds"], "num_rounds", 1, 500)
+    round_value = _public_int(cfg["round_index"], "round_index", 0, rounds)
+    task = cfg["task"]
+    if task not in ("classification", "regression", "count"):
+        raise ValueError("invalid HookApp task")
+    classes = _public_int(cfg["num_classes"], "num_classes", 2, 1024)
+    if type(cfg["app_params"]) is not dict:
+        raise ValueError("app_params must be a JSON object")
+    return {
+        "app_params": _validate_app_params_value(
+            cfg["app_params"], 0, [0], top=True),
+        "round_index": round_value,
+        "num_rounds": rounds,
+        "task": task,
+        "num_classes": classes,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -308,14 +485,32 @@ def _resource_isolation_ok():
 def hook_execution_caps(pcfg, caps=None):
     """Return caps iff every sandbox, resource and timing gate is attested."""
     caps = sandbox_caps() if caps is None else caps
-    timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
     pad_to = float(pcfg.get("egress_time_pad", 0))
     if (not bool(pcfg.get("hook_enabled", False))
             or not _full_sandbox_ok(caps)
             or not _resource_isolation_ok()
-            or pad_to < float(timeout) + _PAD_GUARD):
+            or pad_to < hook_required_time_pad(pcfg)):
         return None
     return caps
+
+
+def hook_required_time_pad(pcfg):
+    """Public minimum envelope covering every sequential Hook child."""
+    timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
+    k = (max(2, min(64, int(pcfg.get("sa_blocks", 8))))
+         if bool(pcfg.get("sample_aggregate", True)) else 1)
+    return float(k * timeout) + _PAD_GUARD
+
+
+def pad_hook_release(release_started, pcfg):
+    """Complete the administrator-pinned minimum-duration release envelope."""
+    started = float(release_started)
+    pad_to = float(pcfg.get("egress_time_pad", 0))
+    if not math.isfinite(started) or not math.isfinite(pad_to) or pad_to < 0:
+        raise RuntimeError("invalid public Hook timing envelope")
+    remaining = pad_to - (time.monotonic() - started)
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def _wrap_sandbox(cmd, caps, td):
@@ -485,7 +680,8 @@ def _patient_row_blocks(unit_ids, n_rows, k, partition_seed):
 
 
 def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
-                       hook_caps=None, unit_ids=None):
+                       hook_caps=None, unit_ids=None, release_started=None,
+                       pad_release=True):
     """Run the upload out-of-process from the global model, then apply the DP gate in the
     trusted parent. The NODE picks the mechanism: sample-and-aggregate
     (conservative sensitivity min(2C,4C/k)) when the
@@ -503,13 +699,13 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
         raise RuntimeError("X and y must contain the same number of rows")
     caps = hook_execution_caps(pcfg, hook_caps)
     timeout = int(pcfg.get("egress_timeout", _DEFAULT_TIMEOUT))
-    pad_to = float(pcfg.get("egress_time_pad", 0))   # 0=off; minimum-duration padding
     # Arbitrary hooks have filesystem/network/resource/timing channels outside
     # the numeric DP gate. Without every operator-attested control, do not touch
     # private data and complete with a data-independent unchanged model.
     if caps is None:
         return [o.astype(np.float32) for o in old]
-    release_started = time.monotonic()
+    release_started = (time.monotonic() if release_started is None
+                       else float(release_started))
     try:
         module_file = _pinned_user_package(module_name)
         partition_seed = seeding.sub_seed(seed, "partition")
@@ -564,6 +760,5 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
     finally:
         # One minimum-duration envelope covers the complete release, including
         # all k S&A children. Each child still has its independent timeout.
-        remaining = pad_to - (time.monotonic() - release_started)
-        if remaining > 0:
-            time.sleep(remaining)
+        if pad_release:
+            pad_hook_release(release_started, pcfg)

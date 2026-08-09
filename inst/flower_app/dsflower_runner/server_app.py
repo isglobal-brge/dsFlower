@@ -11,10 +11,12 @@ re-checks its OWN manifest-pinned track, so a mismatch fails closed node-side):
   * trees — a bespoke one-round summation loop over the Grid: collect each node's
     already-noised DP-GBDT booster and BAG them (concatenate trees, scale weights
     by 1/M). Never FedAvg (it would average mismatched boosters).
+  * validation — sum one fixed-layout DP sufficient-statistic vector per node
+    and save only pooled metrics derived by post-processing.
 
 Final artifacts go to results-dir for the R relay's watchdog: a native model,
 a bounded portable weight record, and history (neural/egress), or booster.json
-and history (trees).
+and history (trees), or pooled DP metrics only (validation).
 """
 
 import json
@@ -27,7 +29,7 @@ import torch
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import (
     FedAvg, FedAdam, FedAdagrad, FedYogi, FedAvgM)
-from flwr.common import ArrayRecord, Context, Message, RecordDict
+from flwr.common import ArrayRecord, Context, Message, MetricRecord, RecordDict
 
 from .params import get_torch_params, set_torch_params
 
@@ -117,10 +119,92 @@ def _array_to_booster(arr):
     return json.loads(bytes(np.asarray(arr, dtype=np.uint8)).decode("utf-8"))
 
 
+def _validated_booster_contract(booster):
+    """Validate the fixed public booster schema before any cross-node bagging."""
+    if not isinstance(booster, dict):
+        raise RuntimeError("DP-GBDT booster must be an object")
+    objective = booster.get("objective")
+    if objective not in ("binary:logistic", "reg:squarederror"):
+        raise RuntimeError("DP-GBDT booster objective is invalid")
+    expected = {
+        "objective", "depth", "n_bins", "base_margin", "learning_rate",
+        "feature_ranges", "trees"}
+    if objective == "reg:squarederror":
+        expected |= {
+            "target_bounds", "margin_bounds", "gradient_clip",
+            "gradient_bounds"}
+    if set(booster) != expected:
+        raise RuntimeError("DP-GBDT booster schema is invalid")
+
+    depth, n_bins = booster["depth"], booster["n_bins"]
+    if (type(depth) is not int or not 1 <= depth <= 10
+            or type(n_bins) is not int or not 2 <= n_bins <= 64):
+        raise RuntimeError("DP-GBDT booster geometry is invalid")
+    for key in ("base_margin", "learning_rate"):
+        value = booster[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))):
+            raise RuntimeError("DP-GBDT booster scalar is invalid")
+    if float(booster["learning_rate"]) <= 0.0:
+        raise RuntimeError("DP-GBDT learning_rate must be positive")
+
+    ranges = booster["feature_ranges"]
+    if not isinstance(ranges, list) or not 1 <= len(ranges) <= 65_536:
+        raise RuntimeError("DP-GBDT feature ranges are invalid")
+    for bounds in ranges:
+        if (not isinstance(bounds, list) or len(bounds) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(float(v)) for v in bounds)
+                or not float(bounds[0]) < float(bounds[1])):
+            raise RuntimeError("DP-GBDT feature range is invalid")
+
+    if objective == "reg:squarederror":
+        for key in ("target_bounds", "margin_bounds", "gradient_bounds"):
+            bounds = booster[key]
+            if (not isinstance(bounds, list) or len(bounds) != 2
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                           or not math.isfinite(float(v)) for v in bounds)):
+                raise RuntimeError("DP-GBDT regression bounds are invalid")
+            ordered = (float(bounds[0]) <= float(bounds[1])
+                       if key == "gradient_bounds"
+                       else float(bounds[0]) < float(bounds[1]))
+            if not ordered:
+                raise RuntimeError("DP-GBDT regression bounds are invalid")
+        clip = booster["gradient_clip"]
+        if (isinstance(clip, bool) or not isinstance(clip, (int, float))
+                or not math.isfinite(float(clip)) or float(clip) <= 0.0):
+            raise RuntimeError("DP-GBDT gradient clip is invalid")
+
+    trees = booster["trees"]
+    if not isinstance(trees, list) or not 1 <= len(trees) <= 200:
+        raise RuntimeError("DP-GBDT tree count is invalid")
+    n_internal, n_leaves = (1 << depth) - 1, 1 << depth
+    for tree in trees:
+        if not isinstance(tree, dict) or set(tree) != {"feat", "thr", "w"}:
+            raise RuntimeError("DP-GBDT tree schema is invalid")
+        feat, thr, weights = tree["feat"], tree["thr"], tree["w"]
+        if (not isinstance(feat, list) or len(feat) != n_internal
+                or any(type(value) is not int or not 0 <= value < len(ranges)
+                       for value in feat)
+                or not isinstance(thr, list) or len(thr) != n_internal
+                or not isinstance(weights, list) or len(weights) != n_leaves):
+            raise RuntimeError("DP-GBDT tree geometry is invalid")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(float(value))
+               for value in thr + weights):
+            raise RuntimeError("DP-GBDT tree contains non-finite values")
+    return {key: booster[key] for key in sorted(expected - {"trees"})}
+
+
 def _bag_boosters(boosters):
     """Bag M already-DP boosters: concatenate their trees, scale every leaf weight
     by 1/M (so prediction = mean of the per-node ensembles). Pure post-processing
     of already-private releases over disjoint row sets."""
+    if not boosters:
+        raise RuntimeError("cannot bag an empty DP-GBDT federation")
+    contracts = [_validated_booster_contract(booster) for booster in boosters]
+    if any(contract != contracts[0] for contract in contracts[1:]):
+        raise RuntimeError("DP-GBDT boosters have incompatible public contracts")
     m = len(boosters)
     merged = {k: v for k, v in boosters[0].items() if k != "trees"}
     merged["n_boosters"] = m
@@ -165,10 +249,11 @@ def _run_trees(grid, cfg):
                 for nid in node_ids]
     replies = grid.send_and_receive(
         messages, timeout=float(cfg.get("round-timeout", 3600)))
-    return _collect_trees(replies, len(node_ids), min_nodes)
+    return _collect_trees(
+        replies, len(node_ids), min_nodes, expected_node_ids=node_ids)
 
 
-def _collect_trees(replies, n_connected, min_nodes):
+def _collect_trees(replies, n_connected, min_nodes, expected_node_ids=None):
     """Bag the successful DP-GBDT boosters and report the TRUE failure count.
 
     FAIL CLOSED unless every connected node returns one booster. A node can error
@@ -176,16 +261,48 @@ def _collect_trees(replies, n_connected, min_nodes):
     and misreport the federation as fully successful. Returns
     (bagged_booster, n_failures)."""
     replies = list(replies)
+    try:
+        sources = [int(reply.metadata.src_node_id) for reply in replies]
+    except Exception as exc:
+        raise RuntimeError("DP-GBDT replies have no verifiable node identity") from exc
+    expected_set = ({int(value) for value in expected_node_ids}
+                    if expected_node_ids is not None else None)
+    if (len(sources) != int(n_connected)
+            or len(set(sources)) != int(n_connected)
+            or (expected_set is not None and set(sources) != expected_set)):
+        raise RuntimeError(
+            "DP-GBDT replies do not match the configured federation roster.")
     boosters = []
+    privacy_noop = False
+    public_unavailable = False
+    execution_unavailable = False
+    replay_unavailable = False
     for r in replies:
         try:
             if r.has_error():
                 continue
+            if int(r.content["metrics"].get(
+                    "replay-cache-missing", 0)) == 1:
+                replay_unavailable = True
+                continue
+            privacy_noop = privacy_noop or int(r.content["metrics"].get(
+                "privacy-noop", 0)) == 1
+            public_unavailable = public_unavailable or int(
+                r.content["metrics"].get(
+                    "public-preflight-unavailable", 0)) == 1
+            execution_unavailable = execution_unavailable or int(
+                r.content["metrics"].get(
+                    "execution-unavailable", 0)) == 1
             arrays = r.content["arrays"].to_numpy_ndarrays()
             if arrays:
                 boosters.append(_array_to_booster(arrays[0]))
         except Exception:
             continue
+    if ((privacy_noop or public_unavailable or execution_unavailable
+            or replay_unavailable)
+            and len(replies) == int(n_connected)
+            and all(not reply.has_error() for reply in replies)):
+        return {"trees": []}, 0, False
     n_failures = int(n_connected) - len(boosters)
     if (len(replies) != int(n_connected)
             or len(boosters) != int(n_connected)):
@@ -193,20 +310,132 @@ def _collect_trees(replies, n_connected, min_nodes):
             "%d of %d node(s) returned a DP-GBDT booster; refusing to bag a "
             "degraded federation (check node logs)."
             % (len(boosters), int(n_connected)))
-    return _bag_boosters(boosters), n_failures
+    return _bag_boosters(boosters), n_failures, not privacy_noop
 
 
-def _save_trees(cfg, booster, n_failures=0):
+def _save_trees(cfg, booster, n_failures=0, available=True):
     results_dir = cfg.get("results-dir")
     if not results_dir:
         return
     os.makedirs(results_dir, exist_ok=True)
-    with open(os.path.join(results_dir, "booster.json"), "w") as f:
-        json.dump(booster, f)
+    if available:
+        with open(os.path.join(results_dir, "booster.json"), "w") as f:
+            json.dump(booster, f)
     with open(os.path.join(results_dir, "history.json"), "w") as f:
         json.dump([{"round": 1, "n_failures": int(n_failures),
+                    "available": bool(available),
                     "n_trees": len(booster.get("trees", [])),
                     "n_boosters": booster.get("n_boosters", 1)}], f)
+
+
+# --------------------------------------------------------------------------- #
+# Validation — one strict pooled sum of node-private sufficient statistics.
+# --------------------------------------------------------------------------- #
+
+def _run_validation(grid, cfg):
+    import time
+    from . import validation
+
+    layout = validation.layout_from_config(dict(cfg))
+    public_arrays = validation.public_model_arrays(dict(cfg))
+    expected = int(cfg.get("min-train-nodes", 2))
+    timeout = float(cfg.get("round-timeout", 600))
+    node_ids, waited = [], 0.0
+    while waited < timeout:
+        node_ids = list(grid.get_node_ids())
+        if len(node_ids) >= expected:
+            break
+        time.sleep(2.0)
+        waited += 2.0
+    if len(node_ids) != expected:
+        return None, expected, False
+    content = RecordDict({
+        "arrays": ArrayRecord(numpy_ndarrays=public_arrays),
+    })
+    messages = [Message(
+        content=content, message_type="train", dst_node_id=node_id,
+        group_id="dsflower-validation") for node_id in node_ids]
+    try:
+        replies = list(grid.send_and_receive(
+            messages, timeout=float(cfg.get("round-timeout", 3600))))
+    except Exception:
+        return None, expected, False
+    try:
+        sources = [int(reply.metadata.src_node_id) for reply in replies]
+    except Exception:
+        return None, expected, False
+    if (len(sources) != expected or len(set(sources)) != expected
+            or set(sources) != {int(value) for value in node_ids}):
+        return None, expected, False
+    vectors = []
+    for reply in replies:
+        if reply.has_error():
+            continue
+        try:
+            metrics = reply.content["metrics"]
+            if (int(metrics.get("replay-cache-missing", 0)) == 1
+                    or int(metrics.get("privacy-noop", 0)) == 1
+                    or int(metrics.get(
+                        "public-preflight-unavailable", 0)) == 1
+                    or int(metrics.get(
+                        "execution-unavailable", 0)) == 1):
+                continue
+            arrays = reply.content["arrays"].to_numpy_ndarrays()
+            if len(arrays) != 1:
+                continue
+            vector = np.asarray(arrays[0], dtype=np.float64)
+            if (vector.shape != (int(layout["size"]),)
+                    or not bool(np.all(np.isfinite(vector)))):
+                continue
+            vectors.append(vector)
+        except Exception:
+            continue
+    if len(replies) != expected or len(vectors) != expected:
+        return None, expected, False
+    stacked = np.stack(vectors, axis=0).astype(np.float64, copy=False)
+    scale = np.max(np.abs(stacked), axis=0)
+    normalized = np.divide(
+        stacked, scale, out=np.zeros_like(stacked), where=scale > 0.0)
+    wide = (np.sum(normalized.astype(np.longdouble), axis=0,
+                   dtype=np.longdouble)
+            * scale.astype(np.longdouble))
+    limit = np.longdouble(np.finfo(np.float64).max)
+    pooled = np.asarray(np.clip(wide, -limit, limit), dtype=np.float64)
+    bounds = (validation.target_bounds_from_config(dict(cfg))
+              if layout["task"] in ("regression", "count") else None)
+    metrics = validation.validation_metrics(
+        pooled, layout, target_bounds=bounds)
+    return metrics, expected, True
+
+
+def _save_validation(cfg, metrics, n_nodes, available):
+    results_dir = cfg.get("results-dir")
+    if not results_dir:
+        return
+    os.makedirs(results_dir, exist_ok=True)
+    history_path = os.path.join(results_dir, "history.json")
+    with open(history_path, "w", encoding="utf-8") as handle:
+        json.dump([{"round": 1, "available": bool(available)}], handle,
+                  allow_nan=False, separators=(",", ":"))
+    payload = {
+        "pooled_only": True,
+        "privacy": "node-dp-pooled-postprocessing",
+        "task": str(cfg.get("validation-task", "")),
+        "n_nodes": int(n_nodes),
+        "available": bool(available),
+    }
+    if available:
+        payload["metrics"] = metrics
+    final = os.path.join(results_dir, "validation.json")
+    temporary = final + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, allow_nan=False,
+                      separators=(",", ":"))
+        os.replace(temporary, final)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 # --------------------------------------------------------------------------- #
@@ -216,10 +445,11 @@ def _save_trees(cfg, booster, n_failures=0):
 def _initial_arrays(cfg, track):
     if track == "egress":
         from . import tier2_lib
+        public_cfg = tier2_lib.public_hook_config(dict(cfg), round_index=0)
         user_mod = tier2_lib.load_user_module(str(cfg["user-module"]))
         n = int(cfg.get("num-features", 0))
         arrays = [np.asarray(a, dtype=np.float64)
-                  for a in user_mod.initial_arrays(dict(cfg), n)]
+                  for a in user_mod.initial_arrays(public_cfg, n)]
         return None, ArrayRecord(numpy_ndarrays=arrays)
     model = _build_initial_model(cfg)
     return model, ArrayRecord(numpy_ndarrays=get_torch_params(model))
@@ -235,8 +465,15 @@ def _initial_arrays(cfg, track):
 class _RequireCompleteTrain:
     """Reject a round unless the configured federation replies successfully."""
 
-    def __init__(self, *, expected_train_nodes, **kwargs):
+    def __init__(self, *, expected_train_nodes,
+                 require_hook_executed=False, **kwargs):
         self.expected_train_nodes = int(expected_train_nodes)
+        self.require_hook_executed = bool(require_hook_executed)
+        self.available_rounds = set()
+        self.privacy_noop_rounds = set()
+        self._last_available_arrays = None
+        self._round_input_arrays = {}
+        self._round_expected_nodes = {}
         super().__init__(**kwargs)
 
     def configure_train(self, server_round, arrays, config, grid):
@@ -251,6 +488,8 @@ class _RequireCompleteTrain:
                 "%d node(s) are connected in round %d, expected exactly %d; "
                 "refusing an unexpected federation roster."
                 % (len(connected), server_round, self.expected_train_nodes))
+        self._round_input_arrays[int(server_round)] = arrays
+        self._round_expected_nodes[int(server_round)] = set(destinations)
         return messages
 
     def aggregate_train(self, server_round, replies):
@@ -263,7 +502,57 @@ class _RequireCompleteTrain:
                 "%d of %d configured node(s) returned a valid update in round %d; "
                 "refusing to aggregate a degraded federation."
                 % (valid_count, self.expected_train_nodes, server_round))
-        return super().aggregate_train(server_round, replies)
+        try:
+            sources = [int(reply.metadata.src_node_id) for reply in replies]
+        except Exception as exc:
+            raise RuntimeError("Training replies have no verifiable node identity") from exc
+        expected_nodes = self._round_expected_nodes.get(int(server_round))
+        if (len(set(sources)) != self.expected_train_nodes
+                or (expected_nodes is not None and set(sources) != expected_nodes)):
+            raise RuntimeError(
+                "Training replies do not match the configured federation roster.")
+        privacy_noop = []
+        for reply in replies:
+            try:
+                metrics = reply.content["metrics"]
+                privacy_noop.append(
+                    int(metrics.get("privacy-noop", 0)) == 1
+                    or int(metrics.get("replay-cache-missing", 0)) == 1
+                    or int(metrics.get(
+                        "public-preflight-unavailable", 0)) == 1
+                    or int(metrics.get(
+                        "execution-unavailable", 0)) == 1)
+            except Exception:
+                privacy_noop.append(False)
+        if any(privacy_noop):
+            self.privacy_noop_rounds.add(int(server_round))
+            baseline = self._round_input_arrays.pop(
+                int(server_round), self._last_available_arrays)
+            self._round_expected_nodes.pop(int(server_round), None)
+            if baseline is None:
+                raise RuntimeError(
+                    "No public round input is available for an unavailable "
+                    "release; refusing to expose a client fallback.")
+            return baseline, MetricRecord({"available": 0})
+        if self.require_hook_executed:
+            ready = []
+            for reply in replies:
+                try:
+                    ready.append(int(reply.content["metrics"].get(
+                        "hook-executed", 0)) == 1)
+                except Exception:
+                    ready.append(False)
+            if not all(ready):
+                raise RuntimeError(
+                    "Hook execution is not available on every configured node; "
+                    "refusing to report an unchanged model as trained.")
+        arrays, metrics = super().aggregate_train(server_round, replies)
+        self._round_input_arrays.pop(int(server_round), None)
+        self._round_expected_nodes.pop(int(server_round), None)
+        if arrays is not None:
+            self.available_rounds.add(int(server_round))
+            self._last_available_arrays = arrays
+        return arrays, metrics
 
 
 class _StrictFedAvg(_RequireCompleteTrain, FedAvg):
@@ -293,7 +582,7 @@ _STRATEGIES = {
 }
 
 
-def _build_strategy(cfg, min_nodes):
+def _build_strategy(cfg, min_nodes, track=None):
     name = str(cfg.get("strategy", "fedavg")).lower()
     if name not in _STRATEGIES:
         raise ValueError(f"Unsupported aggregation strategy: {name}")
@@ -331,19 +620,20 @@ def _build_strategy(cfg, min_nodes):
     else:
         specific = {}
     return _STRATEGIES[name](
-        expected_train_nodes=min_nodes, **common, **specific)
+        expected_train_nodes=min_nodes,
+        require_hook_executed=(track == "egress"), **common, **specific)
 
 
 def _run_fedavg(grid, cfg, track):
     num_rounds = int(cfg.get("num-server-rounds", 1))
     min_nodes = int(cfg.get("min-train-nodes", 2))
     model, initial = _initial_arrays(cfg, track)
-    strategy = _build_strategy(cfg, min_nodes)
+    strategy = _build_strategy(cfg, min_nodes, track=track)
     result = strategy.start(grid=grid, initial_arrays=initial, num_rounds=num_rounds)
-    _save_results(cfg, model, result)
+    _save_results(cfg, model, result, available_rounds=strategy.available_rounds)
 
 
-def _save_results(cfg, model, result):
+def _save_results(cfg, model, result, available_rounds=None):
     results_dir = cfg.get("results-dir")
     if not results_dir:
         return
@@ -354,17 +644,23 @@ def _save_results(cfg, model, result):
             "No client updates were aggregated (all ClientApps failed); nothing to "
             "save. Check the node-side ClientApp logs.")
     num_rounds = int(cfg.get("num-server-rounds", 1))
-    if model is not None:
-        set_torch_params(model, final_arrays)
-        torch.save(model.state_dict(), os.path.join(results_dir, "model.pt"))
-    else:  # egress: no torch model, save raw arrays
-        np.savez(os.path.join(results_dir, "model.npz"), *final_arrays)
-    _save_portable_arrays(results_dir, final_arrays, num_rounds)
+    if available_rounds is None:
+        available_rounds = set(range(1, num_rounds + 1))
+    else:
+        available_rounds = {int(value) for value in available_rounds}
+    if available_rounds:
+        if model is not None:
+            set_torch_params(model, final_arrays)
+            torch.save(model.state_dict(), os.path.join(results_dir, "model.pt"))
+        else:  # egress: no torch model, save raw arrays
+            np.savez(os.path.join(results_dir, "model.npz"), *final_arrays)
+        _save_portable_arrays(results_dir, final_arrays, num_rounds)
 
     per_round = dict(result.train_metrics_clientapp or {})
     history = []
     for rnd in range(1, num_rounds + 1):
-        row = {"round": rnd, "n_failures": 0}
+        row = {"round": rnd, "n_failures": 0,
+               "available": rnd in available_rounds}
         mrec = per_round.get(rnd)
         if mrec is not None and "num-examples" in mrec:
             row["n_examples"] = mrec["num-examples"]
@@ -381,8 +677,11 @@ def _save_results(cfg, model, result):
 def main(grid: Grid, context: Context) -> None:
     cfg = context.run_config
     track = str(cfg.get("dp-track", "neural")).lower()
-    if track == "trees":
-        booster, n_failures = _run_trees(grid, cfg)
-        _save_trees(cfg, booster, n_failures)
+    if track == "validation":
+        metrics, n_nodes, available = _run_validation(grid, cfg)
+        _save_validation(cfg, metrics, n_nodes, available)
+    elif track == "trees":
+        booster, n_failures, available = _run_trees(grid, cfg)
+        _save_trees(cfg, booster, n_failures, available)
     else:  # neural or egress
         _run_fedavg(grid, cfg, track)

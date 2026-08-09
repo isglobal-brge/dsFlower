@@ -37,6 +37,7 @@ class PublicPrivacyTailTests(unittest.TestCase):
             "patient-id-canonicalization": "trim-utf8-v2",
             "source_kind": "privacy_noop",
             "dp-track": "trees",
+            "task-type": "classification",
             "num-features": 2,
             "gbdt-spec": {
                 "objective": "binary:logistic",
@@ -97,6 +98,9 @@ class PublicPrivacyTailTests(unittest.TestCase):
             read_frame.assert_not_called()
             self.assertEqual(os.listdir(manifest_dir), ["manifest.json"])
             self.assertTrue(all(not reply.has_error() for reply in replies))
+            self.assertTrue(all(
+                int(reply.content["metrics"].get("privacy-noop", 0)) == 1
+                for reply in replies))
             arrays = [reply.content["arrays"].to_numpy_ndarrays()[0]
                       for reply in replies]
             np.testing.assert_array_equal(arrays[0], arrays[1])
@@ -166,6 +170,66 @@ class ReplaySafetyTests(unittest.TestCase):
                 actual = reply.content["arrays"].to_numpy_ndarrays()[0]
                 np.testing.assert_array_equal(
                     actual, cached if has_cache else incoming)
+                metrics = reply.content["metrics"]
+                self.assertEqual(
+                    int(metrics.get("replay-cache-missing", 0)),
+                    0 if has_cache else 1)
+
+    def test_public_preflight_failure_and_replay_remain_unavailable(self):
+        new_claim = {
+            "status": "new", "message_id": "m-public-failure",
+            "release_index": 1, "max_releases": 1,
+        }
+        replay_claim = dict(new_claim, status="replay")
+        incoming = np.asarray([4.0, 5.0], dtype=np.float32)
+        message = Message(
+            content=RecordDict({"arrays": ArrayRecord(
+                numpy_ndarrays=[incoming])}),
+            dst_node_id=1, message_type="train")
+        context = SimpleNamespace(state=RecordDict())
+        private_access = AssertionError("public preflight touched private data")
+
+        with (mock.patch.object(
+                  client_app.release_guard, "claim_release",
+                  side_effect=[new_claim, replay_claim]),
+              mock.patch.object(
+                  client_app, "load_pinned_run_config",
+                  side_effect=RuntimeError("public config invalid")),
+              mock.patch.object(
+                  client_app, "load_data", side_effect=private_access) as load_data):
+            first = client_app.train(message, context)
+            replay = client_app.train(message, context)
+
+        load_data.assert_not_called()
+        for reply in (first, replay):
+            self.assertFalse(reply.has_error())
+            self.assertEqual(int(reply.content["metrics"].get(
+                "public-preflight-unavailable", 0)), 1)
+            np.testing.assert_array_equal(
+                reply.content["arrays"].to_numpy_ndarrays()[0], incoming)
+
+    def test_execution_failure_marker_survives_an_exact_replay(self):
+        claim = {
+            "status": "new", "message_id": "m-execution-failure",
+            "release_index": 1, "max_releases": 1,
+        }
+        replay_claim = dict(claim, status="replay")
+        context = SimpleNamespace(state=RecordDict())
+        incoming = np.asarray([2.0, 3.0], dtype=np.float32)
+        message = Message(
+            content=RecordDict({"arrays": ArrayRecord(
+                numpy_ndarrays=[incoming])}),
+            dst_node_id=1, message_type="train")
+
+        client_app._cache_reply(
+            context, claim, [incoming], execution_unavailable=True)
+        reply = client_app._replay_reply(context, replay_claim, message)
+
+        self.assertFalse(reply.has_error())
+        self.assertEqual(int(reply.content["metrics"].get(
+            "execution-unavailable", 0)), 1)
+        np.testing.assert_array_equal(
+            reply.content["arrays"].to_numpy_ndarrays()[0], incoming)
 
 
 class MultilabelRuntimeTests(unittest.TestCase):
@@ -219,14 +283,14 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(strategy.tau, 1e-4)
 
     @staticmethod
-    def _train_reply(value, node_id):
+    def _train_reply(value, node_id, **metrics):
         request = Message(
             content=RecordDict(), dst_node_id=node_id, message_type="train")
         return Message(
             content=RecordDict({
                 "arrays": ArrayRecord(
                     numpy_ndarrays=[np.asarray([value], dtype=np.float64)]),
-                "metrics": MetricRecord({"num-examples": 1}),
+                "metrics": MetricRecord({"num-examples": 1, **metrics}),
             }),
             reply_to=request,
         )
@@ -279,6 +343,65 @@ class StrategyRuntimeTests(unittest.TestCase):
                 ChangingGrid(),
             )
 
+    def test_aggregation_rejects_duplicate_node_replies(self):
+        strategy = server_app._build_strategy(
+            {"strategy": "fedavg"}, min_nodes=2)
+        duplicate = [self._train_reply(1.0, 1), self._train_reply(3.0, 1)]
+        with self.assertRaisesRegex(RuntimeError, "federation roster"):
+            strategy.aggregate_train(1, duplicate)
+
+        raw = np.frombuffer(b"{}", dtype=np.uint8)
+        duplicate_trees = [
+            self._train_reply(raw, 1), self._train_reply(raw, 1)]
+        with self.assertRaisesRegex(RuntimeError, "federation roster"):
+            server_app._collect_trees(
+                duplicate_trees, n_connected=2, min_nodes=2)
+
+    def test_strategy_marks_replay_with_lost_cache_unavailable(self):
+        strategy = server_app._build_strategy(
+            {"strategy": "fedavg"}, min_nodes=2)
+        strategy._round_input_arrays[1] = ArrayRecord(
+            numpy_ndarrays=[np.asarray([0.0])])
+        replies = [
+            self._train_reply(1.0, 1),
+            self._train_reply(3.0, 2, **{"replay-cache-missing": 1}),
+        ]
+        strategy.aggregate_train(1, replies)
+        self.assertEqual(strategy.available_rounds, set())
+        self.assertEqual(strategy.privacy_noop_rounds, {1})
+
+    def test_privacy_tail_is_nonblocking_but_never_replaces_trained_arrays(self):
+        strategy = server_app._build_strategy(
+            {"strategy": "fedavg"}, min_nodes=2)
+        trained, _ = strategy.aggregate_train(1, [
+            self._train_reply(1.0, 1), self._train_reply(3.0, 2)])
+        tail, _ = strategy.aggregate_train(2, [
+            self._train_reply(100.0, 1, **{"privacy-noop": 1}),
+            self._train_reply(200.0, 2, **{"privacy-noop": 1}),
+        ])
+        public_failure, _ = strategy.aggregate_train(3, [
+            self._train_reply(
+                300.0, 1, **{"public-preflight-unavailable": 1}),
+            self._train_reply(
+                400.0, 2, **{"public-preflight-unavailable": 1}),
+        ])
+        execution_failure, _ = strategy.aggregate_train(4, [
+            self._train_reply(
+                500.0, 1, **{"execution-unavailable": 1}),
+            self._train_reply(
+                600.0, 2, **{"execution-unavailable": 1}),
+        ])
+        np.testing.assert_array_equal(
+            trained.to_numpy_ndarrays()[0], np.asarray([2.0]))
+        np.testing.assert_array_equal(
+            tail.to_numpy_ndarrays()[0], np.asarray([2.0]))
+        np.testing.assert_array_equal(
+            public_failure.to_numpy_ndarrays()[0], np.asarray([2.0]))
+        np.testing.assert_array_equal(
+            execution_failure.to_numpy_ndarrays()[0], np.asarray([2.0]))
+        self.assertEqual(strategy.available_rounds, {1})
+        self.assertEqual(strategy.privacy_noop_rounds, {2, 3, 4})
+
     def test_tree_aggregation_rejects_any_missing_booster(self):
         booster = {
             "model_type": "dp_gbdt", "trees": [], "n_trees": 0,
@@ -286,9 +409,99 @@ class StrategyRuntimeTests(unittest.TestCase):
         raw = np.frombuffer(
             json.dumps(booster).encode("utf-8"), dtype=np.uint8)
         valid = [self._train_reply(raw, 1), self._train_reply(raw, 2)]
-        with self.assertRaisesRegex(RuntimeError, "2 of 2.*degraded federation"):
+        with self.assertRaisesRegex(RuntimeError, "1 of 2.*degraded federation"):
             server_app._collect_trees(
-                valid + [self._error_reply(3)], n_connected=2, min_nodes=2)
+                [valid[0], self._error_reply(2)],
+                n_connected=2, min_nodes=2)
+
+        replay_missing = self._train_reply(
+            raw, 2, **{"replay-cache-missing": 1})
+        booster, n_failures, available = server_app._collect_trees(
+            [valid[0], replay_missing], n_connected=2, min_nodes=2)
+        self.assertFalse(available)
+        self.assertEqual(n_failures, 0)
+        self.assertEqual(booster, {"trees": []})
+
+        execution_failure = self._train_reply(
+            raw, 2, **{"execution-unavailable": 1})
+        booster, n_failures, available = server_app._collect_trees(
+            [valid[0], execution_failure], n_connected=2, min_nodes=2)
+        self.assertFalse(available)
+        self.assertEqual(n_failures, 0)
+        self.assertEqual(booster, {"trees": []})
+
+
+class GbdtRuntimeContractTests(unittest.TestCase):
+    @staticmethod
+    def _regression_booster(weights=(2.0, 4.0)):
+        return {
+            "objective": "reg:squarederror", "depth": 1, "n_bins": 8,
+            "base_margin": 0.0, "learning_rate": 0.1,
+            "feature_ranges": [[-1.0, 1.0]],
+            "target_bounds": [-2.0, 2.0], "margin_bounds": [-3.0, 3.0],
+            "gradient_clip": 2.0, "gradient_bounds": [-2.0, 2.0],
+            "trees": [{"feat": [0], "thr": [0.0], "w": list(weights)}],
+        }
+
+    def test_regression_boosters_are_validated_and_bagged(self):
+        first = self._regression_booster((2.0, 4.0))
+        second = self._regression_booster((4.0, 6.0))
+        merged = server_app._bag_boosters([first, second])
+        self.assertEqual(merged["objective"], "reg:squarederror")
+        self.assertEqual(merged["margin_bounds"], [-3.0, 3.0])
+        self.assertEqual(merged["n_boosters"], 2)
+        self.assertEqual(merged["trees"][0]["w"], [1.0, 2.0])
+        self.assertEqual(merged["trees"][1]["w"], [2.0, 3.0])
+
+    def test_constant_valid_regression_gradient_support_is_accepted(self):
+        booster = self._regression_booster()
+        booster["target_bounds"] = [0.0, 1.0]
+        booster["margin_bounds"] = [10.0, 11.0]
+        booster["gradient_bounds"] = [1.0, 1.0]
+        booster["gradient_clip"] = 1.0
+        validated = server_app._validated_booster_contract(booster)
+        self.assertEqual(validated["gradient_bounds"], [1.0, 1.0])
+
+    def test_bagging_rejects_incompatible_or_malformed_boosters(self):
+        first = self._regression_booster()
+        incompatible = self._regression_booster()
+        incompatible["margin_bounds"] = [-4.0, 4.0]
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            server_app._bag_boosters([first, incompatible])
+        malformed = self._regression_booster()
+        malformed["trees"][0]["w"] = [1.0]
+        with self.assertRaisesRegex(RuntimeError, "geometry"):
+            server_app._bag_boosters([malformed])
+
+    def test_regression_spec_is_bound_to_the_manifest_target_bounds(self):
+        manifest = {
+            "dp-track": "trees", "task-type": "regression",
+            "num-features": 1, "run_token": "run_" + "a" * 32,
+            "target-bounds": {"lower": -2.0, "upper": 2.0},
+            "gbdt-spec": {
+                "objective": "reg:squarederror", "max_depth": 2,
+                "n_trees": 3, "learning_rate": 0.1, "reg_lambda": 1.0,
+                "n_bins": 8, "feature_ranges": [[-1.0, 1.0]],
+                "target_bounds": [-2.0, 2.0],
+                "margin_bounds": [-3.0, 3.0], "gradient_clip": 1.5,
+            },
+        }
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir}, run_config={})
+            spec = task.load_gbdt_spec(context)
+            self.assertEqual(spec["target_bounds"], [-2.0, 2.0])
+            self.assertEqual(spec["margin_bounds"], [-3.0, 3.0])
+            self.assertEqual(spec["gradient_clip"], 1.5)
+            manifest["target-bounds"]["upper"] = 3.0
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            with self.assertRaisesRegex(RuntimeError, "disagree"):
+                task.load_gbdt_spec(context)
 
 
 class ArtifactRuntimeTests(unittest.TestCase):
@@ -315,6 +528,38 @@ class ArtifactRuntimeTests(unittest.TestCase):
             self.assertEqual(portable["__shapes__"], [[1, 2], [1]])
             self.assertEqual(portable["__round__"], 2)
             self.assertTrue(os.path.isfile(os.path.join(results_dir, "model.npz")))
+
+    def test_unavailable_privacy_tail_writes_status_but_no_model(self):
+        arrays = [np.asarray([0.0], dtype=np.float32)]
+        result = SimpleNamespace(
+            arrays=SimpleNamespace(to_numpy_ndarrays=lambda: arrays),
+            train_metrics_clientapp={},
+        )
+        with tempfile.TemporaryDirectory() as results_dir:
+            server_app._save_results({
+                "results-dir": results_dir,
+                "num-server-rounds": 1,
+            }, None, result, available_rounds=set())
+            self.assertFalse(os.path.exists(
+                os.path.join(results_dir, "global_model.json")))
+            self.assertFalse(os.path.exists(
+                os.path.join(results_dir, "model.npz")))
+            with open(os.path.join(results_dir, "history.json"),
+                      encoding="utf-8") as handle:
+                history = json.load(handle)
+            self.assertEqual(history, [{
+                "round": 1, "n_failures": 0, "available": False}])
+
+    def test_unavailable_tree_writes_status_but_no_booster(self):
+        with tempfile.TemporaryDirectory() as results_dir:
+            server_app._save_trees(
+                {"results-dir": results_dir}, {"trees": []},
+                available=False)
+            self.assertFalse(os.path.exists(
+                os.path.join(results_dir, "booster.json")))
+            with open(os.path.join(results_dir, "history.json"),
+                      encoding="utf-8") as handle:
+                self.assertFalse(json.load(handle)[0]["available"])
 
     def test_portable_weights_are_bounded_and_reject_non_finite_values(self):
         with tempfile.TemporaryDirectory() as results_dir:

@@ -1,6 +1,7 @@
 """dsFlower DP-GBDT engine (node-side, trusted) — enforced differential privacy
-for gradient-boosted decision trees, via an S-GBDT-style curator-side mechanism
-(Nuradha et al., "Frugal Differentially Private GBDT", arXiv:2309.12041).
+for gradient-boosted decision trees, via a random-split curator-side mechanism
+inspired by Nuradha et al., "Frugal Differentially Private GBDT"
+(arXiv:2309.12041), rather than a full implementation of that paper.
 
 This is the TREES track's privacy core. Like ``dp_harness.py`` it is installed
 with the dsFlower node package and runs as TRUSTED code: the researcher ships
@@ -21,10 +22,10 @@ Design invariants (identical posture to ``dp_harness.py``):
     so tree structures do not need to align across nodes.
   * The ONLY data-touching release per tree is the leaf histogram
     S_t = (G_leaf, H_leaf) in R^{2L}. One individual (a patient under per-patient
-    pooling, else a row) routes to exactly ONE leaf, so the replace-one L2
-    sensitivity is Δ₂ = sqrt((2·g*)² + (h*)²) — the worst case is a *same-leaf*
-    swap, where the gradient coordinate swings by up to 2·g* and the hessian by
-    up to h*.
+    pooling, else a row) routes to exactly ONE leaf. Binary logistic uses the
+    conservative replace-one bound sqrt((2·g*)² + (h*)²). Bounded squared
+    error derives the exact support-aware maximum of a same-leaf gradient swap
+    and a different-leaf swap of two (gradient, unit-Hessian) contributions.
   * Leaf weights are the Newton step computed from the NOISED histogram
     (post-processing of S̃_t — no separate, separately-charged leaf release).
   * Accounting: each S̃_t is the Gaussian mechanism at noise multiplier σ ⇒
@@ -58,19 +59,21 @@ _MAX_TREES = 200
 _MAX_BINS = 64
 _MAX_FEATURES = 65_536
 _MAX_RUN_TOKEN_CHARS = 1024
+_MAX_PUBLIC_BOUND_ABS = 1.0e6
+_MAX_LEAF_WEIGHT_ABS = 1.0e6
 _MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
 _ASCII_ID_TRIM = " \t\r\n"
 
 # Objective allowlist: each maps to FINITE per-instance gradient/hessian clip
-# bounds (g*, h*). Only objectives whose gradient AND hessian are provably
-# bounded are DP-safe without an admin-set clip; unbounded-gradient objectives
-# (e.g. reg:squarederror) are REJECTED here, exactly as Opacus' ModuleValidator
-# rejects BatchNorm on the neural track.
+# bounds (g*, h*). Objectives with naturally unbounded gradients are admitted
+# only through a separate, objective-specific geometry which pins public target
+# and margin bounds and explicitly clips the gradient before aggregation.
 #   binary:logistic — p = sigmoid(F) in (0,1); g = p - y in (-1,1) ⇒ g* = 1;
 #                      h = p(1-p) in (0, 1/4] ⇒ h* = 1/4.
 _OBJECTIVE_CLIP = {
     "binary:logistic": (1.0, 0.25),
 }
+_BOUNDED_REGRESSION_OBJECTIVE = "reg:squarederror"
 
 
 def _require_secure_noise_rng(rng):
@@ -155,17 +158,116 @@ def _validated_run_token(run_token):
     return run_token
 
 
-def clip_bounds(objective):
-    """Return finite (g*, h*) gradient/hessian clip bounds for an allowlisted
-    objective; reject anything else (fail closed)."""
-    obj = str(objective)
-    if obj not in _OBJECTIVE_CLIP:
+def _validated_public_interval(value, name):
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or any(isinstance(v, (bool, np.bool_)) for v in value)):
+        raise ValueError("%s must be [lower, upper]" % name)
+    lo = _finite_float(value[0], "%s.lower" % name)
+    hi = _finite_float(value[1], "%s.upper" % name)
+    if (not lo < hi or abs(lo) > _MAX_PUBLIC_BOUND_ABS
+            or abs(hi) > _MAX_PUBLIC_BOUND_ABS):
         raise ValueError(
-            "DP-GBDT objective %r is not on the bounded-gradient allowlist %r; "
-            "unbounded-gradient objectives need an admin-set clip and are "
-            "refused rather than trained with a wrong sensitivity."
-            % (obj, sorted(_OBJECTIVE_CLIP)))
-    return _OBJECTIVE_CLIP[obj]
+            "%s must be finite with lower < upper inside [-%g, %g]"
+            % (name, _MAX_PUBLIC_BOUND_ABS, _MAX_PUBLIC_BOUND_ABS))
+    return lo, hi
+
+
+def regression_replace_one_sensitivity(gradient_bounds):
+    """Exact L2 bound for a squared-error leaf histogram under replace-one.
+
+    One record contributes ``(g, 1)`` to exactly one leaf.  If replacement
+    records route to the same leaf, Hessians cancel and the largest norm is the
+    gradient diameter ``g_hi-g_lo``.  If they route to different leaves, their
+    two disjoint ``(g, 1)`` contributions subtract, giving at most
+    ``sqrt(2*g_abs^2 + 2)``.  The mechanism must cover the larger geometry; in
+    particular, a narrow gradient interval does *not* remove the sensitivity of
+    moving the unit Hessian/count between leaves.
+    """
+    if (not isinstance(gradient_bounds, (list, tuple))
+            or len(gradient_bounds) != 2
+            or any(isinstance(v, (bool, np.bool_)) for v in gradient_bounds)):
+        raise ValueError("gradient_bounds must be [lower, upper]")
+    g_lo = _finite_float(gradient_bounds[0], "gradient_bounds.lower")
+    g_hi = _finite_float(gradient_bounds[1], "gradient_bounds.upper")
+    if g_lo > g_hi:
+        raise ValueError("gradient_bounds require lower <= upper")
+    g_abs = max(abs(g_lo), abs(g_hi))
+    same_leaf = g_hi - g_lo
+    different_leaf = math.hypot(math.sqrt(2.0) * g_abs, math.sqrt(2.0))
+    result = max(same_leaf, different_leaf)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError("regression sensitivity is not finite and positive")
+    return result
+
+
+def regression_geometry(target_bounds, margin_bounds=None, gradient_clip=None):
+    """Validate public regression controls and derive its clipped geometry.
+
+    ``y`` is clipped to ``target_bounds`` and the public prediction margin is
+    clipped to ``margin_bounds`` before computing ``g = margin-y``.  A finite
+    symmetric ``gradient_clip`` may tighten that already-bounded interval; when
+    omitted it is the maximum possible absolute raw gradient.  Every returned
+    bound is therefore public and fixed before private data or DP noise is read.
+    """
+    target_lo, target_hi = _validated_public_interval(
+        target_bounds, "target_bounds")
+    if margin_bounds is None:
+        margin_lo, margin_hi = target_lo, target_hi
+    else:
+        margin_lo, margin_hi = _validated_public_interval(
+            margin_bounds, "margin_bounds")
+
+    raw_lo = margin_lo - target_hi
+    raw_hi = margin_hi - target_lo
+    raw_abs = max(abs(raw_lo), abs(raw_hi))
+    if gradient_clip is None:
+        clip = raw_abs
+    else:
+        if isinstance(gradient_clip, (bool, np.bool_)):
+            raise ValueError("gradient_clip must be finite and > 0")
+        requested_clip = _finite_float(
+            gradient_clip, "gradient_clip", positive=True)
+        clip = min(raw_abs, requested_clip)
+    if not math.isfinite(clip) or clip <= 0.0:
+        raise ValueError("gradient_clip must be finite and > 0")
+
+    # np.clip is monotone, so clipping the interval endpoints gives the exact
+    # support of every per-record gradient admitted by these public controls.
+    g_lo = min(clip, max(-clip, raw_lo))
+    g_hi = min(clip, max(-clip, raw_hi))
+    g_star = max(abs(g_lo), abs(g_hi))
+    delta2 = regression_replace_one_sensitivity((g_lo, g_hi))
+    return {
+        "target_bounds": (target_lo, target_hi),
+        "margin_bounds": (margin_lo, margin_hi),
+        "gradient_clip": clip,
+        "gradient_bounds": (g_lo, g_hi),
+        "g_star": g_star,
+        "h_star": 1.0,
+        "delta2": delta2,
+    }
+
+
+def _objective_geometry(objective, target_bounds=None, margin_bounds=None,
+                        gradient_clip=None):
+    obj = str(objective)
+    if obj in _OBJECTIVE_CLIP:
+        g_star, h_star = _OBJECTIVE_CLIP[obj]
+        return {"g_star": g_star, "h_star": h_star,
+                "delta2": replace_one_sensitivity(g_star, h_star)}
+    if obj == _BOUNDED_REGRESSION_OBJECTIVE:
+        return regression_geometry(target_bounds, margin_bounds, gradient_clip)
+    raise ValueError(
+        "DP-GBDT objective %r is not on the allowlist %r"
+        % (obj, sorted(list(_OBJECTIVE_CLIP) + [_BOUNDED_REGRESSION_OBJECTIVE])))
+
+
+def clip_bounds(objective, target_bounds=None, margin_bounds=None,
+                gradient_clip=None):
+    """Return finite objective-specific per-record gradient/Hessian bounds."""
+    geometry = _objective_geometry(
+        objective, target_bounds, margin_bounds, gradient_clip)
+    return geometry["g_star"], geometry["h_star"]
 
 
 def replace_one_sensitivity(g_star, h_star):
@@ -312,12 +414,20 @@ def _canonical_patient_id(value):
 # Per-patient pooling (DP unit = patient). Mirrors the neural _pool_by_patient.
 # --------------------------------------------------------------------------- #
 
-def pool_by_patient(X, y, patient_ids):
-    """Collapse each patient's rows into ONE row (mean features, majority/first
-    label) so the DP unit is the patient: one patient then routes to one leaf and
-    contributes one clamped (g, h), bounding its replace-one sensitivity to Δ₂.
-    Returns (X_pooled, y_pooled)."""
+def pool_by_patient(X, y, patient_ids, *, objective="binary:logistic",
+                    target_bounds=None):
+    """Collapse each patient's rows into one row (mean features and bounded mean
+    regression target, or majority binary label). One patient then routes to one
+    leaf and contributes one clamped ``(g, h)``, making the patient the DP unit.
+    Returns ``(X_pooled, y_pooled)``."""
     X, y = _finite_xy(X, y)
+    objective = str(objective)
+    if objective == _BOUNDED_REGRESSION_OBJECTIVE:
+        target_lo, target_hi = _validated_public_interval(
+            target_bounds, "target_bounds")
+        y = np.clip(y, target_lo, target_hi)
+    elif objective not in _OBJECTIVE_CLIP:
+        raise ValueError("unsupported pooling objective %r" % objective)
     pid = np.asarray(patient_ids, dtype=object).ravel()
     if pid.shape != (X.shape[0],):
         raise ValueError("patient_ids length %d != X rows %d" % (pid.size, X.shape[0]))
@@ -331,9 +441,12 @@ def pool_by_patient(X, y, patient_ids):
     for k, u in enumerate(uniq):
         m = pid == u
         Xp[k] = X[m].mean(axis=0)
-        # One outcome per patient: majority label, with the same lowest-label
-        # tie break used by the neural track (a binary tie therefore maps to 0).
-        yp[k] = 1.0 if y[m].mean() > 0.5 else 0.0
+        if objective == _BOUNDED_REGRESSION_OBJECTIVE:
+            yp[k] = np.clip(y[m].mean(), target_lo, target_hi)
+        else:
+            # One outcome per patient: majority label, with the same lowest-label
+            # tie break used by the neural track (a binary tie therefore maps to 0).
+            yp[k] = 1.0 if y[m].mean() > 0.5 else 0.0
     return Xp, yp
 
 
@@ -357,7 +470,18 @@ def predict_margin(booster, X):
 
 def predict_proba(booster, X):
     """sigmoid(margin) for binary:logistic."""
+    if str(booster.get("objective")) != "binary:logistic":
+        raise ValueError("predict_proba requires a binary:logistic booster")
     return _sigmoid(predict_margin(booster, X))
+
+
+def predict_value(booster, X):
+    """Bounded scalar prediction for ``reg:squarederror``."""
+    if str(booster.get("objective")) != _BOUNDED_REGRESSION_OBJECTIVE:
+        raise ValueError("predict_value requires a reg:squarederror booster")
+    margin_lo, margin_hi = _validated_public_interval(
+        booster.get("margin_bounds"), "margin_bounds")
+    return np.clip(predict_margin(booster, X), margin_lo, margin_hi)
 
 
 # --------------------------------------------------------------------------- #
@@ -365,7 +489,9 @@ def predict_proba(booster, X):
 # --------------------------------------------------------------------------- #
 
 def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
-                          sigma, delta2, g_star, h_star, n_leaves, rng):
+                          sigma, delta2, g_star, h_star, n_leaves, rng,
+                          objective="binary:logistic", target_bounds=None,
+                          margin_bounds=None, gradient_clip=None):
     """ONE round, node-side: compute this node's per-leaf (G, H) histogram for the
     given (already public) tree structure, then add the FULL Gaussian noise
     on-node before returning — the curator-side DP release. ``current_margin`` is F(x_i)
@@ -375,6 +501,9 @@ def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
     this; it never ships raw sums.
     """
     rng = _require_secure_noise_rng(rng)
+    objective = str(objective)
+    geometry = _objective_geometry(
+        objective, target_bounds, margin_bounds, gradient_clip)
     X, y = _finite_xy(X, y)
     depth = _bounded_int(depth, "depth", 1, _MAX_DEPTH)
     n_leaves = _bounded_int(n_leaves, "n_leaves", 2, 1 << _MAX_DEPTH)
@@ -411,9 +540,23 @@ def node_noised_histogram(X, y, current_margin, feat, thr, depth, *,
     if not math.isfinite(noise_std):
         raise ValueError("sigma * delta2 must be finite")
 
-    p = _sigmoid(current_margin)
-    g = np.clip(p - y, -g_star, g_star)
-    h = np.clip(p * (1.0 - p), 0.0, h_star)
+    if objective == _BOUNDED_REGRESSION_OBJECTIVE:
+        if (g_star < geometry["g_star"] or h_star < geometry["h_star"]
+                or delta2 < geometry["delta2"]):
+            raise ValueError(
+                "regression histogram controls understate the derived sensitivity")
+        target_lo, target_hi = geometry["target_bounds"]
+        margin_lo, margin_hi = geometry["margin_bounds"]
+        bounded_y = np.clip(y, target_lo, target_hi)
+        bounded_margin = np.clip(current_margin, margin_lo, margin_hi)
+        g = np.clip(
+            bounded_margin - bounded_y,
+            -geometry["gradient_clip"], geometry["gradient_clip"])
+        h = np.ones_like(g, dtype=np.float64)
+    else:
+        p = _sigmoid(current_margin)
+        g = np.clip(p - y, -g_star, g_star)
+        h = np.clip(p * (1.0 - p), 0.0, h_star)
     leaf = route_to_leaf(X, feat, thr, depth)
     G = np.zeros(n_leaves, dtype=np.float64)
     H = np.zeros(n_leaves, dtype=np.float64)
@@ -468,7 +611,10 @@ def grow_tree_from_histograms(summed_hist, n_leaves, reg_lambda, learning_rate):
         raise RuntimeError("DP-GBDT leaf-weight arithmetic overflowed; refusing release")
     if not np.all(np.isfinite(w)):
         raise RuntimeError("DP-GBDT leaf weights are non-finite; refusing release")
-    return w
+    # A public, deterministic saturation keeps every saved booster inside the
+    # fixed model geometry accepted by prediction and private validation.  This
+    # is post-processing of an already-private histogram and costs no privacy.
+    return np.clip(w, -_MAX_LEAF_WEIGHT_ABS, _MAX_LEAF_WEIGHT_ABS)
 
 
 # --------------------------------------------------------------------------- #
@@ -477,10 +623,14 @@ def grow_tree_from_histograms(summed_hist, n_leaves, reg_lambda, learning_rate):
 
 def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
                 feature_ranges, n_bins, run_token, epsilon, delta,
-                noise_rng, base_score=0.5, patient_ids=None):
+                noise_rng, base_score=None, patient_ids=None,
+                target_bounds=None, margin_bounds=None, gradient_clip=None):
     """Train a DP-GBDT booster with trusted-curator DP at one node: each tree is one
-    Gaussian release, σ is calibrated once for T_total = n_trees. Returns the
-    booster dict (our own serializable format).
+    Gaussian release, σ is calibrated once for T_total = n_trees. Bounded
+    squared-error regression additionally requires public ``target_bounds``;
+    ``margin_bounds`` defaults to that interval and ``gradient_clip`` defaults to
+    the largest gradient implied by those intervals. Returns the booster dict
+    (our own serializable format).
 
     DEPLOYED FEDERATION = BAGGING: every node runs this full local fit on its own
     rows and the server BAGS the M boosters (server_app._bag_boosters: concat trees,
@@ -498,7 +648,9 @@ def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
     insecure fallback.
     """
     objective = str(objective)
-    g_star, h_star = clip_bounds(objective)
+    geometry = _objective_geometry(
+        objective, target_bounds, margin_bounds, gradient_clip)
+    g_star, h_star = geometry["g_star"], geometry["h_star"]
     depth = _bounded_int(depth, "depth", 1, _MAX_DEPTH)
     t_total = _bounded_int(n_trees, "n_trees", 1, _MAX_TREES)
     n_bins = _bounded_int(n_bins, "n_bins", 2, _MAX_BINS)
@@ -508,8 +660,14 @@ def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
     delta = _finite_float(delta, "delta")
     if not (0.0 < delta < 1.0):
         raise ValueError("require 0 < delta < 1")
+    if base_score is None:
+        if objective == _BOUNDED_REGRESSION_OBJECTIVE:
+            margin_lo, margin_hi = geometry["margin_bounds"]
+            base_score = margin_lo / 2.0 + margin_hi / 2.0
+        else:
+            base_score = 0.5
     base_score = _finite_float(base_score, "base_score")
-    if not (0.0 <= base_score <= 1.0):
+    if objective == "binary:logistic" and not (0.0 <= base_score <= 1.0):
         raise ValueError("base_score must be in [0, 1]")
     run_token = _validated_run_token(run_token)
     noise_rng = _require_secure_noise_rng(noise_rng)
@@ -518,15 +676,24 @@ def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
     # staged data may retain missing values (drop_missing=FALSE); NaN/Inf must fail
     # closed instead of becoming data-dependent routing or a non-finite release.
     X, y = _finite_xy(X, y)
+    if objective == _BOUNDED_REGRESSION_OBJECTIVE:
+        target_lo, target_hi = geometry["target_bounds"]
+        y = np.clip(y, target_lo, target_hi)
     if patient_ids is not None:
-        X, y = pool_by_patient(X, y, patient_ids)
+        X, y = pool_by_patient(
+            X, y, patient_ids, objective=objective,
+            target_bounds=geometry.get("target_bounds"))
     n, n_features = X.shape
     feature_ranges = _validated_feature_ranges(feature_ranges, n_features)
-    delta2 = replace_one_sensitivity(g_star, h_star)
+    delta2 = geometry["delta2"]
     n_leaves = 1 << depth
     sigma = calibrate_gbdt_sigma(epsilon, delta, t_total)   # ONE σ up front
 
-    base_margin = _logit(base_score)
+    if objective == _BOUNDED_REGRESSION_OBJECTIVE:
+        margin_lo, margin_hi = geometry["margin_bounds"]
+        base_margin = min(margin_hi, max(margin_lo, base_score))
+    else:
+        base_margin = _logit(base_score)
     if not math.isfinite(base_margin):
         raise RuntimeError("DP-GBDT base margin is non-finite; refusing to train")
     booster = {"objective": objective, "depth": depth, "n_bins": n_bins,
@@ -534,6 +701,13 @@ def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
                "feature_ranges": [[a, b] for a, b in feature_ranges],
                "sigma": sigma, "delta2": delta2,
                "epsilon": epsilon, "delta": delta, "trees": []}
+    if objective == _BOUNDED_REGRESSION_OBJECTIVE:
+        booster.update({
+            "target_bounds": list(geometry["target_bounds"]),
+            "margin_bounds": list(geometry["margin_bounds"]),
+            "gradient_clip": geometry["gradient_clip"],
+            "gradient_bounds": list(geometry["gradient_bounds"]),
+        })
     F = np.full(n, base_margin, dtype=np.float64)
     # ONE release-scoped CSPRNG drives every tree's leaf noise.
     debits = 0
@@ -541,7 +715,10 @@ def fit_dp_gbdt(X, y, *, objective, depth, n_trees, learning_rate, reg_lambda,
         feat, thr = random_tree(run_token, t, depth, feature_ranges, n_bins)
         s_tilde = node_noised_histogram(
             X, y, F, feat, thr, depth, sigma=sigma, delta2=delta2,
-            g_star=g_star, h_star=h_star, n_leaves=n_leaves, rng=noise_rng)
+            g_star=g_star, h_star=h_star, n_leaves=n_leaves, rng=noise_rng,
+            objective=objective, target_bounds=geometry.get("target_bounds"),
+            margin_bounds=geometry.get("margin_bounds"),
+            gradient_clip=geometry.get("gradient_clip"))
         if not np.all(np.isfinite(s_tilde)):
             raise RuntimeError("DP-GBDT histogram is non-finite; refusing release")
         debits += 1

@@ -37,13 +37,14 @@ The `configure` script prepares the node Python runtime. Runtime environments
 contain Flower, PyTorch, Opacus, the DP-GBDT implementation and the cryptographic
 dependencies used by the canonical runner.
 
-## Two computation contracts
+## Computation contracts
 
 | Request | Enforced node-side behavior |
 |---|---|
 | Declarative neural/vision specification | Opacus DP-SGD with per-example or, when a server-selected patient identifier exists, per-patient clipping and noise. |
 | Declarative tree specification | DP-GBDT with data-independent structure, bounded gradients/Hessians and noisy leaf histograms. |
 | HookApp (legacy name: Tier2) | Complete-update clipping and conservatively RDP-calibrated Gaussian output perturbation; optional fixed-block sample-and-aggregate only inside the required sandbox. |
+| Private model validation | One fixed Gaussian-noised vector of bounded per-unit sufficient statistics; only pooled metrics are post-processed by the ServerApp. |
 
 Declarative specifications are data, not researcher code. They provide the
 granularity of an `nn.Module` because the trusted runner owns the training loop
@@ -61,14 +62,46 @@ side channels. A HookApp executes only when all of the following are true:
 - the configured minimum-duration timing envelope is valid;
 - the uploaded package passes archive validation, scanning and hash pinning.
 
-If any gate is absent, the HookApp is not executed and the operation returns the
-incoming public model unchanged. This data-independent no-op is intentional and
-fail-closed. `ds.flower.tier2.run()` remains only as a deprecated name for the
-HookApp API.
+Both child functions receive only a bounded, hash-pinned public `app_params`
+object plus trusted `round_index`, `num_rounds`, task and class-count fields.
+Privacy, path, dependency, secret and runtime keys are reserved. Array count and
+shape are fixed for the run, and the Gaussian scale composes the complete round
+transcript. If a public execution gate is absent, the HookApp is not executed and
+the run is reported as `available=false` without a model artifact. A child crash,
+timeout or malformed result inside the sandbox becomes a zero delta and still
+receives the same Gaussian output mechanism. A failure in the trusted runtime
+after private execution starts is also reported only as unavailable, without its
+cause or fallback being accepted as a trained model. `ds.flower.tier2.run()`
+remains only as a deprecated name for the HookApp API.
 
 The Hook timing envelope is defense in depth, not a formal constant-time
 guarantee: cleanup, process availability and storage behavior remain outside the
 numeric DP proof and require deployment-level quotas/isolation when in scope.
+
+The training name `xgboost` is a compatibility label for dsFlower's own
+pure-NumPy random-split DP-GBDT, not the native XGBoost library. The trusted
+implementation supports binary logistic and bounded squared-error regression.
+Native XGBoost, LightGBM and CatBoost are not treated as automatic substitutes:
+their learned bins, split topology, categories and stopping rules are
+data-dependent, so perturbing only the final serialized model would not establish
+formal DP. A HookApp can release any fixed numeric representation under generic
+whole-update DP, but cannot turn a variable native booster into a tight DP model
+without a separately reviewed adapter/mechanism.
+
+Private validation loads an already public declarative model before opening the
+staged validation frame. The current validation track accepts tabular neural and
+DP-GBDT artifacts; vision validation is not yet implemented and fails explicitly.
+Each row or configured patient contributes one bounded
+histogram/sufficient-statistic vector. The node releases its sum once through the
+Gaussian mechanism; exact predictions, labels, counts and per-node metrics never
+leave the node. The ServerApp requires every selected node and derives binary,
+multiclass, ordinal, multilabel, bounded-regression or count metrics only by
+post-processing the pooled DP vector. This is external validation when the
+assigned dataset is independent and resubstitution validation otherwise; it does
+not relabel reuse as cross-validation.
+If any expected node does not provide the fixed private release, the pooled
+artifact reports `available=false` and omits metrics. It never substitutes exact
+or zero-filled metrics, and this does not introduce a query-count lockout.
 
 ## Lifetime accounting without a query-count block
 
@@ -88,16 +121,18 @@ and the infinite transcript by `(epsilon_total, delta_total)`. Reservations are
 transactional and happen in `flowerPrepareRunDS()` before private staging or
 SuperNode execution. Failed runs are not refunded. Exact
 protocol retries never trigger a second private release: the cached response is
-reused when available; otherwise the incoming public model is returned
-unchanged.
+reused when available; otherwise the replay is reported as unavailable and the
+incoming public model is never accepted as a newly trained release.
 
 The accountant does not reject a request merely because a query counter reached
 a cap. There is, however, no mechanism that can combine a finite lifetime budget,
 infinitely many *informative* queries and fixed utility: scheduled allocations
 must tend to zero. When an allocation is below the node's numerical safety
 threshold, the run completes with an unchanged, data-independent model instead
-of attempting an unstable mechanism. A positive epsilon floor would make the
-lifetime privacy loss diverge and is therefore not offered.
+of attempting an unstable mechanism; the coordinator reports
+`available=false` and does not save that fallback as a trained model. A positive
+epsilon floor would make the lifetime privacy loss diverge and is therefore not
+offered.
 
 The default accounting domain is the whole node. Dataset renaming, subsetting or
 small data changes cannot reset it. Multiple domains are disabled by default and
@@ -285,7 +320,7 @@ all other policy controls remain normal DataSHIELD profile options.
 | `dp_sample_aggregate` | `FALSE` | Enable fixed-block HookApp sample-and-aggregate when every sandbox gate is present. |
 | `dp_sa_blocks` | `8` | Public, fixed HookApp block count, constrained to `[2, 64]`; never derived from private cohort size. |
 | `dp_egress_timeout` | `900` | Hook child timeout in seconds. |
-| `dp_egress_time_pad` | `0` | One minimum-duration envelope for the complete Hook release (all S&A blocks); zero disables execution, otherwise at least `dp_egress_timeout + 5`. It is timing defense in depth, not a formal constant-time proof. |
+| `dp_egress_time_pad` | `0` | One minimum-duration envelope for the complete Hook release; zero disables execution. It must be at least `dp_egress_timeout + 5`, or `dp_sa_blocks * dp_egress_timeout + 5` when sequential sample-and-aggregate is enabled. It is timing defense in depth, not a formal constant-time proof. |
 | `dp_egress_memory_mb` | `8192` | Hook child address-space limit in MiB (`512` to `131072`). |
 | `dp_egress_file_mb` | `1024` | Maximum size of any Hook child output file in MiB (`16` to `16384`). |
 | `dp_egress_processes` | `128` | Hook child process/thread limit (`1` to `1024`, where supported). |

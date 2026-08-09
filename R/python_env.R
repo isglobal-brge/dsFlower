@@ -28,7 +28,7 @@
               "torchvision>=0.15.0,<1.0.0",
               "Pillow>=9.0.0", "nibabel>=5.0.0", "pydicom>=2.4.0",
               "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0")
-  # No xgboost venv: the trees track's DP-GBDT (S-GBDT mechanism) is pure numpy,
+  # No xgboost venv: the trees track's random-split DP-GBDT is pure numpy,
   # which the torch venv already provides, so the xgboost LIBRARY is never imported
   # node-side. One venv runs every dp-track (deps: nothing more than needed).
 )
@@ -56,12 +56,16 @@
 .resolve_backend <- function(requested = NULL) {
   req <- requested %||% .dsflower_runtime$torch_backend %||%
     .dsf_option("torch_backend", "auto")
-  req <- tolower(as.character(req)[1])
+  if (!is.character(req) || length(req) != 1L || is.na(req)) {
+    stop("dsflower.torch_backend must be one of auto, cpu, gpu, cuda, or ",
+         "cu<digits>.", call. = FALSE)
+  }
+  req <- tolower(req)
   if (identical(req, "cpu")) return("cpu")
   gpu_venv <- dir.exists(file.path(.venv_root(), "pytorch-gpu"))
   if (req %in% c("", "auto"))
     return(if (gpu_venv && .gpu_present()) "gpu" else "cpu")
-  if (req %in% c("gpu", "cuda") || startsWith(req, "cu")) {
+  if (req %in% c("gpu", "cuda") || grepl("^cu[0-9]+$", req)) {
     if (!.gpu_present())
       stop("torch_backend='", req, "' but no GPU is visible to this node ",
            "(nvidia-smi found none). Give the container GPU access at the node ",
@@ -72,7 +76,8 @@
            "the multi-GB CUDA venv is not built lazily mid-session.", call. = FALSE)
     return("gpu")
   }
-  "cpu"
+  stop("dsflower.torch_backend must be one of auto, cpu, gpu, cuda, or ",
+       "cu<digits>.", call. = FALSE)
 }
 
 #' Normalize a framework / dp-track to its venv. dsFlower runs in ONE torch venv

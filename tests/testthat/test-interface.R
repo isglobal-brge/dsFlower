@@ -222,7 +222,7 @@ test_that("HookApp resource policy is finite, bounded, and unambiguous", {
     list(dsflower.dp_sa_blocks = c(2L, 3L)),
     list(dsflower.dp_egress_timeout = 3601L),
     list(dsflower.dp_egress_timeout = NaN),
-    list(dsflower.dp_egress_time_pad = 3661),
+    list(dsflower.dp_egress_time_pad = 230406),
     list(dsflower.dp_egress_time_pad = c(0, 1)),
     list(dsflower.dp_egress_memory_mb = 511L),
     list(dsflower.dp_egress_file_mb = 16385L),
@@ -237,7 +237,220 @@ test_that("HookApp resource policy is finite, bounded, and unambiguous", {
   expect_error(withr::with_options(
     list(dsflower.dp_egress_timeout = 60L,
          dsflower.dp_egress_time_pad = 64),
-    dsFlower:::.addDpConfigToRunConfig(base)), "timeout \\+ 5")
+    dsFlower:::.addDpConfigToRunConfig(base)), "at least 65")
+})
+
+test_that("HookApp public parameters are canonical and server hash pinned", {
+  wire <- function(json) {
+    gsub("[\r\n]", "", jsonlite::base64_enc(charToRaw(enc2utf8(json))))
+  }
+  encoded <- wire('{"alpha":0.25,"nested":{"labels":["a",null,true]}}')
+  cfg <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "egress",
+    "task-type" = "classification",
+    "num-server-rounds" = 2L,
+    "num-classes" = 2L,
+    "app-params-b64" = encoded
+  ))
+
+  expect_identical(cfg[["app-params-b64"]], encoded)
+  expect_identical(
+    cfg[["app-params-sha256"]],
+    digest::digest(jsonlite::base64_dec(encoded),
+                   algo = "sha256", serialize = FALSE))
+  expect_true("app-params-sha256" %in%
+                dsFlower:::.server_owned_run_config_fields())
+
+  defaults <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "egress", "task-type" = "classification",
+    "num-server-rounds" = 1L, "num-classes" = 2L
+  ))
+  expect_identical(rawToChar(jsonlite::base64_dec(
+    defaults[["app-params-b64"]])), "{}")
+  expect_match(defaults[["app-params-sha256"]], "^[0-9a-f]{64}$")
+})
+
+test_that("HookApp manifest rejects aliases, tampering, and unsafe JSON", {
+  wire <- function(json) {
+    gsub("[\r\n]", "", jsonlite::base64_enc(charToRaw(enc2utf8(json))))
+  }
+  base <- list(
+    "dp-track" = "egress", "task-type" = "classification",
+    "num-server-rounds" = 1L, "num-classes" = 2L
+  )
+  invalid <- list(
+    c(base, list("app_params" = list(alpha = 1))),
+    c(base, list("app-params-extra" = wire("{}"))),
+    c(base, list("app-params-sha256" = strrep("0", 64L))),
+    c(base, list("app-params-b64" = wire('{"b":1,"a":2}'))),
+    c(base, list("app-params-b64" = wire('{"a":1,"a":2}'))),
+    c(base, list("app-params-b64" = wire('{"epsilon":1}'))),
+    c(base, list("app-params-b64" = wire('{"training_epsilon":1}'))),
+    c(base, list("app-params-b64" = wire('{"model_path":"weights"}'))),
+    c(base, list("app-params-b64" = wire('{"value":"dir/file"}'))),
+    c(base, list("app-params-b64" = wire('{"value":1e999}'))),
+    c(base, list("app-params-b64" = "not-base64"))
+  )
+  for (config in invalid) {
+    expect_error(dsFlower:::.addDpConfigToRunConfig(config))
+  }
+
+  too_large <- gsub(
+    "[\r\n]", "",
+    jsonlite::base64_enc(as.raw(rep.int(0L, 65537L))))
+  expect_error(dsFlower:::.addDpConfigToRunConfig(c(
+    base, list("app-params-b64" = too_large))), "bounded")
+  expect_error(dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "neural", "num-server-rounds" = 1L,
+    "app-params-b64" = wire("{}"))), "only valid")
+})
+
+test_that("validation config is pinned to one well-typed release", {
+  config <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "multiclass", "validation-bins" = 24L,
+    "task-type" = "classification", "loss-name" = "cross_entropy",
+    "num-server-rounds" = 1L, "num-features" = 3L,
+    "num-classes" = 4L, "num-labels" = 2L,
+    "target-levels" = c("a", "b", "c", "d")))
+  expect_identical(config[["dp-track"]], "validation")
+  expect_identical(config[["privacy-max-releases"]], 1L)
+  expect_identical(config[["validation-bins"]], 24L)
+  expect_false(config[["allow_per_node_metrics"]])
+
+  maximum <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "multiclass", "task-type" = "classification",
+    "loss-name" = "cross_entropy", "num-server-rounds" = 1L,
+    "num-features" = 3L, "num-classes" = 1024L,
+    "num-labels" = 1024L))
+  expect_identical(maximum[["num-classes"]], 1024L)
+  expect_identical(maximum[["num-labels"]], 1024L)
+  too_many <- list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "multiclass", "task-type" = "classification",
+    "loss-name" = "cross_entropy", "num-server-rounds" = 1L,
+    "num-features" = 3L, "num-classes" = 1025L,
+    "num-labels" = 1024L)
+  expect_error(dsFlower:::.addDpConfigToRunConfig(too_many), "2, 1024")
+
+  wrong_bounds <- list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "binary", "task-type" = "classification",
+    "loss-name" = "bce_logits", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L,
+    "feature-bounds" = list(lower = 0, upper = 1))
+  expect_error(dsFlower:::.addDpConfigToRunConfig(wrong_bounds),
+               "match num-features exactly")
+
+  mixed_case <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "regression", "task-type" = "REGRESSION",
+    "loss-name" = "MSE", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L,
+    "target-bounds" = list(lower = 0, upper = 1)))
+  expect_identical(mixed_case[["loss-name"]], "mse")
+
+  expect_error(dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "binary", "task-type" = "classification",
+    "loss-name" = "bce_logits", "num-server-rounds" = 2L,
+    "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L)),
+    "exactly one")
+  expect_error(dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "regression", "task-type" = "regression",
+    "loss-name" = "bce_logits", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L,
+    "target-bounds" = list(lower = 0, upper = 1))),
+    "disagrees")
+  expect_error(dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "multiclass", "task-type" = "classification",
+    "loss-name" = "bce_logits", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 3L, "num-labels" = 2L)),
+    "binary")
+  expect_error(dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "multilabel", "task-type" = "classification",
+    "loss-name" = "multilabel_bce", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 3L, "num-labels" = 2L)),
+    "binary target levels")
+})
+
+test_that("validation preparation persists the public contract before execution", {
+  local_interface_privacy_state()
+  name <- "test_validation_prepare"
+  dsFlower:::.setHandle(name, mock_handle(table_data = data.frame(
+    age = c(20, 30, 40), marker = c(-1, 0, 1), outcome = c(0, 1, 1))))
+  withr::defer(dsFlower:::.removeHandle(name))
+  config <- list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "binary", "validation-bins" = 16L,
+    "task-type" = "classification", "loss-name" = "bce_logits",
+    "model-spec-b64" = "e30=", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L,
+    "feature-bounds" = list(lower = c(0, -5), upper = c(120, 5)),
+    "target-levels" = c(0, 1))
+  normalized <- dsFlower:::.addDpConfigToRunConfig(config)
+  config[["validation-contract-sha256"]] <-
+    dsFlower:::.validationContractSha256(
+      normalized, c("age", "marker"), "outcome",
+      dsFlower:::.dpUnitPolicy()$dp_unit)
+  expect_error(
+    flowerPrepareRunDS(name, "outcome", NULL, config),
+    "explicit ordered public feature contract")
+  expect_no_error(flowerPrepareRunDS(
+    name, "outcome", c("age", "marker"), config))
+  handle <- dsFlower:::.getHandle(name)
+  manifest <- jsonlite::fromJSON(
+    file.path(handle$staging_dir, "manifest.json"), simplifyVector = FALSE)
+  expect_identical(manifest[["dp-track"]], "validation")
+  expect_identical(manifest[["privacy-max-releases"]], 1L)
+  expect_identical(manifest[["validation-model-track"]], "neural")
+  expect_identical(manifest[["validation-task"]], "binary")
+  expect_identical(manifest[["validation-bins"]], 16L)
+  expect_identical(
+    manifest[["validation-contract-sha256"]],
+    config[["validation-contract-sha256"]])
+})
+
+test_that("validation never stages a patient identifier as model data", {
+  local_interface_privacy_state()
+  withr::local_options(list(
+    dsflower.dp_unit = "patient",
+    dsflower.patient_column = "subject_id"))
+  name <- "test_validation_patient_overlap"
+  dsFlower:::.setHandle(name, mock_handle(table_data = data.frame(
+    subject_id = c("a", "b"), age = c(20, 30), outcome = c(0, 1))))
+  withr::defer(dsFlower:::.removeHandle(name))
+  base <- list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "binary", "validation-bins" = 16L,
+    "task-type" = "classification", "loss-name" = "bce_logits",
+    "model-spec-b64" = "e30=", "num-server-rounds" = 1L,
+    "num-features" = 1L, "num-classes" = 2L, "num-labels" = 2L,
+    "target-levels" = c(0, 1),
+    "validation-contract-sha256" = strrep("a", 64L))
+  expect_error(flowerPrepareRunDS(
+    name, "outcome", "subject_id", base), "patient identifier")
+  expect_error(flowerPrepareRunDS(
+    name, "subject_id", "age", base), "patient identifier")
+})
+
+test_that("validation contract SHA-256 has a cross-package canonical wire", {
+  config <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "multiclass", "validation-bins" = 24L,
+    "task-type" = "classification", "loss-name" = "cross_entropy",
+    "model-spec-b64" = "e30=", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 3L, "num-labels" = 2L,
+    "feature-bounds" = list(lower = c(0, -5), upper = c(100, 5)),
+    "target-levels" = c("a", "b", "c")))
+  expect_identical(
+    dsFlower:::.validationContractSha256(
+      config, c("age", "marker"), "outcome", "patient"),
+    "ecf31e300ff0087e26799f6a4fbe1894e8f8357e0fd35667936653318b040e3f")
 })
 
 test_that("flowerPrepareRunDS stages data correctly", {
@@ -615,7 +828,8 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true(caps$templates_deprecated)
   expect_false(caps$allow_custom_config)
   expect_true(caps$allow_custom_config_deprecated)
-  expect_identical(caps$dp_tracks, c("neural", "trees", "egress"))
+  expect_identical(caps$dp_tracks,
+                   c("neural", "trees", "egress", "validation"))
   expect_setequal(
     caps$declarative_model_ops$layers,
     c("linear", "relu", "gelu", "tanh", "sigmoid", "elu", "silu",
@@ -631,9 +845,11 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_setequal(
     caps$declarative_losses,
     c("bce_logits", "cross_entropy", "mse", "poisson_nll",
-      "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll")
+      "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
+      "huber")
   )
-  expect_identical(caps$tree_objectives, "binary:logistic")
+  expect_setequal(caps$tree_objectives,
+                  c("binary:logistic", "reg:squarederror"))
   expect_setequal(
     caps$aggregation_strategies,
     c("fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm")
@@ -641,6 +857,47 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("max_rounds" %in% names(caps))
   expect_true("min_samples" %in% names(caps))
   expect_false("secure_aggregation_supported" %in% names(caps))
+  expect_false(caps$hook_execution_configured)
+})
+
+test_that("DP-GBDT public ranges must match the pinned feature geometry", {
+  config <- list(
+    "num-features" = 2L,
+    "gbdt-spec" = list(
+      objective = "binary:logistic", max_depth = 2L, n_trees = 3L,
+      learning_rate = 0.1, reg_lambda = 1, n_bins = 8L,
+      feature_ranges = list(c(-1, 1))))
+
+  expect_error(
+    dsFlower:::.normalizeGbdtConfig(config, "trees"),
+    "feature_ranges must match.*num-features")
+})
+
+test_that("Hook readiness capability reflects every public admin gate", {
+  withr::local_options(list(
+    dsflower.hook_enabled = TRUE,
+    dsflower.hook_sandbox_attested = TRUE,
+    dsflower.hook_resource_isolation_attested = TRUE,
+    dsflower.dp_egress_timeout = 30,
+    dsflower.dp_egress_time_pad = 35))
+  caps <- flowerGetCapabilitiesDS()
+  expect_true(caps$hook_time_envelope_configured)
+  expect_true(caps$hook_execution_configured)
+  expect_identical(caps$hook_required_time_pad_seconds, 35)
+})
+
+test_that("Hook sample-and-aggregate timing covers every sequential block", {
+  withr::local_options(list(
+    dsflower.hook_enabled = TRUE,
+    dsflower.hook_sandbox_attested = TRUE,
+    dsflower.hook_resource_isolation_attested = TRUE,
+    dsflower.dp_sample_aggregate = TRUE,
+    dsflower.dp_sa_blocks = 3L,
+    dsflower.dp_egress_timeout = 30,
+    dsflower.dp_egress_time_pad = 95))
+  caps <- flowerGetCapabilitiesDS()
+  expect_identical(caps$hook_required_time_pad_seconds, 95)
+  expect_true(caps$hook_execution_configured)
 })
 
 test_that("flowerGetCapabilitiesDS omits infrastructure and session state", {

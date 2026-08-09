@@ -244,7 +244,7 @@ def assert_pinned_unit_count(context, n_rows, patient_ids=None):
         number = float(raw)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("manifest has an invalid pinned privacy-unit count") from exc
-    if (not math.isfinite(number) or number != math.floor(number) or number < 1):
+    if (not math.isfinite(number) or number != math.floor(number) or number < 0):
         raise ValueError("manifest has an invalid pinned privacy-unit count")
     observed = (int(n_rows) if patient_ids is None else int(np.unique(
         np.asarray([_canonical_patient_id(value) for value in patient_ids],
@@ -451,7 +451,7 @@ def load_dp_track(context=None):
     if "dp-track" not in manifest:
         raise ValueError("manifest is missing the pinned dp-track")
     track = str(manifest["dp-track"]).lower()
-    if track not in ("neural", "trees", "egress"):
+    if track not in ("neural", "trees", "egress", "validation"):
         raise ValueError("invalid dp-track '%s'" % track)
     return track
 
@@ -488,22 +488,141 @@ def load_run_pins(context=None):
                 "manifest pin '%s' must be in [1, %d]" % (key, int(upper)))
         return int(number)
 
-    try:
-        learning_rate = float(
-            cfg.get("learning-rate", manifest.get("learning-rate", 0.01)))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("learning-rate must be in (0, 10]") from exc
-    if (not math.isfinite(learning_rate) or learning_rate <= 0.0
-            or learning_rate > _MAX_LEARNING_RATE):
-        raise ValueError("learning-rate must be in (0, 10]")
+    def bounded_float(key, default, lower, upper, *, lower_open=False,
+                      upper_open=False):
+        try:
+            value = float(manifest.get(key, cfg.get(key, default)))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("manifest pin '%s' must be finite" % key) from exc
+        lower_ok = value > lower if lower_open else value >= lower
+        upper_ok = value < upper if upper_open else value <= upper
+        if not math.isfinite(value) or not lower_ok or not upper_ok:
+            raise ValueError("manifest pin '%s' is outside its allowed range" % key)
+        return value
+
+    def pinned_bool(key, default):
+        value = manifest.get(key, cfg.get(key, default))
+        if type(value) is not bool:
+            raise ValueError("manifest pin '%s' must be boolean" % key)
+        return value
+
+    loss_name = required("loss-name", str)
+    allowed_losses = {
+        "bce_logits", "cross_entropy", "mse", "poisson_nll",
+        "multilabel_bce", "hinge", "negbin_nll", "gamma_nll",
+        "huber", "ordinal"}
+    if loss_name not in allowed_losses:
+        raise ValueError("loss-name is not on the trusted allowlist")
+    loss_fields = {"nb-dispersion", "gamma-shape", "huber-delta"}
+    selected_loss_field = {
+        "negbin_nll": "nb-dispersion",
+        "gamma_nll": "gamma-shape",
+        "huber": "huber-delta",
+    }.get(loss_name)
+    incompatible_loss_fields = (
+        loss_fields - ({selected_loss_field} if selected_loss_field else set())
+    ) & set(manifest)
+    if incompatible_loss_fields:
+        raise ValueError("loss config contains incompatible field(s): %s"
+                         % ", ".join(sorted(incompatible_loss_fields)))
+    if selected_loss_field is not None and selected_loss_field not in manifest:
+        raise ValueError(
+            "manifest is missing selected loss parameter '%s'"
+            % selected_loss_field)
+    if loss_name == "negbin_nll":
+        bounded_float("nb-dispersion", 1.0, 1.0e-6, 1.0e12)
+    elif loss_name == "gamma_nll":
+        bounded_float("gamma-shape", 1.0, 1.0e-6, 1.0e12)
+    elif loss_name == "huber":
+        bounded_float("huber-delta", 1.0, 1.0e-6, 1.0e6)
+
+    learning_rate = bounded_float(
+        "learning-rate", 0.01, 0.0, _MAX_LEARNING_RATE, lower_open=True)
+    optimizer = str(manifest.get(
+        "optimizer-name", cfg.get("optimizer-name", "sgd"))).lower()
+    if optimizer not in ("sgd", "adam", "adamw", "rmsprop"):
+        raise ValueError("optimizer-name is not on the trusted allowlist")
+    scheduler = str(manifest.get(
+        "scheduler-name", cfg.get("scheduler-name", "none"))).lower()
+    if scheduler not in ("none", "step", "exponential", "cosine"):
+        raise ValueError("scheduler-name is not on the trusted allowlist")
+
+    optimizer_config = {
+        "name": optimizer,
+        "weight_decay": bounded_float("weight-decay", 0.0, 0.0, 1000.0),
+        "l1_penalty": bounded_float("l1-penalty", 0.0, 0.0, 1000.0),
+        "momentum": bounded_float(
+            "optimizer-momentum", 0.0, 0.0, 1.0, upper_open=True),
+        "nesterov": pinned_bool("optimizer-nesterov", False),
+        "beta1": bounded_float(
+            "optimizer-beta1", 0.9, 0.0, 1.0, upper_open=True),
+        "beta2": bounded_float(
+            "optimizer-beta2", 0.999, 0.0, 1.0, upper_open=True),
+        "eps": bounded_float(
+            "optimizer-eps", 1e-8, 0.0, 1.0, lower_open=True),
+        "amsgrad": pinned_bool("optimizer-amsgrad", False),
+        "rmsprop_alpha": bounded_float(
+            "optimizer-rmsprop-alpha", 0.99, 0.0, 1.0, upper_open=True),
+    }
+    if optimizer_config["nesterov"] and (
+            optimizer != "sgd" or optimizer_config["momentum"] <= 0.0):
+        raise ValueError("nesterov requires SGD with positive momentum")
+    optimizer_fields = {
+        "optimizer-momentum", "optimizer-nesterov", "optimizer-beta1",
+        "optimizer-beta2", "optimizer-eps", "optimizer-amsgrad",
+        "optimizer-rmsprop-alpha"}
+    optimizer_allowed = {
+        "sgd": {"optimizer-momentum", "optimizer-nesterov"},
+        "adam": {"optimizer-beta1", "optimizer-beta2", "optimizer-eps",
+                 "optimizer-amsgrad"},
+        "adamw": {"optimizer-beta1", "optimizer-beta2", "optimizer-eps",
+                  "optimizer-amsgrad"},
+        "rmsprop": {"optimizer-momentum", "optimizer-eps",
+                    "optimizer-rmsprop-alpha"},
+    }[optimizer]
+    incompatible = (optimizer_fields - optimizer_allowed) & set(manifest)
+    if incompatible:
+        raise ValueError("optimizer config contains incompatible field(s): %s"
+                         % ", ".join(sorted(incompatible)))
+
+    scheduler_config = {
+        "name": scheduler,
+        "step_size": bounded_int("scheduler-step-size", _MAX_LOCAL_EPOCHS)
+            if "scheduler-step-size" in manifest else 1,
+        "gamma": bounded_float(
+            "scheduler-gamma", 0.1, 0.0, _MAX_LEARNING_RATE,
+            lower_open=True),
+        "min_lr": bounded_float(
+            "scheduler-min-lr", 0.0, 0.0, _MAX_LEARNING_RATE),
+    }
+    if scheduler_config["min_lr"] > learning_rate:
+        raise ValueError("scheduler-min-lr cannot exceed learning-rate")
+    scheduler_fields = {
+        "scheduler-step-size", "scheduler-gamma", "scheduler-min-lr"}
+    scheduler_allowed = {
+        "none": set(),
+        "step": {"scheduler-step-size", "scheduler-gamma"},
+        "exponential": {"scheduler-gamma"},
+        "cosine": {"scheduler-min-lr"},
+    }[scheduler]
+    incompatible = (scheduler_fields - scheduler_allowed) & set(manifest)
+    if incompatible:
+        raise ValueError("scheduler config contains incompatible field(s): %s"
+                         % ", ".join(sorted(incompatible)))
+
+    n_classes = bounded_int("num-classes", 1024)
+    if loss_name == "bce_logits" and n_classes != 2:
+        raise ValueError("bce_logits is binary only; use cross_entropy")
 
     return {
-        "loss_name": required("loss-name", str),
+        "loss_name": loss_name,
         "batch_size": bounded_int("batch-size", _MAX_BATCH_SIZE),
         "local_epochs": bounded_int("local-epochs", _MAX_LOCAL_EPOCHS),
         "num_rounds": bounded_int("num-server-rounds", _MAX_SERVER_ROUNDS),
-        "n_classes": required("num-classes", int),
+        "n_classes": n_classes,
         "learning_rate": learning_rate,
+        "optimizer": optimizer_config,
+        "scheduler": scheduler_config,
     }
 
 
@@ -511,6 +630,44 @@ def load_pinned_run_config(context=None):
     """Overlay every node-pinned declarative field onto Flower run_config."""
     manifest = _load_manifest(context)
     cfg = _run_config(context)
+    if str(manifest.get("dp-track", "")).lower() == "egress":
+        # The R service canonicalises and hashes the public app payload before
+        # staging.  Require the Flower bundle to carry that exact copy before a
+        # private file can be opened; neither side may silently substitute it.
+        for key in (
+                "app-params-b64", "app-params-sha256",
+                "num-server-rounds", "task-type", "num-classes",
+                "num-features"):
+            if key not in manifest:
+                raise ValueError("manifest is missing HookApp pin '%s'" % key)
+            if cfg.get(key) != manifest[key]:
+                raise ValueError("Flower HookApp config does not match manifest pin")
+    neural_public_keys = {
+        "learning-rate", "nb-dispersion", "gamma-shape", "huber-delta",
+        "weight-decay",
+        "l1-penalty", "optimizer-name", "optimizer-momentum",
+        "optimizer-nesterov", "optimizer-beta1", "optimizer-beta2",
+        "optimizer-eps", "optimizer-amsgrad", "optimizer-rmsprop-alpha",
+        "scheduler-name", "scheduler-step-size", "scheduler-gamma",
+        "scheduler-min-lr"}
+    if str(manifest.get("dp-track", "")).lower() == "neural":
+        for key in neural_public_keys:
+            if key in cfg and (key not in manifest or cfg[key] != manifest[key]):
+                raise ValueError("Flower neural config does not match manifest pin")
+    if str(manifest.get("dp-track", "")).lower() == "validation":
+        required = [
+            "validation-model-track", "validation-task", "validation-bins",
+            "validation-contract-sha256",
+            "num-server-rounds", "num-features", "num-classes",
+            "num-labels", "loss-name",
+        ]
+        if str(manifest.get("validation-model-track", "")) == "neural":
+            required.append("model-spec-b64")
+        for key in required:
+            if key not in manifest:
+                raise ValueError("manifest is missing validation pin '%s'" % key)
+            if cfg.get(key) != manifest[key]:
+                raise ValueError("Flower validation config does not match manifest pin")
     # The analyst-facing Flower config may name a module for the researcher-side
     # ServerApp, but node execution accepts only the package name derived and
     # written by flowerTier2PinDS after installation/hash verification.
@@ -519,6 +676,16 @@ def load_pinned_run_config(context=None):
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",
         "gbdt-spec", "feature-bounds", "backbone", "image-size", "user-module",
+        "task-type", "app-params-b64", "app-params-sha256",
+        "target-bounds", "target-levels", "validation-model-track",
+        "validation-task", "validation-bins", "validation-contract-sha256",
+        "learning-rate", "weight-decay", "l1-penalty",
+        "optimizer-name", "optimizer-momentum", "optimizer-nesterov",
+        "optimizer-beta1", "optimizer-beta2", "optimizer-eps",
+        "optimizer-amsgrad", "optimizer-rmsprop-alpha",
+        "scheduler-name", "scheduler-step-size", "scheduler-gamma",
+        "scheduler-min-lr",
+        "nb-dispersion", "gamma-shape", "huber-delta",
     )
     for key in keys:
         if key in manifest:
@@ -579,7 +746,7 @@ def _decode_feature_bounds(cfg, n_features):
 
 
 def load_gbdt_spec(context=None):
-    """Validated, manifest-authoritative XGBoost spec for the trees track.
+    """Validated, manifest-authoritative DP-GBDT spec for the trees track.
 
     The client's spec is a DATA dict (never imported / eval'd). The node clamps it
     to admin policy and pins the DP-critical pieces: the objective (dp_gbdt's
@@ -595,8 +762,29 @@ def load_gbdt_spec(context=None):
     cfg = load_pinned_run_config(context)
 
     objective = str(spec.get("objective", cfg.get("objective", "binary:logistic")))
-    max_depth = int(spec.get("max_depth", cfg.get("max-depth", 3)))
-    n_trees = int(spec.get("n_trees", cfg.get("n-trees", 20)))
+    if objective not in ("binary:logistic", "reg:squarederror"):
+        raise RuntimeError("DP-GBDT objective is not on the trusted allowlist")
+
+    def spec_int(key, default, lower, upper):
+        raw = spec.get(key, cfg.get(key.replace("_", "-"), default))
+        if isinstance(raw, bool):
+            raise RuntimeError("DP-GBDT %s must be an integer" % key)
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("DP-GBDT %s must be an integer" % key) from exc
+        if (not math.isfinite(number) or number != math.floor(number)
+                or number < lower or number > upper):
+            raise RuntimeError(
+                "DP-GBDT %s must be in [%d, %d]" % (key, lower, upper))
+        return int(number)
+
+    admin_depth = int(manifest.get("gbdt-max-depth", 6))
+    admin_trees = int(manifest.get("gbdt-max-trees", 200))
+    admin_bins = int(manifest.get("gbdt-max-bins", 64))
+    max_depth = spec_int("max_depth", 3, 1, min(10, admin_depth))
+    n_trees = spec_int("n_trees", 20, 1, min(200, admin_trees))
+    n_bins = spec_int("n_bins", 32, 2, min(64, admin_bins))
     learning_rate = float(spec.get("learning_rate", cfg.get("learning-rate", 0.3)))
     reg_lambda = float(spec.get("reg_lambda", cfg.get("reg-lambda", 1.0)))
     # Newton-step denominator is max(lambda, H+lambda); lambda<=0 (or non-finite lr/lambda)
@@ -604,15 +792,48 @@ def load_gbdt_spec(context=None):
     if not (math.isfinite(learning_rate)
             and 0 < learning_rate <= _MAX_LEARNING_RATE):
         raise RuntimeError("DP-GBDT learning_rate must be in (0, 10]")
-    if not (math.isfinite(reg_lambda) and reg_lambda > 0):
-        reg_lambda = 1e-6
-    reg_lambda = min(reg_lambda, _MAX_GBDT_REG_LAMBDA)
-    n_bins = int(spec.get("n_bins", cfg.get("n-bins", 32)))
+    if not (math.isfinite(reg_lambda) and 0 < reg_lambda <= _MAX_GBDT_REG_LAMBDA):
+        raise RuntimeError("DP-GBDT reg_lambda must be in (0, 1e6]")
     run_token = str(manifest.get("run_token", spec.get("run_token", "dsflower")))
-    # Admin caps (data-independent): bound compute + keep leaves from being singletons.
-    max_depth = max(1, min(max_depth, int(manifest.get("gbdt-max-depth", 6))))
-    n_trees = max(1, min(n_trees, int(manifest.get("gbdt-max-trees", 200))))
-    n_bins = max(2, min(n_bins, int(manifest.get("gbdt-max-bins", 64))))
+
+    def public_interval(value, label):
+        if (not isinstance(value, (list, tuple)) or len(value) != 2
+                or any(isinstance(item, bool) for item in value)):
+            raise RuntimeError("DP-GBDT %s must be [lower, upper]" % label)
+        try:
+            lower, upper = float(value[0]), float(value[1])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("DP-GBDT %s must be numeric" % label) from exc
+        if (not math.isfinite(lower) or not math.isfinite(upper)
+                or not lower < upper or abs(lower) > _MAX_NUMERIC_ABS
+                or abs(upper) > _MAX_NUMERIC_ABS):
+            raise RuntimeError("DP-GBDT %s has invalid public bounds" % label)
+        return [lower, upper]
+
+    target_bounds = margin_bounds = gradient_clip = None
+    task_type = str(manifest.get("task-type", "")).lower()
+    if objective == "reg:squarederror":
+        target_bounds = public_interval(spec.get("target_bounds"), "target_bounds")
+        pinned_target = manifest.get("target-bounds")
+        if not isinstance(pinned_target, dict):
+            raise RuntimeError("manifest is missing regression target-bounds")
+        pinned_pair = public_interval(
+            [pinned_target.get("lower"), pinned_target.get("upper")],
+            "manifest target-bounds")
+        if target_bounds != pinned_pair or task_type != "regression":
+            raise RuntimeError("DP-GBDT regression bounds/task disagree with manifest")
+        margin_bounds = public_interval(
+            spec.get("margin_bounds", target_bounds), "margin_bounds")
+        if spec.get("gradient_clip") is not None:
+            try:
+                gradient_clip = float(spec["gradient_clip"])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("DP-GBDT gradient_clip must be positive") from exc
+            if (not math.isfinite(gradient_clip) or gradient_clip <= 0
+                    or gradient_clip > 2.0 * _MAX_NUMERIC_ABS):
+                raise RuntimeError("DP-GBDT gradient_clip must be in (0, 2e6]")
+    elif task_type != "classification":
+        raise RuntimeError("binary DP-GBDT requires classification task-type")
 
     feature_ranges = spec.get("feature_ranges")
     if not feature_ranges:
@@ -631,6 +852,8 @@ def load_gbdt_spec(context=None):
     return {"objective": objective, "max_depth": max_depth, "n_trees": n_trees,
             "learning_rate": learning_rate, "reg_lambda": reg_lambda,
             "n_bins": n_bins, "run_token": run_token,
+            "target_bounds": target_bounds, "margin_bounds": margin_bounds,
+            "gradient_clip": gradient_clip,
             "feature_ranges": [[float(a), float(b)] for a, b in feature_ranges]}
 
 
