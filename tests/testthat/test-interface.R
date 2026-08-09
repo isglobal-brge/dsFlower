@@ -351,6 +351,15 @@ test_that("validation config is pinned to one well-typed release", {
     "target-bounds" = list(lower = 0, upper = 1)))
   expect_identical(mixed_case[["loss-name"]], "mse")
 
+  quantile <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = "regression", "task-type" = "regression",
+    "loss-name" = "quantile", "quantile-level" = 0.9,
+    "num-server-rounds" = 1L, "num-features" = 2L,
+    "num-classes" = 2L, "num-labels" = 2L,
+    "target-bounds" = list(lower = 0, upper = 1)))
+  expect_identical(quantile[["loss-name"]], "quantile")
+
   expect_error(dsFlower:::.addDpConfigToRunConfig(list(
     "dp-track" = "validation", "validation-model-track" = "neural",
     "validation-task" = "binary", "task-type" = "classification",
@@ -545,18 +554,15 @@ test_that("privacy-tail prepare never opens private sources and remains nonblock
     .stage_image_manifest = private_access
   )
 
-  tree_config <- list(
-    "dp-track" = "trees",
+  neural_config <- list(
+    "dp-track" = "neural",
     "num-server-rounds" = 1L,
     "num-features" = 2L,
     "num-classes" = 2L,
     "target-levels" = c(0, 1),
     "feature-bounds" = list(lower = c(-1, -2), upper = c(1, 2)),
-    "gbdt-spec" = list(
-      objective = "binary:logistic", max_depth = 2L, n_trees = 3L,
-      learning_rate = 0.1, reg_lambda = 1, n_bins = 8L,
-      feature_ranges = list(c(-1, 1), c(-2, 2))
-    )
+    "loss-name" = "bce_logits",
+    "model-spec-b64" = "e30="
   )
 
   handles <- list(
@@ -580,7 +586,7 @@ test_that("privacy-tail prepare never opens private sources and remains nonblock
 
   for (name in names(handles)) {
     dsFlower:::.setHandle(name, handles[[name]])
-    config <- if (identical(name, "tail_file")) tree_config else list()
+    config <- if (identical(name, "tail_file")) neural_config else list()
     expect_no_error(flowerPrepareRunDS(name, "target", c("f1", "f2"), config))
 
     state <- dsFlower:::.getHandle(name)
@@ -601,17 +607,17 @@ test_that("privacy-tail prepare never opens private sources and remains nonblock
     expect_false("samples_file" %in% names(manifest))
   }
 
-  tree_state <- dsFlower:::.getHandle("tail_file")
-  tree_manifest <- jsonlite::fromJSON(
-    file.path(tree_state$staging_dir, "manifest.json"), simplifyVector = FALSE)
-  expect_identical(tree_manifest[["dp-track"]], "trees")
-  expect_identical(tree_manifest[["num-features"]], 2L)
-  expect_identical(tree_manifest[["gbdt-spec"]]$n_trees, 3L)
+  neural_state <- dsFlower:::.getHandle("tail_file")
+  neural_manifest <- jsonlite::fromJSON(
+    file.path(neural_state$staging_dir, "manifest.json"), simplifyVector = FALSE)
+  expect_identical(neural_manifest[["dp-track"]], "neural")
+  expect_identical(neural_manifest[["num-features"]], 2L)
+  expect_identical(neural_manifest[["loss-name"]], "bce_logits")
 
   # A new query receives the next public no-op allocation; it is not rejected.
-  old_token <- tree_state$run_token
+  old_token <- neural_state$run_token
   expect_no_error(flowerPrepareRunDS(
-    "tail_file", "target", c("f1", "f2"), tree_config))
+    "tail_file", "target", c("f1", "f2"), neural_config))
   expect_false(identical(dsFlower:::.getHandle("tail_file")$run_token, old_token))
 })
 
@@ -823,13 +829,14 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("torch_version" %in% names(caps))
   expect_true("opacus_version" %in% names(caps))
   expect_true("runtime_versions_sha256" %in% names(caps))
+  expect_identical(caps$runner_abi, 3L)
   expect_true("templates" %in% names(caps))
   expect_identical(caps$templates, character())
   expect_true(caps$templates_deprecated)
   expect_false(caps$allow_custom_config)
   expect_true(caps$allow_custom_config_deprecated)
   expect_identical(caps$dp_tracks,
-                   c("neural", "trees", "egress", "validation"))
+                   c("neural", "egress", "validation"))
   expect_setequal(
     caps$declarative_model_ops$layers,
     c("linear", "relu", "gelu", "tanh", "sigmoid", "elu", "silu",
@@ -846,10 +853,9 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
     caps$declarative_losses,
     c("bce_logits", "cross_entropy", "mse", "poisson_nll",
       "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
-      "huber")
+      "huber", "quantile")
   )
-  expect_setequal(caps$tree_objectives,
-                  c("binary:logistic", "reg:squarederror"))
+  expect_false("tree_objectives" %in% names(caps))
   expect_setequal(
     caps$aggregation_strategies,
     c("fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm")
@@ -860,17 +866,16 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_false(caps$hook_execution_configured)
 })
 
-test_that("DP-GBDT public ranges must match the pinned feature geometry", {
-  config <- list(
-    "num-features" = 2L,
-    "gbdt-spec" = list(
-      objective = "binary:logistic", max_depth = 2L, n_trees = 3L,
-      learning_rate = 0.1, reg_lambda = 1, n_bins = 8L,
-      feature_ranges = list(c(-1, 1))))
-
+test_that("retired tree contracts fail before private preparation", {
   expect_error(
-    dsFlower:::.normalizeGbdtConfig(config, "trees"),
-    "feature_ranges must match.*num-features")
+    dsFlower:::.addDpConfigToRunConfig(list(
+      "dp-track" = "trees", "num-server-rounds" = 1L)),
+    "dp-track must be one of")
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(list(
+      "dp-track" = "neural", "num-server-rounds" = 1L,
+      "gbdt-spec" = list(objective = "binary:logistic"))),
+    "gbdt-spec is no longer")
 })
 
 test_that("Hook readiness capability reflects every public admin gate", {

@@ -24,7 +24,7 @@ FLOWER_APP = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "flower_app")
 sys.path.insert(0, FLOWER_APP)
 
-from dsflower_runner import (client_app, dp_gbdt, dp_harness, egress_child,
+from dsflower_runner import (client_app, dp_harness, egress_child,
                              model_spec, params, seeding, task, tier2_lib,
                              vision, server_app)  # noqa: E402
 
@@ -202,6 +202,26 @@ class ManifestPrivacyContractTests(unittest.TestCase):
 
 
 class DpSgdAccountingTests(unittest.TestCase):
+    def test_calibration_cache_reuses_only_the_exact_public_horizon(self):
+        cached = dp_harness._cached_noise_multiplier
+        cached.cache_clear()
+        self.addCleanup(cached.cache_clear)
+
+        with mock.patch.object(
+                dp_harness, "calibrate_noise_multiplier",
+                side_effect=[3.75, 4.25]) as calibrate:
+            first = cached(2.0, 1e-5, 0.25, 4, 16, "opacus-test")
+            repeated = cached(2.0, 1e-5, 0.25, 4, 16, "opacus-test")
+            changed = cached(2.0, 1e-5, 0.25, 4, 17, "opacus-test")
+
+        self.assertEqual(first, 3.75)
+        self.assertEqual(repeated, first)
+        self.assertEqual(changed, 4.25)
+        self.assertEqual(calibrate.call_count, 2)
+        self.assertEqual(cached.cache_info().hits, 1)
+        self.assertEqual(cached.cache_info().misses, 2)
+        self.assertEqual(cached.cache_info().maxsize, 128)
+
     def test_replace_one_budget_conversion_matches_two_step_group_privacy(self):
         epsilon, delta = 2.4, 1e-5
         epsilon0, delta0 = dp_harness._replace_one_to_add_remove_budget(
@@ -248,6 +268,8 @@ class DpSgdAccountingTests(unittest.TestCase):
                     dp_harness._replace_one_to_add_remove_budget(epsilon, delta)
 
     def test_calibration_matches_opacus_loader_rate_and_exact_steps(self):
+        dp_harness._cached_noise_multiplier.cache_clear()
+        self.addCleanup(dp_harness._cached_noise_multiplier.cache_clear)
         n_samples, batch_size = 127, 32
         local_epochs, num_rounds = 2, 3
         dataset = TensorDataset(torch.randn(n_samples, 3), torch.randn(n_samples, 1))
@@ -469,7 +491,8 @@ class FiniteGateTests(unittest.TestCase):
         ])
         model.bias.grad_sample = [torch.tensor([[float("inf")], [0.25]])]
 
-        client_app._totalize_grad_samples(model, clipping_norm=1.0)
+        dp_harness.totalize_grad_samples(
+            model.parameters(), clipping_norm=1.0)
 
         for parameter in model.parameters():
             values = (parameter.grad_sample if isinstance(parameter.grad_sample, list)
@@ -501,14 +524,15 @@ class FiniteGateTests(unittest.TestCase):
             not bool(torch.isfinite(parameter.grad_sample).all())
             for parameter in private_model.parameters()))
 
-        client_app._totalize_grad_samples(private_model, clipping_norm=1.0)
+        dp_harness.totalize_grad_samples(
+            private_model.parameters(), clipping_norm=1.0)
 
         flat = [parameter.grad_sample.reshape(2, -1)
                 for parameter in private_model.parameters()]
         per_sample_norm = torch.cat(flat, dim=1).norm(2, dim=1)
         self.assertTrue(bool(torch.isfinite(per_sample_norm).all()))
 
-    def test_opacus_clip_wrapper_totalizes_even_without_client_loop_helper(self):
+    def test_opacus_clip_wrapper_totalizes_exactly_once_immediately_pre_clip(self):
         dataset = TensorDataset(torch.zeros(2, 1), torch.zeros(2, 1))
         loader = DataLoader(dataset, batch_size=2, shuffle=False)
         model = torch.nn.Linear(1, 1)
@@ -524,11 +548,62 @@ class FiniteGateTests(unittest.TestCase):
             parameter.grad_sample = torch.full(sample_shape, float("inf"))
             parameter.grad_sample.reshape(-1)[0] = float("nan")
 
-        optimizer.clip_and_accumulate()
+        with mock.patch.object(
+                dp_harness, "totalize_grad_samples",
+                wraps=dp_harness.totalize_grad_samples) as totalize:
+            optimizer.clip_and_accumulate()
 
+        totalize.assert_called_once()
         self.assertTrue(all(
             bool(torch.isfinite(parameter.summed_grad).all())
             for parameter in optimizer.params))
+
+    def test_vectorized_patient_pooling_preserves_reference_semantics(self):
+        def reference(X, y, groups, loss_name):
+            g = np.asarray([
+                task._canonical_patient_id(value) for value in groups
+            ], dtype=object)
+            Xp, yp = [], []
+            categorical = (loss_name in client_app._CLASSIFICATION_LOSSES
+                           or loss_name == "multilabel_bce")
+            for key in dict.fromkeys(g.tolist()):
+                mask = g == key
+                Xp.append(np.asarray(X[mask], dtype=np.float64).mean(axis=0))
+                values = np.asarray(y[mask])
+                if values.ndim > 1:
+                    pooled = np.asarray(values, dtype=np.float64).mean(axis=0)
+                    if categorical:
+                        pooled = (pooled >= 0.5).astype(values.dtype)
+                elif categorical:
+                    labels, counts = np.unique(values, return_counts=True)
+                    pooled = labels[np.argmax(counts)]
+                else:
+                    pooled = np.asarray(values, dtype=np.float64).mean()
+                yp.append(pooled)
+            return np.stack(Xp), np.asarray(yp, dtype=y.dtype)
+
+        X = np.asarray([
+            [1.0, 8.0], [10.0, 2.0], [3.0, 4.0],
+            [14.0, 6.0], [5.0, 0.0], [18.0, 10.0],
+        ], dtype=np.float32)
+        groups = np.asarray(["p2", "p1", "p2", "p1", "p2", "p1"])
+        cases = (
+            (np.asarray([2, 3, 1, 3, 2, 1], dtype=np.int64),
+             "cross_entropy"),
+            (np.asarray([1.5, 4.0, 2.5, 8.0, 3.5, 12.0], dtype=np.float32),
+             "mse"),
+            (np.asarray([
+                [0, 1], [1, 0], [1, 0],
+                [0, 1], [0, 0], [1, 1],
+            ], dtype=np.float32), "multilabel_bce"),
+        )
+        for y, loss_name in cases:
+            with self.subTest(loss_name=loss_name):
+                expected_X, expected_y = reference(X, y, groups, loss_name)
+                actual_X, actual_y = client_app._pool_by_patient(
+                    X, y, groups, loss_name)
+                np.testing.assert_allclose(actual_X, expected_X, rtol=0, atol=0)
+                np.testing.assert_array_equal(actual_y, expected_y)
 
     def test_public_hook_arrays_are_bounded_and_finite(self):
         valid = client_app._validate_public_egress_arrays([
@@ -784,36 +859,6 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         self.assertEqual(result[1], 2)
 
 
-class SecureGbdtRngTests(unittest.TestCase):
-    def test_client_app_always_injects_release_scoped_secure_rng(self):
-        spec = {
-            "objective": "binary:logistic", "max_depth": 2,
-            "n_trees": 1, "learning_rate": 0.1, "reg_lambda": 1.0,
-            "feature_ranges": [[0.0, 1.0], [0.0, 1.0]],
-            "n_bins": 8, "run_token": "run_" + "a" * 32,
-        }
-        X = np.asarray([[0.0, 0.5], [1.0, 0.25]], dtype=np.float32)
-        y = np.asarray([0.0, 1.0], dtype=np.float32)
-        with (mock.patch.object(client_app, "load_gbdt_spec", return_value=spec),
-              mock.patch.object(client_app, "load_data", return_value=(X, y)),
-              mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=None),
-              mock.patch.object(client_app.task_module,
-                                "assert_pinned_unit_count"),
-              mock.patch.object(client_app.seeding, "master_seed",
-                                return_value=b"m" * 32),
-              mock.patch.object(client_app.dp_gbdt, "fit_dp_gbdt",
-                                return_value={"trees": []}) as fit):
-            arrays, n_units = client_app._train_trees(
-                SimpleNamespace(), {"epsilon": 1.0, "delta": 1e-5},
-                {}, "release:1")
-
-        rng = fit.call_args.kwargs["noise_rng"]
-        self.assertIsInstance(rng, seeding.SecureNumpyRng)
-        self.assertEqual(n_units, 2)
-        self.assertEqual(arrays[0].dtype, np.dtype(np.uint8))
-
-
 class RunPinBoundsTests(unittest.TestCase):
     def test_empty_pinned_privacy_unit_roster_is_structurally_valid(self):
         with tempfile.TemporaryDirectory() as manifest_dir:
@@ -886,26 +931,6 @@ class RunPinBoundsTests(unittest.TestCase):
                 node_config={"manifest-dir": manifest_dir}, run_config={})
             with self.assertRaisesRegex(ValueError, "binary only"):
                 task.load_run_pins(context)
-
-    def test_gbdt_learning_rate_uses_the_same_absolute_ceiling(self):
-        manifest = {
-            "gbdt-spec": {
-                "objective": "binary:logistic", "max_depth": 2,
-                "n_trees": 1, "n_bins": 8, "reg_lambda": 1.0,
-                "learning_rate": task._MAX_LEARNING_RATE + 0.1,
-                "feature_ranges": [[0.0, 1.0]],
-            },
-            "num-features": 1,
-            "run_token": "run_" + "a" * 32,
-        }
-        with tempfile.TemporaryDirectory() as manifest_dir:
-            with open(os.path.join(manifest_dir, "manifest.json"), "w",
-                      encoding="utf-8") as handle:
-                json.dump(manifest, handle)
-            context = SimpleNamespace(
-                node_config={"manifest-dir": manifest_dir}, run_config={})
-            with self.assertRaisesRegex(RuntimeError, "learning_rate"):
-                task.load_gbdt_spec(context)
 
     def test_image_config_is_frozen_from_the_node_manifest(self):
         with tempfile.TemporaryDirectory() as manifest_dir:
@@ -1015,6 +1040,36 @@ class RunPinBoundsTests(unittest.TestCase):
                 json.dump(missing, handle)
             with self.assertRaisesRegex(ValueError, "missing selected"):
                 task.load_run_pins(context)
+
+    def test_quantile_loss_is_pinned_separable_and_bounded(self):
+        criterion = dp_harness.loss_from_allowlist(
+            "quantile", {"quantile-level": 0.75})
+        value = criterion(
+            torch.tensor([[0.0], [2.0]]),
+            torch.tensor([[1.0], [0.0]]))
+        self.assertAlmostEqual(float(value), 0.625)
+        for invalid in (0.0, 1.0, float("nan")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                dp_harness.loss_from_allowlist(
+                    "quantile", {"quantile-level": invalid})
+
+        manifest = {
+            "dp-track": "neural", "loss-name": "quantile",
+            "batch-size": 32, "local-epochs": 1,
+            "num-server-rounds": 1, "num-classes": 2,
+            "learning-rate": 0.01, "optimizer-name": "sgd",
+            "optimizer-momentum": 0.0, "optimizer-nesterov": False,
+            "scheduler-name": "none", "quantile-level": 0.75,
+        }
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            path = os.path.join(manifest_dir, "manifest.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir},
+                run_config=dict(manifest))
+            pins = task.load_run_pins(context)
+            self.assertEqual(pins["loss_name"], "quantile")
 
 
 class HookAppPublicConfigTests(unittest.TestCase):
@@ -1374,17 +1429,7 @@ class ClientAppExceptionBoundaryTests(unittest.TestCase):
             "max_releases": 1, "run_token": "run_" + "a" * 32,
             "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
         }
-        spec = {
-            "objective": "binary:logistic", "max_depth": 2,
-            "n_trees": 2, "learning_rate": 0.1, "reg_lambda": 1.0,
-            "feature_ranges": [[0.0, 1.0]], "n_bins": 8,
-            "run_token": "run_" + "a" * 32,
-        }
-
         def fail_on_private_conversion(*_args, **kwargs):
-            callback = kwargs.get("on_private_start")
-            if callback is not None:
-                callback()
             pd.DataFrame({"private_feature": [sentinel]}).to_numpy(
                 dtype=np.float32)
 
@@ -1401,33 +1446,29 @@ class ClientAppExceptionBoundaryTests(unittest.TestCase):
                                 return_value="release:1"),
               mock.patch.object(client_app, "load_pinned_run_config",
                                 return_value={}),
-              mock.patch.object(client_app, "load_dp_track", return_value="trees"),
+              mock.patch.object(client_app, "load_dp_track", return_value="neural"),
               mock.patch.object(client_app, "load_privacy_config",
                                 return_value={"epsilon": 1.0, "delta": 1e-5}),
-              mock.patch.object(client_app, "load_gbdt_spec", return_value=spec),
-              mock.patch.object(client_app, "_train_trees",
-                                side_effect=fail_on_private_conversion) as train_trees):
+              mock.patch.object(client_app, "load_run_pins",
+                                return_value={"num_rounds": 1}),
+              mock.patch.object(client_app, "_prepare_neural_model",
+                                return_value=(object(), b"m" * 32, 1, False)),
+              mock.patch.object(client_app, "_train_neural",
+                                side_effect=fail_on_private_conversion) as train_neural):
             reply = client_app.train(msg, context)
 
-        train_trees.assert_called_once()
+        train_neural.assert_called_once()
         self.assertFalse(reply.has_error())
         self.assertEqual(dict(reply.content["metrics"]), {
             "num-examples": 1, "execution-unavailable": 1})
         arrays = reply.content["arrays"].to_numpy_ndarrays()
-        booster = json.loads(bytes(np.asarray(arrays[0], dtype=np.uint8)).decode("utf-8"))
-        self.assertEqual(len(booster["trees"]), spec["n_trees"])
-        self.assertTrue(all(
-            np.array_equal(tree["w"], np.zeros(1 << spec["max_depth"]))
-            for tree in booster["trees"]
-        ))
-        self.assertTrue({"privacy_noop", "epsilon", "delta", "sigma", "delta2"}.isdisjoint(
-            booster
-        ))
+        self.assertEqual(len(arrays), 1)
+        np.testing.assert_array_equal(arrays[0], np.zeros(1, dtype=np.float64))
 
         observable = "\n".join((
             repr(reply), repr(reply.error if reply.has_error() else None),
             repr(reply.content), stdout.getvalue(), stderr.getvalue(),
-            bytes(np.asarray(arrays[0], dtype=np.uint8)).decode("utf-8"),
+            repr(arrays),
         ))
         self.assertNotIn(sentinel, observable)
 
@@ -1451,7 +1492,7 @@ class PatientIdGateTests(unittest.TestCase):
                 ["p1", task._MISSING_PATIENT_UNIT],
             )
 
-    def test_v2_patient_id_fixture_matches_every_runner_component(self):
+    def test_v2_patient_id_fixture_matches_active_runner_components(self):
         em_space_id = "\u2003patient\u2003"
         values = [" \tpatient\r\n", em_space_id, "N/A",
                   task._MISSING_PATIENT_UNIT, None, "<NA>", "NaT"]
@@ -1463,8 +1504,6 @@ class PatientIdGateTests(unittest.TestCase):
         loaded = task._load_patient_ids(
             pd.DataFrame({"patient_id": values}), self._patient_manifest())
         self.assertEqual(loaded.tolist(), expected)
-        self.assertEqual(
-            [dp_gbdt._canonical_patient_id(value) for value in values], expected)
         self.assertEqual(
             [tier2_lib._canonical_patient_id(value) for value in values], expected)
 
@@ -1485,11 +1524,6 @@ class PatientIdGateTests(unittest.TestCase):
             groups, 2, 2, b"p" * 32)
         self.assertEqual(n_units, 1)
         self.assertEqual(sorted(np.concatenate(blocks).tolist()), [0, 1])
-        tree_X, tree_y = dp_gbdt.pool_by_patient(
-            np.asarray([[1.0], [3.0]]), np.asarray([0.0, 1.0]), groups)
-        self.assertEqual(tree_X.shape, (1, 1))
-        self.assertEqual(tree_y.shape, (1,))
-        self.assertEqual(tree_y.tolist(), [0.0])
 
     def test_valid_pinned_patient_ids_are_returned(self):
         frame = pd.DataFrame({"patient_id": ["p1", "p2"]})
@@ -2016,12 +2050,6 @@ class PatientPartitionTests(unittest.TestCase):
         self.assertEqual(sorted(np.concatenate(blocks).tolist()), [0, 1])
         with self.assertRaises(RuntimeError):
             tier2_lib._patient_row_blocks(["p1"], 2, 2, b"p" * 32)
-
-        X, y = dp_gbdt.pool_by_patient(
-            np.asarray([[1.0], [2.0]]), np.asarray([0.0, 1.0]),
-            ["p1", None])
-        self.assertEqual(X.shape, (2, 1))
-        self.assertEqual(y.shape, (2,))
 
 
 if __name__ == "__main__":

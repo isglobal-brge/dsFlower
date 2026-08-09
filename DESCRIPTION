@@ -8,8 +8,8 @@ Authors@R: c(
 Description: Server-side DataSHIELD package that runs Flower federated learning
     through a node-installed, hash-pinned runner with server-authoritative
     differential privacy. Provides persistent lifetime privacy accounting,
-    release-scoped cryptographic randomness, declarative DP-SGD and DP-GBDT
-    training, and a fail-closed sandbox gate for untrusted hook code. Raw data
+    release-scoped cryptographic randomness, declarative DP-SGD training, private
+    model validation, and a fail-closed sandbox gate for untrusted hook code. Raw data
     remains on the node; exact feature statistics, node logs, metrics, and cohort
     weights are not released through DataSHIELD.
 License: MIT + file LICENSE

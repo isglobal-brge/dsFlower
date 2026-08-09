@@ -34,15 +34,14 @@ remotes::install_github("isglobal-brge/dsFlower")
 ```
 
 The `configure` script prepares the node Python runtime. Runtime environments
-contain Flower, PyTorch, Opacus, the DP-GBDT implementation and the cryptographic
-dependencies used by the canonical runner.
+contain Flower, PyTorch, Opacus and the cryptographic dependencies used by the
+canonical runner.
 
 ## Computation contracts
 
 | Request | Enforced node-side behavior |
 |---|---|
 | Declarative neural/vision specification | Opacus DP-SGD with per-example or, when a server-selected patient identifier exists, per-patient clipping and noise. |
-| Declarative tree specification | DP-GBDT with data-independent structure, bounded gradients/Hessians and noisy leaf histograms. |
 | HookApp (legacy name: Tier2) | Complete-update clipping and conservatively RDP-calibrated Gaussian output perturbation; optional fixed-block sample-and-aggregate only inside the required sandbox. |
 | Private model validation | One fixed Gaussian-noised vector of bounded per-unit sufficient statistics; only pooled metrics are post-processed by the ServerApp. |
 
@@ -78,19 +77,17 @@ The Hook timing envelope is defense in depth, not a formal constant-time
 guarantee: cleanup, process availability and storage behavior remain outside the
 numeric DP proof and require deployment-level quotas/isolation when in scope.
 
-The training name `xgboost` is a compatibility label for dsFlower's own
-pure-NumPy random-split DP-GBDT, not the native XGBoost library. The trusted
-implementation supports binary logistic and bounded squared-error regression.
-Native XGBoost, LightGBM and CatBoost are not treated as automatic substitutes:
-their learned bins, split topology, categories and stopping rules are
-data-dependent, so perturbing only the final serialized model would not establish
-formal DP. A HookApp can release any fixed numeric representation under generic
-whole-update DP, but cannot turn a variable native booster into a tight DP model
-without a separately reviewed adapter/mechanism.
+No tree learner is exposed by this runner ABI. Native XGBoost, LightGBM and
+CatBoost learn data-dependent bins, split topology, categories and stopping
+rules, so validating public parameters or perturbing only a serialized model
+would not establish formal DP. They require separately reviewed node-owned
+mechanisms. A HookApp can release a fixed numeric representation under generic
+whole-update DP, but cannot turn an ordinary variable-topology booster into a
+tight private learner.
 
 Private validation loads an already public declarative model before opening the
-staged validation frame. The current validation track accepts tabular neural and
-DP-GBDT artifacts; vision validation is not yet implemented and fails explicitly.
+staged validation frame. The current validation track accepts tabular neural
+artifacts; vision validation is not yet implemented and fails explicitly.
 Each row or configured patient contributes one bounded
 histogram/sufficient-statistic vector. The node releases its sum once through the
 Gaussian mechanism; exact predictions, labels, counts and per-node metrics never
@@ -222,7 +219,7 @@ Exact feature counts, sums and sums of squares are disabled. For tabular utility
 the analyst may provide data-independent public lower/upper feature bounds; the
 same clipping and affine transform is applied during training and prediction.
 Without bounds, neural inputs remain unscaled but are locally coerced and
-saturated to `[-1e6, 1e6]`; DP-GBDT uses its public `[0, 1]` range prior.
+saturated to `[-1e6, 1e6]`.
 
 Target preprocessing is also public and per-record. Classification strings or
 factors use an ordered `target_levels`; numeric labels may instead arrive already
@@ -247,8 +244,8 @@ finite saturation after every graph operation, parameters/intermediates bounded
 to magnitude `1e6`, and loss-aware heads (`1e6` for direct MSE regression, `30`
 for logits and log-links). Per-sample gradients are made finite coordinate-wise
 before Opacus applies the server-owned L2 clip, so an overflowing backward pass
-cannot suppress the Gaussian noise. Neural and DP-GBDT learning rates must be in
-`(0, 10]`. The same preprocessing and head saturation are replayed by local
+cannot suppress the Gaussian noise. Neural learning rates must be in `(0, 10]`.
+The same preprocessing and head saturation are replayed by local
 prediction helpers.
 
 Run admission never inspects class or event frequencies. Such a check would turn

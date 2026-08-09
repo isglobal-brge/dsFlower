@@ -398,8 +398,8 @@ flowerInitDS <- function(data_symbol) {
   bins <- suppressWarnings(as.numeric(unlist(
     run_config[["validation-bins"]] %||% 32L, use.names = FALSE)))
   if (length(model_track) != 1L || is.na(model_track) ||
-      !model_track %in% c("neural", "trees")) {
-    stop("validation-model-track must be neural or trees.", call. = FALSE)
+      !identical(model_track, "neural")) {
+    stop("validation-model-track must be neural.", call. = FALSE)
   }
   if (length(task) != 1L || is.na(task) ||
       !task %in% c("binary", "multiclass", "ordinal", "multilabel",
@@ -409,11 +409,6 @@ flowerInitDS <- function(data_symbol) {
   if (length(bins) != 1L || !is.finite(bins) || bins != floor(bins) ||
       bins < 4L || bins > 512L) {
     stop("validation-bins must be an integer in [4, 512].", call. = FALSE)
-  }
-  if (identical(model_track, "trees") &&
-      !task %in% c("binary", "regression")) {
-    stop("The current dp_gbdt validator supports binary or regression tasks.",
-         call. = FALSE)
   }
   n_classes <- suppressWarnings(as.numeric(unlist(
     run_config[["num-classes"]] %||% 2L, use.names = FALSE)))
@@ -454,18 +449,14 @@ flowerInitDS <- function(data_symbol) {
     stop("Multilabel validation requires binary target levels.",
          call. = FALSE)
   }
-  expected_task <- if (identical(model_track, "trees")) {
-    if (identical(loss, "bce_logits")) "binary" else
-      if (identical(loss, "mse")) "regression" else ""
-  } else {
-    switch(loss,
-      bce_logits = "binary",
-      cross_entropy = if (n_classes > 2L) "multiclass" else "binary",
-      hinge = if (n_classes > 2L) "multiclass" else "binary",
-      ordinal = "ordinal", multilabel_bce = "multilabel",
-      mse = "regression", huber = "regression", gamma_nll = "regression",
-      poisson_nll = "count", negbin_nll = "count", "")
-  }
+  expected_task <- switch(loss,
+    bce_logits = "binary",
+    cross_entropy = if (n_classes > 2L) "multiclass" else "binary",
+    hinge = if (n_classes > 2L) "multiclass" else "binary",
+    ordinal = "ordinal", multilabel_bce = "multilabel",
+    mse = "regression", huber = "regression", quantile = "regression",
+    gamma_nll = "regression",
+    poisson_nll = "count", negbin_nll = "count", "")
   if (!nzchar(expected_task) || !identical(task, expected_task)) {
     stop("validation-task disagrees with the pinned model loss.",
          call. = FALSE)
@@ -538,22 +529,6 @@ flowerInitDS <- function(data_symbol) {
     inferred <- if (validation_task %in% c("regression", "count")) {
       validation_task
     } else "classification"
-  } else if (identical(track, "trees")) {
-    spec <- run_config[["gbdt-spec"]]
-    if (!is.list(spec)) {
-      stop("The trees track requires a declarative gbdt-spec object.",
-           call. = FALSE)
-    }
-    objective <- as.character(unlist(
-      spec$objective %||% "", use.names = FALSE))
-    if (length(objective) != 1L || is.na(objective) ||
-        !objective %in% c("binary:logistic", "reg:squarederror")) {
-      stop("gbdt-spec objective must be binary:logistic or reg:squarederror.",
-           call. = FALSE)
-    }
-    inferred <- if (identical(objective, "reg:squarederror")) {
-      "regression"
-    } else "classification"
   } else if (identical(track, "neural")) {
     loss_name <- tolower(as.character(unlist(
       run_config[["loss-name"]] %||% "bce_logits", use.names = FALSE)))
@@ -562,7 +537,8 @@ flowerInitDS <- function(data_symbol) {
     }
     inferred <- switch(
       loss_name,
-      mse = "regression", huber = "regression", gamma_nll = "regression",
+      mse = "regression", huber = "regression", quantile = "regression",
+      gamma_nll = "regression",
       poisson_nll = "count", negbin_nll = "count",
       "classification")
   } else {
@@ -578,103 +554,6 @@ flowerInitDS <- function(data_symbol) {
   }
   run_config[["task-type"]] <- inferred
   run_config[["task_type"]] <- NULL
-  run_config
-}
-
-.normalizeGbdtConfig <- function(run_config, track) {
-  spec <- run_config[["gbdt-spec"]] %||% NULL
-  if (!identical(track, "trees")) {
-    if (!is.null(spec)) {
-      stop("gbdt-spec is only valid for the trees track.", call. = FALSE)
-    }
-    return(run_config)
-  }
-  if (!is.list(spec) || is.null(names(spec)) || any(!nzchar(names(spec))) ||
-      anyDuplicated(names(spec))) {
-    stop("gbdt-spec must be a uniquely named object.", call. = FALSE)
-  }
-  allowed <- c(
-    "objective", "max_depth", "n_trees", "learning_rate", "reg_lambda",
-    "n_bins", "feature_ranges", "target_bounds", "margin_bounds",
-    "gradient_clip")
-  unknown <- setdiff(names(spec), allowed)
-  if (length(unknown)) {
-    stop("Unknown gbdt-spec field(s): ", paste(unknown, collapse = ", "),
-         ".", call. = FALSE)
-  }
-  required <- c(
-    "objective", "max_depth", "n_trees", "learning_rate", "reg_lambda",
-    "n_bins")
-  missing <- setdiff(required, names(spec))
-  if (length(missing)) {
-    stop("gbdt-spec is missing field(s): ", paste(missing, collapse = ", "),
-         ".", call. = FALSE)
-  }
-  scalar <- function(name, lower, upper, integer = FALSE,
-                     lower_open = FALSE) {
-    value <- suppressWarnings(as.numeric(unlist(spec[[name]], use.names = FALSE)))
-    valid <- length(value) == 1L && is.finite(value) &&
-      if (lower_open) value > lower else value >= lower
-    valid <- valid && value <= upper && (!integer || value == floor(value))
-    if (!valid) {
-      stop("gbdt-spec ", name, " is outside its allowed public range.",
-           call. = FALSE)
-    }
-    if (integer) as.integer(value) else value
-  }
-  spec$max_depth <- scalar("max_depth", 1, 6, integer = TRUE)
-  spec$n_trees <- scalar("n_trees", 1, 200, integer = TRUE)
-  spec$learning_rate <- scalar("learning_rate", 0, 10, lower_open = TRUE)
-  spec$reg_lambda <- scalar("reg_lambda", 0, 1e6, lower_open = TRUE)
-  spec$n_bins <- scalar("n_bins", 2, 64, integer = TRUE)
-
-  interval <- function(value, field) {
-    value <- suppressWarnings(as.numeric(unlist(value, use.names = FALSE)))
-    if (length(value) != 2L || any(!is.finite(value)) || value[[1L]] >= value[[2L]] ||
-        any(abs(value) > .DSFLOWER_FLOAT32_SAFE_MAX)) {
-      stop("gbdt-spec ", field,
-           " must be finite [lower, upper] public bounds.", call. = FALSE)
-    }
-    unname(value)
-  }
-  if (!is.null(spec$feature_ranges)) {
-    if (!is.list(spec$feature_ranges) || !length(spec$feature_ranges) ||
-        length(spec$feature_ranges) > 65536L) {
-      stop("gbdt-spec feature_ranges must be a bounded list of intervals.",
-           call. = FALSE)
-    }
-    n_features <- suppressWarnings(as.numeric(unlist(
-      run_config[["num-features"]] %||% NA_real_, use.names = FALSE)))
-    if (length(n_features) != 1L || !is.finite(n_features) ||
-        n_features < 1 || n_features != floor(n_features) ||
-        length(spec$feature_ranges) != n_features) {
-      stop("gbdt-spec feature_ranges must match the pinned num-features.",
-           call. = FALSE)
-    }
-    spec$feature_ranges <- lapply(
-      spec$feature_ranges, interval, field = "feature_ranges")
-  }
-  objective <- as.character(spec$objective)
-  if (identical(objective, "reg:squarederror")) {
-    spec$target_bounds <- interval(spec$target_bounds, "target_bounds")
-    pinned <- run_config[["target-bounds"]]
-    pinned <- c(pinned$lower, pinned$upper)
-    if (!identical(as.numeric(spec$target_bounds), as.numeric(pinned))) {
-      stop("gbdt-spec target_bounds disagree with the pinned target-bounds.",
-           call. = FALSE)
-    }
-    spec$margin_bounds <- interval(
-      spec$margin_bounds %||% spec$target_bounds, "margin_bounds")
-    if (!is.null(spec$gradient_clip)) {
-      spec$gradient_clip <- scalar(
-        "gradient_clip", 0, 2e6, lower_open = TRUE)
-    }
-  } else if (!is.null(spec$target_bounds) || !is.null(spec$margin_bounds) ||
-             !is.null(spec$gradient_clip)) {
-    stop("Regression bounds/clips are invalid for binary:logistic.",
-         call. = FALSE)
-  }
-  run_config[["gbdt-spec"]] <- spec
   run_config
 }
 
@@ -897,24 +776,26 @@ flowerInitDS <- function(data_symbol) {
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
   if (length(track) != 1L || is.na(track) ||
-      !tolower(track) %in% c("neural", "trees", "egress", "validation")) {
-    stop("dp-track must be one of neural, trees, egress, or validation.",
+      !tolower(track) %in% c("neural", "egress", "validation")) {
+    stop("dp-track must be one of neural, egress, or validation.",
          call. = FALSE)
   }
   track <- tolower(track)
+  if (!is.null(run_config[["gbdt-spec"]])) {
+    stop("gbdt-spec is no longer a supported runner contract.", call. = FALSE)
+  }
   run_config[["dp-track"]] <- track
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizePinnedTaskType(run_config, track)
   run_config <- .normalizeHookAppParams(run_config, track)
   run_config <- .normalizePublicFeatureBounds(run_config)
   run_config <- .normalizePublicTargetConfig(run_config)
-  run_config <- .normalizeGbdtConfig(run_config, track)
   run_config[["dp_enabled"]]               <- TRUE
   run_config[["allow_per_node_metrics"]]   <- FALSE
   run_config[["allow_exact_num_examples"]] <- FALSE
   run_config[["fixed_client_sampling"]]    <- TRUE
   policy <- .privacy_policy()  # validate admin policy before touching private data
-  max_releases <- if (track %in% c("trees", "validation")) 1L else
+  max_releases <- if (identical(track, "validation")) 1L else
     as.integer(run_config[["num-server-rounds"]])
   run_config[["privacy-domain"]] <- policy$domain
   run_config[["privacy-adjacency"]] <- policy$adjacency
@@ -1534,7 +1415,6 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     dp_tracks           = runner_caps$dp_tracks,
     declarative_model_ops = runner_caps$declarative_model_ops,
     declarative_losses  = runner_caps$declarative_losses,
-    tree_objectives     = runner_caps$tree_objectives,
     aggregation_strategies = runner_caps$aggregation_strategies,
     max_rounds          = settings$max_rounds,
     allow_custom_config = settings$allow_custom_config,
@@ -1548,7 +1428,7 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     privacy_unit        = privacy_policy$dp_unit,
     privacy_patient_column = privacy_policy$patient_column,
     privacy_nonblocking = TRUE,
-    runner_abi          = 2L,
+    runner_abi          = 3L,
     runner_sha256       = .compute_harness_hash(),
     dp_app_schema_versions = 1L,
     hook_abi            = 2L,

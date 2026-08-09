@@ -8,15 +8,12 @@ re-checks its OWN manifest-pinned track, so a mismatch fails closed node-side):
   * neural / egress — FedAvg over the already-DP client updates (the mean of
     locally-private updates is post-processing, so the per-node guarantee carries
     to the aggregate; no Secure Aggregation needed).
-  * trees — a bespoke one-round summation loop over the Grid: collect each node's
-    already-noised DP-GBDT booster and BAG them (concatenate trees, scale weights
-    by 1/M). Never FedAvg (it would average mismatched boosters).
   * validation — sum one fixed-layout DP sufficient-statistic vector per node
     and save only pooled metrics derived by post-processing.
 
 Final artifacts go to results-dir for the R relay's watchdog: a native model,
-a bounded portable weight record, and history (neural/egress), or booster.json
-and history (trees), or pooled DP metrics only (validation).
+a bounded portable weight record and history (neural/egress), or pooled DP
+metrics only (validation).
 """
 
 import json
@@ -109,223 +106,6 @@ def _build_initial_model(cfg):
     if not isinstance(model, torch.nn.Module):
         raise ValueError("build_from_spec must return a torch.nn.Module")
     return model
-
-
-# --------------------------------------------------------------------------- #
-# Trees — bespoke one-round bagging over already-noised boosters.
-# --------------------------------------------------------------------------- #
-
-def _array_to_booster(arr):
-    return json.loads(bytes(np.asarray(arr, dtype=np.uint8)).decode("utf-8"))
-
-
-def _validated_booster_contract(booster):
-    """Validate the fixed public booster schema before any cross-node bagging."""
-    if not isinstance(booster, dict):
-        raise RuntimeError("DP-GBDT booster must be an object")
-    objective = booster.get("objective")
-    if objective not in ("binary:logistic", "reg:squarederror"):
-        raise RuntimeError("DP-GBDT booster objective is invalid")
-    expected = {
-        "objective", "depth", "n_bins", "base_margin", "learning_rate",
-        "feature_ranges", "trees"}
-    if objective == "reg:squarederror":
-        expected |= {
-            "target_bounds", "margin_bounds", "gradient_clip",
-            "gradient_bounds"}
-    if set(booster) != expected:
-        raise RuntimeError("DP-GBDT booster schema is invalid")
-
-    depth, n_bins = booster["depth"], booster["n_bins"]
-    if (type(depth) is not int or not 1 <= depth <= 10
-            or type(n_bins) is not int or not 2 <= n_bins <= 64):
-        raise RuntimeError("DP-GBDT booster geometry is invalid")
-    for key in ("base_margin", "learning_rate"):
-        value = booster[key]
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))):
-            raise RuntimeError("DP-GBDT booster scalar is invalid")
-    if float(booster["learning_rate"]) <= 0.0:
-        raise RuntimeError("DP-GBDT learning_rate must be positive")
-
-    ranges = booster["feature_ranges"]
-    if not isinstance(ranges, list) or not 1 <= len(ranges) <= 65_536:
-        raise RuntimeError("DP-GBDT feature ranges are invalid")
-    for bounds in ranges:
-        if (not isinstance(bounds, list) or len(bounds) != 2
-                or any(isinstance(v, bool) or not isinstance(v, (int, float))
-                       or not math.isfinite(float(v)) for v in bounds)
-                or not float(bounds[0]) < float(bounds[1])):
-            raise RuntimeError("DP-GBDT feature range is invalid")
-
-    if objective == "reg:squarederror":
-        for key in ("target_bounds", "margin_bounds", "gradient_bounds"):
-            bounds = booster[key]
-            if (not isinstance(bounds, list) or len(bounds) != 2
-                    or any(isinstance(v, bool) or not isinstance(v, (int, float))
-                           or not math.isfinite(float(v)) for v in bounds)):
-                raise RuntimeError("DP-GBDT regression bounds are invalid")
-            ordered = (float(bounds[0]) <= float(bounds[1])
-                       if key == "gradient_bounds"
-                       else float(bounds[0]) < float(bounds[1]))
-            if not ordered:
-                raise RuntimeError("DP-GBDT regression bounds are invalid")
-        clip = booster["gradient_clip"]
-        if (isinstance(clip, bool) or not isinstance(clip, (int, float))
-                or not math.isfinite(float(clip)) or float(clip) <= 0.0):
-            raise RuntimeError("DP-GBDT gradient clip is invalid")
-
-    trees = booster["trees"]
-    if not isinstance(trees, list) or not 1 <= len(trees) <= 200:
-        raise RuntimeError("DP-GBDT tree count is invalid")
-    n_internal, n_leaves = (1 << depth) - 1, 1 << depth
-    for tree in trees:
-        if not isinstance(tree, dict) or set(tree) != {"feat", "thr", "w"}:
-            raise RuntimeError("DP-GBDT tree schema is invalid")
-        feat, thr, weights = tree["feat"], tree["thr"], tree["w"]
-        if (not isinstance(feat, list) or len(feat) != n_internal
-                or any(type(value) is not int or not 0 <= value < len(ranges)
-                       for value in feat)
-                or not isinstance(thr, list) or len(thr) != n_internal
-                or not isinstance(weights, list) or len(weights) != n_leaves):
-            raise RuntimeError("DP-GBDT tree geometry is invalid")
-        if any(isinstance(value, bool) or not isinstance(value, (int, float))
-               or not math.isfinite(float(value))
-               for value in thr + weights):
-            raise RuntimeError("DP-GBDT tree contains non-finite values")
-    return {key: booster[key] for key in sorted(expected - {"trees"})}
-
-
-def _bag_boosters(boosters):
-    """Bag M already-DP boosters: concatenate their trees, scale every leaf weight
-    by 1/M (so prediction = mean of the per-node ensembles). Pure post-processing
-    of already-private releases over disjoint row sets."""
-    if not boosters:
-        raise RuntimeError("cannot bag an empty DP-GBDT federation")
-    contracts = [_validated_booster_contract(booster) for booster in boosters]
-    if any(contract != contracts[0] for contract in contracts[1:]):
-        raise RuntimeError("DP-GBDT boosters have incompatible public contracts")
-    m = len(boosters)
-    merged = {k: v for k, v in boosters[0].items() if k != "trees"}
-    merged["n_boosters"] = m
-    merged["trees"] = []
-    for b in boosters:
-        for tree in b.get("trees", []):
-            merged["trees"].append({
-                "feat": tree["feat"], "thr": tree["thr"],
-                "w": [float(w) / m for w in tree["w"]],
-            })
-    return merged
-
-
-def _run_trees(grid, cfg):
-    import time
-    min_nodes = int(cfg.get("min-train-nodes", 2))
-    timeout = float(cfg.get("round-timeout", 600))
-    # SuperNodes dial in shortly AFTER the run starts. FedAvg waits for them
-    # internally; the manual trees loop must too -- otherwise get_node_ids()
-    # returns empty at t=0 and the run aborts (and, with the tunnel pump driven by
-    # the client run wait-loop, can leave the run hanging). Poll until enough connect.
-    node_ids, waited = [], 0.0
-    while waited < timeout:
-        node_ids = [n for n in grid.get_node_ids()]
-        if len(node_ids) >= min_nodes:
-            break
-        time.sleep(2.0)
-        waited += 2.0
-    if len(node_ids) != min_nodes:
-        raise RuntimeError(
-            "%d node(s) connected after %ds, expected exactly %d; refusing an "
-            "unexpected federation roster"
-            % (len(node_ids), int(waited), min_nodes))
-    # Each node trains its FULL curator-side DP-GBDT in one round (the booster's n_trees is
-    # the node-internal boosting; one message exchange suffices). No init model.
-    empty = RecordDict({"arrays": ArrayRecord(numpy_ndarrays=[np.zeros(1, dtype=np.float64)])})
-    # Build messages with the modern Message constructor (mirrors FedAvg's
-    # _construct_messages) -- NOT the deprecated Grid.create_message, whose shim
-    # builds a message the 1.3x SuperNodes don't route (the round-trip then hangs).
-    messages = [Message(content=empty, message_type="train",
-                        dst_node_id=nid, group_id="dsflower-trees")
-                for nid in node_ids]
-    replies = grid.send_and_receive(
-        messages, timeout=float(cfg.get("round-timeout", 3600)))
-    return _collect_trees(
-        replies, len(node_ids), min_nodes, expected_node_ids=node_ids)
-
-
-def _collect_trees(replies, n_connected, min_nodes, expected_node_ids=None):
-    """Bag the successful DP-GBDT boosters and report the TRUE failure count.
-
-    FAIL CLOSED unless every connected node returns one booster. A node can error
-    after dialling in, and silently bagging the survivors would weaken the model
-    and misreport the federation as fully successful. Returns
-    (bagged_booster, n_failures)."""
-    replies = list(replies)
-    try:
-        sources = [int(reply.metadata.src_node_id) for reply in replies]
-    except Exception as exc:
-        raise RuntimeError("DP-GBDT replies have no verifiable node identity") from exc
-    expected_set = ({int(value) for value in expected_node_ids}
-                    if expected_node_ids is not None else None)
-    if (len(sources) != int(n_connected)
-            or len(set(sources)) != int(n_connected)
-            or (expected_set is not None and set(sources) != expected_set)):
-        raise RuntimeError(
-            "DP-GBDT replies do not match the configured federation roster.")
-    boosters = []
-    privacy_noop = False
-    public_unavailable = False
-    execution_unavailable = False
-    replay_unavailable = False
-    for r in replies:
-        try:
-            if r.has_error():
-                continue
-            if int(r.content["metrics"].get(
-                    "replay-cache-missing", 0)) == 1:
-                replay_unavailable = True
-                continue
-            privacy_noop = privacy_noop or int(r.content["metrics"].get(
-                "privacy-noop", 0)) == 1
-            public_unavailable = public_unavailable or int(
-                r.content["metrics"].get(
-                    "public-preflight-unavailable", 0)) == 1
-            execution_unavailable = execution_unavailable or int(
-                r.content["metrics"].get(
-                    "execution-unavailable", 0)) == 1
-            arrays = r.content["arrays"].to_numpy_ndarrays()
-            if arrays:
-                boosters.append(_array_to_booster(arrays[0]))
-        except Exception:
-            continue
-    if ((privacy_noop or public_unavailable or execution_unavailable
-            or replay_unavailable)
-            and len(replies) == int(n_connected)
-            and all(not reply.has_error() for reply in replies)):
-        return {"trees": []}, 0, False
-    n_failures = int(n_connected) - len(boosters)
-    if (len(replies) != int(n_connected)
-            or len(boosters) != int(n_connected)):
-        raise RuntimeError(
-            "%d of %d node(s) returned a DP-GBDT booster; refusing to bag a "
-            "degraded federation (check node logs)."
-            % (len(boosters), int(n_connected)))
-    return _bag_boosters(boosters), n_failures, not privacy_noop
-
-
-def _save_trees(cfg, booster, n_failures=0, available=True):
-    results_dir = cfg.get("results-dir")
-    if not results_dir:
-        return
-    os.makedirs(results_dir, exist_ok=True)
-    if available:
-        with open(os.path.join(results_dir, "booster.json"), "w") as f:
-            json.dump(booster, f)
-    with open(os.path.join(results_dir, "history.json"), "w") as f:
-        json.dump([{"round": 1, "n_failures": int(n_failures),
-                    "available": bool(available),
-                    "n_trees": len(booster.get("trees", [])),
-                    "n_boosters": booster.get("n_boosters", 1)}], f)
 
 
 # --------------------------------------------------------------------------- #
@@ -459,7 +239,7 @@ def _initial_arrays(cfg, track):
 # already-DP client updates, on the researcher's SuperLink -- so by the DP
 # post-processing theorem the per-node (epsilon, delta) guarantee is unchanged.
 # The strategy is pure aggregation, never a privacy knob. FedProx is excluded
-# (it needs a node-side proximal term); the trees track never reaches here.
+# (it needs a node-side proximal term).
 
 
 class _RequireCompleteTrain:
@@ -680,8 +460,5 @@ def main(grid: Grid, context: Context) -> None:
     if track == "validation":
         metrics, n_nodes, available = _run_validation(grid, cfg)
         _save_validation(cfg, metrics, n_nodes, available)
-    elif track == "trees":
-        booster, n_failures, available = _run_trees(grid, cfg)
-        _save_trees(cfg, booster, n_failures, available)
     else:  # neural or egress
         _run_fedavg(grid, cfg, track)

@@ -26,6 +26,7 @@ manifest.json — never from client-controlled pyproject config.
 """
 
 import math
+from functools import lru_cache
 
 import numpy as np
 
@@ -225,6 +226,20 @@ def calibrate_noise_multiplier(epsilon, delta, sample_rate, total_epochs,
         "(epsilon, delta, sample_rate, epochs) are valid.")
 
 
+@lru_cache(maxsize=128)
+def _cached_noise_multiplier(epsilon, delta, sample_rate, total_epochs,
+                             total_steps, opacus_version):
+    """Memoize exact accountant results for an immutable public run horizon.
+
+    ``opacus_version`` is deliberately part of the key: it prevents a result
+    calibrated by one accountant implementation from being reused after an
+    in-process test/development reload with another version.
+    """
+    return calibrate_noise_multiplier(
+        epsilon=epsilon, delta=delta, sample_rate=sample_rate,
+        total_epochs=total_epochs, total_steps=total_steps)
+
+
 def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
                        epsilon, delta, local_epochs, num_rounds=1,
                        noise_multiplier=None, n_samples=None, batch_size=None,
@@ -242,7 +257,7 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
     per-sample-gradient sensitivity bound). We assert validity here as a
     backstop and do NOT silently fix() the architecture.
     """
-    from opacus import PrivacyEngine
+    from opacus import PrivacyEngine, __version__ as opacus_version
     from opacus.validators import ModuleValidator
 
     if not ModuleValidator.is_valid(model):
@@ -279,11 +294,10 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
         # steps; using epochs with batch_size/n can under-count at ceil boundaries.
         total_epochs = max(1, int(num_rounds)) * max(1, int(local_epochs))
         sample_rate = 1.0 / float(steps_per_epoch)
-        noise_multiplier = calibrate_noise_multiplier(
-            epsilon=epsilon, delta=delta, sample_rate=sample_rate,
-            total_epochs=total_epochs,
-            total_steps=steps_per_epoch * total_epochs,
-        )
+        noise_multiplier = _cached_noise_multiplier(
+            float(epsilon), float(delta), float(sample_rate),
+            int(total_epochs), int(steps_per_epoch * total_epochs),
+            str(opacus_version))
 
     privacy_engine = PrivacyEngine()
     # DP noise is replaced below by a ChaCha20 stream derived from the node secret
@@ -355,15 +369,15 @@ def resolve_dp_track(run_config, manifest_track):
     """Server-DERIVED, unforgeable DP routing: choose the enforced-DP mechanism from
     WHAT was actually submitted, never from a client-stated preference. An uploaded
     user-module (arbitrary foreign code) ALWAYS gets the output-perturbation floor
-    ('egress'), never DP-SGD ('neural') or DP-GBDT ('trees') -- a client cannot route
+    ('egress'), never DP-SGD ('neural') -- a client cannot route
     its own code to a tighter mechanism. For node-built artifacts the node-pinned
-    manifest track applies (declarative spec -> neural, gbdt spec -> trees). Anything
+    manifest track applies (declarative spec -> neural). Anything
     unrecognized fails closed to the universal floor. This is the single, testable
     routing decision; client_app.train() calls it (the neural track additionally only
     ever runs the hash-verified harness, so foreign code cannot impersonate it)."""
     if run_config.get("user-module"):
         return "egress"
-    if manifest_track in ("neural", "trees", "egress", "validation"):
+    if manifest_track in ("neural", "egress", "validation"):
         return manifest_track
     return "egress"
 
@@ -817,6 +831,21 @@ def _huber_factory(cfg):
     return nn.HuberLoss(delta=delta, reduction="mean")
 
 
+def _quantile_factory(cfg):
+    """Per-sample pinball loss for one public conditional quantile."""
+    quantile = float(cfg.get("quantile-level", 0.5))
+    if not math.isfinite(quantile) or not 0.0 < quantile < 1.0:
+        raise ValueError("quantile-level must be in (0, 1), got %r"
+                         % (quantile,))
+
+    def quantile_loss(pred, target):
+        import torch
+        residual = target.reshape(-1) - pred.reshape(-1)
+        return torch.maximum(
+            quantile * residual, (quantile - 1.0) * residual).mean()
+    return quantile_loss
+
+
 # Custom TRUSTED per-sample losses (node code, never client code): name -> factory(cfg).
 # Each MUST decompose per sample with mean reduction so the DP-SGD sensitivity bound
 # holds; enforced by per_sample_independence_probe + the DP safety suite. Hyperparams
@@ -826,6 +855,7 @@ _CUSTOM_LOSS_FACTORY = {
     "negbin_nll": _negbin_nll_factory,
     "gamma_nll": _gamma_nll_factory,
     "huber": _huber_factory,
+    "quantile": _quantile_factory,
 }
 
 

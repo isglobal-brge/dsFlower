@@ -308,7 +308,7 @@ class ValidationInferenceTests(unittest.TestCase):
         self.assertEqual(empty.shape, (0, 3))
         self.assertLessEqual(max(batch_sizes), 3)
 
-    def test_public_preprocessing_replays_neural_and_tree_contracts(self):
+    def test_public_preprocessing_replays_neural_contract(self):
         values = np.asarray([
             [np.nan, np.inf], [-100.0, 100.0], [2.0, 14.0]])
         cfg = {"feature-bounds": {
@@ -316,10 +316,6 @@ class ValidationInferenceTests(unittest.TestCase):
         np.testing.assert_array_equal(
             validation._apply_feature_bounds(values, cfg),
             np.asarray([[0.0, 0.0], [-1.0, 1.0], [0.0, 0.0]],
-                       dtype=np.float32))
-        np.testing.assert_array_equal(
-            validation._apply_tree_bounds(values, cfg),
-            np.asarray([[2.0, 14.0], [-100.0, 100.0], [2.0, 14.0]],
                        dtype=np.float32))
 
     def test_server_loads_saved_neural_artifact_as_public_arrays(self):
@@ -347,27 +343,11 @@ class ValidationInferenceTests(unittest.TestCase):
         for got, want in zip(actual, expected):
             np.testing.assert_array_equal(got, want)
 
-    def test_server_loads_saved_tree_artifact_as_public_array(self):
-        booster = {
-            "objective": "binary:logistic", "depth": 1,
-            "base_margin": 0.0,
-            "feature_ranges": [[0.0, 1.0], [0.0, 1.0]],
-            "trees": [{"feat": [0], "thr": [0.5], "w": [-1.0, 1.0]}],
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "booster.json")
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(booster, handle)
-            cfg = {
+    def test_server_rejects_legacy_tree_validation_track(self):
+        with self.assertRaisesRegex(ValueError, "must be neural"):
+            validation.public_model_arrays({
                 "validation-model-track": "trees", "num-features": 2,
-                "validation-model-path-b64": base64.b64encode(
-                    path.encode("utf-8")).decode("ascii"),
-            }
-            arrays = validation.public_model_arrays(cfg)
-        self.assertEqual(len(arrays), 1)
-        self.assertEqual(arrays[0].dtype, np.uint8)
-        self.assertEqual(
-            validation.decode_public_booster(arrays[0], input_dim=2), booster)
+            })
 
     def test_public_model_arrays_are_transport_bounded(self):
         with mock.patch.object(validation, "_MAX_PUBLIC_ELEMENTS", 1):
@@ -381,7 +361,7 @@ class ValidationInferenceTests(unittest.TestCase):
             validation._bounded_public_arrays([
                 np.asarray([np.inf], dtype=np.float32)])
 
-    def test_client_tree_transport_can_use_the_byte_dominant_cap(self):
+    def test_client_public_transport_honors_an_explicit_element_cap(self):
         with mock.patch.object(client_app, "_MAX_EGRESS_ELEMENTS", 1):
             with self.assertRaises(RuntimeError):
                 client_app._validate_public_egress_arrays([
@@ -409,54 +389,6 @@ class ValidationInferenceTests(unittest.TestCase):
             ordinal, np.asarray([[1.0, 2.0]]), "ordinal")
         self.assertEqual(probs.shape, (1, 3))
         np.testing.assert_allclose(probs.sum(axis=1), np.ones(1))
-
-    def test_public_booster_is_validated_before_prediction(self):
-        booster = {
-            "objective": "binary:logistic", "depth": 1,
-            "base_margin": 0.0,
-            "feature_ranges": [[0.0, 1.0], [0.0, 1.0]],
-            "trees": [{"feat": [0], "thr": [0.5], "w": [-1.0, 1.0]}],
-        }
-        wire = np.frombuffer(
-            json.dumps(booster).encode("utf-8"), dtype=np.uint8)
-        parsed = validation.decode_public_booster(wire, input_dim=2)
-        score = validation.booster_predictions(
-            parsed, np.asarray([[0.0, 0.0], [1.0, 0.0]]))
-        self.assertLess(score[0], 0.5)
-        self.assertGreater(score[1], 0.5)
-
-        booster["trees"][0]["feat"] = [2]
-        bad = np.frombuffer(json.dumps(booster).encode("utf-8"), dtype=np.uint8)
-        with self.assertRaises(ValueError):
-            validation.decode_public_booster(bad, input_dim=2)
-
-    def test_public_booster_accepts_more_than_20000_bounded_trees(self):
-        tree = {"feat": [0], "thr": [0.5], "w": [-1.0, 1.0]}
-        booster = {
-            "objective": "binary:logistic", "depth": 1,
-            "base_margin": 0.0, "feature_ranges": [[0.0, 1.0]],
-            "trees": [tree] * 20001,
-        }
-        wire = np.frombuffer(
-            json.dumps(booster, separators=(",", ":")).encode("utf-8"),
-            dtype=np.uint8)
-        parsed = validation.decode_public_booster(wire, input_dim=1)
-        self.assertEqual(len(parsed["trees"]), 20001)
-
-    def test_bounded_regression_booster_uses_its_public_prediction_domain(self):
-        booster = {
-            "objective": "reg:squarederror", "depth": 1,
-            "base_margin": 5.0,
-            "feature_ranges": [[0.0, 1.0]],
-            "target_bounds": [0.0, 10.0], "margin_bounds": [0.0, 10.0],
-            "trees": [{"feat": [0], "thr": [0.5], "w": [-20.0, 20.0]}],
-        }
-        wire = np.frombuffer(
-            json.dumps(booster).encode("utf-8"), dtype=np.uint8)
-        parsed = validation.decode_public_booster(wire, input_dim=1)
-        prediction = validation.booster_predictions(
-            parsed, np.asarray([[0.0], [1.0]]))
-        np.testing.assert_array_equal(prediction, np.asarray([0.0, 10.0]))
 
     def test_layout_from_config_accepts_server_scalar_target_bounds(self):
         layout = validation.layout_from_config({
@@ -543,33 +475,14 @@ class ValidationInferenceTests(unittest.TestCase):
                 validation.validation_layout("classification", bins=8)).sum(axis=0)
             self.assertFalse(np.array_equal(released[0], raw))
 
-    def test_node_tree_validation_releases_only_private_statistics(self):
+    def test_node_rejects_legacy_tree_validation_before_private_read(self):
         with tempfile.TemporaryDirectory() as directory:
-            with open(os.path.join(directory, "data.csv"), "w",
-                      encoding="utf-8") as handle:
-                handle.write("x1,x2,y\n0,1,0\n1,0,1\n1,1,1\n")
             with open(os.path.join(directory, "manifest.json"), "w",
                       encoding="utf-8") as handle:
                 json.dump({
-                    "data_file": "data.csv", "data_format": "csv",
-                    "data_type": "tabular", "target_column": "y",
-                    "feature_columns": ["x1", "x2"], "dp-unit": "row",
-                    "patient_column": None, "n_units": 3,
-                    "task-type": "classification", "loss-name": "bce_logits",
-                    "num-classes": 2, "num-labels": 2,
+                    "data_type": "tabular", "feature_columns": ["x1", "x2"],
+                    "patient_column": None,
                 }, handle)
-            secret = os.path.join(directory, "node-secret")
-            with open(secret, "w", encoding="ascii") as handle:
-                handle.write("24" * 32)
-            os.chmod(secret, 0o600)
-            booster = {
-                "objective": "binary:logistic", "depth": 1,
-                "base_margin": 0.0,
-                "feature_ranges": [[0.0, 1.0], [0.0, 1.0]],
-                "trees": [{"feat": [0], "thr": [0.5], "w": [-1.0, 1.0]}],
-            }
-            wire = np.frombuffer(
-                json.dumps(booster).encode("utf-8"), dtype=np.uint8)
             cfg = {
                 "validation-model-track": "trees",
                 "validation-task": "binary", "validation-bins": 8,
@@ -578,14 +491,14 @@ class ValidationInferenceTests(unittest.TestCase):
             }
             context = type("Context", (), {
                 "node_config": {"manifest-dir": directory}})()
-            with mock.patch.dict(os.environ, {
-                    "DSFLOWER_NODE_SECRET_FILE": secret}):
-                released = validation.private_model_validation(
-                    context, cfg, {"epsilon": 1.0, "delta": 1e-5},
-                    "run_tree:1:1", [wire])
-            self.assertEqual(len(released), 1)
-            self.assertEqual(released[0].shape, (16,))
-            self.assertTrue(np.all(np.isfinite(released[0])))
+            with mock.patch(
+                    "dsflower_runner.task.load_data",
+                    side_effect=AssertionError("private read")) as load_data:
+                with self.assertRaisesRegex(ValueError, "must be neural"):
+                    validation.private_model_validation(
+                        context, cfg, {"epsilon": 1.0, "delta": 1e-5},
+                        "run_legacy:1:1", [np.zeros(1, dtype=np.float32)])
+            load_data.assert_not_called()
 
     def test_invalid_public_model_fails_before_private_frame_read(self):
         with tempfile.TemporaryDirectory() as directory:

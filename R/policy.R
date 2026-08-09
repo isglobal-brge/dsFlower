@@ -26,16 +26,15 @@
   pytorch_densenet121       = list(framework = "pytorch_vision", requires_secagg = FALSE),
   pytorch_unet2d            = list(framework = "pytorch_vision", requires_secagg = FALSE),
   pytorch_tcn               = list(framework = "pytorch",        requires_secagg = FALSE),
-  pytorch_lstm              = list(framework = "pytorch",        requires_secagg = FALSE),
-  xgboost                   = list(framework = "xgboost",       requires_secagg = FALSE)
+  pytorch_lstm              = list(framework = "pytorch",        requires_secagg = FALSE)
 )
 
-# Public vocabulary implemented by runner ABI 2.  These are capabilities of the
+# Public vocabulary implemented by runner ABI 3.  These are capabilities of the
 # node-resident, hash-pinned executor; they are not names of executable app
-# templates. Keep this list in lockstep with model_spec.py, dp_harness.py,
-# dp_gbdt.py, and server_app.py when the runner ABI changes.
+# templates. Keep this list in lockstep with model_spec.py, dp_harness.py, and
+# server_app.py when the runner ABI changes.
 .RUNNER_PUBLIC_CAPABILITIES <- list(
-  dp_tracks = c("neural", "trees", "egress", "validation"),
+  dp_tracks = c("neural", "egress", "validation"),
   declarative_model_ops = list(
     layers = c(
       "linear", "relu", "gelu", "tanh", "sigmoid", "elu", "silu",
@@ -49,9 +48,8 @@
   declarative_losses = c(
     "bce_logits", "cross_entropy", "mse", "poisson_nll",
     "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
-    "huber"
+    "huber", "quantile"
   ),
-  tree_objectives = c("binary:logistic", "reg:squarederror"),
   aggregation_strategies = c(
     "fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm"
   )

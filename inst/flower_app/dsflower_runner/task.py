@@ -19,7 +19,6 @@ _MAX_BATCH_SIZE = 65_536
 _MAX_LOCAL_EPOCHS = 1_000
 _MAX_SERVER_ROUNDS = 500
 _MAX_LEARNING_RATE = 10.0
-_MAX_GBDT_REG_LAMBDA = 1.0e6
 _MAX_NUMERIC_ABS = 1.0e6
 _MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
 _INVALID_IMAGE = "__dsflower_invalid_image__"
@@ -88,8 +87,7 @@ def _load_target(y_series, manifest):
             raise ValueError("manifest has invalid public target-levels")
         n_classes = len(levels["values"])
     else:
-        n_classes = int(manifest.get(
-            "num-classes", 2 if manifest.get("dp-track") == "trees" else 2))
+        n_classes = int(manifest.get("num-classes", 2))
     if n_classes < 2 or n_classes > 1024:
         raise ValueError("manifest has invalid public class count")
     numeric = pd.to_numeric(y_series, errors="coerce").to_numpy(
@@ -442,16 +440,13 @@ def _run_config(context):
 
 def load_dp_track(context=None):
     """The enforced-DP track. Read from the manifest (authoritative once the node
-    pins it); fall back to the client run config during the transition, exactly
-    like load_run_pins / load_gbdt_spec. Defaults to 'neural'. (Security note: the
-    track only selects WHICH enforced-DP mechanism runs; every track is enforced
-    node-side, so a client-chosen track cannot dodge DP -- at most pick trees vs
-    neural. The manifest pin, once added, makes it fully node-authoritative.)"""
+    pins it). The track only selects which node-enforced DP mechanism runs; the
+    manifest pin makes it node-authoritative."""
     manifest = _load_manifest(context)
     if "dp-track" not in manifest:
         raise ValueError("manifest is missing the pinned dp-track")
     track = str(manifest["dp-track"]).lower()
-    if track not in ("neural", "trees", "egress", "validation"):
+    if track not in ("neural", "egress", "validation"):
         raise ValueError("invalid dp-track '%s'" % track)
     return track
 
@@ -510,14 +505,15 @@ def load_run_pins(context=None):
     allowed_losses = {
         "bce_logits", "cross_entropy", "mse", "poisson_nll",
         "multilabel_bce", "hinge", "negbin_nll", "gamma_nll",
-        "huber", "ordinal"}
+        "huber", "quantile", "ordinal"}
     if loss_name not in allowed_losses:
         raise ValueError("loss-name is not on the trusted allowlist")
-    loss_fields = {"nb-dispersion", "gamma-shape", "huber-delta"}
+    loss_fields = {"nb-dispersion", "gamma-shape", "huber-delta", "quantile-level"}
     selected_loss_field = {
         "negbin_nll": "nb-dispersion",
         "gamma_nll": "gamma-shape",
         "huber": "huber-delta",
+        "quantile": "quantile-level",
     }.get(loss_name)
     incompatible_loss_fields = (
         loss_fields - ({selected_loss_field} if selected_loss_field else set())
@@ -535,6 +531,11 @@ def load_run_pins(context=None):
         bounded_float("gamma-shape", 1.0, 1.0e-6, 1.0e12)
     elif loss_name == "huber":
         bounded_float("huber-delta", 1.0, 1.0e-6, 1.0e6)
+    elif loss_name == "quantile":
+        quantile = bounded_float("quantile-level", 0.5, 0.0, 1.0,
+                                 lower_open=True)
+        if quantile >= 1.0:
+            raise ValueError("quantile-level must be in (0, 1)")
 
     learning_rate = bounded_float(
         "learning-rate", 0.01, 0.0, _MAX_LEARNING_RATE, lower_open=True)
@@ -644,6 +645,7 @@ def load_pinned_run_config(context=None):
                 raise ValueError("Flower HookApp config does not match manifest pin")
     neural_public_keys = {
         "learning-rate", "nb-dispersion", "gamma-shape", "huber-delta",
+        "quantile-level",
         "weight-decay",
         "l1-penalty", "optimizer-name", "optimizer-momentum",
         "optimizer-nesterov", "optimizer-beta1", "optimizer-beta2",
@@ -675,7 +677,7 @@ def load_pinned_run_config(context=None):
     keys = (
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",
-        "gbdt-spec", "feature-bounds", "backbone", "image-size", "user-module",
+        "feature-bounds", "backbone", "image-size", "user-module",
         "task-type", "app-params-b64", "app-params-sha256",
         "target-bounds", "target-levels", "validation-model-track",
         "validation-task", "validation-bins", "validation-contract-sha256",
@@ -685,7 +687,7 @@ def load_pinned_run_config(context=None):
         "optimizer-amsgrad", "optimizer-rmsprop-alpha",
         "scheduler-name", "scheduler-step-size", "scheduler-gamma",
         "scheduler-min-lr",
-        "nb-dispersion", "gamma-shape", "huber-delta",
+        "nb-dispersion", "gamma-shape", "huber-delta", "quantile-level",
     )
     for key in keys:
         if key in manifest:
@@ -721,145 +723,8 @@ def _decode_feature_norm(cfg, n_features):
     return mean, sd
 
 
-def _decode_feature_bounds(cfg, n_features):
-    """Decode public bounds pinned in the manifest or legacy b64 run config."""
-    bounds = cfg.get("feature-bounds")
-    if bounds is None and cfg.get("feature-bounds-b64"):
-        import base64
-        try:
-            bounds = json.loads(base64.b64decode(
-                str(cfg["feature-bounds-b64"]), validate=True).decode("utf-8"))
-        except Exception as exc:
-            raise RuntimeError("feature-bounds-b64 is invalid: %s" % exc)
-    if bounds is None:
-        return None
-    lower = np.asarray(bounds.get("lower", []), dtype=np.float64)
-    upper = np.asarray(bounds.get("upper", []), dtype=np.float64)
-    if lower.shape != (int(n_features),) or upper.shape != (int(n_features),):
-        raise RuntimeError("public feature bounds do not match num features")
-    if (not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper))
-            or not np.all(lower < upper)
-            or np.any(np.abs(lower) > _MAX_NUMERIC_ABS)
-            or np.any(np.abs(upper) > _MAX_NUMERIC_ABS)):
-        raise RuntimeError("public feature bounds must be finite with lower < upper")
-    return lower, upper
-
-
-def load_gbdt_spec(context=None):
-    """Validated, manifest-authoritative DP-GBDT spec for the trees track.
-
-    The client's spec is a DATA dict (never imported / eval'd). The node clamps it
-    to admin policy and pins the DP-critical pieces: the objective (dp_gbdt's
-    bounded-gradient allowlist), the depth / tree / bin caps (so leaves are not
-    singletons and compute is bounded), the run token that seeds the PUBLIC random
-    splits, and the data-independent feature ranges (the binning prior -- never
-    data quantiles). Returns the dict consumed by dp_gbdt.fit_dp_gbdt.
-    """
-    manifest = _load_manifest(context)
-    if "gbdt-spec" not in manifest:
-        raise ValueError("manifest is missing the pinned gbdt-spec")
-    spec = dict(manifest.get("gbdt-spec", {}) or {})
-    cfg = load_pinned_run_config(context)
-
-    objective = str(spec.get("objective", cfg.get("objective", "binary:logistic")))
-    if objective not in ("binary:logistic", "reg:squarederror"):
-        raise RuntimeError("DP-GBDT objective is not on the trusted allowlist")
-
-    def spec_int(key, default, lower, upper):
-        raw = spec.get(key, cfg.get(key.replace("_", "-"), default))
-        if isinstance(raw, bool):
-            raise RuntimeError("DP-GBDT %s must be an integer" % key)
-        try:
-            number = float(raw)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise RuntimeError("DP-GBDT %s must be an integer" % key) from exc
-        if (not math.isfinite(number) or number != math.floor(number)
-                or number < lower or number > upper):
-            raise RuntimeError(
-                "DP-GBDT %s must be in [%d, %d]" % (key, lower, upper))
-        return int(number)
-
-    admin_depth = int(manifest.get("gbdt-max-depth", 6))
-    admin_trees = int(manifest.get("gbdt-max-trees", 200))
-    admin_bins = int(manifest.get("gbdt-max-bins", 64))
-    max_depth = spec_int("max_depth", 3, 1, min(10, admin_depth))
-    n_trees = spec_int("n_trees", 20, 1, min(200, admin_trees))
-    n_bins = spec_int("n_bins", 32, 2, min(64, admin_bins))
-    learning_rate = float(spec.get("learning_rate", cfg.get("learning-rate", 0.3)))
-    reg_lambda = float(spec.get("reg_lambda", cfg.get("reg-lambda", 1.0)))
-    # Newton-step denominator is max(lambda, H+lambda); lambda<=0 (or non-finite lr/lambda)
-    # can yield inf/NaN leaf weights. Clamp to safe values (fail-closed on the math).
-    if not (math.isfinite(learning_rate)
-            and 0 < learning_rate <= _MAX_LEARNING_RATE):
-        raise RuntimeError("DP-GBDT learning_rate must be in (0, 10]")
-    if not (math.isfinite(reg_lambda) and 0 < reg_lambda <= _MAX_GBDT_REG_LAMBDA):
-        raise RuntimeError("DP-GBDT reg_lambda must be in (0, 1e6]")
-    run_token = str(manifest.get("run_token", spec.get("run_token", "dsflower")))
-
-    def public_interval(value, label):
-        if (not isinstance(value, (list, tuple)) or len(value) != 2
-                or any(isinstance(item, bool) for item in value)):
-            raise RuntimeError("DP-GBDT %s must be [lower, upper]" % label)
-        try:
-            lower, upper = float(value[0]), float(value[1])
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise RuntimeError("DP-GBDT %s must be numeric" % label) from exc
-        if (not math.isfinite(lower) or not math.isfinite(upper)
-                or not lower < upper or abs(lower) > _MAX_NUMERIC_ABS
-                or abs(upper) > _MAX_NUMERIC_ABS):
-            raise RuntimeError("DP-GBDT %s has invalid public bounds" % label)
-        return [lower, upper]
-
-    target_bounds = margin_bounds = gradient_clip = None
-    task_type = str(manifest.get("task-type", "")).lower()
-    if objective == "reg:squarederror":
-        target_bounds = public_interval(spec.get("target_bounds"), "target_bounds")
-        pinned_target = manifest.get("target-bounds")
-        if not isinstance(pinned_target, dict):
-            raise RuntimeError("manifest is missing regression target-bounds")
-        pinned_pair = public_interval(
-            [pinned_target.get("lower"), pinned_target.get("upper")],
-            "manifest target-bounds")
-        if target_bounds != pinned_pair or task_type != "regression":
-            raise RuntimeError("DP-GBDT regression bounds/task disagree with manifest")
-        margin_bounds = public_interval(
-            spec.get("margin_bounds", target_bounds), "margin_bounds")
-        if spec.get("gradient_clip") is not None:
-            try:
-                gradient_clip = float(spec["gradient_clip"])
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise RuntimeError("DP-GBDT gradient_clip must be positive") from exc
-            if (not math.isfinite(gradient_clip) or gradient_clip <= 0
-                    or gradient_clip > 2.0 * _MAX_NUMERIC_ABS):
-                raise RuntimeError("DP-GBDT gradient_clip must be in (0, 2e6]")
-    elif task_type != "classification":
-        raise RuntimeError("binary DP-GBDT requires classification task-type")
-
-    feature_ranges = spec.get("feature_ranges")
-    if not feature_ranges:
-        n_features = int(manifest.get("num-features", 0))
-        if n_features <= 0:
-            raise RuntimeError(
-                "manifest must pin num-features before DP-GBDT execution")
-        # Threshold ranges are public constants, never exact node statistics.
-        bounds = _decode_feature_bounds(cfg, n_features)
-        if bounds is not None:
-            lower, upper = bounds
-            feature_ranges = [[float(lower[j]), float(upper[j])]
-                              for j in range(n_features)]
-        else:
-            feature_ranges = [[0.0, 1.0]] * n_features
-    return {"objective": objective, "max_depth": max_depth, "n_trees": n_trees,
-            "learning_rate": learning_rate, "reg_lambda": reg_lambda,
-            "n_bins": n_bins, "run_token": run_token,
-            "target_bounds": target_bounds, "margin_bounds": margin_bounds,
-            "gradient_clip": gradient_clip,
-            "feature_ranges": [[float(a), float(b)] for a, b in feature_ranges]}
-
-
 def load_tabular_patient_ids(context=None):
-    """Patient/subject ids for the tabular frame (or None) so the tabular neural +
-    trees paths can make the patient the DP unit, mirroring the image path."""
+    """Patient/subject ids so tabular neural training uses patient-level DP."""
     manifest = _load_manifest(context)
     if manifest.get("data_type") == "image":
         return None

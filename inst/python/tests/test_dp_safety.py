@@ -354,6 +354,27 @@ check("huber has scalar width and the wide regression output domain",
       and model_spec.output_limit_for_loss("huber") == model_spec._MAX_ACTIVATION_ABS)
 
 # --------------------------------------------------------------------------- #
+print("== quantile regression (public level, per-sample DP-SGD) ==")
+ql = dh.loss_from_allowlist("quantile", {"quantile-level": 0.8})
+qp = torch.tensor([[0.0], [2.0]])
+qy = torch.tensor([[1.0], [0.0]])
+check("quantile uses the exact public pinball level",
+      torch.isclose(ql(qp, qy), torch.tensor(0.6)))
+check("changing quantile-level changes the applied loss",
+      not torch.equal(ql(qp, qy), dh.loss_from_allowlist(
+          "quantile", {"quantile-level": 0.2})(qp, qy)))
+check("quantile rejects endpoints and non-finite levels",
+      all(rejects(lambda q=q: dh.loss_from_allowlist(
+          "quantile", {"quantile-level": q})) for q in (0.0, 1.0, math.nan)))
+check("quantile model passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          nn.Linear(3, 1), ql, torch.randn(8, 3), torch.randn(8, 1))))
+check("quantile has scalar width and the wide regression output domain",
+      model_spec.output_width("quantile", {"num-classes": 2}) == 1
+      and model_spec.output_limit_for_loss("quantile")
+      == model_spec._MAX_ACTIVATION_ABS)
+
+# --------------------------------------------------------------------------- #
 print("== ordinal (CORN): node-decided K-1 width + stock per-sample BCE ==")
 check("ordinal output_width = K-1", model_spec.output_width("ordinal", {"num-classes": 4}) == 3)
 check("ordinal degenerate (K=2) width = 1", model_spec.output_width("ordinal", {"num-classes": 2}) == 1)
@@ -502,11 +523,12 @@ check("direct MSE regression keeps a wide finite output domain",
 # --------------------------------------------------------------------------- #
 print("== adaptive routing: the SERVER picks the DP mechanism, unforgeably ==")
 check("declarative spec -> neural (DP-SGD, tight)", dh.resolve_dp_track({}, "neural") == "neural")
-check("gbdt spec -> trees (DP-GBDT)", dh.resolve_dp_track({}, "trees") == "trees")
+check("retired trees track -> fail-closed to the floor",
+      dh.resolve_dp_track({}, "trees") == "egress")
 check("explicit egress -> egress (output-perturbation floor)", dh.resolve_dp_track({}, "egress") == "egress")
 check("uploaded code requesting NEURAL -> FORCED to the floor (cannot be fooled)",
       dh.resolve_dp_track({"user-module": "evil"}, "neural") == "egress")
-check("uploaded code requesting TREES -> FORCED to the floor",
+check("uploaded code requesting retired TREES -> FORCED to the floor",
       dh.resolve_dp_track({"user-module": "evil"}, "trees") == "egress")
 check("unrecognized track -> fail-closed to the floor",
       dh.resolve_dp_track({}, "weird") == "egress")

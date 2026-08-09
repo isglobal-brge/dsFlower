@@ -1,7 +1,7 @@
 """dsFlower unified trusted ClientApp (node side) — always-on enforced DP.
 
-The researcher ships only a model SPEC (a declarative nn.Module architecture, or
-a dsFlower DP-GBDT data spec) + hyperparameters -- DATA, never code, so nothing the
+The researcher ships only a declarative nn.Module model SPEC + hyperparameters
+-- DATA, never code, so nothing the
 researcher submits executes in this interpreter; this trusted, node-resident
 harness owns every DP-critical step, so the guarantee cannot be bypassed. The
 node-written, tamper-proof manifest pins the enforced-DP TRACK and all privacy +
@@ -11,12 +11,9 @@ Tracks, dispatched on the manifest's pinned ``dp-track``:
   * neural — Opacus DP-SGD over a client nn.Module (tabular, or an image sub-mode
     that trains only a head on FROZEN-backbone features). Per-sample clip + noise;
     the loss is harness-owned; the released state_dict is stash-gated.
-  * trees  — enforced random-split DP-GBDT: complete trees with the full
-    Gaussian noise added by the node-side curator to each leaf histogram, then a
-    booster the untrusted ServerApp bags by post-processing.
   * egress — the labelled-weaker fallback: the client's own local_update, wrapped
     in output-perturbation DP (whole-update clip + Gaussian noise). Admission-gated.
-  * validation — trusted inference for a public neural/DP-GBDT artifact followed
+  * validation — trusted inference for a public neural artifact followed
     by one patient-bounded Gaussian release of sufficient statistics.
 """
 
@@ -35,15 +32,14 @@ from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
 
 from .task import (load_data, load_image_collection, is_image_run,
                    load_privacy_config, load_dp_track, load_run_pins,
-                   load_gbdt_spec, load_tabular_patient_ids,
-                   load_pinned_run_config)
+                   load_tabular_patient_ids, load_pinned_run_config)
 from .params import get_torch_params, set_torch_params, load_user_model
 
 # RELATIVE imports only: resolve within this trusted package, so an uploaded module on
-# sys.path / PYTHONPATH cannot shadow dp_harness / dp_gbdt and execute in the parent at
+# sys.path / PYTHONPATH cannot shadow dp_harness and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import (dp_harness, dp_gbdt, release_guard, seeding,
+from . import (dp_harness, release_guard, seeding,
                task as task_module, validation)
 
 
@@ -289,19 +285,6 @@ def _assert_finite_release(model):
         raise RuntimeError("DP-SGD produced a non-finite parameter; refusing release")
 
 
-def _totalize_grad_samples(model, clipping_norm):
-    """Make every per-sample gradient finite before Opacus computes its L2 clip.
-
-    Deep but valid declarative graphs can overflow during backpropagation even
-    when every forward activation is saturated.  Opacus cannot safely clip an
-    ``inf``/``nan`` norm (``inf * 0`` becomes ``nan``), so first apply a fixed,
-    record-local coordinate saturation.  Opacus then enforces the authoritative
-    global per-sample L2 bound as usual; this preprocessing cannot enlarge that
-    bound or alter the accountant.
-    """
-    dp_harness.totalize_grad_samples(model.parameters(), clipping_norm)
-
-
 def _prep_target(y, loss_name, n_classes):
     """Target tensor shaped for the harness-owned loss. n_classes is node-pinned and
     only used by encodings that need the class/level count (ordinal)."""
@@ -432,7 +415,6 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
             optimizer.zero_grad()
             loss = criterion(model(xb), yb)
             loss.backward()
-            _totalize_grad_samples(model, pcfg["clipping_norm"])
             # Defense-in-depth for the param-stash (A1): undo ANY in-place write the
             # forward made to the leaf params BEFORE the optimizer steps, so weights
             # evolve ONLY via the (noised) DP-SGD update, never a forward side effect.
@@ -511,24 +493,53 @@ def _pool_by_patient(X, y, groups, loss_name):
     g = np.asarray(
         [task_module._canonical_patient_id(gv) for gv in groups],
         dtype=object)
-    Xp, yp = [], []
+    # Assign compact group indices in first-appearance order.  Aggregation then
+    # becomes O(rows) rather than scanning all rows once per patient.
+    group_index = {}
+    inverse = np.empty(len(g), dtype=np.intp)
+    for row, key in enumerate(g.tolist()):
+        if key not in group_index:
+            group_index[key] = len(group_index)
+        inverse[row] = group_index[key]
+    n_groups = len(group_index)
+    if n_groups == 0:
+        raise ValueError("cannot pool an empty patient collection")
+    counts = np.bincount(inverse, minlength=n_groups).astype(np.float64)
+
+    x_values = np.asarray(X, dtype=np.float64)
+    Xp = np.zeros((n_groups,) + x_values.shape[1:], dtype=np.float64)
+    np.add.at(Xp, inverse, x_values)
+    Xp /= counts.reshape((n_groups,) + (1,) * (x_values.ndim - 1))
+
+    values = np.asarray(y)
     categorical = (loss_name in _CLASSIFICATION_LOSSES
                    or loss_name == "multilabel_bce")
-    for key in dict.fromkeys(g.tolist()):
-        m = g == key
-        Xp.append(np.asarray(X[m], dtype=np.float64).mean(axis=0))
-        values = np.asarray(y[m])
-        if values.ndim > 1:
-            pooled = np.asarray(values, dtype=np.float64).mean(axis=0)
-            if categorical:
-                pooled = (pooled >= 0.5).astype(values.dtype)
-        elif categorical:
-            labels, counts = np.unique(values, return_counts=True)
-            pooled = labels[np.argmax(counts)]
-        else:
-            pooled = np.asarray(values, dtype=np.float64).mean()
-        yp.append(pooled)
-    return np.stack(Xp), np.asarray(yp, dtype=y.dtype)
+    if values.ndim > 1:
+        yp = np.zeros((n_groups,) + values.shape[1:], dtype=np.float64)
+        np.add.at(yp, inverse, np.asarray(values, dtype=np.float64))
+        yp /= counts.reshape((n_groups,) + (1,) * (values.ndim - 1))
+        if categorical:
+            yp = (yp >= 0.5).astype(values.dtype)
+    elif categorical:
+        # Sparse group/label counts avoid a potentially huge patients x classes
+        # matrix. np.unique sorts labels, so selecting the first maximum keeps
+        # the previous deterministic lowest-label tie break.
+        labels, label_inverse = np.unique(values, return_inverse=True)
+        pair_ids, pair_counts = np.unique(
+            inverse * len(labels) + label_inverse, return_counts=True)
+        pair_groups = pair_ids // len(labels)
+        pair_labels = pair_ids % len(labels)
+        max_counts = np.zeros(n_groups, dtype=pair_counts.dtype)
+        np.maximum.at(max_counts, pair_groups, pair_counts)
+        candidates = np.flatnonzero(pair_counts == max_counts[pair_groups])
+        candidate_groups = pair_groups[candidates]
+        first = np.r_[True, candidate_groups[1:] != candidate_groups[:-1]]
+        yp = labels[pair_labels[candidates[first]]]
+    else:
+        yp = np.zeros(n_groups, dtype=np.float64)
+        np.add.at(yp, inverse, np.asarray(values, dtype=np.float64))
+        yp /= counts
+    return Xp, np.asarray(yp, dtype=y.dtype)
 
 
 def _apply_feature_norm(X, cfg):
@@ -622,42 +633,6 @@ def _train_neural(context, cfg, pcfg, pins, model, master, input_dim,
     return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master)
 
 
-# --------------------------------------------------------------------------- #
-# Trees track (enforced DP-GBDT, node-side central DP)
-# --------------------------------------------------------------------------- #
-
-def _booster_to_array(booster):
-    """Serialize the booster (our own format) to a uint8 array for transport."""
-    public_booster = dict(booster)
-    for key in ("sigma", "delta2", "epsilon", "delta", "privacy_noop"):
-        public_booster.pop(key, None)
-    return np.frombuffer(json.dumps(public_booster).encode("utf-8"), dtype=np.uint8)
-
-
-def _train_trees(context, pcfg, cfg, private_release_id,
-                 on_private_start=None):
-    spec = load_gbdt_spec(context)                 # validated, manifest-authoritative
-    if on_private_start is not None:
-        on_private_start()
-    X, y = load_data(context)
-    X = _totalize_private_features(X)
-    pids = load_tabular_patient_ids(context)       # per-patient DP unit when present
-    task_module.assert_pinned_unit_count(context, len(y), pids)
-    master = seeding.master_seed(cfg, X, y, private_release_id)
-    booster = dp_gbdt.fit_dp_gbdt(
-        X, y, objective=spec["objective"], depth=spec["max_depth"],
-        n_trees=spec["n_trees"], learning_rate=spec["learning_rate"],
-        reg_lambda=spec["reg_lambda"], feature_ranges=spec["feature_ranges"],
-        n_bins=spec["n_bins"], run_token=spec["run_token"],
-        epsilon=pcfg["epsilon"], delta=pcfg["delta"], patient_ids=pids,
-        target_bounds=spec.get("target_bounds"),
-        margin_bounds=spec.get("margin_bounds"),
-        gradient_clip=spec.get("gradient_clip"),
-        noise_rng=seeding.np_rng(seeding.sub_seed(master, "gbdt-noise")))
-    n = len(y) if pids is None else int(np.unique(pids).size)
-    return [_booster_to_array(booster)], n
-
-
 def _public_noop_arrays(msg, context, track):
     """Bounded response independent of private rows when no release is available."""
     if track == "validation":
@@ -666,44 +641,8 @@ def _public_noop_arrays(msg, context, track):
         # ServerApp publish only ``available=false``, with no exception detail,
         # fake metric or replacement private release.
         return [np.zeros(1, dtype=np.float64)]
-    if track != "trees":
-        return _validate_public_egress_arrays(
-            msg.content["arrays"], label="public fallback model")
-    spec = load_gbdt_spec(context)  # manifest/public config only; no data needed
-    depth = int(spec["max_depth"])
-    trees = []
-    for tree_index in range(int(spec["n_trees"])):
-        feat, thr = dp_gbdt.random_tree(
-            spec["run_token"], tree_index, depth,
-            spec["feature_ranges"], spec["n_bins"])
-        trees.append({
-            "feat": feat.tolist(),
-            "thr": thr.tolist(),
-            "w": np.zeros(1 << depth, dtype=np.float64).tolist(),
-        })
-    base_margin = 0.0
-    if spec["objective"] == "reg:squarederror":
-        base_margin = sum(spec["margin_bounds"]) / 2.0
-    booster = {
-        "objective": spec["objective"],
-        "depth": depth,
-        "n_bins": spec["n_bins"],
-        "base_margin": base_margin,
-        "learning_rate": spec["learning_rate"],
-        "feature_ranges": spec["feature_ranges"],
-        "trees": trees,
-    }
-    if spec["objective"] == "reg:squarederror":
-        geometry = dp_gbdt.regression_geometry(
-            spec["target_bounds"], spec["margin_bounds"],
-            spec["gradient_clip"])
-        booster.update({
-            "target_bounds": spec["target_bounds"],
-            "margin_bounds": spec["margin_bounds"],
-            "gradient_clip": geometry["gradient_clip"],
-            "gradient_bounds": list(geometry["gradient_bounds"]),
-        })
-    return [_booster_to_array(booster)]
+    return _validate_public_egress_arrays(
+        msg.content["arrays"], label="public fallback model")
 
 
 def _safe_public_noop_arrays(msg, context, track):
@@ -821,15 +760,9 @@ def train(msg: Message, context: Context) -> Message:
                 raise RuntimeError("validation release horizon must be exactly one")
             public_arrays = _validate_public_egress_arrays(
                 msg.content["arrays"], label="public validation model",
-                max_elements=(_MAX_EGRESS_BYTES if str(cfg.get(
-                    "validation-model-track", "")).lower() == "trees"
-                    else _MAX_EGRESS_ELEMENTS))
+                max_elements=_MAX_EGRESS_ELEMENTS)
             new_arrays = validation.private_model_validation(
                 context, cfg, pcfg, private_release_id, public_arrays,
-                on_private_start=mark_private_started)
-        elif track == "trees":
-            new_arrays, _n = _train_trees(
-                context, pcfg, cfg, private_release_id,
                 on_private_start=mark_private_started)
         elif track == "egress":
             from . import tier2_lib
