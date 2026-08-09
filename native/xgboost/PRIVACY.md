@@ -15,9 +15,9 @@ V1 keeps two mechanism identities separate:
 - `fixed-point-discrete-v1` is a mathematical fixed-point discrete-Gaussian
   profile with exact integer sensitivity and rational budget allocation.  The
   repository contains a pinned minimal CKS20 source port and deterministic C
-  ABI under `native/dp_primitives`.  Patch 0003 connects it only to the
-  compile-time-isolated test core; that does not make the end-to-end tree
-  mechanism complete or enable a capability.
+  ABI under `native/dp_primitives`.  Patch 0003 connects it only to the curated
+  `DSFLOWER_DP_CORE=ON` bundle; that internal native target does not by itself
+  enable or advertise a public capability.
 
 One profile's semantic randomness identity is never valid for the other. The
 mechanism ID, effective fixed-point/noise scales or floating-point profile,
@@ -44,11 +44,14 @@ privacy database belongs to the mechanism.
 
 Adjacency is bounded `replace_one`: two datasets have the same public unit
 slots and differ in all values of at most one slot.  Before the native ABI is
-entered, dsFlower must materialize exactly one row for every declared privacy
-unit using `one-record-per-unit-v1`.  A patient unit therefore requires
-server-side contribution bounding and canonicalization before XGBoost sees the
-matrix.  Row multiplicity, weights or duplicated unit identifiers are not
-accepted.
+entered, the trusted dsFlower adapter materializes exactly one effective row
+for every declared privacy unit using `one-record-per-unit-v1`.  In patient
+mode it canonicalizes identifiers, maps invalid identifiers to the single
+conservative missing-unit sentinel, and averages all finite observations for
+each feature (all-missing stays missing).  Regression targets use the same
+bounded mean; binary targets use majority with a zero tie.  The fork receives
+only these effective rows and never pools raw patient records itself.  Row
+weights and multiplicities cannot cross that boundary.
 
 Sticky randomness protects an identical semantic training from averaging. Its
 authenticated key derivation binds the mechanism and runtime versions,
@@ -71,10 +74,11 @@ arithmetic remains exact conditional on uniform bytes.
 
 The proof applies only to all of the following restrictions:
 
-- binary logistic classification restricted to labels in `{0, 1}`, or bounded
-  squared-error regression restricted to targets inside public bounds; the
-  adapter rejects out-of-domain values and the native boundary revalidates
-  them rather than clipping labels or targets;
+- binary logistic classification with effective labels in `{0, 1}`, or bounded
+  squared-error regression with effective targets inside public bounds; the
+  adapter totalizes private numeric values under the public bounds before unit
+  aggregation, and the native boundary revalidates the resulting matrix rather
+  than applying a second data-dependent admission rule;
 - CPU, in-memory, single-process training, one output and one tree per round;
 - a public, fixed number `T >= 1` of trees and `D >= 1` histogram levels per
   tree, depthwise construction and a worst-case `T * D` release schedule;
@@ -88,6 +92,18 @@ The proof applies only to all of the following restrictions:
   regularization, finite positive denominator protection and leaf clipping;
 - every stopping, split, missing-direction, topology, weight, gain and cover
   decision uses public values or already privatized values only.
+
+The adapter's total mapping is fixed. Feature `NaN` remains missing, feature
+infinities map to the corresponding public bound, and finite outliers are
+clipped before averaging. A regression `NaN` maps to the public midpoint,
+infinities map to the corresponding target bound, and finite values are
+clipped. A finite binary value maps to one iff it is at least `0.5`; a
+non-finite binary value maps to zero. Patient duplicates are averaged after
+this mapping, except binary labels which use strict majority (ties map to
+zero). An aligned empty input becomes one public sentinel row with all features
+missing and target zero/midpoint. Only the final binned rows and effective
+targets bind sticky randomness; raw values, identifiers and visit counts do
+not.
 
 V1 rejects GPU, distributed and external-memory execution; row/column
 subsampling; DART; categorical, ranking, survival, multiclass and multi-target

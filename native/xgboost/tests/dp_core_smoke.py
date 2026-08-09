@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the isolated deterministic fixed-point DP histogram core."""
+"""Exercise the curated deterministic fixed-point DP histogram core."""
 
 from __future__ import annotations
 
@@ -152,7 +152,7 @@ def assert_safe_serialization(
         key,
         b"a" * 64,
         b"one-record-per-unit-v1",
-        b"dsflower.xgboost.dp_hist.v0-scaffold",
+        b"xgboost/fixed-point-discrete/v1",
         struct.pack("<4f", 0.0, 1.0, 2.0, 3.0),
     )
     for artifact in (model, snapshot, config):
@@ -430,9 +430,10 @@ def main(library: str, primitives_library: str | None = None) -> None:
     lib = ct.CDLL(library)
     try:
         configure_core_api(lib)
+        assert lib.XGBSetGlobalConfig(b'{"verbosity":0}') == 0
         status = ct.c_char_p()
         assert lib.XGBDsFlowerPrivacyScaffoldStatus(ct.byref(status)) == 0
-        assert status.value == b"test-only:fixed-point-core:no-production-capability"
+        assert status.value == b"bundle-core:fixed-point-discrete-v1:internal-only"
 
         assert_objective(lib, b"regression", b"reg:squarederror")
         assert_objective(lib, b"binary_classification", b"binary:logistic")

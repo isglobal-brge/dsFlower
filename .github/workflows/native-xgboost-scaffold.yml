@@ -1,4 +1,4 @@
-name: Native XGBoost scaffold
+name: Native XGBoost curated bundle
 
 on:
   push:
@@ -72,6 +72,6 @@ jobs:
             inst/python/tests/test_xgboost_accounting.py \
             inst/python/tests/test_xgboost_adapter.py \
             inst/python/tests/test_xgboost_sanitizer.py
-      - name: Verify normal fail-closed build and isolated DP core
+      - name: Verify fail-closed build and curated DP bundle
         shell: bash
         run: native/xgboost/tests/run.sh

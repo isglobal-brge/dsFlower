@@ -1,3 +1,3 @@
 bfadac689d59166edb95c24a44d81e1cc3fcb570c43567dd279038f621203f01  patches/0001-dsflower-dp-scaffold.patch
 a0d7d616df4e7040def4f553f9fd1522fa4ed2510e951a31818bf1c849d9a86d  patches/0002-bind-public-schema-and-dmatrix.patch
-7a257026030bd3492ab7d51eca3165175863a86de0d485abb329aa0638f24983  patches/0003-add-test-only-fixed-point-dp-histogram-core.patch
+b6aa768563e79b3adf1a80a3738bcaafb20236824f566a6baf6a40d4aa27cd93  patches/0003-add-fixed-point-dp-histogram-core.patch

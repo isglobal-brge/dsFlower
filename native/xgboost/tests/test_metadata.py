@@ -29,6 +29,7 @@ def main() -> None:
     assert len(metadata["DSFLOWER_XGB_UPSTREAM_SOURCE_SHA256"]) == 64
     assert len(metadata["DSFLOWER_DMLC_CORE_COMMIT"]) == 40
     assert metadata["DSFLOWER_XGB_PATCHSET_VERSION"] == "3"
+    assert len(metadata["DSFLOWER_XGB_PATCHED_TREE"]) == 40
 
     checksums: dict[str, str] = {}
     for line in (ROOT / "PATCHES.sha256").read_text(encoding="utf-8").splitlines():
@@ -81,12 +82,13 @@ def main() -> None:
         "requires one tree per boosting round",
         "fail-closed scaffold",
         "privatization has not been implemented or proven",
-        "DSFLOWER_DP_CORE_TESTING",
+        "DSFLOWER_DP_CORE",
+        "xgboost/fixed-point-discrete/v1",
         "cks20-discrete-gaussian-i64-hmac-sha256-v1",
         "MakeReleaseDomain",
         "TryGetNextTreeIndex",
         "RecordSuccessfulTree",
-        "test-only:fixed-point-core:no-production-capability",
+        "bundle-core:fixed-point-discrete-v1:internal-only",
         "dsflower_dp_add_discrete_gaussian_i64",
     )
     for guard in required_guards:
@@ -105,6 +107,24 @@ def main() -> None:
     )
     for contract in forbidden_contracts:
         assert contract not in patch_text
+
+    core_patch = (ROOT / "patches" / "0003-add-fixed-point-dp-histogram-core.patch").read_text(
+        encoding="utf-8"
+    )
+    assert "DSFLOWER_DP_CORE_TESTING" not in core_patch
+    assert "test-only:fixed-point-core" not in core_patch
+
+    package_script = (ROOT / "scripts" / "package_bundle.py").read_text(encoding="utf-8")
+    verify_script = (ROOT / "scripts" / "verify_bundle.py").read_text(encoding="utf-8")
+    for contract in (
+        "dsflower-xgboost-bundle-v1",
+        "bundle-core:fixed-point-discrete-v1:internal-only",
+        "xgboost/fixed-point-discrete/v1",
+        "DSFLOWER_XGB_PATCHED_TREE",
+    ):
+        assert contract in package_script
+    assert "is_symlink" in verify_script
+    assert "actual_entries != expected_entries" in verify_script
 
     allowed_top_level = {
         ".gitattributes",

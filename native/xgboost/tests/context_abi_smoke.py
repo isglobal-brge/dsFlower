@@ -48,6 +48,8 @@ class PrivacyContext(ct.Structure):
 
 def configure_api(lib: ct.CDLL) -> None:
     lib.XGBGetLastError.restype = ct.c_char_p
+    lib.XGBSetGlobalConfig.argtypes = [ct.c_char_p]
+    lib.XGBSetGlobalConfig.restype = ct.c_int
     lib.XGBDsFlowerSetPrivacyContext.argtypes = [ct.POINTER(PrivacyContext)]
     lib.XGBDsFlowerClearPrivacyContext.argtypes = []
     lib.XGBDsFlowerPrivacyContextReady.argtypes = [ct.POINTER(ct.c_int)]
@@ -124,7 +126,7 @@ def valid_context(
         3,
         key,
         32,
-        b"dsflower.xgboost.dp_hist.v0-scaffold",
+        b"xgboost/fixed-point-discrete/v1",
         b"patient",
         b"replace_one",
         b"trim-utf8-v2",
@@ -310,6 +312,7 @@ def assert_cross_thread_context_swap_rejected(
 def main(library: str) -> None:
     lib = ct.CDLL(library)
     configure_api(lib)
+    assert lib.XGBSetGlobalConfig(b'{"verbosity":0}') == 0
 
     status = ct.c_char_p()
     assert lib.XGBDsFlowerPrivacyScaffoldStatus(ct.byref(status)) == 0
