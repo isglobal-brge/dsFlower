@@ -1726,12 +1726,6 @@ flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
                                "dsflower.restrict_connectivity=FALSE for trusted local dev.")))
   }
 
-  # Per-session rate limit to blunt scanning even within the allowed scope.
-  if (!.connectivity_rate_ok()) {
-    return(list(reachable = FALSE,
-                error = "Connectivity check rate limit exceeded; try again shortly."))
-  }
-
   .probe_tcp(host, port, timeout_secs)
 }
 

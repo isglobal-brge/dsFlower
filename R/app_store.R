@@ -165,8 +165,6 @@
   list(
     max_bytes = .app_positive_integer_option(
       "app_spool_max_bytes", 1024^3),
-    max_uploads = .app_positive_integer_option(
-      "app_spool_max_uploads", 128),
     ttl_seconds = .app_positive_integer_option(
       "app_spool_ttl_seconds", 24 * 60 * 60)
   )
@@ -388,8 +386,13 @@
           referenced <- c(referenced, token)
           next
         }
-        age <- as.numeric(difftime(now, .app_last_activity(spool), units = "secs"))
-        if (is.finite(age) && age >= ttl_seconds) {
+        # TTL is only incomplete-upload garbage collection. Once an app has a
+        # verified unpacked package it is a catalogue entry and persists until
+        # explicit deletion; the catalogue has no count or age limit.
+        installed <- dir.exists(file.path(spool, "unpacked"))
+        age <- as.numeric(difftime(
+          now, .app_last_activity(spool), units = "secs"))
+        if (!installed && is.finite(age) && age >= ttl_seconds) {
           unlink(spool, recursive = TRUE, force = TRUE)
           if (dir.exists(spool) || file.exists(spool)) {
             stop("Could not remove an expired app spool.", call. = FALSE)
@@ -415,13 +418,8 @@
 
 # Called with the global store lock held.
 #' @keywords internal
-.assert_app_spool_quota <- function(root, policy, additional_bytes = 0,
-                                    new_upload = FALSE) {
+.assert_app_spool_quota <- function(root, policy, additional_bytes = 0) {
   usage <- .app_spool_usage(root)
-  if (usage$uploads + as.integer(isTRUE(new_upload)) > policy$max_uploads) {
-    stop("App upload store reached dsflower.app_spool_max_uploads (",
-         format(policy$max_uploads, scientific = FALSE), ").", call. = FALSE)
-  }
   if (usage$bytes + additional_bytes > policy$max_bytes) {
     stop("App upload store exceeds dsflower.app_spool_max_bytes (",
          format(policy$max_bytes, scientific = FALSE), " bytes).", call. = FALSE)
@@ -541,7 +539,7 @@ flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
                call. = FALSE)
         }
         .assert_app_spool_quota(
-          root, policy, additional_bytes = append_n, new_upload = is_new)
+          root, policy, additional_bytes = append_n)
         if (is_new) spool <- .app_spool_dir(token, create = TRUE)
         if (append_n > 0) {
           con <- file(bin, "ab")

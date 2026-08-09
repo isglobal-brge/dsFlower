@@ -308,8 +308,7 @@ all other policy controls remain normal DataSHIELD profile options.
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |
 | `max_fab_bytes` | `52428800` | Per-FAB compressed upload cap. |
 | `app_spool_max_bytes` | `1073741824` | Global logical-byte cap across all uploaded FABs and unpacked apps. |
-| `app_spool_max_uploads` | `128` | Global cap on simultaneous upload-token directories. |
-| `app_spool_ttl_seconds` | `86400` | Inactive-upload retention; locked operations and staging-referenced apps are skipped by GC. |
+| `app_spool_ttl_seconds` | `86400` | Incomplete-upload retention; installed catalogue apps persist until explicit deletion. Locked operations and staging-referenced apps are skipped by GC. |
 | `tunnel_chunk_bytes` | `524288` | Maximum decoded payload in one DSI tunnel exchange; constrained to 16--512 KiB and negotiated with the client. The upper bound stays below DSI's expression-parser limit; larger streams are carried as multiple exact chunks. |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; at least eight chunks and at most 64 GiB. TCP backpressure applies when full. |
 | `tunnel_request_max_bytes` | `67108864` | Maximum encoded fan-out request accepted before JSON decoding; constrained to 1--256 MiB. |
@@ -335,13 +334,13 @@ tmpfs or quota-enforced volume. Bubblewrap/RLIMIT alone do not satisfy this
 second gate. Without both attestations, the time envelope and `hook_enabled`, a
 HookApp remains a data-independent no-op.
 
-Upload admission and writes are serialized by a node-global lock, so the byte
-and token-directory caps are atomic across R sessions. Before each admitted
-chunk, lazy TTL collection removes expired entries only when their per-upload
-lock can be acquired without waiting. Pinning also records the server-generated
-run token in the app spool: GC revalidates it against the permitted staging roots
-and retains the app until that staging directory is cleaned, even for runs longer
-than the TTL. Explicit `flowerAppDeleteDS()` remains an intentional deletion.
+Upload admission and writes are serialized by a node-global lock, so the
+physical byte cap is atomic across R sessions. There is no catalogue-entry or
+call-count quota. Before each admitted chunk, lazy TTL collection removes only
+expired incomplete uploads and only when their per-upload lock can be acquired
+without waiting. Verified installed apps persist until explicit
+`flowerAppDeleteDS()`. Pinning also records the server-generated run token in the
+app spool so active bytes remain immutable for the complete run.
 
 The DSI transport is capability-bound and all-or-nothing. It does not add
 encryption to DataSHIELD itself: production Opal/Armadillo frontends must enforce
