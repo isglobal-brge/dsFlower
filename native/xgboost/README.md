@@ -5,19 +5,46 @@ native XGBoost backend.  It does **not** vendor XGBoost and it does **not** yet
 provide differentially private training.
 
 The first patch adds an opt-in TreeUpdater registration and a C ABI for a
-server-authoritative privacy context.  Both layers fail closed:
+server-authoritative privacy context.  The second patch upgrades that C ABI to
+v2 and binds the complete public training shape.  Both layers fail closed:
 
 - an incomplete or malformed context is rejected;
 - the context cannot be replaced without an explicit wipe;
 - its 32-byte noise key is never written to model configuration;
+- the context owns exactly one in-memory CPU DMatrix and rejects another one;
+- public numeric feature bounds and cuts are copied and float-validated;
+- only single-output `binary:logistic` and `reg:squarederror`, with explicit
+  public target bounds/base score, requested total-tree bound, and exact depth,
+  are accepted;
+- gradients are tagged by the built-in objective path, so public custom-gradient
+  APIs cannot impersonate either accepted objective;
 - even a complete context cannot train because histogram privatization has not
   yet been implemented and proven.
 
 The scaffold ABI accepts `privacy_unit=row|patient` but fixes
 `adjacency=replace_one`, `unit_canonicalization=trim-utf8-v2`,
 `contribution_strategy=one-record-per-unit-v1`, and `max_rows_per_unit=1`.
-For v1, dsFlower must materialize exactly one DMatrix row per declared privacy
-unit before entering XGBoost.  The fork does not silently pool raw patient rows.
+For this contribution contract, dsFlower must materialize exactly one DMatrix
+row per declared privacy unit before entering XGBoost.  The fork does not
+silently pool raw patient rows.
+ABI v2 additionally rejects external-memory/categorical matrices, ranking,
+row/feature weights, base margins, survival bounds, and labels outside the
+server-pinned task bounds.  It seals labels against later metadata mutation,
+binds updater configuration to a process-unique context generation (including
+across threads), and restricts execution to CPU, one output, one tree per round,
+the exclusive trusted updater, and a non-data-derived base score.  All C
+pointers are borrowed only for the call;
+the implementation copies the DMatrix shared pointer, schema, cuts, strings,
+and derived key.
+
+Because every Update remains unconditionally rejected, ABI v2 records the
+requested `max_trees` but does not claim to count successful rounds yet.  That
+counter is a required part of the later training patch, before activation.
+
+The v2 `noise_key` is specific to the v0 scaffold mechanism.  It does not bind
+the sampler or entropy architecture of a future formal mechanism; a later ABI
+may replace it with separately reviewed mechanism/sampler pins and fresh
+entropy.
 
 Consequently, this scaffold is deliberately not connected to dsFlower's public
 capabilities or runner.  `grow_dsflower_dp_hist` must not be advertised or used

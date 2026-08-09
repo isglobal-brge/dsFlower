@@ -26,6 +26,7 @@ require_command "$CMAKE_COMMAND"
   -DKEEP_BUILD_ARTIFACTS_IN_BINARY_DIR=ON \
   -DCMAKE_BUILD_TYPE=Release
 "$CMAKE_COMMAND" --build "$BUILD" --target xgboost \
+  --config Release \
   --parallel "${DSFLOWER_XGB_BUILD_JOBS:-2}"
 
 printf '%s\n' "built fail-closed scaffold in $BUILD"

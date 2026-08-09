@@ -22,9 +22,11 @@ BUILD="$WORK/build"
 "$TEST_DIR/test_provenance_rejections.sh" "$SOURCE" "$WORK"
 "$ROOT/scripts/build.sh" "$SOURCE" "$BUILD"
 
-LIBRARY=$(find "$BUILD" -type f \( \
+LIBRARY=$(find "$BUILD" \( -type f -o -type l \) \( \
   -name 'libxgboost.so' -o -name 'libxgboost.dylib' -o \
+  -name 'libxgboost.so.[0-9]*' -o \
   -name 'libxgboost.[0-9]*.so' -o -name 'libxgboost.[0-9]*.dylib' \
+  -o -name 'xgboost.dll' \
 \) -print | head -n 1)
 [ -n "$LIBRARY" ] || {
   printf '%s\n' "built libxgboost was not found under $BUILD" >&2

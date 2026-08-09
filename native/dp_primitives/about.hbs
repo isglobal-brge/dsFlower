@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>dsFlower native DP third-party licenses</title></head>
+<body>
+<h1>Third-party licenses</h1>
+<p>Generated from the locked Rust dependency graph by cargo-about 0.9.1.</p>
+{{#each licenses}}
+<section>
+<h2 id="{{id}}">{{name}}</h2>
+<p>Used by:</p>
+<ul>
+{{#each used_by}}
+<li>{{crate.name}} {{crate.version}}{{#if crate.repository}} — <a href="{{crate.repository}}">source</a>{{/if}}</li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+</section>
+{{/each}}
+</body>
+</html>
