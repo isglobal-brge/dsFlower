@@ -458,8 +458,8 @@ def _read_file(path, *, max_bytes=None, expected_sha256=None):
     before = _secure_metadata(path)
     if max_bytes is not None and before.st_size > max_bytes:
         _reject()
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | \
-        getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | \
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError:
