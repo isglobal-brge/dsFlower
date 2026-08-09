@@ -1,0 +1,1129 @@
+diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
+index 3e584ddc84cfa5290c48ef8c25a20631253c643e..f80203baa6f42c3c24cfa5e1813751744b7e3a6a 100644
+--- a/include/xgboost/c_api.h
++++ b/include/xgboost/c_api.h
+@@ -78,75 +78,98 @@ XGB_DLL int XGBuildInfo(char const **out);
+-
++
+ /**
+  * @brief Get the string message of the last error.
+  *
+  *   Most functions in XGBoost returns 0 when success and non-zero when an error
+  *   occurred. In the case of error, @ref XGBGetLastError can be used to retrieve the
+  *   error message
+  *
+  *   This function is thread safe.
+  *
+  * @return The error message from the last error.
+  */
+ XGB_DLL const char *XGBGetLastError();
+-
++
+ /**
+  * @brief ABI version for the opt-in dsFlower privacy context.
+  *
+  * @warning This ABI belongs to a fail-closed development scaffold.  It does
+  * not make XGBoost training differentially private.
+  */
+-#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 1U
++#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 2U
+-
++
+ /**
+  * @brief Server-authoritative pins required by the dsFlower updater scaffold.
+  *
+  * Every pointer is borrowed only for the duration of
+  * XGBDsFlowerSetPrivacyContext.  The implementation copies validated values
+  * and never serializes noise_key into a model or XGBoost configuration.  The
+  * caller must pass a context-derived key, never its durable noise root.
+- * ABI v1 also requires a DMatrix already materialized as exactly one row per
+- * declared privacy unit; the updater never performs patient canonicalization.
++ * This key requirement is specific to the v0 scaffold mechanism, not a pin on
++ * the sampler or entropy contract of a future formal mechanism.
++ * ABI v2 binds the context to exactly one DMatrixHandle and copies its shared
++ * ownership.  It also copies a complete public numeric feature schema and
++ * public split cuts.  The caller may release all borrowed pointers, including
++ * the DMatrixHandle wrapper, after this function returns successfully.
++ *
++ * The bound DMatrix must already contain exactly one row per declared privacy
++ * unit; the updater never performs patient canonicalization.
+  */
+ typedef struct XGBDsFlowerPrivacyContext {
+   uint32_t struct_size;
+   uint32_t abi_version;
+   const unsigned char *noise_key;
+   size_t noise_key_size;
+   const char *mechanism_id;
+   const char *noise_key_id;
+   const char *privacy_epoch;
+   const char *node_id_hash;
+   const char *dataset_snapshot_hash;
+   const char *cohort_hash;
+   const char *query_hash;
+   const char *mechanism_config_hash;
+   const char *allocation_hash;
+   const char *privacy_unit;
+   const char *adjacency;
+   const char *unit_canonicalization;
+   const char *contribution_strategy;
+   double epsilon;
+   double delta;
+   double gradient_clip;
+   double hessian_clip;
+   uint64_t max_rows_per_unit;
++  DMatrixHandle dmatrix;
++  const char *task_id;
++  const char *objective;
++  double target_lower_bound;
++  double target_upper_bound;
++  double base_score;
++  uint64_t max_trees;
++  uint64_t max_depth;
++  const double *feature_lower_bounds;
++  size_t feature_lower_bounds_size;
++  const double *feature_upper_bounds;
++  size_t feature_upper_bounds_size;
++  const uint64_t *cut_ptrs;
++  size_t cut_ptrs_size;
++  const double *cut_values;
++  size_t cut_values_size;
+ } XGBDsFlowerPrivacyContext;
+-
++
+ /**
+  * @brief Install a validated privacy context on the calling thread.
+  *
+  * A second install fails until XGBDsFlowerClearPrivacyContext is called.
+  * This API returning success does not authorize training: the scaffold updater
+  * still rejects every update until histogram privatization is implemented and
+  * independently verified.
+  */
+ XGB_DLL int XGBDsFlowerSetPrivacyContext(const XGBDsFlowerPrivacyContext *context);
+-
++
+ /** @brief Wipe and remove the calling thread's dsFlower privacy context. */
+ XGB_DLL int XGBDsFlowerClearPrivacyContext(void);
+-
++
+ /** @brief Report whether every required context pin is present and valid. */
+ XGB_DLL int XGBDsFlowerPrivacyContextReady(int *out_ready);
+-
++
+ /** @brief Return a static status string for deployment guards. */
+ XGB_DLL int XGBDsFlowerPrivacyScaffoldStatus(const char **out_status);
+diff --git a/include/xgboost/gradient.h b/include/xgboost/gradient.h
+index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93b191dd01 100644
+--- a/include/xgboost/gradient.h
++++ b/include/xgboost/gradient.h
+@@ -1,52 +1,71 @@
+ /**
+  * Copyright 2025, XGBoost Contributors
+  */
+ #pragma once
+-
++
+ #include <xgboost/base.h>    // for GradientPair
+ #include <xgboost/linalg.h>  // for Matrix
+ #include <xgboost/logging.h>
+-
++
+ #include <cstddef>  // for size_t
++#include <cstdint>  // for uint8_t
+-
++
+ namespace xgboost {
++class LearnerImpl;
++
+ /**
+  * @brief Container for gradient produced by objective.
+  */
+ struct GradientContainer {
++  enum class ObjectiveSource : std::uint8_t {
++    kExternal = 0,
++    kBinaryLogistic = 1,
++    kSquaredError = 2,
++    kOtherBuiltIn = 3,
++  };
++
+   /** @brief Gradient used for multi-target tree split and linear model. */
+   linalg::Matrix<GradientPair> gpair;
+   /** @brief Gradient used for tree leaf value, optional. */
+   linalg::Matrix<GradientPair> value_gpair;
+-
++
+   [[nodiscard]] bool HasValueGrad() const noexcept { return !value_gpair.Empty(); }
+-
++
++  /** @brief Provenance assigned only by Learner's built-in objective path. */
++  [[nodiscard]] ObjectiveSource GetObjectiveSource() const noexcept { return source_; }
++
+   [[nodiscard]] std::size_t NumSplitTargets() const noexcept { return gpair.Shape(1); }
+   [[nodiscard]] std::size_t NumTargets() const noexcept {
+     return HasValueGrad() ? value_gpair.Shape(1) : this->gpair.Shape(1);
+   }
+-
++
+   linalg::MatrixView<GradientPair const> ValueGrad(Context const* ctx) const {
+     if (HasValueGrad()) {
+       return this->value_gpair.View(ctx->Device());
+     }
+     return this->gpair.View(ctx->Device());
+   }
+-
++
+   [[nodiscard]] linalg::Matrix<GradientPair> const* Grad() const { return &gpair; }
+   [[nodiscard]] linalg::Matrix<GradientPair>* Grad() { return &gpair; }
+-
++
+   [[nodiscard]] linalg::Matrix<GradientPair> const* FullGradOnly() const {
+     if (this->HasValueGrad()) {
+       LOG(FATAL) << "Reduced gradient is not yet supported.";
+     }
+     return this->Grad();
+   }
+   [[nodiscard]] linalg::Matrix<GradientPair>* FullGradOnly() {
+     if (this->HasValueGrad()) {
+       LOG(FATAL) << "Reduced gradient is not yet supported.";
+     }
+     return this->Grad();
+   }
++
++ private:
++  friend class LearnerImpl;
++  void MarkObjectiveGradient(ObjectiveSource source) noexcept { source_ = source; }
++
++  ObjectiveSource source_{ObjectiveSource::kExternal};
+ };
+ }  // namespace xgboost
+diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
+index 7bd2cee5a1dc83ef4598c6f949e952a7fdc764c1..a425c2ab64a61e40dd0587ca5c725b928665d57b 100644
+--- a/plugin/dsflower/README.md
++++ b/plugin/dsflower/README.md
+@@ -1,27 +1,50 @@
+ # dsFlower DP histogram updater scaffold
+-
++
+ This opt-in plugin is deliberately **not a DP implementation**.  It reserves a
+ TreeUpdater name and a C ABI for server-authoritative privacy context.  It
+ validates all required context pins, keeps the noise key out of serialized
+ XGBoost configuration, and then rejects every training update.
+-
++
+-The v1 adapter boundary accepts only `privacy_unit=row|patient`,
++The v2 adapter boundary accepts only `privacy_unit=row|patient`,
+ `adjacency=replace_one`, `unit_canonicalization=trim-utf8-v2`,
+ `contribution_strategy=one-record-per-unit-v1`, and `max_rows_per_unit=1`.
+ The server must materialize the DMatrix as one row per privacy unit before it
+ crosses this ABI; this scaffold does not canonicalize or pool patients itself.
++The context takes shared ownership of exactly one in-memory CPU DMatrix and
++copies public float-safe feature bounds and split cuts.  It accepts only numeric
++single-output binary-logistic or squared-error tasks, with explicit public
++target bounds, base score, requested total-tree bound, and depth.  Ranking, row
++or feature weights, base margins, survival bounds, categorical data, external
++memory, and a different
++DMatrix are rejected before the updater reaches its unconditional failure.
++Gradient provenance is tagged inside `LearnerImpl`; public custom-gradient C
++APIs remain untrusted and are rejected by the updater.
++The label vector is sealed at context installation and checked again at Update,
++and an updater cannot survive a clear/set context rotation, even across
++threads, because generations are process-unique.  The context also
++requires CPU, one output, one tree per round, one exclusive updater, and
++`boost_from_average=0` when specified.  Since every Update is still rejected,
++v2 records but does not yet consume/enforce the total `max_trees`; the training
++patch must add the successful-round counter before capability activation.
++
++The required `noise_key` belongs only to the v0 scaffold mechanism.  It does
++not constrain the entropy or sampler contract of a later formal mechanism; a
++future ABI may replace it with separately reviewed sampler/mechanism pins and
++fresh entropy.
+-
++
+ The updater must remain unavailable to production integration until a later
+ patch implements and proves all of the following before any data-dependent
+ split, topology, leaf, metric, log, or model artifact can leave the trusted
+ process:
+-
++
+ - patient-level contribution bounding;
+-- public or privately selected bins;
+-- cryptographically keyed, domain-separated noise;
++- public or privately selected bins (v2 validates public cuts but does not use
++  them for training yet);
++- a separately reviewed sampler and entropy source appropriate to the claimed
++  mechanism;
+ - privatized gradient/hessian histograms before split selection;
+ - explicit composition accounting and replay-stable release identity;
+ - tests covering every egress and failure path.
+-
++
+ Build only for scaffold verification with `-DPLUGIN_DSFLOWER_DP=ON`.  Selecting
+ `grow_dsflower_dp_hist` always fails closed in this patch.
+diff --git a/plugin/dsflower/dsflower_context.cc b/plugin/dsflower/dsflower_context.cc
+index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d570744f901dae 100644
+--- a/plugin/dsflower/dsflower_context.cc
++++ b/plugin/dsflower/dsflower_context.cc
+@@ -1,93 +1,355 @@
+ /**
+  * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ #include "dsflower_context.h"
+-
++
+ #include <algorithm>
++#include <atomic>
++#include <cerrno>
+ #include <cmath>
++#include <cstdlib>
++#include <limits>
+ #include <string_view>
+ #include <utility>
+-
++
+ #include "../../src/c_api/c_api_error.h"
++#include "../../src/c_api/c_api_utils.h"
++#include "../../src/data/simple_dmatrix.h"
+ #include "xgboost/logging.h"
+-
++
+ namespace xgboost::tree::dsflower {
+ namespace {
+-
++
+ constexpr std::size_t kHashSize = 64;
+ constexpr std::size_t kMaxTokenSize = 128;
+-
++
+-void SecureZero(unsigned char* ptr, std::size_t size) {
+-  volatile unsigned char* out = ptr;
+-  while (size-- != 0) {
+-    *out++ = 0;
+-  }
+-}
+-
+ struct ContextSlot {
+   PrivacyContext value;
+   bool ready{false};
+-
++
+   ~ContextSlot() { Reset(); }
+-
++
+   void Reset() {
+-    SecureZero(value.noise_key.data(), value.noise_key.size());
+     value = PrivacyContext{};
+     ready = false;
+   }
+ };
+-
++
+ thread_local ContextSlot g_context;
++std::atomic<std::uint64_t> g_context_generation{0};
+-
++
+ bool IsLowerHexHash(const char* value) {
+   if (value == nullptr) {
+     return false;
+   }
+   std::string_view text{value};
+   return text.size() == kHashSize &&
+          std::all_of(text.cbegin(), text.cend(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+          });
+ }
+-
++
+ bool IsToken(const char* value) {
+   if (value == nullptr) {
+     return false;
+   }
+   std::string_view text{value};
+   return !text.empty() && text.size() <= kMaxTokenSize &&
+          std::all_of(text.cbegin(), text.cend(), [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                   c == ':' || c == '-';
+          });
+ }
+-
++
+ bool Reject(std::string message, std::string* error) {
+   if (error != nullptr) {
+     *error = std::move(message);
+   }
+   return false;
+ }
+-
++
++bool NextContextGeneration(std::uint64_t* out, std::string* error) {
++  auto current = g_context_generation.load(std::memory_order_relaxed);
++  while (true) {
++    if (current == std::numeric_limits<std::uint64_t>::max()) {
++      return Reject("dsFlower privacy context generation space is exhausted", error);
++    }
++    if (g_context_generation.compare_exchange_weak(current, current + 1,
++                                                   std::memory_order_relaxed)) {
++      *out = current + 1;
++      return true;
++    }
++  }
++}
++
++bool ToFiniteFloat(double value, float* out) {
++  if (!std::isfinite(value) ||
++      value < static_cast<double>(std::numeric_limits<float>::lowest()) ||
++      value > static_cast<double>(std::numeric_limits<float>::max())) {
++    return false;
++  }
++  auto converted = static_cast<float>(value);
++  if (!std::isfinite(converted)) {
++    return false;
++  }
++  *out = converted;
++  return true;
++}
++
++bool CopyPublicSchema(const XGBDsFlowerPrivacyContext& input, PrivacyContext* next,
++                      std::string* error) {
++  if (input.feature_lower_bounds == nullptr || input.feature_upper_bounds == nullptr ||
++      input.feature_lower_bounds_size == 0 ||
++      input.feature_lower_bounds_size != input.feature_upper_bounds_size ||
++      input.feature_lower_bounds_size > kMaxFeatures) {
++    return Reject("dsFlower feature bounds must contain one to 8192 matched features", error);
++  }
++  auto n_features = input.feature_lower_bounds_size;
++  if (input.cut_ptrs == nullptr || input.cut_ptrs_size != n_features + 1) {
++    return Reject("dsFlower cut_ptrs must contain exactly feature_count + 1 entries", error);
++  }
++  if (input.cut_values_size == 0 || input.cut_values_size > kMaxTotalCuts ||
++      input.cut_values == nullptr) {
++    return Reject("dsFlower public cuts must contain one to 16384 values", error);
++  }
++
++  std::vector<double> lower(input.feature_lower_bounds,
++                            input.feature_lower_bounds + n_features);
++  std::vector<double> upper(input.feature_upper_bounds,
++                            input.feature_upper_bounds + n_features);
++  std::vector<std::uint64_t> cut_ptrs(input.cut_ptrs, input.cut_ptrs + input.cut_ptrs_size);
++  std::vector<double> cuts(input.cut_values, input.cut_values + input.cut_values_size);
++
++  if (cut_ptrs.front() != 0 || cut_ptrs.back() != cuts.size()) {
++    return Reject("dsFlower cut_ptrs must start at zero and end at cut_values_size", error);
++  }
++  for (std::size_t i = 0; i < n_features; ++i) {
++    if (cut_ptrs[i] > cut_ptrs[i + 1] || cut_ptrs[i + 1] > cuts.size()) {
++      return Reject("dsFlower cut_ptrs must be monotone and in range", error);
++    }
++  }
++
++  next->feature_lower_bounds.resize(n_features);
++  next->feature_upper_bounds.resize(n_features);
++  next->cut_values.resize(cuts.size());
++  next->cut_ptrs = std::move(cut_ptrs);
++  for (std::size_t i = 0; i < n_features; ++i) {
++    float lo{0.0f};
++    float hi{0.0f};
++    if (!ToFiniteFloat(lower[i], &lo) || !ToFiniteFloat(upper[i], &hi) || !(lo < hi)) {
++      return Reject("dsFlower feature bounds must remain finite and strict after float conversion",
++                    error);
++    }
++    next->feature_lower_bounds[i] = lo;
++    next->feature_upper_bounds[i] = hi;
++
++    auto begin = next->cut_ptrs[i];
++    auto end = next->cut_ptrs[i + 1];
++    float previous = lo;
++    for (auto j = begin; j < end; ++j) {
++      float cut{0.0f};
++      if (!ToFiniteFloat(cuts[j], &cut) || !(lo < cut && cut < hi) || !(previous < cut)) {
++        return Reject(
++            "dsFlower cuts must remain finite, strict, increasing and inside bounds after float "
++            "conversion",
++            error);
++      }
++      next->cut_values[j] = cut;
++      previous = cut;
++    }
++  }
++  return true;
++}
++
++bool ValidateTask(const XGBDsFlowerPrivacyContext& input, PrivacyContext* next,
++                  std::string* error) {
++  if (input.task_id == nullptr || input.objective == nullptr) {
++    return Reject("dsFlower task_id and objective are required", error);
++  }
++  std::string_view task{input.task_id};
++  std::string_view objective{input.objective};
++  bool is_binary = task == "binary_classification";
++  bool is_regression = task == "regression";
++  if ((!is_binary && !is_regression) ||
++      (is_binary && objective != "binary:logistic") ||
++      (is_regression && objective != "reg:squarederror")) {
++    return Reject(
++        "dsFlower supports only binary_classification/binary:logistic or "
++        "regression/reg:squarederror",
++        error);
++  }
++  if (!std::isfinite(input.target_lower_bound) ||
++      !std::isfinite(input.target_upper_bound) ||
++      !(input.target_lower_bound < input.target_upper_bound)) {
++    return Reject("dsFlower public target bounds must be finite and strict", error);
++  }
++  if (is_binary &&
++      (input.target_lower_bound != 0.0 || input.target_upper_bound != 1.0)) {
++    return Reject("dsFlower binary target bounds must equal zero and one", error);
++  }
++  if (!std::isfinite(input.base_score) ||
++      input.base_score < input.target_lower_bound ||
++      input.base_score > input.target_upper_bound ||
++      (is_binary && (input.base_score <= 0.0 || input.base_score >= 1.0))) {
++    return Reject("dsFlower public base_score must lie inside the target bounds", error);
++  }
++  float target_lower{0.0f};
++  float target_upper{0.0f};
++  float base_score{0.0f};
++  if (!ToFiniteFloat(input.target_lower_bound, &target_lower) ||
++      !ToFiniteFloat(input.target_upper_bound, &target_upper) ||
++      !(target_lower < target_upper) || !ToFiniteFloat(input.base_score, &base_score) ||
++      base_score < target_lower || base_score > target_upper ||
++      (is_binary && (base_score <= 0.0f || base_score >= 1.0f))) {
++    return Reject("dsFlower target bounds and base_score must be representable as finite floats",
++                  error);
++  }
++  next->task_id = input.task_id;
++  next->objective = input.objective;
++  next->target_lower_bound = target_lower;
++  next->target_upper_bound = target_upper;
++  next->base_score = base_score;
++  return true;
++}
++
++bool ValidateDMatrix(std::shared_ptr<DMatrix> const& dmatrix, PrivacyContext const& context,
++                     std::string* error) {
++  if (!dmatrix || dynamic_cast<data::SimpleDMatrix*>(dmatrix.get()) == nullptr) {
++    return Reject("dsFlower requires an in-memory SimpleDMatrix", error);
++  }
++  if (dmatrix->Ctx() == nullptr || !dmatrix->Ctx()->IsCPU()) {
++    return Reject("dsFlower requires a CPU DMatrix", error);
++  }
++  auto const& info = dmatrix->Info();
++  if (info.num_row_ == 0 || info.num_col_ != context.feature_lower_bounds.size()) {
++    return Reject("dsFlower DMatrix dimensions do not match the public feature schema", error);
++  }
++  if (info.labels.Shape(0) != info.num_row_ || info.labels.Shape(1) != 1) {
++    return Reject("dsFlower requires exactly one label per DMatrix row", error);
++  }
++  auto feature_types = info.feature_types.ConstHostSpan();
++  if ((!feature_types.empty() && feature_types.size() != info.num_col_) ||
++      std::any_of(feature_types.cbegin(), feature_types.cend(),
++                  [](FeatureType type) { return type != FeatureType::kNumerical; })) {
++    return Reject("dsFlower requires numeric, non-categorical features", error);
++  }
++  if (!info.group_ptr_.empty() || !info.weights_.Empty() || !info.feature_weights.Empty() ||
++      !info.base_margin_.Empty() || !info.labels_lower_bound_.Empty() ||
++      !info.labels_upper_bound_.Empty()) {
++    return Reject(
++        "dsFlower does not accept ranking groups, row/feature weights, base margins, or survival "
++        "bounds",
++        error);
++  }
++  auto labels = info.labels.Data()->ConstHostSpan();
++  bool is_binary = context.task_id == "binary_classification";
++  for (float label : labels) {
++    if (!std::isfinite(label) || label < context.target_lower_bound ||
++        label > context.target_upper_bound || (is_binary && label != 0.0f && label != 1.0f)) {
++      return Reject("dsFlower labels do not satisfy the server-owned task and target bounds",
++                    error);
++    }
++  }
++  if (!context.sealed_labels.empty() &&
++      (labels.size() != context.sealed_labels.size() ||
++       !std::equal(labels.cbegin(), labels.cend(), context.sealed_labels.cbegin()))) {
++    return Reject("dsFlower labels changed after privacy context binding", error);
++  }
++  return true;
++}
++
++PrivacyContext CloneContext(PrivacyContext const& source) {
++  PrivacyContext out;
++  out.noise_key.Assign(source.noise_key.Get().data());
++  out.noise_key_id = source.noise_key_id;
++  out.privacy_epoch = source.privacy_epoch;
++  out.node_id_hash = source.node_id_hash;
++  out.dataset_snapshot_hash = source.dataset_snapshot_hash;
++  out.cohort_hash = source.cohort_hash;
++  out.query_hash = source.query_hash;
++  out.mechanism_config_hash = source.mechanism_config_hash;
++  out.allocation_hash = source.allocation_hash;
++  out.privacy_unit = source.privacy_unit;
++  out.adjacency = source.adjacency;
++  out.unit_canonicalization = source.unit_canonicalization;
++  out.contribution_strategy = source.contribution_strategy;
++  out.epsilon = source.epsilon;
++  out.delta = source.delta;
++  out.gradient_clip = source.gradient_clip;
++  out.hessian_clip = source.hessian_clip;
++  out.max_rows_per_unit = source.max_rows_per_unit;
++  out.dmatrix = source.dmatrix;
++  out.task_id = source.task_id;
++  out.objective = source.objective;
++  out.target_lower_bound = source.target_lower_bound;
++  out.target_upper_bound = source.target_upper_bound;
++  out.base_score = source.base_score;
++  out.max_trees = source.max_trees;
++  out.max_depth = source.max_depth;
++  out.generation = source.generation;
++  out.feature_lower_bounds = source.feature_lower_bounds;
++  out.feature_upper_bounds = source.feature_upper_bounds;
++  out.cut_ptrs = source.cut_ptrs;
++  out.cut_values = source.cut_values;
++  out.sealed_labels = source.sealed_labels;
++  return out;
++}
++
++bool FindArgument(Args const& args, std::string_view name, std::string* value) {
++  for (auto const& argument : args) {
++    if (argument.first == name) {
++      *value = argument.second;
++      return true;
++    }
++  }
++  return false;
++}
++
++bool ParseFiniteDouble(std::string const& text, double* out) {
++  errno = 0;
++  char* end{nullptr};
++  auto value = std::strtod(text.c_str(), &end);
++  if (errno != 0 || end == text.c_str() || end == nullptr || *end != '\0' ||
++      !std::isfinite(value)) {
++    return false;
++  }
++  *out = value;
++  return true;
++}
++
++bool ParseUnsigned(std::string const& text, std::uint64_t* out) {
++  if (text.empty() || text.front() < '0' || text.front() > '9') {
++    return false;
++  }
++  errno = 0;
++  char* end{nullptr};
++  auto value = std::strtoull(text.c_str(), &end, 10);
++  if (errno != 0 || end == text.c_str() || end == nullptr || *end != '\0') {
++    return false;
++  }
++  *out = value;
++  return true;
++}
++
+ }  // namespace
+-
++
+ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error) {
+   if (g_context.ready) {
+     return Reject("dsFlower privacy context is already installed on this thread", error);
+   }
+   if (input.struct_size != sizeof(XGBDsFlowerPrivacyContext)) {
+     return Reject("dsFlower privacy context struct_size mismatch", error);
+   }
+   if (input.abi_version != XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION) {
+     return Reject("unsupported dsFlower privacy context ABI version", error);
+   }
+   if (input.noise_key == nullptr || input.noise_key_size != kNoiseKeySize) {
+     return Reject("dsFlower noise_key must contain exactly 32 bytes", error);
+   }
+   if (std::all_of(input.noise_key, input.noise_key + input.noise_key_size,
+                   [](unsigned char value) { return value == 0; })) {
+     return Reject("dsFlower noise_key must not be all zero", error);
+   }
+   if (input.mechanism_id == nullptr ||
+@@ -116,69 +378,158 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
+       std::string_view{input.unit_canonicalization} != "trim-utf8-v2") {
+     return Reject("dsFlower unit_canonicalization must be trim-utf8-v2", error);
+   }
+   if (input.contribution_strategy == nullptr ||
+       std::string_view{input.contribution_strategy} != "one-record-per-unit-v1") {
+     return Reject("dsFlower contribution_strategy must be one-record-per-unit-v1", error);
+   }
+   if (!std::isfinite(input.epsilon) || input.epsilon <= 0.0) {
+     return Reject("dsFlower epsilon must be finite and positive", error);
+   }
+   if (!std::isfinite(input.delta) || input.delta <= 0.0 || input.delta >= 1.0) {
+     return Reject("dsFlower delta must be finite and strictly between zero and one", error);
+   }
+   if (!std::isfinite(input.gradient_clip) || input.gradient_clip <= 0.0 ||
+       !std::isfinite(input.hessian_clip) || input.hessian_clip <= 0.0) {
+     return Reject("dsFlower gradient and hessian clips must be finite and positive", error);
+   }
+   if (input.max_rows_per_unit != 1) {
+     return Reject("dsFlower max_rows_per_unit must equal one", error);
+   }
++  if (input.max_trees == 0 || input.max_trees > kMaxTrees) {
++    return Reject("dsFlower max_trees must be between one and 10000", error);
++  }
++  if (input.max_depth == 0 || input.max_depth > kMaxDepth) {
++    return Reject("dsFlower max_depth must be between one and 32", error);
++  }
+-
++
+   PrivacyContext next;
++  if (!ValidateTask(input, &next, error) || !CopyPublicSchema(input, &next, error)) {
++    return false;
++  }
++  if (input.dmatrix == nullptr) {
++    return Reject("dsFlower requires exactly one non-null DMatrixHandle", error);
++  }
++  next.dmatrix = CastDMatrixHandle(input.dmatrix);
++  next.max_trees = input.max_trees;
++  next.max_depth = input.max_depth;
++  if (!ValidateDMatrix(next.dmatrix, next, error)) {
++    return false;
++  }
++  auto labels = next.dmatrix->Info().labels.Data()->ConstHostSpan();
++  next.sealed_labels.assign(labels.cbegin(), labels.cend());
++
+   next.noise_key_id = input.noise_key_id;
+   next.privacy_epoch = input.privacy_epoch;
+   next.node_id_hash = input.node_id_hash;
+   next.dataset_snapshot_hash = input.dataset_snapshot_hash;
+   next.cohort_hash = input.cohort_hash;
+   next.query_hash = input.query_hash;
+   next.mechanism_config_hash = input.mechanism_config_hash;
+   next.allocation_hash = input.allocation_hash;
+   next.privacy_unit = input.privacy_unit;
+   next.adjacency = input.adjacency;
+   next.unit_canonicalization = input.unit_canonicalization;
+   next.contribution_strategy = input.contribution_strategy;
+   next.epsilon = input.epsilon;
+   next.delta = input.delta;
+   next.gradient_clip = input.gradient_clip;
+   next.hessian_clip = input.hessian_clip;
+   next.max_rows_per_unit = input.max_rows_per_unit;
++  if (!NextContextGeneration(&next.generation, error)) {
++    return false;
++  }
++  next.noise_key.Assign(input.noise_key);
++
+   g_context.value = std::move(next);
+-  std::copy_n(input.noise_key, kNoiseKeySize, g_context.value.noise_key.begin());
+   g_context.ready = true;
+   return true;
+ }
+-
++
+ void ClearPrivacyContext() { g_context.Reset(); }
+-
++
+ bool PrivacyContextReady() { return g_context.ready; }
+-
++
++bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
++                                     std::uint64_t* out_generation, std::string* error) {
++  if (!g_context.ready) {
++    return Reject("dsFlower updater requires an installed privacy context", error);
++  }
++  if (task == nullptr) {
++    return Reject("dsFlower updater requires an inspectable objective task", error);
++  }
++  if (out_generation == nullptr) {
++    return Reject("dsFlower updater generation output is required", error);
++  }
++  auto expected_task = g_context.value.task_id == "binary_classification" ? ObjInfo::kBinary
++                                                                          : ObjInfo::kRegression;
++  if (task->task != expected_task) {
++    return Reject("dsFlower XGBoost objective task does not match the privacy context", error);
++  }
++  std::string objective;
++  if (!FindArgument(args, "objective", &objective) || objective != g_context.value.objective) {
++    return Reject("dsFlower XGBoost objective must be explicitly server-pinned", error);
++  }
++  std::string base_score_text;
++  double base_score{0.0};
++  if (!FindArgument(args, "base_score", &base_score_text) ||
++      !ParseFiniteDouble(base_score_text, &base_score) ||
++      static_cast<float>(base_score) != static_cast<float>(g_context.value.base_score)) {
++    return Reject("dsFlower XGBoost base_score must be explicitly server-pinned", error);
++  }
++  std::string value;
++  if (FindArgument(args, "boost_from_average", &value) && value != "0" && value != "false") {
++    return Reject("dsFlower XGBoost boost_from_average must remain disabled", error);
++  }
++  if (!FindArgument(args, "updater", &value) || value != "grow_dsflower_dp_hist") {
++    return Reject("dsFlower XGBoost requires the exclusive trusted updater", error);
++  }
++  for (auto const& pin : {std::pair<std::string_view, std::uint64_t>{"num_class", 0},
++                          {"num_target", 1}, {"num_parallel_tree", 1}}) {
++    std::uint64_t parsed{0};
++    if (FindArgument(args, pin.first, &value) &&
++        (!ParseUnsigned(value, &parsed) || parsed != pin.second)) {
++      return Reject("dsFlower XGBoost requires a single-output, one-tree execution shape", error);
++    }
++  }
++  if (FindArgument(args, "multi_strategy", &value) && value != "one_output_per_tree") {
++    return Reject("dsFlower XGBoost requires one_output_per_tree", error);
++  }
++  if (FindArgument(args, "process_type", &value) && value != "default") {
++    return Reject("dsFlower XGBoost does not update pre-existing trees", error);
++  }
++  if (FindArgument(args, "device", &value) && value != "cpu") {
++    return Reject("dsFlower XGBoost requires CPU execution", error);
++  }
++  *out_generation = g_context.value.generation;
++  return true;
++}
++
++PrivacyContextSnapshot SnapshotPrivacyContextForDMatrix(DMatrix* dmatrix) {
++  CHECK(g_context.ready) << "dsFlower privacy context is not installed";
++  CHECK(dmatrix != nullptr && g_context.value.dmatrix.get() == dmatrix)
++      << "dsFlower updater DMatrix does not match the context-bound DMatrix";
++  std::string error;
++  CHECK(ValidateDMatrix(g_context.value.dmatrix, g_context.value, &error)) << error;
++  return PrivacyContextSnapshot{CloneContext(g_context.value)};
++}
++
+ }  // namespace xgboost::tree::dsflower
+-
++
+ XGB_DLL int XGBDsFlowerSetPrivacyContext(const XGBDsFlowerPrivacyContext* context) {
+   API_BEGIN();
+   xgboost_CHECK_C_ARG_PTR(context);
+   std::string error;
+   CHECK(xgboost::tree::dsflower::TrySetPrivacyContext(*context, &error)) << error;
+   API_END();
+ }
+-
++
+ XGB_DLL int XGBDsFlowerClearPrivacyContext(void) {
+   API_BEGIN();
+   xgboost::tree::dsflower::ClearPrivacyContext();
+   API_END();
+ }
+-
++
+ XGB_DLL int XGBDsFlowerPrivacyContextReady(int* out_ready) {
+   API_BEGIN();
+   xgboost_CHECK_C_ARG_PTR(out_ready);
+   *out_ready = xgboost::tree::dsflower::PrivacyContextReady() ? 1 : 0;
+diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_context.h
+index ca0cbcd1e325169adc8bb98fb28a1de1a08533b1..65dd422148b0f1cf20e6dd9d0efb21039fd21588 100644
+--- a/plugin/dsflower/dsflower_context.h
++++ b/plugin/dsflower/dsflower_context.h
+@@ -1,48 +1,137 @@
+ /**
+  * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ #ifndef XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
+ #define XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
+-
++
++#include <algorithm>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
+ #include <string>
++#include <vector>
+-
++
++#include "xgboost/base.h"
+ #include "xgboost/c_api.h"
++#include "xgboost/data.h"
++#include "xgboost/task.h"
+-
++
+ namespace xgboost::tree::dsflower {
+-
++
+ inline constexpr char kScaffoldMechanismId[] =
+     "dsflower.xgboost.dp_hist.v0-scaffold";
+ inline constexpr std::size_t kNoiseKeySize = 32;
++inline constexpr std::size_t kMaxFeatures = 8192;
++inline constexpr std::size_t kMaxTotalCuts = 16384;
++inline constexpr std::uint64_t kMaxTrees = 10000;
++inline constexpr std::uint64_t kMaxDepth = 32;
++
++class SensitiveKey {
++ public:
++  SensitiveKey() = default;
++  SensitiveKey(SensitiveKey const&) = delete;
++  SensitiveKey& operator=(SensitiveKey const&) = delete;
++
++  SensitiveKey(SensitiveKey&& other) noexcept { this->MoveFrom(&other); }
++  SensitiveKey& operator=(SensitiveKey&& other) noexcept {
++    if (this != &other) {
++      this->Wipe();
++      this->MoveFrom(&other);
++    }
++    return *this;
++  }
++
++  ~SensitiveKey() { this->Wipe(); }
++
++  void Assign(unsigned char const* input) {
++    this->Wipe();
++    std::copy_n(input, value_.size(), value_.begin());
++  }
++
++  [[nodiscard]] std::array<unsigned char, kNoiseKeySize> const& Get() const { return value_; }
++
++ private:
++  void MoveFrom(SensitiveKey* other) {
++    std::copy(other->value_.cbegin(), other->value_.cend(), value_.begin());
++    other->Wipe();
++  }
++
++  void Wipe() {
++    volatile unsigned char* out = value_.data();
++    for (std::size_t i = 0; i < value_.size(); ++i) {
++      out[i] = 0;
++    }
++  }
++
++  std::array<unsigned char, kNoiseKeySize> value_{};
++};
+-
++
+ struct PrivacyContext {
+-  std::array<unsigned char, kNoiseKeySize> noise_key{};
++  SensitiveKey noise_key;
+   std::string noise_key_id;
+   std::string privacy_epoch;
+   std::string node_id_hash;
+   std::string dataset_snapshot_hash;
+   std::string cohort_hash;
+   std::string query_hash;
+   std::string mechanism_config_hash;
+   std::string allocation_hash;
+   std::string privacy_unit;
+   std::string adjacency;
+   std::string unit_canonicalization;
+   std::string contribution_strategy;
+   double epsilon{0.0};
+   double delta{0.0};
+   double gradient_clip{0.0};
+   double hessian_clip{0.0};
+   std::uint64_t max_rows_per_unit{0};
++  std::shared_ptr<DMatrix> dmatrix;
++  std::string task_id;
++  std::string objective;
++  double target_lower_bound{0.0};
++  double target_upper_bound{0.0};
++  double base_score{0.0};
++  std::uint64_t max_trees{0};
++  std::uint64_t max_depth{0};
++  std::uint64_t generation{0};
++  std::vector<float> feature_lower_bounds;
++  std::vector<float> feature_upper_bounds;
++  std::vector<std::uint64_t> cut_ptrs;
++  std::vector<float> cut_values;
++  std::vector<float> sealed_labels;
++
++  PrivacyContext() = default;
++  PrivacyContext(PrivacyContext const&) = delete;
++  PrivacyContext& operator=(PrivacyContext const&) = delete;
++  PrivacyContext(PrivacyContext&&) noexcept = default;
++  PrivacyContext& operator=(PrivacyContext&&) noexcept = default;
++};
++
++class PrivacyContextSnapshot {
++ public:
++  PrivacyContextSnapshot(PrivacyContextSnapshot const&) = delete;
++  PrivacyContextSnapshot& operator=(PrivacyContextSnapshot const&) = delete;
++  PrivacyContextSnapshot(PrivacyContextSnapshot&&) noexcept = default;
++  PrivacyContextSnapshot& operator=(PrivacyContextSnapshot&&) noexcept = default;
++
++  [[nodiscard]] PrivacyContext const& Get() const { return value_; }
++
++ private:
++  friend PrivacyContextSnapshot SnapshotPrivacyContextForDMatrix(DMatrix* dmatrix);
++  explicit PrivacyContextSnapshot(PrivacyContext value) : value_{std::move(value)} {}
++
++  PrivacyContext value_;
+ };
+-
++
+ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error);
+ void ClearPrivacyContext();
+ bool PrivacyContextReady();
++bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
++                                     std::uint64_t* out_generation, std::string* error);
++PrivacyContextSnapshot SnapshotPrivacyContextForDMatrix(DMatrix* dmatrix);
+-
++
+ }  // namespace xgboost::tree::dsflower
+-
++
+ #endif  // XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
+diff --git a/plugin/dsflower/dsflower_updater.cc b/plugin/dsflower/dsflower_updater.cc
+index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabee0e716ff 100644
+--- a/plugin/dsflower/dsflower_updater.cc
++++ b/plugin/dsflower/dsflower_updater.cc
+@@ -1,60 +1,82 @@
+ /**
+  * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ #include "dsflower_context.h"
+-
++
++#include <algorithm>
++#include <string>
+ #include <vector>
+-
++
++#include "../../src/tree/param.h"
+ #include "xgboost/gradient.h"
+ #include "xgboost/json.h"
+ #include "xgboost/logging.h"
+ #include "xgboost/tree_updater.h"
+-
++
+ namespace xgboost::tree {
+-
++
+ DMLC_REGISTRY_FILE_TAG(dsflower_dp_hist_scaffold);
+-
++
+ class DsFlowerDpHistUpdater final : public TreeUpdater {
+  public:
+-  explicit DsFlowerDpHistUpdater(Context const* ctx) : TreeUpdater{ctx} {}
++  DsFlowerDpHistUpdater(Context const* ctx, ObjInfo const* task) : TreeUpdater{ctx}, task_{task} {}
+-
++
+-  void Configure(Args const&) override {
+-    CHECK(dsflower::PrivacyContextReady())
+-        << "dsFlower DP histogram updater requires a complete server-authoritative "
+-           "privacy context on the calling thread";
++  void Configure(Args const& args) override {
++    std::string error;
++    CHECK(ctx_ != nullptr && ctx_->IsCPU()) << "dsFlower XGBoost requires CPU execution";
++    CHECK(dsflower::TryValidateUpdaterConfiguration(args, task_, &configured_generation_, &error))
++        << error;
+     configured_ = true;
+   }
+-
++
+   void LoadConfig(Json const&) override {
+     // Context is intentionally neither serialized nor restored from a model.
+     configured_ = false;
+   }
+-
++
+   void SaveConfig(Json* out) const override {
+     (*out)["name"] = String{Name()};
+     (*out)["status"] = String{"scaffold-only"};
+   }
+-
++
+   [[nodiscard]] char const* Name() const override { return "grow_dsflower_dp_hist"; }
+-
++
+-  void Update(TrainParam const*, GradientContainer*, DMatrix*,
++  void Update(TrainParam const* param, GradientContainer* gpair, DMatrix* dmatrix,
+               common::Span<HostDeviceVector<bst_node_t>>,
+-              std::vector<RegTree*> const&) override {
++              std::vector<RegTree*> const& trees) override {
+     CHECK(configured_ && dsflower::PrivacyContextReady())
+         << "dsFlower DP histogram updater was not configured with a complete privacy context";
++    auto context = dsflower::SnapshotPrivacyContextForDMatrix(dmatrix);
++    CHECK_EQ(context.Get().generation, configured_generation_)
++        << "dsFlower privacy context changed since updater configuration";
++    auto expected_source = context.Get().task_id == "binary_classification"
++                               ? GradientContainer::ObjectiveSource::kBinaryLogistic
++                               : GradientContainer::ObjectiveSource::kSquaredError;
++    CHECK(gpair != nullptr && gpair->GetObjectiveSource() == expected_source)
++        << "dsFlower updater rejects custom, external, or mismatched objective gradients";
++    CHECK(std::any_of(context.Get().noise_key.Get().cbegin(), context.Get().noise_key.Get().cend(),
++                      [](unsigned char value) { return value != 0; }) &&
++          !context.Get().cut_values.empty() && context.Get().cut_ptrs.front() == 0 &&
++          context.Get().cut_ptrs.back() == context.Get().cut_values.size())
++        << "dsFlower context snapshot lost its copied key or public schema";
++    CHECK(param != nullptr && static_cast<std::uint64_t>(param->max_depth) == context.Get().max_depth)
++        << "dsFlower XGBoost max_depth does not match the context-bound exact depth";
++    CHECK_EQ(trees.size(), 1) << "dsFlower XGBoost requires one tree per boosting round";
+     LOG(FATAL) << "grow_dsflower_dp_hist is a fail-closed scaffold: histogram "
+                   "privatization has not been implemented or proven";
+   }
+-
++
+  private:
+   bool configured_{false};
++  std::uint64_t configured_generation_{0};
++  ObjInfo const* task_{nullptr};
+ };
+-
++
+ XGBOOST_REGISTER_TREE_UPDATER(DsFlowerDpHistUpdater, "grow_dsflower_dp_hist")
+     .describe("Fail-closed dsFlower DP histogram updater scaffold.")
+-    .set_body([](Context const* ctx, ObjInfo const*) {
+-      return new DsFlowerDpHistUpdater{ctx};
++    .set_body([](Context const* ctx, ObjInfo const* task) {
++      return new DsFlowerDpHistUpdater{ctx, task};
+     });
+-
++
+ }  // namespace xgboost::tree
+diff --git a/src/learner.cc b/src/learner.cc
+index d1a5e1de479543550a9f3a2b19261e0e253ebc5e..b7f72fe497dd8a6246e17244d8a588dc4789731a 100644
+--- a/src/learner.cc
++++ b/src/learner.cc
+@@ -1109,40 +1109,47 @@ class LearnerImpl : public LearnerIO {
+     monitor_.Start("UpdateOneIter");
+     TrainingObserver::Instance().Update(iter);
+     this->Configure();
+     this->FitIntercept(this->tparam_, train.get());
+-
++
+     if (ctx_.seed_per_iteration) {
+       ctx_.Rng().seed(ctx_.seed * kRandSeedMagic + this->BoostedRounds());
+     }
+-
++
+     this->ValidateDMatrix(train.get(), true);
+-
++
+     auto predt = prediction_container_.Cache(train, ctx_.Device());
+-
++
+     monitor_.Start("PredictRaw");
+     this->PredictRaw(train.get(), predt.get(), true, 0, 0);
+     TrainingObserver::Instance().Observe(predt->predictions, "Predictions");
+     monitor_.Stop("PredictRaw");
+-
++
+     monitor_.Start("GetGradient");
+     GetGradient(predt->predictions, train->Info(), iter, &gpair_.gpair);
++    auto gradient_source = GradientContainer::ObjectiveSource::kOtherBuiltIn;
++    if (tparam_.objective == "binary:logistic") {
++      gradient_source = GradientContainer::ObjectiveSource::kBinaryLogistic;
++    } else if (tparam_.objective == "reg:squarederror") {
++      gradient_source = GradientContainer::ObjectiveSource::kSquaredError;
++    }
++    gpair_.MarkObjectiveGradient(gradient_source);
+     monitor_.Stop("GetGradient");
+     TrainingObserver::Instance().Observe(gpair_.Grad()->Data(), "Gradients");
+-
++
+     gbm_->DoBoost(train.get(), &gpair_, predt.get(), obj_.get());
+     monitor_.Stop("UpdateOneIter");
+   }
+-
++
+   void BoostOneIter(std::int32_t, std::shared_ptr<DMatrix> train,
+                     GradientContainer* in_gpair) override {
+     this->monitor_.Start(__func__);
+     this->Configure();
+-
++
+     if (ctx_.seed_per_iteration) {
+       ctx_.Rng().seed(ctx_.seed * kRandSeedMagic + this->BoostedRounds());
+     }
+-
++
+     this->ValidateDMatrix(train.get(), true);
+     if (in_gpair->HasValueGrad()) {
+       CHECK_EQ(this->learner_model_param_.OutputLength(), in_gpair->NumTargets())
+           << "Value gradient should have the same number of targets as the overall model.";

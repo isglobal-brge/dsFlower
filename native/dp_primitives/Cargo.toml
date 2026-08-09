@@ -1,0 +1,24 @@
+[package]
+name = "dsflower-dp-primitives"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dashu-base = { version = "=0.4.3", default-features = false }
+dashu-int = { version = "=0.4.3", default-features = false, features = ["std"] }
+dashu-ratio = { version = "=0.4.4", default-features = false, features = ["std"] }
+getrandom = { version = "=0.4.3", default-features = false }
+zeroize = { version = "=1.8.2", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+overflow-checks = true
+panic = "unwind"
+strip = "symbols"

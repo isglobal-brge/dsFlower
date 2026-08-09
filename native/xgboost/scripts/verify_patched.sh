@@ -39,8 +39,10 @@ EXPECTED_TREE=$(GIT_INDEX_FILE="$EXPECTED_INDEX" git -C "$SOURCE" write-tree)
 # separately by verify_upstream.sh; this tree contains its pinned gitlink.
 GIT_INDEX_FILE="$ACTUAL_INDEX" git -C "$SOURCE" read-tree \
   "$DSFLOWER_XGB_UPSTREAM_COMMIT"
-GIT_INDEX_FILE="$ACTUAL_INDEX" git -c core.filemode=true \
-  -C "$SOURCE" add -A -f -- .
+# Respect the checkout's filemode capability.  On filesystems without POSIX
+# mode bits, read-tree preserves the pinned modes while add still captures all
+# build-visible content.
+GIT_INDEX_FILE="$ACTUAL_INDEX" git -C "$SOURCE" add -A -f -- .
 ACTUAL_TREE=$(GIT_INDEX_FILE="$ACTUAL_INDEX" git -C "$SOURCE" write-tree)
 
 [ "$ACTUAL_TREE" = "$EXPECTED_TREE" ] ||

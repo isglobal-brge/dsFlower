@@ -47,8 +47,10 @@ trap cleanup_index EXIT HUP INT TERM
 
 GIT_INDEX_FILE="$DMLC_INDEX" git -C "$SOURCE/dmlc-core" read-tree \
   "$DSFLOWER_DMLC_CORE_COMMIT"
-GIT_INDEX_FILE="$DMLC_INDEX" git -c core.filemode=true \
-  -C "$SOURCE/dmlc-core" add -A -f -- .
+# Respect the checkout's filemode capability.  Git for Windows uses
+# core.filemode=false because NTFS does not reproduce POSIX executable bits;
+# the modes already loaded by read-tree remain authoritative there.
+GIT_INDEX_FILE="$DMLC_INDEX" git -C "$SOURCE/dmlc-core" add -A -f -- .
 ACTUAL_DMLC_TREE=$(GIT_INDEX_FILE="$DMLC_INDEX" \
   git -C "$SOURCE/dmlc-core" write-tree)
 EXPECTED_DMLC_TREE=$(git -C "$SOURCE/dmlc-core" rev-parse \

@@ -28,6 +28,7 @@ def main() -> None:
     assert metadata["DSFLOWER_XGB_UPSTREAM_COMMIT"] == PINNED_COMMIT
     assert len(metadata["DSFLOWER_XGB_UPSTREAM_ARCHIVE_SHA256"]) == 64
     assert len(metadata["DSFLOWER_DMLC_CORE_COMMIT"]) == 40
+    assert metadata["DSFLOWER_XGB_PATCHSET_VERSION"] == "2"
 
     checksums: dict[str, str] = {}
     for line in (ROOT / "PATCHES.sha256").read_text(encoding="utf-8").splitlines():
@@ -51,6 +52,29 @@ def main() -> None:
         "trim-utf8-v2",
         "one-record-per-unit-v1",
         "max_rows_per_unit",
+        "XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 2U",
+        "DMatrixHandle dmatrix",
+        "data::SimpleDMatrix",
+        "binary:logistic",
+        "reg:squarederror",
+        "target_lower_bound",
+        "base_score",
+        "max_trees",
+        "max_depth",
+        "cut_ptrs",
+        "cut_values",
+        "SnapshotPrivacyContextForDMatrix",
+        "ObjectiveSource::kBinaryLogistic",
+        "ObjectiveSource::kSquaredError",
+        "rejects custom, external, or mismatched objective gradients",
+        "feature_weights.Empty",
+        "labels changed after privacy context binding",
+        "changed since updater configuration",
+        "std::atomic<std::uint64_t> g_context_generation",
+        "boost_from_average must remain disabled",
+        "requires the exclusive trusted updater",
+        "requires CPU execution",
+        "requires one tree per boosting round",
         "fail-closed scaffold",
         "privatization has not been implemented or proven",
     )
@@ -64,10 +88,12 @@ def main() -> None:
     allowed_top_level = {
         "LICENSES.md",
         "PATCHES.sha256",
+        "PRIVACY.md",
         "PROVENANCE.md",
         "README.md",
         "UPSTREAM.env",
         "patches",
+        "reference",
         "scripts",
         "tests",
     }
