@@ -280,13 +280,20 @@ class XGBoostBundleTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows DACL invariant")
     def test_windows_real_acl_success_path(self):
-        bundle._secure_parent_chain(self.directory.root)
-        bundle._windows_secure_acl(
-            self.directory.root, require_node_owner=True,
-            parent_chain=False)
-        bundle._windows_secure_acl(
-            self.directory.root / bundle.MANIFEST_NAME,
-            require_node_owner=True, parent_chain=False)
+        try:
+            bundle._secure_parent_chain(self.directory.root)
+            bundle._windows_secure_acl(
+                self.directory.root, require_node_owner=True,
+                parent_chain=False)
+            bundle._windows_secure_acl(
+                self.directory.root / bundle.MANIFEST_NAME,
+                require_node_owner=True, parent_chain=False)
+        except bundle.BundleVerificationError:
+            details = subprocess.run(
+                ["icacls", str(self.directory.root)], check=True,
+                capture_output=True, text=True,
+            ).stdout
+            self.fail("Windows fixture DACL was rejected:\n%s" % details)
 
     @unittest.skipUnless(
         sys.platform.startswith("linux"), "Linux POSIX ACL invariant")
