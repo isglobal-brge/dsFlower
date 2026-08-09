@@ -88,18 +88,3 @@
   # Non-literal hostname, no coordinator pinned: deny by default.
   TRUE
 }
-
-#' Per-session rate limit for connectivity checks
-#' @keywords internal
-.connectivity_rate_ok <- function(max_per_min = 30L) {
-  now <- Sys.time()
-  hist <- .dsflower_env$.conn_check_times
-  if (is.null(hist)) hist <- now[0]
-  hist <- hist[difftime(now, hist, units = "secs") < 60]
-  if (length(hist) >= max_per_min) {
-    .dsflower_env$.conn_check_times <- hist
-    return(FALSE)
-  }
-  .dsflower_env$.conn_check_times <- c(hist, now)
-  TRUE
-}

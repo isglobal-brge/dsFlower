@@ -204,11 +204,10 @@ test_that("app spool rejects root, token, and nested symbolic links", {
   expect_error(dsFlower:::.app_spool_usage(root), "Symbolic links")
 })
 
-test_that("global byte and upload-count quotas are enforced", {
+test_that("global byte cap is enforced without a catalogue-count quota", {
   root <- .local_app_spool()
   withr::local_options(list(
-    dsflower.app_spool_max_bytes = 3,
-    dsflower.app_spool_max_uploads = 10
+    dsflower.app_spool_max_bytes = 3
   ))
   first <- .test_app_token(31)
   second <- .test_app_token(32)
@@ -222,17 +221,17 @@ test_that("global byte and upload-count quotas are enforced", {
   dsFlower::flowerAppDeleteDS(first)
   withr::local_options(list(
     dsflower.app_spool_max_bytes = 100,
+    # The retired option is deliberately ignored: catalogue size is limited
+    # only by the administrator-owned physical byte cap.
     dsflower.app_spool_max_uploads = 1
   ))
   dsFlower::flowerAppPushDS(first, .enc_b64(as.raw(1)), 0)
-  expect_error(
-    dsFlower::flowerAppPushDS(second, .enc_b64(as.raw(2)), 0),
-    "app_spool_max_uploads"
-  )
-  expect_equal(dsFlower:::.app_spool_usage(root)$uploads, 1L)
+  expect_true(dsFlower::flowerAppPushDS(
+    second, .enc_b64(as.raw(2)), 0)$ok)
+  expect_equal(dsFlower:::.app_spool_usage(root)$uploads, 2L)
 })
 
-test_that("global quota admission is atomic across concurrent uploads", {
+test_that("concurrent uploads have no catalogue-count quota", {
   skip_on_os("windows")
   root <- .local_app_spool()
   withr::local_options(list(
@@ -262,9 +261,8 @@ test_that("global quota admission is atomic across concurrent uploads", {
   expect_true(all(file.exists(ready)))
   file.create(go)
   results <- parallel::mccollect(jobs)
-  expect_equal(sum(vapply(results, isTRUE, logical(1))), 1L)
-  expect_true(any(grepl("app_spool_max_uploads", unlist(results))))
-  expect_equal(dsFlower:::.app_spool_usage(root)$uploads, 1L)
+  expect_true(all(vapply(results, isTRUE, logical(1))))
+  expect_equal(dsFlower:::.app_spool_usage(root)$uploads, 2L)
 })
 
 test_that("TTL GC removes stale spools but skips a locked active upload", {
@@ -328,6 +326,23 @@ test_that("TTL GC retains a pinned app until its staging run is cleaned", {
   expect_contains(expired_gc$removed, token)
   expect_false(dir.exists(spool))
   expect_equal(dsFlower:::.app_spool_usage(root)$uploads, 0L)
+})
+
+test_that("TTL garbage collection never expires installed catalogue apps", {
+  root <- .local_app_spool()
+  withr::local_options(list(dsflower.app_spool_ttl_seconds = 1))
+  token <- .test_app_token(39, "usr")
+  spool <- dsFlower:::.app_spool_dir(token)
+  installed <- file.path(spool, "unpacked")
+  dir.create(installed, mode = "0700")
+  writeLines("verified", file.path(installed, "module.py"))
+  now <- Sys.time()
+  dsFlower:::.touch_app_activity(spool, now - 100)
+
+  collected <- dsFlower:::.app_spool_gc(now)
+  expect_false(token %in% collected$removed)
+  expect_true(dir.exists(installed))
+  expect_equal(dsFlower:::.app_spool_usage(root)$uploads, 1L)
 })
 
 test_that("a live run lease makes verified app bytes immutable", {
