@@ -290,6 +290,9 @@ all other policy controls remain normal DataSHIELD profile options.
 
 | Option suffix | Default | Meaning |
 |---|---:|---|
+| `dp_accounting_mode` | `lifetime-geometric` | `lifetime-geometric` preserves a finite node/domain bound but its numerical tail eventually has no useful release; `per-release-audit` never exhausts, reports finite-prefix composition, and provides only a per-training guarantee. |
+| `dp_per_training_epsilon` | unset | Required administrator-pinned epsilon for every training in `per-release-audit` mode; maximum `10`. |
+| `dp_per_training_delta` | unset | Required administrator-pinned delta for every training in `per-release-audit` mode; maximum `1e-3`. |
 | `dp_total_epsilon` | `3` | Lifetime epsilon for the accounting domain; hard maximum `10`. |
 | `dp_total_delta` | `1e-5` | Lifetime delta; hard maximum `1e-3`. Choose it materially below `1 / protected_units` for the domain. |
 | `dp_budget_decay` | `0.5` | Geometric `rho`, constrained to `[0.5, 0.99]`. |
@@ -381,6 +384,24 @@ options(
   default.dsflower.hook_enabled = FALSE
 )
 ```
+
+For deployments that prefer useful releases without a query-count cutoff, use
+the explicit audit-only policy instead:
+
+```r
+options(
+  default.dsflower.dp_accounting_mode = "per-release-audit",
+  default.dsflower.dp_per_training_epsilon = 1,
+  default.dsflower.dp_per_training_delta = 1e-6
+)
+```
+
+This is formal DP for each training release, and identical semantic replays do
+not add another release. It deliberately does not claim one finite lifetime
+epsilon/delta for an unlimited sequence of new, adaptive trainings: standard
+DP composition makes that combination impossible. Unlimited HPO/CV without
+further composition must operate as post-processing of one persisted DP
+synopsis.
 
 Policy values are bound when a domain is first initialized; incompatible changes
 then fail closed. Losing or corrupting the seed causes a recorded runtime

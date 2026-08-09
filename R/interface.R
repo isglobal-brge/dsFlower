@@ -1385,6 +1385,8 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
   settings <- .flowerDisclosureSettings()
 
   privacy_policy <- .privacy_policy()
+  privacy_audit_only <- identical(
+    privacy_policy$accounting_mode, "per-release-audit")
   runner_caps <- .RUNNER_PUBLIC_CAPABILITIES
   hook_enabled <- isTRUE(as.logical(.dsf_option("hook_enabled", FALSE)))
   hook_sandbox <- isTRUE(as.logical(
@@ -1422,12 +1424,29 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     min_samples         = 0L,
     min_clients_per_round = 1L,
     dp_required         = TRUE,
-    privacy_accountant  = "bounded-geometric-basic-composition-v2",
-    privacy_total_epsilon = privacy_policy$total_epsilon,
-    privacy_total_delta = privacy_policy$total_delta,
+    privacy_accountant  = if (privacy_audit_only) {
+      "audit-only-basic-composition-v1"
+    } else {
+      "bounded-geometric-basic-composition-v2"
+    },
+    privacy_accounting_mode = privacy_policy$accounting_mode,
+    privacy_lifetime_bound = !privacy_audit_only,
+    privacy_total_epsilon = if (privacy_audit_only) {
+      NA_real_
+    } else {
+      privacy_policy$total_epsilon
+    },
+    privacy_total_delta = if (privacy_audit_only) {
+      NA_real_
+    } else {
+      privacy_policy$total_delta
+    },
+    privacy_per_training_epsilon = privacy_policy$per_training_epsilon,
+    privacy_per_training_delta = privacy_policy$per_training_delta,
     privacy_unit        = privacy_policy$dp_unit,
     privacy_patient_column = privacy_policy$patient_column,
     privacy_nonblocking = TRUE,
+    privacy_release_availability_unbounded = privacy_audit_only,
     runner_abi          = 3L,
     runner_sha256       = .compute_harness_hash(),
     dp_app_schema_versions = 1L,
@@ -1534,7 +1553,7 @@ flowerFeatureStatsDS <- function(data_symbol, feature_columns = NULL) {
        disabled = TRUE, reason = "exact-feature-statistics-disabled")
 }
 
-#' Query the server-owned lifetime privacy policy
+#' Query the server-owned privacy accounting policy
 #'
 #' By default this exposes only the fixed policy, not other analysts' allocation
 #' count.  A custodian may set \code{dsflower.expose_privacy_status=TRUE} to expose
@@ -1548,9 +1567,31 @@ flowerPrivacyBudgetDS <- function(handle_symbol = NULL, target_column = NULL) {
     return(.privacy_budget_status())
   }
   policy <- .privacy_policy()
+  if (identical(policy$accounting_mode, "per-release-audit")) {
+    return(list(
+      accountant = "audit-only-basic-composition-v1",
+      accounting_mode = policy$accounting_mode,
+      domain = policy$domain,
+      lifetime_bound = FALSE,
+      nonblocking = TRUE,
+      release_availability_unbounded = TRUE,
+      guarantee_scope = "per-training-release",
+      per_training_epsilon = policy$per_training_epsilon,
+      per_training_delta = policy$per_training_delta,
+      dp_unit = policy$dp_unit,
+      patient_column = policy$patient_column,
+      unit_canonicalization = policy$unit_canonicalization,
+      adjacency = policy$adjacency,
+      composition_statement = paste(
+        "Finite-prefix composition is audit-only.",
+        "There is no finite lifetime epsilon/delta bound for an unlimited",
+        "sequence of semantically new releases.")))
+  }
   list(
     accountant = "bounded-geometric-basic-composition-v2",
+    accounting_mode = policy$accounting_mode,
     domain = policy$domain,
+    lifetime_bound = TRUE,
     total_epsilon = policy$total_epsilon,
     total_delta = policy$total_delta,
     decay = policy$decay,
@@ -1558,7 +1599,8 @@ flowerPrivacyBudgetDS <- function(handle_symbol = NULL, target_column = NULL) {
     patient_column = policy$patient_column,
     unit_canonicalization = policy$unit_canonicalization,
     adjacency = policy$adjacency,
-    nonblocking = TRUE)
+    nonblocking = TRUE,
+    release_availability_unbounded = FALSE)
 }
 
 # --- Internal metric parsing ---

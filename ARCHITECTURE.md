@@ -328,6 +328,9 @@ epsilon and delta remain session/profile options.
 
 | Option | Default | Meaning |
 |---|---:|---|
+| `dp_accounting_mode` | `lifetime-geometric` | Finite lifetime geometric accounting, or explicit `per-release-audit` with no exhaustion and no finite lifetime claim |
+| `dp_per_training_epsilon` | unset | Required fixed epsilon per training in `per-release-audit`, maximum `10` |
+| `dp_per_training_delta` | unset | Required fixed delta per training in `per-release-audit`, maximum `1e-3` |
 | `dp_total_epsilon` | `3` | Node/domain lifetime epsilon, maximum `10` |
 | `dp_total_delta` | `1e-5` | Node/domain lifetime delta, maximum `1e-3`; choose materially below `1 / protected_units` |
 | `dp_budget_decay` | `0.5` | Geometric `rho`, in `[0.5, 0.99]` |
@@ -379,6 +382,14 @@ options(
   default.dsflower.hook_enabled = FALSE
 )
 ```
+
+Availability-first deployments can instead configure
+`dp_accounting_mode="per-release-audit"` with explicit per-training epsilon and
+delta. Every semantically new training then remains available and the ledger
+reports conservative finite-prefix composition without enforcing exhaustion.
+That mode has a per-training DP guarantee, not one finite lifetime guarantee for
+unlimited new queries. Unlimited HPO/CV under a fixed privacy cost therefore
+requires reuse of one persisted DP synopsis followed only by post-processing.
 
 Changing a bound after the ledger has been initialized is rejected. Seed loss,
 malformation or an unsafe mode causes an automatic CSPRNG rotation and a new

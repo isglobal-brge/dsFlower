@@ -2,7 +2,7 @@
 % Please edit documentation in R/interface.R
 \name{flowerPrivacyBudgetDS}
 \alias{flowerPrivacyBudgetDS}
-\title{Query the server-owned lifetime privacy policy}
+\title{Query the server-owned privacy accounting policy}
 \usage{
 flowerPrivacyBudgetDS(handle_symbol = NULL, target_column = NULL)
 }

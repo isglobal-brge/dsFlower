@@ -1,16 +1,32 @@
-# Module: Persistent, non-blocking privacy accounting
+# Module: Persistent privacy accounting
 #
-# Each new run receives one term of a geometric privacy schedule.  Basic
-# adaptive composition then bounds every finite prefix (and the infinite
-# transcript) by the server-owned lifetime policy.  The schedule never rejects a
-# run because a budget was "exhausted": allocations decrease towards zero.  Once
-# a per-release allocation is too small to calibrate robustly, the runner emits a
-# public no-release record that the coordinator reports as unavailable; the exact
-# allocation remains recorded and no fallback is accepted as a trained model.
+# The default lifetime-geometric mode is the historical bounded accountant: each
+# new run receives one term of a convergent schedule.  Numerically unusable tail
+# allocations become public no-release records, preserving the finite lifetime
+# bound without silently weakening the mechanism.
+#
+# The explicit per-release-audit mode instead assigns one administrator-pinned
+# epsilon/delta pair to every new training reservation and never exhausts a
+# budget.  Its ledger reports basic composition for each finite prefix, but does
+# not claim a finite lifetime bound.  This distinction is unavoidable: standard
+# DP composition cannot provide both a finite lifetime epsilon/delta and
+# unlimited semantically new releases with a fixed positive privacy allocation.
 
 .privacy_allocation_slack <- 1 - 1e-12
 
 .privacy_policy <- function() {
+  accounting_mode <- .dsf_option(
+    "dp_accounting_mode", "lifetime-geometric")
+  if (length(accounting_mode) != 1L || is.na(accounting_mode)) {
+    stop("dsflower.dp_accounting_mode must be one scalar string.",
+         call. = FALSE)
+  }
+  accounting_mode <- tolower(trimws(as.character(accounting_mode)))
+  if (!accounting_mode %in% c("lifetime-geometric", "per-release-audit")) {
+    stop("dsflower.dp_accounting_mode must be exactly 'lifetime-geometric' ",
+         "or 'per-release-audit'.", call. = FALSE)
+  }
+
   total_epsilon <- suppressWarnings(as.numeric(
     .dsf_option("dp_total_epsilon", 3.0)))
   total_delta <- suppressWarnings(as.numeric(
@@ -58,6 +74,31 @@
          call. = FALSE)
   }
 
+  per_training_epsilon <- NULL
+  per_training_delta <- NULL
+  if (identical(accounting_mode, "per-release-audit")) {
+    per_training_epsilon <- suppressWarnings(as.numeric(
+      .dsf_option("dp_per_training_epsilon", NULL)))
+    per_training_delta <- suppressWarnings(as.numeric(
+      .dsf_option("dp_per_training_delta", NULL)))
+    if (length(per_training_epsilon) != 1L ||
+        !is.finite(per_training_epsilon) ||
+        per_training_epsilon < min_release_epsilon ||
+        per_training_epsilon > 10) {
+      stop("dsflower.dp_per_training_epsilon must be explicitly configured, ",
+           "finite, and in [dsflower.dp_min_release_epsilon, 10].",
+           call. = FALSE)
+    }
+    if (length(per_training_delta) != 1L ||
+        !is.finite(per_training_delta) ||
+        per_training_delta < min_release_delta ||
+        per_training_delta > 1e-3) {
+      stop("dsflower.dp_per_training_delta must be explicitly configured, ",
+           "finite, and in [dsflower.dp_min_release_delta, 1e-3].",
+           call. = FALSE)
+    }
+  }
+
   policy_text <- function(canonicalization) paste(
     "dsflower-privacy-v5", domain,
     format(total_epsilon, digits = 17, scientific = TRUE),
@@ -71,20 +112,41 @@
     adjacency,
     format(.privacy_allocation_slack, digits = 17, scientific = TRUE),
     sep = "|")
+  lifetime_policy_hash <- digest::digest(
+    policy_text(unit_policy$canonicalization),
+    algo = "sha256", serialize = FALSE)
+  policy_hash <- lifetime_policy_hash
+  if (identical(accounting_mode, "per-release-audit")) {
+    audit_text <- paste(
+      "dsflower-privacy-per-release-audit-v1", domain,
+      format(per_training_epsilon, digits = 17, scientific = TRUE),
+      format(per_training_delta, digits = 17, scientific = TRUE),
+      format(min_release_epsilon, digits = 17, scientific = TRUE),
+      format(min_release_delta, digits = 17, scientific = TRUE),
+      unit_policy$dp_unit,
+      unit_policy$patient_column %||% "<none>",
+      unit_policy$canonicalization,
+      adjacency,
+      sep = "|")
+    policy_hash <- digest::digest(
+      audit_text, algo = "sha256", serialize = FALSE)
+  }
+
   list(
+    accounting_mode = accounting_mode,
     domain = domain,
     total_epsilon = total_epsilon,
     total_delta = total_delta,
     decay = decay,
     min_release_epsilon = min_release_epsilon,
     min_release_delta = min_release_delta,
+    per_training_epsilon = per_training_epsilon,
+    per_training_delta = per_training_delta,
     dp_unit = unit_policy$dp_unit,
     patient_column = unit_policy$patient_column,
     unit_canonicalization = unit_policy$canonicalization,
     adjacency = adjacency,
-    policy_hash = digest::digest(
-      policy_text(unit_policy$canonicalization),
-      algo = "sha256", serialize = FALSE),
+    policy_hash = policy_hash,
     legacy_v1_policy_hash = digest::digest(
       policy_text("trim-utf8-v1"), algo = "sha256", serialize = FALSE)
   )
@@ -562,6 +624,7 @@ flowerPrivacyBootstrap <- function() {
 # equivalence-class partitions must not be mixed without an offline roster audit.
 .migrate_v1_policy_hash <- function(con, policy, stored_hash) {
   if (identical(as.character(stored_hash), policy$policy_hash)) return(TRUE)
+  if (!identical(policy$accounting_mode, "lifetime-geometric")) return(FALSE)
   if (!identical(as.character(stored_hash), policy$legacy_v1_policy_hash) ||
       !identical(policy$unit_canonicalization, "trim-utf8-v2")) {
     return(FALSE)
@@ -630,7 +693,33 @@ flowerPrivacyBootstrap <- function() {
          policy, epsilon, delta, max_releases))
 }
 
-#' Atomically reserve the next lifetime allocation for a run
+.privacy_per_training_allocation <- function(policy, max_releases = 1L) {
+  epsilon <- policy$per_training_epsilon
+  delta <- policy$per_training_delta
+  if (!.privacy_release_is_viable(policy, epsilon, delta, max_releases)) {
+    stop(
+      "The configured per-training epsilon/delta is below the numerical ",
+      "minimum after division across privacy max_releases. Increase the ",
+      "administrator-pinned per-training allocation or reduce the public ",
+      "release horizon.", call. = FALSE)
+  }
+  list(epsilon = epsilon, delta = delta, release_enabled = TRUE)
+}
+
+.privacy_run_allocation <- function(policy, index, max_releases = 1L) {
+  if (identical(policy$accounting_mode, "per-release-audit")) {
+    return(.privacy_per_training_allocation(policy, max_releases))
+  }
+  .privacy_geometric_allocation(policy, index, max_releases)
+}
+
+.privacy_reservation_is_enabled <- function(policy, epsilon, delta,
+                                            max_releases = 1L) {
+  if (identical(policy$accounting_mode, "per-release-audit")) return(TRUE)
+  .privacy_release_is_viable(policy, epsilon, delta, max_releases)
+}
+
+#' Atomically reserve the next configured privacy allocation for a run
 #' @keywords internal
 .reserve_privacy_run <- function(run_token, max_releases) {
   if (length(run_token) != 1L || is.na(run_token)) {
@@ -649,6 +738,12 @@ flowerPrivacyBootstrap <- function() {
   }
 
   policy <- .privacy_policy()
+  # In audit-only mode this validates the complete public calibration contract
+  # before resolving or creating any persistent state, and therefore before a
+  # caller may proceed to private data access.
+  if (identical(policy$accounting_mode, "per-release-audit")) {
+    .privacy_per_training_allocation(policy, max_releases)
+  }
   path <- .privacy_ledger_path()
   con <- .privacy_db_connect(path)
   on.exit(DBI::dbDisconnect(con), add = TRUE)
@@ -692,10 +787,16 @@ flowerPrivacyBootstrap <- function() {
       stop("Existing privacy reservation has a different release horizon.",
            call. = FALSE)
     }
-    DBI::dbExecute(con, "COMMIT")
-    committed <- TRUE
     eps <- as.numeric(existing$epsilon[[1]])
     del <- as.numeric(existing$delta[[1]])
+    if (identical(policy$accounting_mode, "per-release-audit") &&
+        (!identical(eps, policy$per_training_epsilon) ||
+         !identical(del, policy$per_training_delta))) {
+      stop("Existing audit-only reservation differs from the configured ",
+           "per-training epsilon/delta.", call. = FALSE)
+    }
+    DBI::dbExecute(con, "COMMIT")
+    committed <- TRUE
     return(list(
       domain = policy$domain,
       allocation_index = as.numeric(existing$allocation_index[[1]]),
@@ -704,7 +805,10 @@ flowerPrivacyBootstrap <- function() {
       patient_column = policy$patient_column,
       unit_canonicalization = policy$unit_canonicalization,
       adjacency = policy$adjacency,
-      release_enabled = .privacy_release_is_viable(
+      accounting_mode = policy$accounting_mode,
+      lifetime_bound = identical(
+        policy$accounting_mode, "lifetime-geometric"),
+      release_enabled = .privacy_reservation_is_enabled(
         policy, eps, del, max_releases),
       run_token = run_token, ledger_path = path, idempotent = TRUE))
   }
@@ -715,12 +819,24 @@ flowerPrivacyBootstrap <- function() {
           "FROM privacy_policy WHERE domain = ?"),
     params = list(policy$domain))
   if (nrow(stored) == 0L) {
+    stored_epsilon <- if (identical(
+        policy$accounting_mode, "per-release-audit")) {
+      policy$per_training_epsilon
+    } else {
+      policy$total_epsilon
+    }
+    stored_delta <- if (identical(
+        policy$accounting_mode, "per-release-audit")) {
+      policy$per_training_delta
+    } else {
+      policy$total_delta
+    }
     DBI::dbExecute(
       con,
       paste("INSERT INTO privacy_policy",
             "(domain,total_epsilon,total_delta,decay,policy_hash,next_index)",
             "VALUES (?,?,?,?,?,1)"),
-      params = list(policy$domain, policy$total_epsilon, policy$total_delta,
+      params = list(policy$domain, stored_epsilon, stored_delta,
                     policy$decay, policy$policy_hash))
     index <- 1
   } else {
@@ -737,7 +853,7 @@ flowerPrivacyBootstrap <- function() {
     }
   }
 
-  allocation <- .privacy_geometric_allocation(policy, index, max_releases)
+  allocation <- .privacy_run_allocation(policy, index, max_releases)
   DBI::dbExecute(
     con,
     paste("INSERT INTO privacy_reservations",
@@ -754,6 +870,9 @@ flowerPrivacyBootstrap <- function() {
 
   c(allocation, list(
     domain = policy$domain, allocation_index = index,
+    accounting_mode = policy$accounting_mode,
+    lifetime_bound = identical(
+      policy$accounting_mode, "lifetime-geometric"),
     dp_unit = policy$dp_unit, patient_column = policy$patient_column,
     unit_canonicalization = policy$unit_canonicalization,
     adjacency = policy$adjacency,
@@ -771,11 +890,52 @@ flowerPrivacyBootstrap <- function() {
     "SELECT next_index FROM privacy_policy WHERE domain = ?",
     params = list(policy$domain))
   n <- if (nrow(row)) as.numeric(row$next_index[[1]]) - 1 else 0
+  if (identical(policy$accounting_mode, "per-release-audit")) {
+    composition <- DBI::dbGetQuery(
+      con,
+      paste(
+        "SELECT COUNT(*) AS reservations,",
+        "COALESCE(SUM(epsilon), 0) AS epsilon,",
+        "COALESCE(SUM(delta), 0) AS delta,",
+        "COALESCE(SUM(claimed_releases), 0) AS claimed_releases",
+        "FROM privacy_reservations WHERE domain = ?"),
+      params = list(policy$domain))
+    return(list(
+      accountant = "audit-only-basic-composition-v1",
+      accounting_mode = policy$accounting_mode,
+      domain = policy$domain,
+      lifetime_bound = FALSE,
+      nonblocking = TRUE,
+      release_availability_unbounded = TRUE,
+      guarantee_scope = "per-training-release",
+      per_training_epsilon = policy$per_training_epsilon,
+      per_training_delta = policy$per_training_delta,
+      dp_unit = policy$dp_unit,
+      patient_column = policy$patient_column,
+      unit_canonicalization = policy$unit_canonicalization,
+      adjacency = policy$adjacency,
+      allocations = as.numeric(composition$reservations[[1L]]),
+      claimed_releases = as.numeric(
+        composition$claimed_releases[[1L]]),
+      allocated_epsilon = as.numeric(composition$epsilon[[1L]]),
+      allocated_delta = as.numeric(composition$delta[[1L]]),
+      remaining_epsilon = NA_real_,
+      remaining_delta = NA_real_,
+      composition_statement = paste(
+        "Finite-prefix basic composition is reported for audit only.",
+        "Unlimited semantically new releases with a fixed positive",
+        "allocation do not have a finite lifetime epsilon/delta bound.")))
+  }
   allocated_weight <- if (n <= 0) 0 else
     .privacy_allocation_slack * (1 - policy$decay^n)
   list(
     accountant = "bounded-geometric-basic-composition-v2",
+    accounting_mode = policy$accounting_mode,
     domain = policy$domain,
+    lifetime_bound = TRUE,
+    nonblocking = TRUE,
+    release_availability_unbounded = FALSE,
+    guarantee_scope = "node-domain-lifetime",
     total_epsilon = policy$total_epsilon,
     total_delta = policy$total_delta,
     decay = policy$decay,
