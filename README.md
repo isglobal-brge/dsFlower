@@ -6,18 +6,18 @@ by the data custodian. It is installed on each Opal/Rock node and pairs with the
 researcher-side
 [`dsFlowerClient`](https://github.com/isglobal-brge/dsFlowerClient) package.
 
-The node, its persistent privacy accountant and its installed canonical runner
-are trusted. The researcher, submitted configuration, Flower coordinator and
+The node, its custodial root secret and its installed canonical runner are
+trusted. The researcher, submitted configuration, Flower coordinator and
 uploaded code are not. The supported privacy contract is therefore deliberately
 narrow: every numeric model update released by a SuperNode is produced by the
-node-installed, hash-pinned runner under a server-owned `(epsilon, delta)`
-allocation. `dsFlower` is not an unrestricted remote Python executor.
+node-installed, hash-pinned runner under a server-owned per-training
+`(epsilon, delta)` contract. `dsFlower` is not an unrestricted remote Python executor.
 
 ## Package roles
 
 | Package | Installed at | Responsibility |
 |---|---|---|
-| `dsFlower` | Data-owning Opal/Rock node | Validate and stage local data, reserve privacy allocations, enforce the selected DP mechanism, run a Flower SuperNode and minimize DataSHIELD egress. |
+| `dsFlower` | Data-owning Opal/Rock node | Validate and stage local data, bind the per-training privacy contract, enforce the selected DP mechanism, run a Flower SuperNode and minimize DataSHIELD egress. |
 | `dsFlowerClient` | Researcher workstation | Create declarative requests, verify runner compatibility, operate the SuperLink and coordinate cleanup. |
 
 Raw rows, images, masks and patient identifiers remain on the data node. Model
@@ -42,7 +42,7 @@ canonical runner.
 | Request | Enforced node-side behavior |
 |---|---|
 | Declarative neural/vision specification | Opacus DP-SGD with per-example or, when a server-selected patient identifier exists, per-patient clipping and noise. |
-| HookApp (legacy name: Tier2) | Complete-update clipping and conservatively RDP-calibrated Gaussian output perturbation; optional fixed-block sample-and-aggregate only inside the required sandbox. |
+| HookApp | Complete-update clipping and conservatively RDP-calibrated Gaussian output perturbation; optional fixed-block sample-and-aggregate only inside the required sandbox. |
 | Private model validation | One fixed Gaussian-noised vector of bounded per-unit sufficient statistics; only pooled metrics are post-processed by the ServerApp. |
 
 Declarative specifications are data, not researcher code. They provide the
@@ -70,8 +70,7 @@ the run is reported as `available=false` without a model artifact. A child crash
 timeout or malformed result inside the sandbox becomes a zero delta and still
 receives the same Gaussian output mechanism. A failure in the trusted runtime
 after private execution starts is also reported only as unavailable, without its
-cause or fallback being accepted as a trained model. `ds.flower.tier2.run()`
-remains only as a deprecated name for the HookApp API.
+cause or fallback being accepted as a trained model.
 
 The Hook timing envelope is defense in depth, not a formal constant-time
 guarantee: cleanup, process availability and storage behavior remain outside the
@@ -100,50 +99,15 @@ If any expected node does not provide the fixed private release, the pooled
 artifact reports `available=false` and omits metrics. It never substitutes exact
 or zero-filled metrics, and this does not introduce a query-count lockout.
 
-## Lifetime accounting without a query-count block
+## Per-training privacy
 
-Privacy is server-authoritative. The client cannot set epsilon, delta, clipping,
-the accountant domain, release index or HookApp controls. For new run `n`, the
-persistent SQLite accountant reserves:
-
-```text
-w_n       = s (1 - rho) rho^(n - 1),  s = 1 - 10^-12
-epsilon_n = epsilon_total w_n
-delta_n   = delta_total w_n
-```
-
-The weights sum to less than one (the tiny slack avoids floating-point
-overshoot), so basic adaptive composition bounds every finite prefix
-and the infinite transcript by `(epsilon_total, delta_total)`. Reservations are
-transactional and happen in `flowerPrepareRunDS()` before private staging or
-SuperNode execution. Failed runs are not refunded. Exact
-protocol retries never trigger a second private release: the cached response is
-reused when available; otherwise the replay is reported as unavailable and the
-incoming public model is never accepted as a newly trained release.
-
-The accountant does not reject a request merely because a query counter reached
-a cap. There is, however, no mechanism that can combine a finite lifetime budget,
-infinitely many *informative* queries and fixed utility: scheduled allocations
-must tend to zero. When an allocation is below the node's numerical safety
-threshold, the run completes with an unchanged, data-independent model instead
-of attempting an unstable mechanism; the coordinator reports
-`available=false` and does not save that fallback as a trained model. A positive
-epsilon floor would make the lifetime privacy loss diverge and is therefore not
-offered.
-
-The default accounting domain is the whole node. Dataset renaming, subsetting or
-small data changes cannot reset it. Multiple domains are disabled by default and
-are sound only when a custodian has established that their protected populations
-are disjoint. SQLite is a single-host accountant; replicas protecting the same
-population require one shared transactional backend and anti-rollback controls.
-The ledger file must be owned by the Rock process with mode `0600`; its parent
-directory must have the same owner and no group/world write permission. The
-release runner also compares the directory and database device/inode before and
-after `sqlite3.connect()`. Given a trusted enclosing mount path, these checks
-protect the database and SQLite sidecar entries from ordinary cross-user
-replacement, but they are not anti-rollback storage and cannot exclude a
-malicious process running as the same UID swapping a path out and back between
-checks.
+Privacy is server-authoritative. The client cannot set epsilon, delta, clipping
+or HookApp controls. The custodian pins one positive epsilon/delta pair for each
+training, and its accountant composes that contract across the training's own
+rounds. There is no historical database, quota or resource-specific balance.
+Distinct trainings are independent releases and compose in the standard way
+when an analyst chooses to reason about them together. HPO over one released DP
+model or synopsis is ordinary post-processing.
 
 The guarantee is accounted independently at each node. If one person can occur
 at `m` observed nodes, their federation-wide guarantee composes across those
@@ -157,16 +121,16 @@ configured patient.
 This protects the values contributed by that unit; it is not an unbounded
 add/remove membership guarantee for a changing number of privacy units.
 
-## Deterministic, release-scoped randomness
+## Deterministic, semantic-scoped randomness
 
 Determinism prevents averaging only for an exact replay. Reusing one fixed noise
 vector for distinct or adaptively related queries is unsafe because correlated
-answers can cancel it. `dsFlower` therefore combines replay memoization with
-lifetime composition and derives fresh deterministic randomness per release:
+answers can cancel it. `dsFlower` derives deterministic randomness from a
+canonical, mechanism-bound semantic identity:
 
 ```text
-release_key = HMAC-SHA256(node_secret,
-                          protocol_version || release_id)
+release_key = HMAC-SHA256(noise_root,
+                          protocol_version || mechanism || semantic_id)
 subkey      = HMAC-SHA256(release_key, mechanism_axis)
 ```
 
@@ -174,26 +138,35 @@ The node secret is 32 bytes from the operating-system CSPRNG, created at runtime
 stored outside staging with mode `0600` and never exposed to submitted code. Its
 file must be owned by the Rock service UID; its real parent directory may be
 owned by that UID or root, but must not be writable by group or other users.
-The parent is checked before and after the key is opened. When both state paths
-are explicitly provided as process environment variables, the supplied Rock
-image bootstraps after runtime mounts are ready and before opening its port.
+The parent is checked before and after the key is opened. When its path is
+explicitly provided as a process environment variable, the supplied Rock image
+bootstraps after runtime mounts are ready and before opening its port.
 Otherwise it deliberately waits for the first `flowerInitDS()`, when DataSHIELD
 profile options exist. Neither `configure` nor `.onLoad()` creates privacy state,
-and both Docker builds assert that no seed or ledger entered the image. A
+and both Docker builds assert that no seed entered the image. A
 bootstrap storage error does not take Rock down; every private entry point
 retries and remains fail-closed until the mount is repaired.
 
 A missing, malformed or permissively-mode'd regular key owned by the service UID
-is atomically replaced from fresh OS entropy. The ledger records an append-only
-key epoch/fingerprint without advancing the privacy allocation counter. A
-symlink, foreign-owned file or unsafe parent is never followed or overwritten.
-Existing exact retries still use their cached bytes or a public no-op, so an old
-key is not needed to recompute a release. The secret is deliberately independent
+is atomically replaced from fresh OS entropy. A symlink, foreign-owned file or
+unsafe parent is never followed or overwritten. Rotation starts an independent
+noise domain and never blocks a query. The secret is deliberately independent
 of R's mutable RNG and `datashield.seed`. DP
 Gaussian noise, Poisson sampling and HookApp partitioning use separate
 ChaCha20-backed streams. Data-independent Torch initialization/dropout uses a
 separate HMAC-derived seed in the framework PRNG; it is not used as the DP noise
-source. Configuration and private data are deliberately absent from key derivation.
+source. The semantic identity binds the effective public configuration, policy,
+round, incoming public arrays, transformed or patient-pooled private tensors and
+a runtime fingerprint (runner bytes, dependency versions and selected backend).
+Paths, run tokens, message IDs and timestamps are deliberately excluded. The
+private-input digest never leaves the node.
+
+The trusted built-in tracks request strict deterministic Torch kernels. HookApps
+receive deterministic Python, NumPy and Torch seeds, and their final noise key is
+also bound to the validated clipped update. Arbitrary native user code cannot be
+certified deterministic by a static scanner, so exact stateless retry stickiness
+for HookApps applies only to deterministic HookApps. Hook execution is disabled
+by default and remains the deliberately weaker, custodian-gated extension path.
 
 The current Gaussian sampler is a hardened Box--Muller construction over
 IEEE-754 values. ChaCha20 makes its finite random choices unpredictable, but it
@@ -201,7 +174,7 @@ does not turn floating-point output into an exact continuous Gaussian. The
 implemented guarantee is therefore the documented computational/practical DP
 contract, not a claim of a formally verified finite-precision mechanism. Moving
 to a verified discrete-Gaussian sampler would require a new mechanism/accountant
-ABI and a privacy-policy migration, rather than a drop-in RNG change.
+ABI and a reviewed privacy-contract change, rather than a drop-in RNG change.
 
 DataSHIELD does not define a portable, connector-level confidential seed for
 Opal or Armadillo. Current Opal releases inject a short `datashield.seed` R
@@ -259,50 +232,35 @@ conservative (it can protect several unidentified subjects together and reduce
 utility). A meaningful per-person interpretation still requires the custodian to
 provide a complete, stable identifier roster across releases.
 
-`flowerPrepareRunDS()` reserves the next non-blocking geometric allocation before
-it reads private table/file contents. Failed attempts are charged and never
-refunded; `flowerEnsureSuperNodeDS()` only confirms the same idempotent
-reservation. This ordering is defense in depth, not a claim that charging an
-exception would make it DP: private-value validation is therefore totalised as
-described above rather than returned as a success/error bit.
+`flowerPrepareRunDS()` validates and pins the complete per-training contract
+before it reads private table/file contents. `flowerEnsureSuperNodeDS()` checks
+the same pins again before launching the runner. Private-value preprocessing is
+totalised rather than returned as a success/error bit.
 
 Node-side training logs and metrics are not returned through DataSHIELD, and
 Flower aggregation weights are fixed rather than revealing cohort size. The
-legacy `flowerLogDS()`, `flowerMetricsDS()` and `flowerFeatureStatsDS()` symbols
-remain callable for compatibility but return empty/disabled responses. The
-global model is the intended DP release; DP bounds an individual's influence on
-its distribution, not the possibility of every form of model inversion.
+server exposes no log, metric or exact feature-statistics endpoint. The global
+model is the intended DP release; DP bounds an individual's influence on its
+distribution, not the possibility of every form of model inversion.
 
 ## Custodian options
 
 Options use the `dsflower.*` prefix, with the standard
 `default.dsflower.*` DataSHIELD fallback.
 
-The supplied Rock image performs a pre-service bootstrap only when a deployment
-explicitly provides both `DSFLOWER_NODE_SECRET_FILE` and
-`DSFLOWER_PRIVACY_LEDGER_PATH`. Without both, it waits for the first session so
-Opal/Armadillo profile R options retain their historical precedence. If an ENV
-and R option both name a ledger, they must resolve to the same path; a conflict
-fails closed instead of silently selecting different accounting state. For the
-recoverable node key, `DSFLOWER_NODE_SECRET_FILE` deliberately takes precedence
-over the R option, so a stale option never blocks safe regeneration. Epsilon and
-all other policy controls remain normal DataSHIELD profile options.
+The supplied Rock image performs a pre-service key bootstrap only when a
+deployment explicitly provides `DSFLOWER_NODE_SECRET_FILE`. Otherwise it waits
+for the first session so Opal/Armadillo profile R options retain their normal
+precedence. The environment variable takes precedence over the R option, so a
+stale option cannot block safe regeneration. Epsilon and all other policy
+controls remain normal DataSHIELD profile options.
 
 | Option suffix | Default | Meaning |
 |---|---:|---|
-| `dp_accounting_mode` | `lifetime-geometric` | `lifetime-geometric` preserves a finite node/domain bound but its numerical tail eventually has no useful release; `per-release-audit` never exhausts, reports finite-prefix composition, and provides only a per-training guarantee. |
-| `dp_per_training_epsilon` | unset | Required administrator-pinned epsilon for every training in `per-release-audit` mode; maximum `10`. |
-| `dp_per_training_delta` | unset | Required administrator-pinned delta for every training in `per-release-audit` mode; maximum `1e-3`. |
-| `dp_total_epsilon` | `3` | Lifetime epsilon for the accounting domain; hard maximum `10`. |
-| `dp_total_delta` | `1e-5` | Lifetime delta; hard maximum `1e-3`. Choose it materially below `1 / protected_units` for the domain. |
-| `dp_budget_decay` | `0.5` | Geometric `rho`, constrained to `[0.5, 0.99]`. |
-| `dp_min_release_epsilon` | `1e-6` | Per-message numerical viability threshold and hard safety minimum; never a positive allocation floor. |
-| `dp_min_release_delta` | `1e-12` | Per-message numerical viability threshold and hard safety minimum. |
-| `dp_privacy_domain` | `node` | Persistent accountant domain. |
-| `dp_unit` | `row` | Lifetime adjacency unit: exactly `row` or `patient`. |
+| `dp_per_training_epsilon` | `1` | Administrator-pinned epsilon for every training release; maximum `10`. |
+| `dp_per_training_delta` | `1e-6` | Administrator-pinned delta for every training release; maximum `1e-3`. |
+| `dp_unit` | `row` | Adjacency unit: exactly `row` or `patient`. |
 | `patient_column` | unset | Required explicit stable identifier when `dp_unit="patient"`; never auto-detected. |
-| `dp_allow_multiple_domains` | `FALSE` | Opt-in reserved for demonstrably disjoint populations. |
-| `privacy_ledger_path` | persistent node path | SQLite ledger; R option keeps precedence and a conflicting runtime ENV is rejected. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |
 | `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; `DSFLOWER_NODE_SECRET_FILE` takes precedence when a deployment selects a secret-manager path. |
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |
@@ -311,7 +269,6 @@ all other policy controls remain normal DataSHIELD profile options.
 | `app_spool_ttl_seconds` | `86400` | Incomplete-upload retention; installed catalogue apps persist until explicit deletion. Locked operations and staging-referenced apps are skipped by GC. |
 | `tunnel_chunk_bytes` | `524288` | Maximum decoded payload in one DSI tunnel exchange; constrained to 16--512 KiB and negotiated with the client. The upper bound stays below DSI's expression-parser limit; larger streams are carried as multiple exact chunks. |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; at least eight chunks and at most 64 GiB. TCP backpressure applies when full. |
-| `tunnel_request_max_bytes` | `67108864` | Maximum encoded fan-out request accepted before JSON decoding; constrained to 1--256 MiB. |
 | `tunnel_loss_tolerance` | `180` | Seconds without a relay heartbeat before the node forwarder exits; constrained to 5--86400. |
 | `hook_enabled` | `FALSE` | Allow HookApp execution, subject to every other gate. |
 | `hook_sandbox_attested` | `FALSE` | Custodian attestation of the Bubblewrap boundary. |
@@ -323,7 +280,6 @@ all other policy controls remain normal DataSHIELD profile options.
 | `dp_egress_memory_mb` | `8192` | Hook child address-space limit in MiB (`512` to `131072`). |
 | `dp_egress_file_mb` | `1024` | Maximum size of any Hook child output file in MiB (`16` to `16384`). |
 | `dp_egress_processes` | `128` | Hook child process/thread limit (`1` to `1024`, where supported). |
-| `expose_privacy_status` | `FALSE` | Expose allocation count/status to clients. |
 | `allow_untrusted_coordinator` | `FALSE` | Permit a coordinator to observe already-private per-node updates. |
 
 `hook_resource_isolation_attested=TRUE` is an operator assertion, not an
@@ -373,48 +329,18 @@ Example:
 
 ```r
 options(
-  default.dsflower.dp_total_epsilon = 3,
-  default.dsflower.dp_total_delta = 1e-5,
-  default.dsflower.dp_budget_decay = 0.5,
+  default.dsflower.dp_per_training_epsilon = 1,
+  default.dsflower.dp_per_training_delta = 1e-6,
   default.dsflower.dp_unit = "row",
-  default.dsflower.privacy_ledger_path = "/var/lib/dsflower/privacy/ledger.sqlite",
   default.dsflower.node_secret_path = "/var/lib/dsflower/privacy/noise_root",
   default.dsflower.app_spool_root = "/var/lib/dsflower/appstore",
   default.dsflower.hook_enabled = FALSE
 )
 ```
 
-For deployments that prefer useful releases without a query-count cutoff, use
-the explicit audit-only policy instead:
-
-```r
-options(
-  default.dsflower.dp_accounting_mode = "per-release-audit",
-  default.dsflower.dp_per_training_epsilon = 1,
-  default.dsflower.dp_per_training_delta = 1e-6
-)
-```
-
-This is formal DP for each training release, and identical semantic replays do
-not add another release. It deliberately does not claim one finite lifetime
-epsilon/delta for an unlimited sequence of new, adaptive trainings: standard
-DP composition makes that combination impossible. Unlimited HPO/CV without
-further composition must operate as post-processing of one persisted DP
-synopsis.
-
-Policy values are bound when a domain is first initialized; incompatible changes
-then fail closed. Losing or corrupting the seed causes a recorded runtime
-rotation and does not reset accounting. Deleting, rolling back or cloning the
-ledger can invalidate the declared lifetime guarantee and must be prevented
-operationally.
-The one-way `trim-utf8-v1` to `trim-utf8-v2` identifier migration preserves row
-accounting. In patient mode it proceeds only when the ledger has no legacy
-claims, and atomically exhausts every outstanding legacy reservation before
-binding v2; any claimed legacy release fails closed and requires an offline
-roster audit.
-Pre-unit legacy ledgers are intentionally not migrated automatically. Their
-historical adjacency cannot be inferred safely from stored state; rotate them
-only through a separately audited, administrator-attested migration.
+The epsilon/delta pair describes one training. Its rounds are calibrated as one
+mechanism; later trainings do not consume a stored balance. HPO/CV over one
+released DP synopsis or model is post-processing.
 
 The Python privacy runtime is constrained to the audited compatibility families:
 Flower 1.31.x, Torch 2.x, Opacus 1.x and torchvision 0.x. Provisioning writes the
@@ -436,18 +362,17 @@ base. If no `uv` is installed, dsFlower does not execute a mutable remote
 installer or a `latest` URL. Automatic Python bootstrap requires both an exact
 official release tag in `DSFLOWER_UV_VERSION` and its platform archive digest
 in `DSFLOWER_UV_SHA256`; a mismatch fails before extraction. For containers,
-persist `/var/lib/dsflower/privacy/` (ledger plus the runtime-generated seed) and
-the app-store directory. A secret-manager file may instead be selected through
+persist `/var/lib/dsflower/privacy/noise_root` and the app-store directory. A
+secret-manager file may instead be selected through
 `DSFLOWER_NODE_SECRET_FILE`. Do not mount all of `/var/lib/dsflower`, because
 that path also contains the baked venvs.
 
-The deterministic CSPRNG is keyed by the dedicated node secret and a unique
-ledger release identity. This prevents averaging exact retries and stream reuse,
+The deterministic CSPRNG is keyed by the dedicated node secret and a canonical
+semantic release identity. This prevents averaging exact retries and stream reuse,
 but is a computational guarantee: disclosure of the persistent key can recreate
-historical streams when their release identities are known. Production nodes
-should keep it in a KMS/HSM-backed secret lifecycle, version keys, retire old
-versions after retry windows, and retain cached replies rather than recomputing
-old releases.
+streams for known semantic identities. Production nodes should keep it in a
+KMS/HSM-backed secret lifecycle. Preserving the same root preserves deterministic
+recomputation; rotating it intentionally starts a new randomness domain.
 
 ## Server-side lifecycle
 
@@ -455,10 +380,10 @@ old releases.
 |---|---|
 | Connectivity/capabilities | `flowerPingDS`, `flowerCheckConnectivityDS`, `flowerGetCapabilitiesDS` |
 | Handle lifecycle | `flowerInitDS`, `flowerDestroyDS` |
-| Staging, validation and reservation | `flowerPrepareRunDS` |
+| Staging and validation | `flowerPrepareRunDS` |
 | SuperNode lifecycle | `flowerEnsureSuperNodeDS`, `flowerCleanupRunDS`, `flowerStatusDS` |
 | App integrity | `flowerAppPushDS`, `flowerAppInstallDS`, `flowerAppDeleteDS`, `flowerTier2PinDS` |
-| Privacy status/compatibility egress | `flowerPrivacyBudgetDS`, `flowerMetricsDS`, `flowerLogDS`, `flowerFeatureStatsDS` |
+| Privacy policy | `flowerPrivacyPolicyDS` |
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the precise trust boundary,
 mechanism contracts, deployment requirements and residual limitations.

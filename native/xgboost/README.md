@@ -41,10 +41,11 @@ Because every Update remains unconditionally rejected, ABI v2 records the
 requested `max_trees` but does not claim to count successful rounds yet.  That
 counter is a required part of the later training patch, before activation.
 
-The v2 `noise_key` is specific to the v0 scaffold mechanism.  It does not bind
-the sampler or entropy architecture of a future formal mechanism; a later ABI
-may replace it with separately reviewed mechanism/sampler pins and fresh
-entropy.
+The server derives the v2 `noise_key` from its custodial root and the complete
+canonical semantic training identity. Every sampler and mechanism coordinate
+must consume only a deterministic, domain-separated PRF stream from that key;
+operating-system randomness and persisted reply artifacts are not valid
+alternatives.
 
 Consequently, this scaffold is deliberately not connected to dsFlower's public
 capabilities or runner.  `grow_dsflower_dp_hist` must not be advertised or used
@@ -86,6 +87,7 @@ its pinned commit tree.
 The next patch must implement patient contribution bounding and add noise to
 gradient/hessian histograms before *any* split, topology, leaf, metric, log, or
 model artifact can depend on private statistics.  It also needs a formal
-accountant, domain-separated CSPRNG derivation, replay tests, adversarial egress
-tests, and a written privacy proof.  Until those conditions are independently
-reviewed, the unconditional training rejection is a security invariant.
+per-training accountant, deterministic domain-separated PRF derivation, replay
+tests, adversarial egress tests, and a written privacy proof.  Until those
+conditions are independently reviewed, the unconditional training rejection
+is a security invariant.

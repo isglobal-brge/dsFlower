@@ -11,7 +11,7 @@ A named list with \code{dp_unit}, \code{patient_column}, and the
   identifier canonicalisation version.
 }
 \description{
-The adjacency relation is a lifetime policy, not a per-run heuristic.
+The adjacency relation is a server-owned policy, not an analyst heuristic.
 \code{dsflower.dp_unit} defaults to \code{"row"}.  Selecting
 \code{"patient"} requires one explicit, stable
 \code{dsflower.patient_column}; no column-name auto-detection or row fallback

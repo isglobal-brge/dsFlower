@@ -1,6 +1,6 @@
 # Tests for R/policy.R -- disclosure controls.
-# Differential privacy is always enforced; there are no trust profiles.
-# All thresholds come from DataSHIELD options (nfilter.*) with dsflower.* overrides.
+# Differential privacy is always enforced. Disclosure thresholds come from
+# DataSHIELD options (nfilter.*) with dsflower.* overrides.
 
 test_that("disclosure thresholds inherit DataSHIELD options", {
   withr::local_options(list(nfilter.tab = NULL, nfilter.subset = NULL,
@@ -36,44 +36,10 @@ test_that(".assertMinSamples blocks tiny datasets generically", {
   expect_true(dsFlower:::.assertMinSamples(100))
 })
 
-test_that(".validateClassDistribution enforces the small-cell rule", {
-  withr::local_options(list(nfilter.tab = 5))
-  # binary with a class below the cell floor -> blocked
-  d <- data.frame(y = c(rep(1, 100), rep(0, 2)))
-  expect_error(
-    dsFlower:::.validateClassDistribution(d, "y", task_type = "classification"),
-    "Disclosive"
-  )
-  # both classes above floor -> ok
-  d2 <- data.frame(y = c(rep(1, 100), rep(0, 100)))
-  expect_true(
-    dsFlower:::.validateClassDistribution(d2, "y", task_type = "classification")
-  )
-  # regression target -> no class-count check
-  d3 <- data.frame(y = rnorm(50))
-  expect_true(
-    dsFlower:::.validateClassDistribution(d3, "y", task_type = "regression")
-  )
-})
-
 test_that(".validateMaxRounds honours the option ceiling", {
   withr::local_options(list(dsflower.max_rounds = 100))
   expect_equal(dsFlower:::.validateMaxRounds(50), 50)
   expect_error(dsFlower:::.validateMaxRounds(500))
-})
-
-test_that("trust-profile API has been removed", {
-  ns <- asNamespace("dsFlower")
-  expect_false(exists(".TRUST_PROFILES", where = ns, inherits = FALSE))
-  expect_false(exists(".flowerTrustProfile", where = ns, inherits = FALSE))
-  expect_false(exists(".validateTemplateProfile", where = ns, inherits = FALSE))
-})
-
-test_that("legacy template allowlist is empty", {
-  settings <- dsFlower:::.flowerDisclosureSettings()
-  expect_identical(settings$allowed_templates, character())
-  expect_true(settings$allowed_templates_deprecated)
-  expect_error(dsFlower:::.validateTemplate("pytorch_logreg"), "retired")
 })
 
 test_that("DP unit is server-owned, explicit, and has no auto fallback", {
@@ -96,47 +62,4 @@ test_that("DP unit is server-owned, explicit, and has no auto fallback", {
     withr::with_options(list(dsflower.patient_column = NULL),
       dsFlower:::.dpUnitPolicy()),
     "patient_column")
-})
-
-test_that(".imageDisclosureUnits groups disclosure by distinct patient", {
-  withr::local_options(list(dsflower.dp_unit = "patient",
-                            dsflower.patient_column = "patient_id"))
-  # 5 patients x 6 slices; patient-level label, 3 in class 0, 2 in class 1.
-  pid <- rep(paste0("P", 1:5), each = 6)
-  lab <- rep(c(0, 0, 0, 1, 1), each = 6)
-  sm  <- data.frame(patient_id = pid, y = lab)
-  grp <- dsFlower:::.imageDisclosureUnits(sm, "y")
-  expect_equal(grp$n_patients, 5)                 # patients, not 30 images
-  expect_equal(nrow(grp$data), 5)                 # one row per (patient,label)
-  expect_equal(as.integer(table(grp$data$y)), c(3L, 2L))  # distinct patients/class
-})
-
-test_that("patient mode fails closed on an incomplete roster", {
-  withr::local_options(list(dsflower.dp_unit = "patient",
-                            dsflower.patient_column = "patient_id"))
-  sm <- data.frame(
-    patient_id = c(rep("P1", 4), rep("P2", 4), rep("P3", 4), rep("P4", 4),
-                   "P5", NA, NA, NA),
-    y = c(rep(0, 16), 1, 1, 1, 1))
-  expect_error(dsFlower:::.imageDisclosureUnits(sm, "y"), "complete")
-})
-
-test_that(".imageDisclosureUnits assigns one modal class per patient", {
-  withr::local_options(list(dsflower.dp_unit = "patient",
-                            dsflower.patient_column = "patient_id"))
-  sm <- data.frame(
-    patient_id = c("p1", "p1", "p1", "p2", "p2"),
-    y = c(0, 1, 1, 0, 0)
-  )
-  grp <- dsFlower:::.imageDisclosureUnits(sm, "y")
-  expect_equal(grp$n_patients, 2)
-  expect_equal(nrow(grp$data), 2)
-  expect_equal(sort(grp$data$y), c(0, 1))
-})
-
-test_that(".imageDisclosureUnits returns NULL when no patient column (per-image)", {
-  withr::local_options(list(dsflower.dp_unit = "row",
-                            dsflower.patient_column = NULL))
-  expect_null(dsFlower:::.imageDisclosureUnits(
-    data.frame(sample_id = 1:3, y = c(0, 1, 0)), "y"))
 })

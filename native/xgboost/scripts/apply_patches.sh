@@ -9,6 +9,12 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 [ "$#" -eq 1 ] || die "usage: $0 UPSTREAM_SOURCE"
 SOURCE=$1
+
+if "$SCRIPT_DIR/verify_patched.sh" "$SOURCE" >/dev/null 2>&1; then
+  printf '%s\n' "patchset already applied"
+  exit 0
+fi
+
 "$SCRIPT_DIR/verify_upstream.sh" "$SOURCE"
 
 for PATCH in "$DSFLOWER_XGB_ROOT"/patches/*.patch; do

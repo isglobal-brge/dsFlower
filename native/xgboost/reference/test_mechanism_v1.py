@@ -1,6 +1,10 @@
 from decimal import Decimal, localcontext
 from fractions import Fraction
+from pathlib import Path
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mechanism_v1 import (
     CONTINUOUS_PRACTICAL_V1,

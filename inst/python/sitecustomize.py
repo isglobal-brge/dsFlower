@@ -7,8 +7,8 @@ Threat model: the ClientApp (FAB) is delivered to the node at run time and
 runs IN-PROCESS with read access to the staged data. A malicious client must
 not be able to run unverified code. So we DENY by default: any "foreign" code
 module -- one loaded from outside the interpreter's stdlib / site-packages
-(i.e. delivered application code) -- must be the exact template the server
-pinned for this run, verified by a recursive SHA-256 of its package contents.
+(i.e. delivered application code) -- must be explicitly pinned by the server
+for this run, verified by a recursive SHA-256 of its package contents.
 Anything else kills the process immediately.
 
 NOTE: an import hook is a defence-in-depth layer, not an absolute boundary.
@@ -25,12 +25,10 @@ import sysconfig
 
 
 MANIFEST_DIR = os.environ.get("DSFLOWER_MANIFEST_DIR", "")
-EXPECTED_HASH_FILE = os.path.join(MANIFEST_DIR, "expected_hash.txt") if MANIFEST_DIR else ""
-EXPECTED_TEMPLATE_FILE = os.path.join(MANIFEST_DIR, "expected_template.txt") if MANIFEST_DIR else ""
 MANIFEST_FILE = os.path.join(MANIFEST_DIR, "manifest.json") if MANIFEST_DIR else ""
-# Multi-package pinning (Tier-2): {package_name: sha256}. When present, EVERY
-# foreign package must be listed and hash-match (default-deny). This lets a run
-# pin a trusted runner package AND a separately-verified uploaded app package.
+# Every run uses one package-pin map: {package_name: sha256}. Every foreign
+# package must be listed and hash-match (default-deny). Hook runs add their
+# separately verified uploaded package to the canonical runner pin.
 PINNED_PACKAGES_FILE = os.path.join(MANIFEST_DIR, "pinned_packages.json") if MANIFEST_DIR else ""
 
 
@@ -120,8 +118,8 @@ def _is_foreign(path):
 
 def _hash_package(pkg_dir):
     """Recursive SHA-256 of all files under pkg_dir (excludes compiled
-    artifacts that differ per environment). Mirrors .compute_template_hash in
-    interface.R byte-for-byte: sorted by forward-slash relative path, each as
+    artifacts that differ per environment). Mirrors .compute_harness_hash and
+    .hash_pkg_dir byte-for-byte: sorted by forward-slash relative path, each as
     relpath + "\\n" + content + "\\x00"."""
     hasher = hashlib.sha256()
     entries = []
@@ -146,14 +144,6 @@ def _hash_package(pkg_dir):
     return hasher.hexdigest()
 
 
-def _read(path):
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
 _PINNED_MAP = _load_pinned_map()
 _USER_MODULE = _load_user_module_name()
 
@@ -163,33 +153,13 @@ def _verify_foreign(top_name, pkg_dir):
     the process is killed -- BEFORE the module body runs."""
     actual = _hash_package(pkg_dir)
 
-    # Multi-package mode (Tier-2): every foreign package must be listed in
-    # pinned_packages.json and hash-match. Lets a trusted runner package and a
-    # separately-verified uploaded app package both run, nothing else.
-    if _PINNED_MAP is not None:
-        expected = _PINNED_MAP.get(top_name)
-        if expected is None:
-            _abort("package '%s' is not in pinned_packages.json (default-deny)."
-                   % top_name)
-        if actual != expected:
-            _abort("code hash mismatch for '%s'\n  expected: %s\n  actual:   %s\n"
-                   "  package:  %s" % (top_name, expected, actual, pkg_dir))
-        return
-
-    # Legacy single-package mode (Tier-1 harness).
-    if not EXPECTED_HASH_FILE or not os.path.exists(EXPECTED_HASH_FILE):
-        _abort("foreign code package '%s' about to load but no "
-               "expected_hash.txt to verify against." % top_name)
-
-    expected = _read(EXPECTED_HASH_FILE)
-    if not expected:
-        _abort("expected_hash.txt is empty.")
-
-    pinned = _read(EXPECTED_TEMPLATE_FILE) if EXPECTED_TEMPLATE_FILE else ""
-    if pinned and top_name != pinned:
-        _abort("unexpected application package '%s' (server pinned '%s'). "
-               "Only the pinned template may run." % (top_name, pinned))
-
+    if _PINNED_MAP is None:
+        _abort("foreign code package '%s' about to load without a package pin map."
+               % top_name)
+    expected = _PINNED_MAP.get(top_name)
+    if expected is None:
+        _abort("package '%s' is not in pinned_packages.json (default-deny)."
+               % top_name)
     if actual != expected:
         _abort("code hash mismatch for '%s'\n  expected: %s\n  actual:   %s\n"
                "  package:  %s" % (top_name, expected, actual, pkg_dir))

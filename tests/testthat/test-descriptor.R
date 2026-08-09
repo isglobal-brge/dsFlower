@@ -87,9 +87,7 @@ test_that("flowerInitDS accepts FlowerDatasetDescriptor", {
   privacy <- withr::local_tempdir()
   withr::local_envvar(c(
     DSFLOWER_NODE_SECRET_FILE = file.path(privacy, "noise_root"),
-    DSFLOWER_PRIVACY_LEDGER_PATH = file.path(privacy, "ledger.sqlite"),
-    DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
-    DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
   ))
   desc <- flower_dataset_descriptor(
     dataset_id = "test.init",

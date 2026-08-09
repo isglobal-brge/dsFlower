@@ -86,7 +86,7 @@ def output_width(loss_name, cfg):
     """The node-decided output width for the run's PINNED loss. The researcher never
     specifies output width: the spec ends with a linear to the symbolic ``@out`` and
     the node fills it in from the loss it pinned, so a mis-sized head is impossible.
-    Mirrors the historical generator logic, but server-authoritative."""
+    Matches the declarative model contract and remains server-authoritative."""
     nc = int(cfg.get("num-classes", 2))
     if loss_name in ("cross_entropy", "hinge"):
         return max(2, nc)                      # one logit per class (softmax-CE / margin-SVM)

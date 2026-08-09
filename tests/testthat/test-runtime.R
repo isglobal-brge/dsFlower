@@ -3,19 +3,20 @@
 local_runtime_privacy_state <- function(.local_envir = parent.frame()) {
   state_dir <- tempfile("dsflower-runtime-state-")
   dir.create(state_dir, recursive = TRUE)
+  if (.Platform$OS.type == "windows") {
+    dsFlower:::.windows_set_private_acl(state_dir, is_directory = TRUE)
+  }
   secret <- file.path(state_dir, "node-secret")
-  ledger <- file.path(state_dir, "ledger.sqlite")
   writeChar(strrep("a", 64), secret, eos = NULL)
-  Sys.chmod(secret, "0600")
-  file.create(ledger)
+  if (.Platform$OS.type == "windows") {
+    dsFlower:::.windows_set_private_acl(secret, is_directory = FALSE)
+  } else {
+    Sys.chmod(secret, "0600")
+  }
   withr::defer(unlink(state_dir, recursive = TRUE), envir = .local_envir)
-  withr::local_options(list(dsflower.privacy_ledger_path = ledger),
-                       .local_envir = .local_envir)
   withr::local_envvar(c(
     DSFLOWER_NODE_SECRET_FILE = secret,
-    DSFLOWER_PRIVACY_LEDGER_PATH = NA_character_,
-    DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
-    DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+    DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
   ), .local_envir = .local_envir)
   invisible(state_dir)
 }
@@ -28,29 +29,24 @@ test_that("torch backend selection rejects unknown or malformed values", {
   expect_error(dsFlower:::.resolve_backend(c("cpu", "gpu")), "torch_backend")
 })
 
-test_that("the final Python boundary creates and repairs missing privacy state", {
+test_that("the final Python boundary creates and repairs only the noise root", {
   withr::with_tempdir({
     state_dir <- file.path(getwd(), "privacy")
     secret <- file.path(state_dir, "noise_root")
-    ledger <- file.path(state_dir, "ledger.sqlite")
-    withr::local_options(list(dsflower.privacy_ledger_path = ledger))
     withr::local_envvar(c(
       DSFLOWER_NODE_SECRET_FILE = secret,
-      DSFLOWER_PRIVACY_LEDGER_PATH = ledger,
-      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1",
-      DSFLOWER_TEST_ALLOW_EPHEMERAL_LEDGER = "1"
+      DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"
     ))
 
     expect_false(file.exists(secret))
-    expect_false(file.exists(ledger))
     dir.create(file.path(getwd(), "staging-1"))
     first_env <- dsFlower:::.build_clean_python_env(
       file.path(getwd(), "venv"), file.path(getwd(), "staging-1"))
     first_secret <- readLines(secret, warn = FALSE)
     expect_match(first_secret, "^[0-9a-f]{64}$")
-    expect_true(file.exists(ledger))
     expect_identical(unname(first_env[["DSFLOWER_NODE_SECRET_FILE"]]), secret)
-    expect_identical(unname(first_env[["DSFLOWER_PRIVACY_LEDGER_PATH"]]), ledger)
+    expect_setequal(list.files(state_dir), c("noise_root", "noise_root.lock"))
+    expect_identical(file.info(paste0(secret, ".lock"))$size[[1L]], 0)
 
     unlink(secret)
     dir.create(file.path(getwd(), "staging-2"))
@@ -59,11 +55,7 @@ test_that("the final Python boundary creates and repairs missing privacy state",
     expect_match(readLines(secret, warn = FALSE), "^[0-9a-f]{64}$")
     expect_false(identical(readLines(secret, warn = FALSE), first_secret))
     expect_identical(unname(second_env[["DSFLOWER_NODE_SECRET_FILE"]]), secret)
-
-    con <- DBI::dbConnect(RSQLite::SQLite(), ledger)
-    on.exit(DBI::dbDisconnect(con), add = TRUE)
-    expect_equal(DBI::dbGetQuery(
-      con, "SELECT COUNT(*) AS n FROM privacy_key_epochs")$n, 2L)
+    expect_setequal(list.files(state_dir), c("noise_root", "noise_root.lock"))
   })
 })
 
@@ -298,19 +290,17 @@ test_that(".supernode_ensure uses --root-certificates when ca_cert_path provided
   )
 
   local_mocked_bindings(
-    .random_available_port = function() 11111L
+    .random_available_port = function() 11111L,
+    .resolve_framework_runtime = function(framework) {
+      list(framework = framework, supernode_cmd = fake_supernode,
+           python = "python3", venv_path = tempdir())
+    }
   )
 
   mock_manifest <- file.path(tempdir(), "tls_test_manifest")
   dir.create(mock_manifest, showWarnings = FALSE)
   fake_supernode <- tempfile("flower-supernode")
   file.create(fake_supernode)
-  jsonlite::write_json(
-    list(supernode_cmd = fake_supernode, python = "python3",
-         venv_path = tempdir()),
-    file.path(mock_manifest, "runtime.json"),
-    auto_unbox = TRUE
-  )
 
   # We need to mock processx::process$new — use a different approach:
   # intercept at the registry level by checking args after the fact
@@ -341,11 +331,11 @@ test_that(".supernode_ensure errors when no ca_cert_path", {
   dir.create(mock_manifest, showWarnings = FALSE)
   fake_supernode <- tempfile("flower-supernode")
   file.create(fake_supernode)
-  jsonlite::write_json(
-    list(supernode_cmd = fake_supernode, python = "python3",
-         venv_path = tempdir()),
-    file.path(mock_manifest, "runtime.json"),
-    auto_unbox = TRUE
+  local_mocked_bindings(
+    .resolve_framework_runtime = function(framework) {
+      list(framework = framework, supernode_cmd = fake_supernode,
+           python = "python3", venv_path = tempdir())
+    }
   )
 
   expect_error(
@@ -417,10 +407,4 @@ test_that("strict Python provisioning fails closed without a lock", {
   expect_error(dsFlower:::.python_lock_path(must_exist = TRUE),
                "hash-locked Python environment is required")
   expect_true(is.na(dsFlower:::.python_env_spec_hash("pytorch")))
-})
-
-test_that(".supernode_read_log returns empty for unknown manifest_dir", {
-  result <- dsFlower:::.supernode_read_log("/nonexistent/path")
-  expect_type(result, "character")
-  expect_equal(length(result), 0)
 })

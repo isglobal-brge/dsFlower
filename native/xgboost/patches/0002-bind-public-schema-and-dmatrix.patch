@@ -1,45 +1,25 @@
 diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
-index 3e584ddc84cfa5290c48ef8c25a20631253c643e..f80203baa6f42c3c24cfa5e1813751744b7e3a6a 100644
+index 6a73dbad92b5e0a1f30ca4d912201f3ae5dc2115..9e074095d796c0010714ea992cbc292245ade5e1 100644
 --- a/include/xgboost/c_api.h
 +++ b/include/xgboost/c_api.h
-@@ -78,75 +78,98 @@ XGB_DLL int XGBuildInfo(char const **out);
--
-+
- /**
-  * @brief Get the string message of the last error.
-  *
-  *   Most functions in XGBoost returns 0 when success and non-zero when an error
-  *   occurred. In the case of error, @ref XGBGetLastError can be used to retrieve the
-  *   error message
-  *
-  *   This function is thread safe.
-  *
-  * @return The error message from the last error.
-  */
- XGB_DLL const char *XGBGetLastError();
--
-+
- /**
-  * @brief ABI version for the opt-in dsFlower privacy context.
-  *
+@@ -95,7 +95,7 @@ XGB_DLL const char *XGBGetLastError();
   * @warning This ABI belongs to a fail-closed development scaffold.  It does
   * not make XGBoost training differentially private.
   */
 -#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 1U
 +#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 2U
--
-+
+
  /**
   * @brief Server-authoritative pins required by the dsFlower updater scaffold.
-  *
-  * Every pointer is borrowed only for the duration of
+@@ -104,8 +104,16 @@ XGB_DLL const char *XGBGetLastError();
   * XGBDsFlowerSetPrivacyContext.  The implementation copies validated values
   * and never serializes noise_key into a model or XGBoost configuration.  The
   * caller must pass a context-derived key, never its durable noise root.
 - * ABI v1 also requires a DMatrix already materialized as exactly one row per
 - * declared privacy unit; the updater never performs patient canonicalization.
-+ * This key requirement is specific to the v0 scaffold mechanism, not a pin on
-+ * the sampler or entropy contract of a future formal mechanism.
++ * The server derives this key from its custodial root and the complete canonical
++ * semantic training identity.  Native mechanism coordinates must consume it
++ * only through deterministic, domain-separated PRF derivation.
 + * ABI v2 binds the context to exactly one DMatrixHandle and copies its shared
 + * ownership.  It also copies a complete public numeric feature schema and
 + * public split cuts.  The caller may release all borrowed pointers, including
@@ -50,24 +30,7 @@ index 3e584ddc84cfa5290c48ef8c25a20631253c643e..f80203baa6f42c3c24cfa5e181375174
   */
  typedef struct XGBDsFlowerPrivacyContext {
    uint32_t struct_size;
-   uint32_t abi_version;
-   const unsigned char *noise_key;
-   size_t noise_key_size;
-   const char *mechanism_id;
-   const char *noise_key_id;
-   const char *privacy_epoch;
-   const char *node_id_hash;
-   const char *dataset_snapshot_hash;
-   const char *cohort_hash;
-   const char *query_hash;
-   const char *mechanism_config_hash;
-   const char *allocation_hash;
-   const char *privacy_unit;
-   const char *adjacency;
-   const char *unit_canonicalization;
-   const char *contribution_strategy;
-   double epsilon;
-   double delta;
+@@ -129,6 +137,22 @@ typedef struct XGBDsFlowerPrivacyContext {
    double gradient_clip;
    double hessian_clip;
    uint64_t max_rows_per_unit;
@@ -88,49 +51,18 @@ index 3e584ddc84cfa5290c48ef8c25a20631253c643e..f80203baa6f42c3c24cfa5e181375174
 +  const double *cut_values;
 +  size_t cut_values_size;
  } XGBDsFlowerPrivacyContext;
--
-+
+
  /**
-  * @brief Install a validated privacy context on the calling thread.
-  *
-  * A second install fails until XGBDsFlowerClearPrivacyContext is called.
-  * This API returning success does not authorize training: the scaffold updater
-  * still rejects every update until histogram privatization is implemented and
-  * independently verified.
-  */
- XGB_DLL int XGBDsFlowerSetPrivacyContext(const XGBDsFlowerPrivacyContext *context);
--
-+
- /** @brief Wipe and remove the calling thread's dsFlower privacy context. */
- XGB_DLL int XGBDsFlowerClearPrivacyContext(void);
--
-+
- /** @brief Report whether every required context pin is present and valid. */
- XGB_DLL int XGBDsFlowerPrivacyContextReady(int *out_ready);
--
-+
- /** @brief Return a static status string for deployment guards. */
- XGB_DLL int XGBDsFlowerPrivacyScaffoldStatus(const char **out_status);
 diff --git a/include/xgboost/gradient.h b/include/xgboost/gradient.h
 index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93b191dd01 100644
 --- a/include/xgboost/gradient.h
 +++ b/include/xgboost/gradient.h
-@@ -1,52 +1,71 @@
- /**
-  * Copyright 2025, XGBoost Contributors
-  */
- #pragma once
--
-+
- #include <xgboost/base.h>    // for GradientPair
- #include <xgboost/linalg.h>  // for Matrix
+@@ -8,12 +8,22 @@
  #include <xgboost/logging.h>
--
-+
+
  #include <cstddef>  // for size_t
 +#include <cstdint>  // for uint8_t
--
-+
+
  namespace xgboost {
 +class LearnerImpl;
 +
@@ -148,42 +80,17 @@ index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93
    /** @brief Gradient used for multi-target tree split and linear model. */
    linalg::Matrix<GradientPair> gpair;
    /** @brief Gradient used for tree leaf value, optional. */
-   linalg::Matrix<GradientPair> value_gpair;
--
-+
+@@ -21,6 +31,9 @@ struct GradientContainer {
+
    [[nodiscard]] bool HasValueGrad() const noexcept { return !value_gpair.Empty(); }
--
-+
+
 +  /** @brief Provenance assigned only by Learner's built-in objective path. */
 +  [[nodiscard]] ObjectiveSource GetObjectiveSource() const noexcept { return source_; }
 +
    [[nodiscard]] std::size_t NumSplitTargets() const noexcept { return gpair.Shape(1); }
    [[nodiscard]] std::size_t NumTargets() const noexcept {
      return HasValueGrad() ? value_gpair.Shape(1) : this->gpair.Shape(1);
-   }
--
-+
-   linalg::MatrixView<GradientPair const> ValueGrad(Context const* ctx) const {
-     if (HasValueGrad()) {
-       return this->value_gpair.View(ctx->Device());
-     }
-     return this->gpair.View(ctx->Device());
-   }
--
-+
-   [[nodiscard]] linalg::Matrix<GradientPair> const* Grad() const { return &gpair; }
-   [[nodiscard]] linalg::Matrix<GradientPair>* Grad() { return &gpair; }
--
-+
-   [[nodiscard]] linalg::Matrix<GradientPair> const* FullGradOnly() const {
-     if (this->HasValueGrad()) {
-       LOG(FATAL) << "Reduced gradient is not yet supported.";
-     }
-     return this->Grad();
-   }
-   [[nodiscard]] linalg::Matrix<GradientPair>* FullGradOnly() {
-     if (this->HasValueGrad()) {
-       LOG(FATAL) << "Reduced gradient is not yet supported.";
+@@ -48,5 +61,11 @@ struct GradientContainer {
      }
      return this->Grad();
    }
@@ -196,19 +103,13 @@ index da4ffe9741ecfdff3718c5ba26b3efc39532c932..8765d0ad42b028c296f56aacddadab93
  };
  }  // namespace xgboost
 diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
-index 7bd2cee5a1dc83ef4598c6f949e952a7fdc764c1..a425c2ab64a61e40dd0587ca5c725b928665d57b 100644
+index fb265eb2a7c788270ee76030be51a8800618796b..5d9216dff4e1deb3697983b6efd6c0a198109b58 100644
 --- a/plugin/dsflower/README.md
 +++ b/plugin/dsflower/README.md
-@@ -1,27 +1,50 @@
- # dsFlower DP histogram updater scaffold
--
-+
- This opt-in plugin is deliberately **not a DP implementation**.  It reserves a
- TreeUpdater name and a C ABI for server-authoritative privacy context.  It
+@@ -5,11 +5,33 @@ TreeUpdater name and a C ABI for server-authoritative privacy context.  It
  validates all required context pins, keeps the noise key out of serialized
  XGBoost configuration, and then rejects every training update.
--
-+
+
 -The v1 adapter boundary accepts only `privacy_unit=row|patient`,
 +The v2 adapter boundary accepts only `privacy_unit=row|patient`,
  `adjacency=replace_one`, `unit_canonicalization=trim-utf8-v2`,
@@ -232,44 +133,34 @@ index 7bd2cee5a1dc83ef4598c6f949e952a7fdc764c1..a425c2ab64a61e40dd0587ca5c725b92
 +v2 records but does not yet consume/enforce the total `max_trees`; the training
 +patch must add the successful-round counter before capability activation.
 +
-+The required `noise_key` belongs only to the v0 scaffold mechanism.  It does
-+not constrain the entropy or sampler contract of a later formal mechanism; a
-+future ABI may replace it with separately reviewed sampler/mechanism pins and
-+fresh entropy.
--
-+
++The server derives the required `noise_key` from its custodial root and the
++complete canonical semantic training identity.  Every sampler and mechanism
++coordinate must consume only a deterministic, domain-separated PRF stream from
++that key; operating-system randomness and persisted reply artifacts are not
++valid alternatives.
+
  The updater must remain unavailable to production integration until a later
  patch implements and proves all of the following before any data-dependent
- split, topology, leaf, metric, log, or model artifact can leave the trusted
+@@ -17,8 +39,10 @@ split, topology, leaf, metric, log, or model artifact can leave the trusted
  process:
--
-+
+
  - patient-level contribution bounding;
 -- public or privately selected bins;
--- cryptographically keyed, domain-separated noise;
+-- deterministic, server-derived, domain-separated semantic PRF noise;
 +- public or privately selected bins (v2 validates public cuts but does not use
 +  them for training yet);
-+- a separately reviewed sampler and entropy source appropriate to the claimed
-+  mechanism;
++- a separately reviewed sampler consuming only the server-derived,
++  domain-separated semantic PRF stream;
  - privatized gradient/hessian histograms before split selection;
- - explicit composition accounting and replay-stable release identity;
+ - per-training composition accounting and deterministic semantic PRF identity;
  - tests covering every egress and failure path.
--
-+
- Build only for scaffold verification with `-DPLUGIN_DSFLOWER_DP=ON`.  Selecting
- `grow_dsflower_dp_hist` always fails closed in this patch.
 diff --git a/plugin/dsflower/dsflower_context.cc b/plugin/dsflower/dsflower_context.cc
-index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d570744f901dae 100644
+index f676a6954ddba7ae3ba384a0c5ef856b076eb241..119ab30da3195cf00bedde4fd9af9eaf5619871b 100644
 --- a/plugin/dsflower/dsflower_context.cc
 +++ b/plugin/dsflower/dsflower_context.cc
-@@ -1,93 +1,355 @@
- /**
-  * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
-  * SPDX-License-Identifier: Apache-2.0
-  */
+@@ -5,11 +5,17 @@
  #include "dsflower_context.h"
--
-+
+
  #include <algorithm>
 +#include <atomic>
 +#include <cerrno>
@@ -278,22 +169,17 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
 +#include <limits>
  #include <string_view>
  #include <utility>
--
-+
+
  #include "../../src/c_api/c_api_error.h"
 +#include "../../src/c_api/c_api_utils.h"
 +#include "../../src/data/simple_dmatrix.h"
  #include "xgboost/logging.h"
--
-+
+
  namespace xgboost::tree::dsflower {
- namespace {
--
-+
+@@ -17,13 +23,6 @@ namespace {
+
  constexpr std::size_t kHashSize = 64;
- constexpr std::size_t kMaxTokenSize = 128;
--
-+
+
 -void SecureZero(unsigned char* ptr, std::size_t size) {
 -  volatile unsigned char* out = ptr;
 -  while (size-- != 0) {
@@ -304,57 +190,25 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
  struct ContextSlot {
    PrivacyContext value;
    bool ready{false};
--
-+
+@@ -31,13 +30,13 @@ struct ContextSlot {
    ~ContextSlot() { Reset(); }
--
-+
+
    void Reset() {
 -    SecureZero(value.noise_key.data(), value.noise_key.size());
      value = PrivacyContext{};
      ready = false;
    }
  };
--
-+
+
  thread_local ContextSlot g_context;
 +std::atomic<std::uint64_t> g_context_generation{0};
--
-+
+
  bool IsLowerHexHash(const char* value) {
    if (value == nullptr) {
-     return false;
-   }
-   std::string_view text{value};
-   return text.size() == kHashSize &&
-          std::all_of(text.cbegin(), text.cend(), [](char c) {
-            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-          });
- }
--
-+
- bool IsToken(const char* value) {
-   if (value == nullptr) {
-     return false;
-   }
-   std::string_view text{value};
-   return !text.empty() && text.size() <= kMaxTokenSize &&
-          std::all_of(text.cbegin(), text.cend(), [](char c) {
-            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9') || c == '.' || c == '_' ||
-                   c == ':' || c == '-';
-          });
- }
--
-+
- bool Reject(std::string message, std::string* error) {
-   if (error != nullptr) {
-     *error = std::move(message);
-   }
+@@ -57,6 +56,268 @@ bool Reject(std::string message, std::string* error) {
    return false;
  }
--
-+
+
 +bool NextContextGeneration(std::uint64_t* out, std::string* error) {
 +  auto current = g_context_generation.load(std::memory_order_relaxed);
 +  while (true) {
@@ -549,7 +403,6 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
 +  PrivacyContext out;
 +  out.noise_key.Assign(source.noise_key.Get().data());
 +  out.noise_key_id = source.noise_key_id;
-+  out.privacy_epoch = source.privacy_epoch;
 +  out.node_id_hash = source.node_id_hash;
 +  out.dataset_snapshot_hash = source.dataset_snapshot_hash;
 +  out.cohort_hash = source.cohort_hash;
@@ -619,44 +472,9 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
 +}
 +
  }  // namespace
--
-+
+
  bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error) {
-   if (g_context.ready) {
-     return Reject("dsFlower privacy context is already installed on this thread", error);
-   }
-   if (input.struct_size != sizeof(XGBDsFlowerPrivacyContext)) {
-     return Reject("dsFlower privacy context struct_size mismatch", error);
-   }
-   if (input.abi_version != XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION) {
-     return Reject("unsupported dsFlower privacy context ABI version", error);
-   }
-   if (input.noise_key == nullptr || input.noise_key_size != kNoiseKeySize) {
-     return Reject("dsFlower noise_key must contain exactly 32 bytes", error);
-   }
-   if (std::all_of(input.noise_key, input.noise_key + input.noise_key_size,
-                   [](unsigned char value) { return value == 0; })) {
-     return Reject("dsFlower noise_key must not be all zero", error);
-   }
-   if (input.mechanism_id == nullptr ||
-@@ -116,69 +378,158 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
-       std::string_view{input.unit_canonicalization} != "trim-utf8-v2") {
-     return Reject("dsFlower unit_canonicalization must be trim-utf8-v2", error);
-   }
-   if (input.contribution_strategy == nullptr ||
-       std::string_view{input.contribution_strategy} != "one-record-per-unit-v1") {
-     return Reject("dsFlower contribution_strategy must be one-record-per-unit-v1", error);
-   }
-   if (!std::isfinite(input.epsilon) || input.epsilon <= 0.0) {
-     return Reject("dsFlower epsilon must be finite and positive", error);
-   }
-   if (!std::isfinite(input.delta) || input.delta <= 0.0 || input.delta >= 1.0) {
-     return Reject("dsFlower delta must be finite and strictly between zero and one", error);
-   }
-   if (!std::isfinite(input.gradient_clip) || input.gradient_clip <= 0.0 ||
-       !std::isfinite(input.hessian_clip) || input.hessian_clip <= 0.0) {
-     return Reject("dsFlower gradient and hessian clips must be finite and positive", error);
-   }
+@@ -116,8 +377,29 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
    if (input.max_rows_per_unit != 1) {
      return Reject("dsFlower max_rows_per_unit must equal one", error);
    }
@@ -666,8 +484,7 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
 +  if (input.max_depth == 0 || input.max_depth > kMaxDepth) {
 +    return Reject("dsFlower max_depth must be between one and 32", error);
 +  }
--
-+
+
    PrivacyContext next;
 +  if (!ValidateTask(input, &next, error) || !CopyPublicSchema(input, &next, error)) {
 +    return false;
@@ -685,19 +502,9 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
 +  next.sealed_labels.assign(labels.cbegin(), labels.cend());
 +
    next.noise_key_id = input.noise_key_id;
-   next.privacy_epoch = input.privacy_epoch;
    next.node_id_hash = input.node_id_hash;
    next.dataset_snapshot_hash = input.dataset_snapshot_hash;
-   next.cohort_hash = input.cohort_hash;
-   next.query_hash = input.query_hash;
-   next.mechanism_config_hash = input.mechanism_config_hash;
-   next.allocation_hash = input.allocation_hash;
-   next.privacy_unit = input.privacy_unit;
-   next.adjacency = input.adjacency;
-   next.unit_canonicalization = input.unit_canonicalization;
-   next.contribution_strategy = input.contribution_strategy;
-   next.epsilon = input.epsilon;
-   next.delta = input.delta;
+@@ -134,8 +416,12 @@ bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* e
    next.gradient_clip = input.gradient_clip;
    next.hessian_clip = input.hessian_clip;
    next.max_rows_per_unit = input.max_rows_per_unit;
@@ -711,14 +518,10 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
    g_context.ready = true;
    return true;
  }
--
-+
- void ClearPrivacyContext() { g_context.Reset(); }
--
-+
+@@ -144,6 +430,70 @@ void ClearPrivacyContext() { g_context.Reset(); }
+
  bool PrivacyContextReady() { return g_context.ready; }
--
-+
+
 +bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
 +                                     std::uint64_t* out_generation, std::string* error) {
 +  if (!g_context.ready) {
@@ -784,41 +587,16 @@ index 78bb734fa62e7d328140557a88865a350716a0e5..0ba5a3ca3b35453ad8467cb6c7d57074
 +}
 +
  }  // namespace xgboost::tree::dsflower
--
-+
+
  XGB_DLL int XGBDsFlowerSetPrivacyContext(const XGBDsFlowerPrivacyContext* context) {
-   API_BEGIN();
-   xgboost_CHECK_C_ARG_PTR(context);
-   std::string error;
-   CHECK(xgboost::tree::dsflower::TrySetPrivacyContext(*context, &error)) << error;
-   API_END();
- }
--
-+
- XGB_DLL int XGBDsFlowerClearPrivacyContext(void) {
-   API_BEGIN();
-   xgboost::tree::dsflower::ClearPrivacyContext();
-   API_END();
- }
--
-+
- XGB_DLL int XGBDsFlowerPrivacyContextReady(int* out_ready) {
-   API_BEGIN();
-   xgboost_CHECK_C_ARG_PTR(out_ready);
-   *out_ready = xgboost::tree::dsflower::PrivacyContextReady() ? 1 : 0;
 diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_context.h
-index ca0cbcd1e325169adc8bb98fb28a1de1a08533b1..65dd422148b0f1cf20e6dd9d0efb21039fd21588 100644
+index 1b99a79a7ae622e36f2aa7ac106439cfcc0722bc..97ba97b876c4c9fc9cd8de92732ee74e4a6b8015 100644
 --- a/plugin/dsflower/dsflower_context.h
 +++ b/plugin/dsflower/dsflower_context.h
-@@ -1,48 +1,137 @@
- /**
-  * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
-  * SPDX-License-Identifier: Apache-2.0
-  */
+@@ -5,21 +5,71 @@
  #ifndef XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
  #define XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
--
-+
+
 +#include <algorithm>
  #include <array>
  #include <cstddef>
@@ -826,17 +604,14 @@ index ca0cbcd1e325169adc8bb98fb28a1de1a08533b1..65dd422148b0f1cf20e6dd9d0efb2103
 +#include <memory>
  #include <string>
 +#include <vector>
--
-+
+
 +#include "xgboost/base.h"
  #include "xgboost/c_api.h"
 +#include "xgboost/data.h"
 +#include "xgboost/task.h"
--
-+
+
  namespace xgboost::tree::dsflower {
--
-+
+
  inline constexpr char kScaffoldMechanismId[] =
      "dsflower.xgboost.dp_hist.v0-scaffold";
  inline constexpr std::size_t kNoiseKeySize = 32;
@@ -884,25 +659,14 @@ index ca0cbcd1e325169adc8bb98fb28a1de1a08533b1..65dd422148b0f1cf20e6dd9d0efb2103
 +
 +  std::array<unsigned char, kNoiseKeySize> value_{};
 +};
--
-+
+
  struct PrivacyContext {
 -  std::array<unsigned char, kNoiseKeySize> noise_key{};
 +  SensitiveKey noise_key;
    std::string noise_key_id;
-   std::string privacy_epoch;
    std::string node_id_hash;
    std::string dataset_snapshot_hash;
-   std::string cohort_hash;
-   std::string query_hash;
-   std::string mechanism_config_hash;
-   std::string allocation_hash;
-   std::string privacy_unit;
-   std::string adjacency;
-   std::string unit_canonicalization;
-   std::string contribution_strategy;
-   double epsilon{0.0};
-   double delta{0.0};
+@@ -36,11 +86,50 @@ struct PrivacyContext {
    double gradient_clip{0.0};
    double hessian_clip{0.0};
    std::uint64_t max_rows_per_unit{0};
@@ -943,56 +707,39 @@ index ca0cbcd1e325169adc8bb98fb28a1de1a08533b1..65dd422148b0f1cf20e6dd9d0efb2103
 +
 +  PrivacyContext value_;
  };
--
-+
+
  bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error);
  void ClearPrivacyContext();
  bool PrivacyContextReady();
 +bool TryValidateUpdaterConfiguration(Args const& args, ObjInfo const* task,
 +                                     std::uint64_t* out_generation, std::string* error);
 +PrivacyContextSnapshot SnapshotPrivacyContextForDMatrix(DMatrix* dmatrix);
--
-+
+
  }  // namespace xgboost::tree::dsflower
--
-+
- #endif  // XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
+
 diff --git a/plugin/dsflower/dsflower_updater.cc b/plugin/dsflower/dsflower_updater.cc
 index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabee0e716ff 100644
 --- a/plugin/dsflower/dsflower_updater.cc
 +++ b/plugin/dsflower/dsflower_updater.cc
-@@ -1,60 +1,82 @@
- /**
-  * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
-  * SPDX-License-Identifier: Apache-2.0
+@@ -4,8 +4,11 @@
   */
  #include "dsflower_context.h"
--
-+
+
 +#include <algorithm>
 +#include <string>
  #include <vector>
--
-+
+
 +#include "../../src/tree/param.h"
  #include "xgboost/gradient.h"
  #include "xgboost/json.h"
  #include "xgboost/logging.h"
- #include "xgboost/tree_updater.h"
--
-+
- namespace xgboost::tree {
--
-+
- DMLC_REGISTRY_FILE_TAG(dsflower_dp_hist_scaffold);
--
-+
+@@ -17,12 +20,13 @@ DMLC_REGISTRY_FILE_TAG(dsflower_dp_hist_scaffold);
+
  class DsFlowerDpHistUpdater final : public TreeUpdater {
   public:
 -  explicit DsFlowerDpHistUpdater(Context const* ctx) : TreeUpdater{ctx} {}
 +  DsFlowerDpHistUpdater(Context const* ctx, ObjInfo const* task) : TreeUpdater{ctx}, task_{task} {}
--
-+
+
 -  void Configure(Args const&) override {
 -    CHECK(dsflower::PrivacyContextReady())
 -        << "dsFlower DP histogram updater requires a complete server-authoritative "
@@ -1004,23 +751,11 @@ index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabe
 +        << error;
      configured_ = true;
    }
--
-+
-   void LoadConfig(Json const&) override {
-     // Context is intentionally neither serialized nor restored from a model.
-     configured_ = false;
-   }
--
-+
-   void SaveConfig(Json* out) const override {
-     (*out)["name"] = String{Name()};
-     (*out)["status"] = String{"scaffold-only"};
-   }
--
-+
+
+@@ -38,23 +42,41 @@ class DsFlowerDpHistUpdater final : public TreeUpdater {
+
    [[nodiscard]] char const* Name() const override { return "grow_dsflower_dp_hist"; }
--
-+
+
 -  void Update(TrainParam const*, GradientContainer*, DMatrix*,
 +  void Update(TrainParam const* param, GradientContainer* gpair, DMatrix* dmatrix,
                common::Span<HostDeviceVector<bst_node_t>>,
@@ -1047,15 +782,13 @@ index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabe
      LOG(FATAL) << "grow_dsflower_dp_hist is a fail-closed scaffold: histogram "
                    "privatization has not been implemented or proven";
    }
--
-+
+
   private:
    bool configured_{false};
 +  std::uint64_t configured_generation_{0};
 +  ObjInfo const* task_{nullptr};
  };
--
-+
+
  XGBOOST_REGISTER_TREE_UPDATER(DsFlowerDpHistUpdater, "grow_dsflower_dp_hist")
      .describe("Fail-closed dsFlower DP histogram updater scaffold.")
 -    .set_body([](Context const* ctx, ObjInfo const*) {
@@ -1063,37 +796,14 @@ index 1ea2fea51bb1d2d2a03686834508301daa777027..39f53801464de1ad2db744ed50ebdabe
 +    .set_body([](Context const* ctx, ObjInfo const* task) {
 +      return new DsFlowerDpHistUpdater{ctx, task};
      });
--
-+
+
  }  // namespace xgboost::tree
 diff --git a/src/learner.cc b/src/learner.cc
 index d1a5e1de479543550a9f3a2b19261e0e253ebc5e..b7f72fe497dd8a6246e17244d8a588dc4789731a 100644
 --- a/src/learner.cc
 +++ b/src/learner.cc
-@@ -1109,40 +1109,47 @@ class LearnerImpl : public LearnerIO {
-     monitor_.Start("UpdateOneIter");
-     TrainingObserver::Instance().Update(iter);
-     this->Configure();
-     this->FitIntercept(this->tparam_, train.get());
--
-+
-     if (ctx_.seed_per_iteration) {
-       ctx_.Rng().seed(ctx_.seed * kRandSeedMagic + this->BoostedRounds());
-     }
--
-+
-     this->ValidateDMatrix(train.get(), true);
--
-+
-     auto predt = prediction_container_.Cache(train, ctx_.Device());
--
-+
-     monitor_.Start("PredictRaw");
-     this->PredictRaw(train.get(), predt.get(), true, 0, 0);
-     TrainingObserver::Instance().Observe(predt->predictions, "Predictions");
-     monitor_.Stop("PredictRaw");
--
-+
+@@ -1126,5 +1126,12 @@ class LearnerImpl : public LearnerIO {
+
      monitor_.Start("GetGradient");
      GetGradient(predt->predictions, train->Info(), iter, &gpair_.gpair);
 +    auto gradient_source = GradientContainer::ObjectiveSource::kOtherBuiltIn;
@@ -1105,25 +815,3 @@ index d1a5e1de479543550a9f3a2b19261e0e253ebc5e..b7f72fe497dd8a6246e17244d8a588dc
 +    gpair_.MarkObjectiveGradient(gradient_source);
      monitor_.Stop("GetGradient");
      TrainingObserver::Instance().Observe(gpair_.Grad()->Data(), "Gradients");
--
-+
-     gbm_->DoBoost(train.get(), &gpair_, predt.get(), obj_.get());
-     monitor_.Stop("UpdateOneIter");
-   }
--
-+
-   void BoostOneIter(std::int32_t, std::shared_ptr<DMatrix> train,
-                     GradientContainer* in_gpair) override {
-     this->monitor_.Start(__func__);
-     this->Configure();
--
-+
-     if (ctx_.seed_per_iteration) {
-       ctx_.Rng().seed(ctx_.seed * kRandSeedMagic + this->BoostedRounds());
-     }
--
-+
-     this->ValidateDMatrix(train.get(), true);
-     if (in_gpair->HasValueGrad()) {
-       CHECK_EQ(this->learner_model_param_.OutputLength(), in_gpair->NumTargets())
-           << "Value gradient should have the same number of targets as the overall model.";

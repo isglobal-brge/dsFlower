@@ -61,21 +61,6 @@
   )
 }
 
-#' Maximum legacy encoded request accepted before JSON decoding
-#' @keywords internal
-.tunnel_request_max_bytes <- function(chunk_bytes = .tunnel_chunk_bytes()) {
-  # The raw chunk is base64-encoded inside JSON and that JSON is base64-encoded
-  # once more for the DataSHIELD expression transport.
-  minimum_request <- 4 * ceiling(
-    (4 * ceiling(as.numeric(chunk_bytes) / 3) + 1024) / 3
-  ) + 4096
-  .tunnel_limit(
-    "tunnel_request_max_bytes", 64 * 1024^2,
-    max(1024^2, minimum_request),
-    256 * 1024^2
-  )
-}
-
 #' Validate one absolute byte offset in a tunnel stream
 #' @keywords internal
 .tunnel_offset <- function(value) {
@@ -317,15 +302,13 @@
 #'
 #' The RELAY owns the byte offsets, so this method is loss-free and idempotent: a
 #' retried call re-delivers / re-reads the same byte ranges without duplication
-#' or loss. Current clients pass the scalar \code{pa}, \code{pd}, \code{pf}, and
-#' \code{g} arguments directly, avoiding a second JSON/base64 layer. The legacy
-#' \code{req} envelope (direct or keyed by node name) remains accepted. Returns this
-#' node's list(ok = TRUE, node, sz = new down-stream absolute EOF,
+#' or loss. Clients pass the scalar \code{pa}, \code{pd}, \code{pf}, and
+#' \code{g} arguments directly. Returns this node's list(ok = TRUE, node,
+#' sz = new down-stream absolute EOF,
 #' ud = "B64:" SuperNode->SuperLink bytes from pf, ue = new up.bin EOF,
 #' g = connection generation). Payloads are
 #' bounded to the node-owned chunk size and exchanges are serialized per tunnel.
 #' @param conn_id Character; tunnel connection id.
-#' @param req Character; legacy \code{.ds_encode}'d request, or "".
 #' @param pa Numeric; down append-offset believed by the relay.
 #' @param pd Character; URL-safe base64 SuperLink-to-SuperNode bytes.
 #' @param pf Numeric; up read-offset acknowledged by the relay.
@@ -333,8 +316,8 @@
 #' @return list(ok, node, sz, ud, ue, g) for this node.
 #' @keywords internal
 #' @export
-flowerTunnelExchangeDS <- function(conn_id, req = "", pa = NULL, pd = "",
-                                   pf = 0, g = NULL) {
+flowerTunnelExchangeDS <- function(conn_id, pa = NULL, pd = "", pf = 0,
+                                   g = NULL) {
   cid <- .tunnel_conn_id(conn_id)
   p <- .dsflower_env[[.tunnel_forwarder_key(cid)]]
   if (!identical(.dsflower_env$tunnel_conn_id, cid) ||
@@ -346,38 +329,15 @@ flowerTunnelExchangeDS <- function(conn_id, req = "", pa = NULL, pd = "",
   spool <- .tunnel_spool(conn_id)
   chunk_bytes <- .tunnel_chunk_bytes()
   spool_max_bytes <- .tunnel_spool_max_bytes(chunk_bytes)
-  if (!is.character(req) || length(req) != 1L || is.na(req)) {
-    stop("Invalid tunnel request.", call. = FALSE)
-  }
-  if (nchar(req, type = "bytes") > .tunnel_request_max_bytes(chunk_bytes)) {
-    stop("Tunnel request exceeds the configured size limit.", call. = FALSE)
-  }
   .with_tunnel_lock(spool, {
     # Relay heartbeat: the forwarder self-terminates if this stops updating (the
     # researcher's relay died / lost connection), which lets its SuperNode notice
     # the SuperLink is gone and self-terminate too.
     cat(".", file = file.path(spool, "relay_hb"))
     nm <- .dsflower_env[[paste0("tunnel_name_", cid)]]
-    r <- if (!is.null(pa) || !is.null(g)) {
-      list(pa = pa, pd = pd, pf = pf, g = g)
-    } else {
-      NULL
-    }
-    if (is.null(r) && is.character(req) && length(req) == 1L &&
-        !is.na(req) && nzchar(req)) {
-      decoded <- tryCatch(.ds_arg(req), error = function(e) NULL)
-      if (is.list(decoded)) {
-        # Accept both former envelope shapes when they carry a generation fence.
-        if (all(c("pa", "pd", "pf", "g") %in% names(decoded))) {
-          r <- decoded
-        } else if (!is.null(nm) && is.list(decoded[[nm]])) {
-          r <- decoded[[nm]]
-        }
-      }
-    }
     gen <- .tunnel_current_generation(spool)
-    request_gen <- if (!is.null(r) && !is.null(r$g)) {
-      tryCatch(.tunnel_generation(r$g), error = function(e) NULL)
+    request_gen <- if (!is.null(g)) {
+      tryCatch(.tunnel_generation(g), error = function(e) NULL)
     } else {
       NULL
     }
@@ -387,9 +347,9 @@ flowerTunnelExchangeDS <- function(conn_id, req = "", pa = NULL, pd = "",
       # the relay can reset its socket and offsets.
       list(ok = TRUE, node = nm, sz = 0, ud = "", ue = 0, g = gen)
     } else {
-      pa <- .tunnel_offset(r$pa %||% NA)
-      pd <- r$pd %||% ""
-      pf <- .tunnel_offset(r$pf %||% 0)
+      pa <- .tunnel_offset(pa %||% NA)
+      pd <- pd %||% ""
+      pf <- .tunnel_offset(pf %||% 0)
       up_state <- .tunnel_spool_state(spool, "up.bin", create = TRUE)
       if (pf < up_state$base || pf > up_state$eof) {
         stop("Invalid tunnel read acknowledgment.", call. = FALSE)
@@ -496,13 +456,12 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
   cid <- .tunnel_conn_id(conn_id)
   port <- .tunnel_port(listen_port)
   abi <- suppressWarnings(as.numeric(protocol_abi))
-  if (length(abi) != 1L || is.na(abi) || !is.finite(abi) || abi != 3) {
+  if (length(abi) != 1L || is.na(abi) || !is.finite(abi) || abi != 4) {
     stop("Incompatible dsFlower tunnel protocol ABI; deploy matching server and client versions.",
          call. = FALSE)
   }
   chunk_bytes <- .tunnel_chunk_bytes()
   spool_max_bytes <- .tunnel_spool_max_bytes(chunk_bytes)
-  .tunnel_request_max_bytes(chunk_bytes)
   if (!is.character(node_name) || length(node_name) != 1L ||
       is.na(node_name) || !nzchar(node_name)) {
     stop("Invalid tunnel node name.", call. = FALSE)
@@ -525,7 +484,7 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
         ok = TRUE,
         listen = paste0("127.0.0.1:", port),
         chunk_bytes = chunk_bytes,
-        protocol_abi = 3L
+        protocol_abi = 4L
       ))
     }
     if (!is.null(active_port)) {
@@ -595,7 +554,7 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
     ok = TRUE,
     listen = paste0("127.0.0.1:", port),
     chunk_bytes = chunk_bytes,
-    protocol_abi = 3L
+    protocol_abi = 4L
   )
 }
 

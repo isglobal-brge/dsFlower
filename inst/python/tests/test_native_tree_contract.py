@@ -85,7 +85,6 @@ def _manifest(mode="native-tight", engine="xgboost",
             "schema_hash": _public_schema(
                 cuts=mode == "native-tight", task=task
             )["sha256"],
-            "privacy_epoch_hash": "d" * 64,
         },
         "resources": {
             "threads": 4,
@@ -376,7 +375,7 @@ class IdentityTests(unittest.TestCase):
         changed_allocation = copy.deepcopy(base)
         changed_allocation["privacy"]["epsilon"] = 2.0
         changed_allocation["privacy"]["delta"] = 2e-6
-        self.assertEqual(
+        self.assertNotEqual(
             query_id,
             contract.semantic_query_identity(self.root, changed_allocation),
         )
@@ -394,7 +393,7 @@ class IdentityTests(unittest.TestCase):
             query_id,
             contract.semantic_query_identity(b"x" * 32, manifest),
         )
-        with self.assertRaisesRegex(ValueError, "at least 32 bytes"):
+        with self.assertRaisesRegex(ValueError, "exactly 32 bytes"):
             contract.semantic_query_identity(b"short", manifest)
 
         changed = copy.deepcopy(manifest)

@@ -81,9 +81,16 @@ def main() -> None:
     for guard in required_guards:
         assert guard in patch_text, f"missing fail-closed guard: {guard}"
 
-    forbidden_claims = ("production-ready DP", "DP guarantee is complete")
-    for claim in forbidden_claims:
-        assert claim not in patch_text
+    forbidden_contracts = (
+        "production-ready DP",
+        "DP guarantee is complete",
+        "privacy_epoch",
+        "privacy_epoch_hash",
+        "fresh entropy",
+        "persisting the committed artifact",
+    )
+    for contract in forbidden_contracts:
+        assert contract not in patch_text
 
     allowed_top_level = {
         ".gitattributes",

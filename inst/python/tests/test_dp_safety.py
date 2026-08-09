@@ -238,15 +238,16 @@ _pinned_file = lambda name: os.path.join(_T2DIR, name, "__init__.py")
 with _mock.patch.object(tier2_lib, "hook_execution_caps", return_value=_test_caps), \
         _mock.patch.object(tier2_lib, "_pinned_user_package", side_effect=_pinned_file):
     _seed = b"t" * 32
+    _execution_seed = b"e" * 32
     _ex = tier2_lib.gated_local_update(
         "t2_exfil", g, Xraw, yraw, _hook_cfg, pcfg,
-        seed=_seed, hook_caps=_test_caps)
+        seed=_seed, execution_seed=_execution_seed, hook_caps=_test_caps)
     check("Tier-2 exfil via weights DESTROYED by the gate (1e6 raw -> O(sigma))",
           np.max(np.abs(np.concatenate([(o - gg).ravel()
                                         for o, gg in zip(_ex, g)]))) < 100)
     _mk = tier2_lib.gated_local_update(
         "t2_monkey", g, Xraw, yraw, _hook_cfg, pcfg,
-        seed=_seed, hook_caps=_test_caps)
+        seed=_seed, execution_seed=_execution_seed, hook_caps=_test_caps)
     check("Tier-2 in-process MONKEYPATCH defeated by isolation (parent DP intact, release bounded)",
           np.max(np.abs(np.concatenate([(o - gg).ravel()
                                         for o, gg in zip(_mk, g)]))) < 100)
@@ -257,30 +258,31 @@ with _mock.patch.object(tier2_lib, "hook_execution_caps", return_value=_test_cap
                      tier2_lib.dp_harness.SecureNumpyRng))
     _ws = tier2_lib.gated_local_update(
         "t2_wrongshape", g, Xraw, yraw, _hook_cfg, pcfg,
-        seed=_seed, hook_caps=_test_caps)
+        seed=_seed, execution_seed=_execution_seed, hook_caps=_test_caps)
     check("Tier-2 shape-mismatch NEUTRALIZED (validate-or-zero -> noisy global shape)",
           len(_ws) == len(g) and all(a.shape == o.shape for a, o in zip(_ws, g))
           and all(np.all(np.isfinite(a)) for a in _ws))
     _cr = tier2_lib.gated_local_update(
         "t2_crash", g, Xraw, yraw, _hook_cfg, pcfg,
-        seed=_seed, hook_caps=_test_caps)
+        seed=_seed, execution_seed=_execution_seed, hook_caps=_test_caps)
     check("Tier-2 crashing/data-dependent upload -> finite NOISY release",
           all(np.all(np.isfinite(a)) for a in _cr)
           and all(a.shape == o.shape for a, o in zip(_cr, g))
           and any(not np.array_equal(a, o) for a, o in zip(_cr, g)))
     _hr = tier2_lib.gated_local_update(
         "t2_huge", g, Xraw, yraw, _hook_cfg, pcfg,
-        seed=_seed, hook_caps=_test_caps)
+        seed=_seed, execution_seed=_execution_seed, hook_caps=_test_caps)
     check("Tier-2 oversized result rejected by the size cap -> noisy zero update (no parent OOM)",
           len(_hr) == len(g) and all(a.shape == o.shape for a, o in zip(_hr, g)))
     _wc = tier2_lib.gated_local_update(
         "t2_count", g, Xraw, yraw, _hook_cfg, pcfg,
-        seed=_seed, hook_caps=_test_caps)
+        seed=_seed, execution_seed=_execution_seed, hook_caps=_test_caps)
     check("Tier-2 wrong array-count rejected before load -> noisy zero update",
           len(_wc) == len(g) and all(np.all(np.isfinite(a)) for a in _wc))
     check("gated_local_update refuses a non-str module (the node never imports an object)",
           rejects(lambda: tier2_lib.gated_local_update(
               object(), g, Xraw, yraw, _hook_cfg, pcfg, seed=_seed,
+              execution_seed=_execution_seed,
               hook_caps=_test_caps)))
 import time as _time
 _t0 = _time.monotonic()

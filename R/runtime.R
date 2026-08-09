@@ -82,43 +82,7 @@
   NULL
 }
 
-#' Resolve template runtime descriptor
-#'
-#' Maps template_name -> framework -> venv -> absolute paths.
-#' This is the single source of truth for how to launch a SuperNode.
-#'
-#' @param template_name Character.
-#' @return Named list: template_name, framework, venv_path, supernode_cmd.
-#' @keywords internal
-.resolve_template_runtime <- function(template_name) {
-  caps <- .TEMPLATE_METADATA[[template_name]]
-  if (is.null(caps) || is.null(caps$framework))
-    stop("Unknown template or no framework for: ", template_name, call. = FALSE)
-
-  framework <- caps$framework
-  venv_root <- .venv_root()
-  venv_path <- file.path(venv_root, .framework_venv(framework))
-  python <- file.path(venv_path, "bin", "python")
-  cmd <- file.path(venv_path, "bin", "flower-supernode")
-
-  # File-based validation only -- no subprocess calls
-  if (!dir.exists(venv_path))
-    stop("Venv not found: ", venv_path, ". Run dsFlower configure.", call. = FALSE)
-  if (!file.exists(python))
-    stop("Python not found: ", python, call. = FALSE)
-  if (!file.exists(cmd))
-    stop("flower-supernode not found: ", cmd, call. = FALSE)
-
-  list(
-    template_name = template_name,
-    framework = framework,
-    venv_path = venv_path,
-    supernode_cmd = cmd,
-    python = python
-  )
-}
-
-#' Resolve the SuperNode runtime for a framework directly (no template).
+#' Resolve the SuperNode runtime for a framework directly.
 #' Used for the dsFlower trusted runners (harness / tier2), which are torch apps.
 #' @keywords internal
 .resolve_framework_runtime <- function(framework) {
@@ -148,14 +112,9 @@
   current_path <- Sys.getenv("PATH", "")
   # This is the final common boundary before trusted Python can make a private
   # release. Bootstrap here as defence in depth so a future launch path cannot
-  # accidentally depend on an earlier caller having materialized the key.
+  # accidentally omit the only persistent privacy state: the node root secret.
   privacy_state <- .privacy_runtime_bootstrap()
   secret_path <- .validate_node_secret(privacy_state$secret_path)
-  ledger_path <- privacy_state$ledger_path
-  if (!file.exists(ledger_path)) {
-    stop("The privacy ledger was not initialized before SuperNode launch.",
-         call. = FALSE)
-  }
   flwr_home <- file.path(staging_dir, ".flwr")
   if (.path_is_symlink(flwr_home) ||
       ((file.exists(flwr_home) || dir.exists(flwr_home)) &&
@@ -189,12 +148,13 @@
     DYLD_LIBRARY_PATH = "",
     PYTHONHOME = "",
     PYTHONNOUSERSITE = "1",
+    PYTHONHASHSEED = "0",
+    CUBLAS_WORKSPACE_CONFIG = ":4096:8",
     VIRTUAL_ENV = venv_path,
-    PATH = paste0(venv_bin, ":", current_path),
+    PATH = paste0(venv_bin, .Platform$path.sep, current_path),
     FLWR_HOME = flwr_home,
     DSFLOWER_MANIFEST_DIR = staging_dir,
     DSFLOWER_NODE_SECRET_FILE = secret_path,
-    DSFLOWER_PRIVACY_LEDGER_PATH = ledger_path,
     DSF_SAA_SANDBOX_OK = if (isTRUE(as.logical(
       .dsf_option("hook_sandbox_attested", FALSE)))) "1" else "0",
     DSF_HOOK_RESOURCE_ISOLATION_OK = if (isTRUE(as.logical(
@@ -256,7 +216,7 @@
 #' @keywords internal
 .supernode_ensure <- function(superlink_address, manifest_dir,
                               python_path = "python3", ca_cert_path = NULL,
-                              template_name = NULL, insecure = FALSE) {
+                              insecure = FALSE) {
   # Policy check
   settings <- .flowerDisclosureSettings()
   if (!settings$allow_supernode_spawn) {
@@ -295,39 +255,10 @@
          call. = FALSE)
   }
 
-  # Resolve SuperNode command from runtime descriptor (written by prepare)
-  # This ensures we use the absolute venv path, never PATH fallback
-  runtime_json <- file.path(manifest_dir, "runtime.json")
-  runtime_desc <- NULL
-  env_info <- NULL
-
-  if (file.exists(runtime_json)) {
-    runtime_desc <- jsonlite::fromJSON(runtime_json, simplifyVector = FALSE)
-    supernode_cmd <- runtime_desc$supernode_cmd
-    if (!file.exists(supernode_cmd))
-      stop("SuperNode binary not found: ", supernode_cmd, call. = FALSE)
-    env_info <- list(
-      python = runtime_desc$python,
-      flower_supernode = supernode_cmd,
-      source = "venv")
-  } else if (!is.null(template_name)) {
-    # Fallback: resolve at launch time
-    runtime_desc <- .resolve_template_runtime(template_name)
-    supernode_cmd <- runtime_desc$supernode_cmd
-    env_info <- list(
-      python = runtime_desc$python,
-      flower_supernode = supernode_cmd,
-      source = "venv")
-  } else {
-    # No template (Tier-2 uploaded app, or a harness run without a template): the
-    # dsFlower trusted runners are torch apps, so default to the pytorch venv.
-    runtime_desc <- .resolve_framework_runtime("pytorch")
-    supernode_cmd <- runtime_desc$supernode_cmd
-    env_info <- list(
-      python = runtime_desc$python,
-      flower_supernode = supernode_cmd,
-      source = "venv")
-  }
+  # The release runner is node-resident and hash-pinned. Resolve its framework
+  # directly instead of accepting an analyst-selected executable runtime.
+  runtime_desc <- .resolve_framework_runtime("pytorch")
+  supernode_cmd <- runtime_desc$supernode_cmd
 
   # Create log directory
   log_dir <- file.path(tempdir(), "dsflower", "supernodes")
@@ -365,9 +296,7 @@
   }
 
   # Build clean Python environment (strips R's LD_LIBRARY_PATH etc.)
-  venv_path <- if (!is.null(runtime_desc)) runtime_desc$venv_path
-               else if (!is.null(env_info)) dirname(dirname(env_info$python))
-               else ""
+  venv_path <- runtime_desc$venv_path
   spawn_env <- .build_clean_python_env(venv_path, manifest_dir,
                                         extra_pypath = new_pypath)
   if (exists("tier2_app_dir", inherits = FALSE)) {
@@ -393,8 +322,7 @@
   # and reaps the whole subtree, so nothing can reach PID 1. Graceful fallback to a
   # direct launch if the wrapper script or venv python is missing (older install).
   reaper_py <- system.file("python", "supernode_reaper.py", package = "dsFlower")
-  venv_python <- (if (!is.null(runtime_desc)) runtime_desc$python else NULL) %||%
-                 file.path(venv_path, "bin", "python")
+  venv_python <- runtime_desc$python %||% file.path(venv_path, "bin", "python")
   use_reaper <- nzchar(reaper_py) && file.exists(reaper_py) &&
                 !is.null(venv_python) && nzchar(venv_python) && file.exists(venv_python)
 
@@ -586,31 +514,6 @@
   })
 
   do.call(rbind, rows)
-}
-
-#' Read sanitized SuperNode log
-#'
-#' @param manifest_dir Character; the manifest directory (registry key).
-#' @param last_n Integer; number of lines to return (default 50).
-#' @return Character vector of sanitized log lines.
-#' @keywords internal
-.supernode_read_log <- function(manifest_dir, last_n = 50L) {
-  entry <- .supernode_lookup(manifest_dir)
-  if (is.null(entry)) {
-    log_path <- NULL
-  } else {
-    log_path <- entry$log_path
-  }
-
-  if (is.null(log_path) || !file.exists(log_path)) {
-    return(character(0))
-  }
-
-  lines <- readLines(log_path, warn = FALSE)
-  if (length(lines) > last_n) {
-    lines <- utils::tail(lines, last_n)
-  }
-  .sanitizeLogs(lines, last_n)
 }
 
 # ---------------------------------------------------------------------------

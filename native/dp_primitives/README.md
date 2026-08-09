@@ -21,14 +21,16 @@ pinning it is not a substitute for dsFlower's own proof review, known-issue
 audit and cross-platform release tests. `UPSTREAM.env` records the exact
 upstream tree, archive and source-file hashes used for line-by-line review.
 
-No seed crosses this ABI.  Sticky semantics come from dsFlower's durable
-semantic-artifact ledger: the first release uses fresh system CSPRNG entropy,
-and every equivalent retry replays the exact committed artifact.  This avoids
-both noise averaging and a platform-dependent deterministic floating sampler.
+No seed crosses the current ABI, so this primitive is not yet compatible with
+dsFlower's stateless sticky contract. Before activation, its adapter must feed
+the sampler a domain-separated stream derived from the custodial node root and
+the canonical semantic training identity. Equivalent retries must therefore
+recompute the same bytes without a database or artifact cache; a changed
+effective statistic or mechanism configuration must derive a different stream.
 
 This library is not itself a complete DP algorithm.  A caller must prove and
 enforce contribution bounds, fixed-point sensitivity, scale calibration,
-composition, artifact memoization, and egress sanitization.  Until the native
+within-training composition, semantic PRF binding, and egress sanitization. Until the native
 engine adapters do so, no capability may be advertised.
 
 The exact rejection sampler and arbitrary-precision arithmetic are

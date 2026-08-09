@@ -4,12 +4,10 @@
 \alias{flowerTunnelExchangeDS}
 \title{Idempotent bidirectional tunnel exchange in one fan-out call (AGGREGATE)}
 \usage{
-flowerTunnelExchangeDS(conn_id, req = "", pa = NULL, pd = "", pf = 0, g = NULL)
+flowerTunnelExchangeDS(conn_id, pa = NULL, pd = "", pf = 0, g = NULL)
 }
 \arguments{
 \item{conn_id}{Character; tunnel connection id.}
-
-\item{req}{Character; legacy \code{.ds_encode}'d request, or "".}
 
 \item{pa}{Numeric; down append-offset believed by the relay.}
 
@@ -25,10 +23,9 @@ list(ok, node, sz, ud, ue, g) for this node.
 \description{
 The RELAY owns the byte offsets, so this method is loss-free and idempotent: a
 retried call re-delivers / re-reads the same byte ranges without duplication
-or loss. Current clients pass the scalar \code{pa}, \code{pd}, \code{pf}, and
-\code{g} arguments directly, avoiding a second JSON/base64 layer. The legacy
-\code{req} envelope (direct or keyed by node name) remains accepted. Returns this
-node's list(ok = TRUE, node, sz = new down-stream absolute EOF,
+or loss. Clients pass the scalar \code{pa}, \code{pd}, \code{pf}, and
+\code{g} arguments directly. Returns this node's list(ok = TRUE, node,
+sz = new down-stream absolute EOF,
 ud = "B64:" SuperNode->SuperLink bytes from pf, ue = new up.bin EOF,
 g = connection generation). Payloads are
 bounded to the node-owned chunk size and exchanges are serialized per tunnel.

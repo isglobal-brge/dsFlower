@@ -110,7 +110,7 @@ test_that(".stageData creates directory, data file, and manifest", {
 
   staging_dir <- dsFlower:::.stageData(
     data, token, "target", c("f1", "f2"),
-    extra_config = list(num_rounds = 5L)
+    extra_config = list("num-server-rounds" = 5L)
   )
   on.exit(unlink(staging_dir, recursive = TRUE))
 
@@ -124,7 +124,7 @@ test_that(".stageData creates directory, data file, and manifest", {
   expect_equal(manifest$n_units, 10)
   expect_equal(manifest$target_column, "target")
   expect_equal(manifest$feature_columns, c("f1", "f2"))
-  expect_equal(manifest$num_rounds, 5L)
+  expect_equal(manifest[["num-server-rounds"]], 5L)
 
   # Data file should be either parquet or csv depending on arrow availability
   expect_true(manifest$data_format %in% c("csv", "parquet"))
@@ -171,6 +171,10 @@ test_that("run_config cannot provide structural or duplicate manifest fields", {
     dsFlower:::.validate_client_run_config(list(`user-module` = "attacker")),
     "server-owned manifest field"
   )
+  expect_error(
+    dsFlower:::.validate_client_run_config(list(privacy_future_field = 1)),
+    "server-owned manifest field"
+  )
   duplicated <- list(1L, 2L)
   names(duplicated) <- c("batch-size", "batch-size")
   expect_error(
@@ -186,6 +190,21 @@ test_that("run_config cannot provide structural or duplicate manifest fields", {
     ),
     "server-owned field"
   )
+})
+
+test_that("stale staging cleanup covers configured roots", {
+  root <- withr::local_tempdir()
+  old <- file.path(root, "dsflower", "run_old")
+  fresh <- file.path(root, "dsflower", "run_fresh")
+  dir.create(old, recursive = TRUE)
+  dir.create(fresh, recursive = TRUE)
+  writeLines("private", file.path(old, "manifest.json"))
+  Sys.setFileTime(old, Sys.time() - 48 * 60 * 60)
+
+  dsFlower:::.cleanup_stale_staging(max_age_hours = 24, bases = root)
+
+  expect_false(dir.exists(old))
+  expect_true(dir.exists(fresh))
 })
 
 test_that("tabular staging preserves the explicit server patient DP unit", {
@@ -265,48 +284,35 @@ test_that("image staging counts the server-selected patient privacy units", {
   expect_equal(manifest$patient_column, "patient_id")
 })
 
-test_that("privacy reservation update is atomic and keeps exact no-op budgets", {
+test_that("stateless privacy contract update is atomic", {
   data <- data.frame(f1 = 1:10, target = rep(0:1, 5))
   token <- paste0("run_", strrep("c", 32))
+  run_config <- dsFlower:::.addDpConfigToRunConfig(list(
+    "num-server-rounds" = 5L
+  ))
   staging_dir <- dsFlower:::.stageData(
     data, token, "target", "f1",
-    extra_config = list(
-      "privacy-max-releases" = 5L,
-      "privacy-reserved" = FALSE,
-      "privacy-release-enabled" = FALSE,
-      "privacy-epsilon" = 0,
-      "privacy-delta" = 0
-    )
+    extra_config = run_config
   )
   on.exit(unlink(staging_dir, recursive = TRUE), add = TRUE)
-  reservation <- list(
-    run_token = token,
-    max_releases = 5L,
-    release_enabled = FALSE,
-    domain = "node",
-    allocation_index = 30L,
-    epsilon = 2.79396772384644e-9,
-    delta = 9.31322574615479e-15,
-    dp_unit = "row",
-    patient_column = NULL,
-    unit_canonicalization = "trim-utf8-v2"
-  )
-  dsFlower:::.apply_privacy_reservation(staging_dir, reservation)
+  contract <- dsFlower:::.privacy_training_contract(token, 5L)
+  dsFlower:::.apply_privacy_contract(staging_dir, contract)
 
   manifest_path <- file.path(staging_dir, "manifest.json")
   manifest <- jsonlite::fromJSON(manifest_path)
-  expect_false(manifest[["privacy-release-enabled"]])
-  expect_equal(manifest[["privacy-epsilon"]], reservation$epsilon)
-  expect_equal(manifest[["privacy-delta"]], reservation$delta)
+  expect_identical(manifest[["num-server-rounds"]], 5L)
+  expect_equal(manifest[["privacy-epsilon"]], contract$epsilon)
+  expect_equal(manifest[["privacy-delta"]], contract$delta)
+  expect_identical(manifest[["privacy-policy-sha256"]], contract$policy_hash)
   expect_length(list.files(staging_dir, pattern = "^\\.manifest-", all.files = TRUE), 0L)
   if (.Platform$OS.type == "unix") {
     expect_equal(as.integer(file.info(manifest_path)$mode),
                  as.integer(as.octmode("0600")))
   }
 
-  reservation$run_token <- paste0("run_", strrep("d", 32))
+  contract$run_token <- paste0("run_", strrep("d", 32))
   expect_error(
-    dsFlower:::.apply_privacy_reservation(staging_dir, reservation),
+    dsFlower:::.apply_privacy_contract(staging_dir, contract),
     "run token does not match"
   )
 })
@@ -370,14 +376,6 @@ test_that("multilabel staging applies one public binary contract per target", {
   expect_error(
     dsFlower:::.transformPublicTarget(data, c("first", "first"), cfg),
     "unique"
-  )
-})
-
-test_that("legacy template routing is rejected before private staging", {
-  expect_error(
-    dsFlower:::.validate_client_run_config(
-      list(template_name = "pytorch_logreg")),
-    "retired"
   )
 })
 

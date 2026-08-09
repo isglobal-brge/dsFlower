@@ -27,6 +27,40 @@ def _load_hook(manifest_dir):
 
 
 class ParentImportBoundaryTests(unittest.TestCase):
+    def test_foreign_packages_require_the_single_pin_map_contract(self):
+        with tempfile.TemporaryDirectory() as root:
+            package = os.path.join(root, "foreignpkg")
+            os.mkdir(package)
+            with open(os.path.join(package, "__init__.py"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("VALUE = 1\n")
+
+            unpinned, _ = _load_hook(root)
+            with (mock.patch.object(unpinned, "_abort",
+                                    side_effect=RuntimeError("denied")) as abort,
+                  self.assertRaisesRegex(RuntimeError, "denied")):
+                unpinned._verify_foreign("foreignpkg", package)
+            abort.assert_called_once()
+
+            actual = unpinned._hash_package(package)
+            with open(os.path.join(root, "pinned_packages.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"foreignpkg": actual}, fh)
+            pinned, _ = _load_hook(root)
+            with mock.patch.object(pinned, "_abort") as abort:
+                pinned._verify_foreign("foreignpkg", package)
+            abort.assert_not_called()
+
+            with open(os.path.join(root, "pinned_packages.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"foreignpkg": "0" * 64}, fh)
+            mismatched, _ = _load_hook(root)
+            with (mock.patch.object(mismatched, "_abort",
+                                    side_effect=RuntimeError("denied")) as abort,
+                  self.assertRaisesRegex(RuntimeError, "denied")):
+                mismatched._verify_foreign("foreignpkg", package)
+            abort.assert_called_once()
+
     def test_uploaded_module_is_denied_before_runtime_and_safe_path_exemptions(self):
         for module_name in ("flwr", "numpy", "torch"):
             with self.subTest(module_name=module_name), tempfile.TemporaryDirectory() as root:

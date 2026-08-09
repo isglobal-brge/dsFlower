@@ -19,6 +19,7 @@ SOURCE="$WORK/xgboost"
 BUILD="$WORK/build"
 "$ROOT/scripts/fetch_upstream.sh" "$SOURCE"
 "$ROOT/scripts/apply_patches.sh" "$SOURCE"
+"$ROOT/scripts/apply_patches.sh" "$SOURCE"
 "$TEST_DIR/test_provenance_rejections.sh" "$SOURCE" "$WORK"
 "$ROOT/scripts/build.sh" "$SOURCE" "$BUILD"
 

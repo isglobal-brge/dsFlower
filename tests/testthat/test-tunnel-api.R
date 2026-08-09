@@ -116,7 +116,7 @@ test_that("failed forwarder startup kills its process and clears all state", {
   )
 
   expect_error(
-    dsFlower::flowerTunnelUpDS(cid, 18080L, "site", protocol_abi = 3L),
+    dsFlower::flowerTunnelUpDS(cid, 18080L, "site", protocol_abi = 4L),
     "failed to start"
   )
   expect_null(env$tunnel_conn_id)
@@ -143,7 +143,7 @@ test_that("tunnel startup rejects a mismatched ABI before side effects", {
     "Incompatible dsFlower tunnel protocol ABI"
   )
   expect_error(
-    dsFlower::flowerTunnelUpDS(cid, 18080L, "site", protocol_abi = 1L),
+    dsFlower::flowerTunnelUpDS(cid, 18080L, "site", protocol_abi = 3L),
     "Incompatible dsFlower tunnel protocol ABI"
   )
   expect_null(env$tunnel_conn_id)
@@ -229,16 +229,6 @@ test_that("absolute offsets remain idempotent across spool compaction", {
   )
 })
 
-.test_tunnel_arg <- function(x) {
-  json <- as.character(jsonlite::toJSON(
-    x, auto_unbox = TRUE, null = "null"
-  ))
-  b64 <- gsub("[\r\n]", "", jsonlite::base64_enc(charToRaw(json)))
-  b64 <- gsub("\\+", "-", b64)
-  b64 <- gsub("/", "_", b64)
-  paste0("B64:", gsub("=+$", "", b64))
-}
-
 .activate_test_tunnel <- function(cid, node = "site1", generation = 1) {
   env <- dsFlower:::.dsflower_env
   key <- dsFlower:::.tunnel_forwarder_key(cid)
@@ -285,11 +275,6 @@ test_that("the maximum DSI-safe tunnel chunk round-trips without truncation", {
     dsFlower:::.app_b64_dec(encoded_payload, max_bytes = 512 * 1024L),
     payload
   )
-
-  request <- list(pa = 0, pd = encoded_payload, pf = 0, g = 1)
-  outer <- .test_tunnel_arg(request)
-  decoded <- dsFlower:::.ds_arg(outer)
-  expect_identical(decoded$pd, encoded_payload)
 
   cid <- paste0("dsf_", strrep("f", 32))
   spool <- .activate_test_tunnel(cid)
@@ -344,7 +329,7 @@ test_that("512 KiB tunnel chunks traverse real DSI and DSLite", {
   port <- as.integer(trimws(port_result$stdout))
   cid <- paste0("dsf_", strrep("6", 32))
   ready <- DSI::datashield.aggregate(conns, call(
-    "flowerTunnelUpDS", cid, port, "site", protocol_abi = 3L
+    "flowerTunnelUpDS", cid, port, "site", protocol_abi = 4L
   ))
   expect_true(ready$site$ok)
   expect_equal(ready$site$chunk_bytes, 512 * 1024)
@@ -391,12 +376,12 @@ test_that("generation fencing rejects stale reconnect traffic", {
   expect_identical(dsFlower::flowerTunnelExchangeDS(
     cid, pa = 7, pd = "", pf = 0, g = 2
   )$sz, 7)
+})
 
-  # The former node-keyed envelope remains accepted when it carries the fence.
-  keyed <- .test_tunnel_arg(list(site1 = list(
-    pa = 7, pd = dsFlower:::.tunnel_enc(charToRaw("!")), pf = 0, g = 2
-  )))
-  expect_identical(dsFlower::flowerTunnelExchangeDS(cid, keyed)$sz, 8)
+test_that("tunnel exchange accepts only direct transport arguments", {
+  expect_identical(
+    names(formals(dsFlower::flowerTunnelExchangeDS)),
+    c("conn_id", "pa", "pd", "pf", "g"))
 })
 
 test_that("downstream backpressure still drains the upstream stream", {

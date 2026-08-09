@@ -580,7 +580,7 @@ def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, del
     by the C-ball diameter 2C. The mean sensitivity is conservatively
     min(2C, 4C/k), where the outer 2C is the diameter of the mean's own C-ball. Thus k=2
     claims no amplification; k>2 can still improve utility. It composes as an ordinary
-    per-round Gaussian release in the RDP/PRV ledger.
+    per-round Gaussian release in the training's RDP/PRV accountant.
 
     The CALLER must (1) build the block partition independently of feature/label VALUES
     (a random row permutation, or a keyed assignment that keeps each patient's rows

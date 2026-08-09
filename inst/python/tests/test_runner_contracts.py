@@ -21,148 +21,56 @@ sys.path.insert(0, FLOWER_APP)
 from dsflower_runner import client_app, server_app, task  # noqa: E402
 
 
-class PublicPrivacyTailTests(unittest.TestCase):
-    def test_neural_noop_uses_only_public_inputs(self):
-        token = "run_" + "a" * 32
-        manifest = {
-            "run_token": token,
-            "data_type": "tabular",
-            "data_format": "none",
-            "n_samples": 0,
-            "n_units": 0,
-            "target_column": "target",
-            "feature_columns": ["f1", "f2"],
-            "dp-unit": "row",
-            "patient_column": None,
-            "patient-id-canonicalization": "trim-utf8-v2",
-            "source_kind": "privacy_noop",
-            "dp-track": "neural",
-            "task-type": "classification",
-            "num-features": 2,
-            "privacy-reserved": True,
-            "privacy-release-enabled": False,
-            "privacy-domain": "node",
-            "privacy-allocation-index": 30,
-            "privacy-max-releases": 1,
-            "privacy-epsilon": 1.0e-9,
-            "privacy-delta": 1.0e-15,
-            "privacy-adjacency": "replace_one",
-        }
-        claim = {
-            "status": "noop", "message_id": "tail", "release_index": None,
-            "max_releases": 1, "run_token": token, "allocation_index": 30,
-            "epsilon": 1.0e-9, "delta": 1.0e-15,
-        }
-        msg = Message(
-            content=RecordDict({
-                "arrays": ArrayRecord(
-                    numpy_ndarrays=[np.zeros(1, dtype=np.float64)])
-            }),
-            dst_node_id=1,
-            message_type="train",
-        )
-
-        with tempfile.TemporaryDirectory() as manifest_dir:
-            with open(os.path.join(manifest_dir, "manifest.json"), "w",
-                      encoding="utf-8") as handle:
-                json.dump(manifest, handle)
-            context = SimpleNamespace(
-                node_config={"manifest-dir": manifest_dir},
-                run_config={}, state=RecordDict())
-
-            private_read = AssertionError("private data was read")
-            with (mock.patch.object(client_app.release_guard, "claim_release",
-                                    return_value=claim),
-                  mock.patch.object(client_app, "load_data",
-                                    side_effect=private_read) as load_data,
-                  mock.patch.object(client_app, "load_image_collection",
-                                    side_effect=private_read) as load_images,
-                  mock.patch.object(client_app, "load_tabular_patient_ids",
-                                    side_effect=private_read) as load_ids,
-                  mock.patch.object(task, "_read_staged_frame",
-                                    side_effect=private_read) as read_frame):
-                replies = [client_app.train(msg, context) for _ in range(2)]
-
-            load_data.assert_not_called()
-            load_images.assert_not_called()
-            load_ids.assert_not_called()
-            read_frame.assert_not_called()
-            self.assertEqual(os.listdir(manifest_dir), ["manifest.json"])
-            self.assertTrue(all(not reply.has_error() for reply in replies))
-            self.assertTrue(all(
-                int(reply.content["metrics"].get("privacy-noop", 0)) == 1
-                for reply in replies))
-            arrays = [reply.content["arrays"].to_numpy_ndarrays()[0]
-                      for reply in replies]
-            np.testing.assert_array_equal(arrays[0], arrays[1])
-            np.testing.assert_array_equal(
-                arrays[0], np.zeros(1, dtype=np.float64))
-
-
 class ReplaySafetyTests(unittest.TestCase):
     def test_replay_never_reads_private_data_or_new_seed(self):
         claim = {
             "status": "replay", "message_id": "m-replay", "release_index": 1,
-            "max_releases": 2, "run_token": "run_" + "a" * 32,
-            "allocation_index": 1, "epsilon": 1.0, "delta": 1e-5,
+            "num_rounds": 2, "run_token": "run_" + "a" * 32,
+            "request_id": "1" * 64, "epsilon": 1.0, "delta": 1e-5,
         }
         incoming = np.asarray([1.0, 2.0], dtype=np.float32)
         cached = np.asarray([9.0, 8.0], dtype=np.float32)
         private_access = AssertionError("replay touched private release state")
 
-        for has_cache in (True, False):
-            with self.subTest(has_cache=has_cache):
-                msg = Message(
-                    content=RecordDict({
-                        "arrays": ArrayRecord(numpy_ndarrays=[incoming])
-                    }),
-                    dst_node_id=1,
-                    message_type="train",
-                )
-                context = SimpleNamespace(state=RecordDict())
-                if has_cache:
-                    client_app._cache_reply(context, claim, [cached])
+        msg = Message(
+            content=RecordDict({
+                "arrays": ArrayRecord(numpy_ndarrays=[incoming])
+            }), dst_node_id=1, message_type="train")
+        context = SimpleNamespace(state=RecordDict())
+        client_app._cache_reply(context, claim, [cached])
 
-                with (mock.patch.object(
-                          client_app.release_guard, "claim_release",
-                          return_value=claim),
-                      mock.patch.object(
-                          client_app.release_guard, "release_id",
-                          side_effect=private_access) as release_id,
-                      mock.patch.object(
-                          client_app, "load_pinned_run_config",
-                          side_effect=private_access) as load_config,
-                      mock.patch.object(
-                          client_app, "load_data",
-                          side_effect=private_access) as load_data,
-                      mock.patch.object(
-                          client_app, "load_image_collection",
-                          side_effect=private_access) as load_images,
-                      mock.patch.object(
-                          client_app.seeding, "master_seed",
-                          side_effect=private_access) as master_seed,
-                      mock.patch.object(
-                          client_app, "_train_neural",
-                          side_effect=private_access) as train_neural):
-                    reply = client_app.train(msg, context)
+        with (mock.patch.object(
+                  client_app.release_guard, "claim_release",
+                  return_value=claim),
+              mock.patch.object(
+                  client_app, "load_pinned_run_config",
+                  side_effect=private_access) as load_config,
+              mock.patch.object(
+                  client_app, "load_data",
+                  side_effect=private_access) as load_data,
+              mock.patch.object(
+                  client_app, "load_image_collection",
+                  side_effect=private_access) as load_images,
+              mock.patch.object(
+                  client_app.seeding, "master_seed",
+                  side_effect=private_access) as master_seed,
+              mock.patch.object(
+                  client_app, "_train_neural",
+                  side_effect=private_access) as train_neural):
+            reply = client_app.train(msg, context)
 
-                for private_call in (
-                        release_id, load_config, load_data, load_images,
-                        master_seed, train_neural):
-                    private_call.assert_not_called()
-                self.assertFalse(reply.has_error())
-                actual = reply.content["arrays"].to_numpy_ndarrays()[0]
-                np.testing.assert_array_equal(
-                    actual, cached if has_cache else incoming)
-                metrics = reply.content["metrics"]
-                self.assertEqual(
-                    int(metrics.get("replay-cache-missing", 0)),
-                    0 if has_cache else 1)
+        for private_call in (
+                load_config, load_data, load_images, master_seed, train_neural):
+            private_call.assert_not_called()
+        self.assertFalse(reply.has_error())
+        actual = reply.content["arrays"].to_numpy_ndarrays()[0]
+        np.testing.assert_array_equal(actual, cached)
 
     def test_public_preflight_failure_and_replay_remain_unavailable(self):
         new_claim = {
             "status": "new", "message_id": "m-public-failure",
-            "release_index": 1, "max_releases": 1,
+            "release_index": 1, "num_rounds": 1,
+            "request_id": "2" * 64,
         }
         replay_claim = dict(new_claim, status="replay")
         incoming = np.asarray([4.0, 5.0], dtype=np.float32)
@@ -195,7 +103,8 @@ class ReplaySafetyTests(unittest.TestCase):
     def test_execution_failure_marker_survives_an_exact_replay(self):
         claim = {
             "status": "new", "message_id": "m-execution-failure",
-            "release_index": 1, "max_releases": 1,
+            "release_index": 1, "num_rounds": 1,
+            "request_id": "3" * 64,
         }
         replay_claim = dict(claim, status="replay")
         context = SimpleNamespace(state=RecordDict())
@@ -327,6 +236,29 @@ class StrategyRuntimeTests(unittest.TestCase):
                 ChangingGrid(),
             )
 
+    def test_strategy_pins_a_fresh_exact_round_config_for_every_message(self):
+        class Grid:
+            @staticmethod
+            def get_node_ids():
+                return [11, 22]
+
+        strategy = server_app._build_strategy(
+            {"strategy": "fedavg"}, min_nodes=2)
+        shared = ConfigRecord({"public-option": 7})
+        messages = strategy.configure_train(
+            2,
+            ArrayRecord(numpy_ndarrays=[np.asarray([0.0])]),
+            shared,
+            Grid(),
+        )
+        self.assertNotIn("server-round", shared)
+        self.assertEqual(len(messages), 2)
+        for message in messages:
+            config = message.content["config"]
+            self.assertIsInstance(config, ConfigRecord)
+            self.assertEqual(config["server-round"], 2)
+            self.assertEqual(config["public-option"], 7)
+
     def test_aggregation_rejects_duplicate_node_replies(self):
         strategy = server_app._build_strategy(
             {"strategy": "fedavg"}, min_nodes=2)
@@ -334,35 +266,32 @@ class StrategyRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "federation roster"):
             strategy.aggregate_train(1, duplicate)
 
-    def test_strategy_marks_replay_with_lost_cache_unavailable(self):
+    def test_strategy_marks_public_preflight_unavailable(self):
         strategy = server_app._build_strategy(
             {"strategy": "fedavg"}, min_nodes=2)
         strategy._round_input_arrays[1] = ArrayRecord(
             numpy_ndarrays=[np.asarray([0.0])])
         replies = [
             self._train_reply(1.0, 1),
-            self._train_reply(3.0, 2, **{"replay-cache-missing": 1}),
+            self._train_reply(
+                3.0, 2, **{"public-preflight-unavailable": 1}),
         ]
         strategy.aggregate_train(1, replies)
         self.assertEqual(strategy.available_rounds, set())
-        self.assertEqual(strategy.privacy_noop_rounds, {1})
+        self.assertEqual(strategy.unavailable_rounds, {1})
 
-    def test_privacy_tail_is_nonblocking_but_never_replaces_trained_arrays(self):
+    def test_unavailable_rounds_never_replace_trained_arrays(self):
         strategy = server_app._build_strategy(
             {"strategy": "fedavg"}, min_nodes=2)
         trained, _ = strategy.aggregate_train(1, [
             self._train_reply(1.0, 1), self._train_reply(3.0, 2)])
-        tail, _ = strategy.aggregate_train(2, [
-            self._train_reply(100.0, 1, **{"privacy-noop": 1}),
-            self._train_reply(200.0, 2, **{"privacy-noop": 1}),
-        ])
-        public_failure, _ = strategy.aggregate_train(3, [
+        public_failure, _ = strategy.aggregate_train(2, [
             self._train_reply(
                 300.0, 1, **{"public-preflight-unavailable": 1}),
             self._train_reply(
                 400.0, 2, **{"public-preflight-unavailable": 1}),
         ])
-        execution_failure, _ = strategy.aggregate_train(4, [
+        execution_failure, _ = strategy.aggregate_train(3, [
             self._train_reply(
                 500.0, 1, **{"execution-unavailable": 1}),
             self._train_reply(
@@ -371,15 +300,13 @@ class StrategyRuntimeTests(unittest.TestCase):
         np.testing.assert_array_equal(
             trained.to_numpy_ndarrays()[0], np.asarray([2.0]))
         np.testing.assert_array_equal(
-            tail.to_numpy_ndarrays()[0], np.asarray([2.0]))
-        np.testing.assert_array_equal(
             public_failure.to_numpy_ndarrays()[0], np.asarray([2.0]))
         np.testing.assert_array_equal(
             execution_failure.to_numpy_ndarrays()[0], np.asarray([2.0]))
         self.assertEqual(strategy.available_rounds, {1})
-        self.assertEqual(strategy.privacy_noop_rounds, {2, 3, 4})
+        self.assertEqual(strategy.unavailable_rounds, {2, 3})
 
-class LegacyBackendRemovalTests(unittest.TestCase):
+class RemovedBackendTests(unittest.TestCase):
     def test_tree_track_is_rejected_and_runtime_entry_points_are_absent(self):
         with tempfile.TemporaryDirectory() as manifest_dir:
             with open(os.path.join(manifest_dir, "manifest.json"), "w",
