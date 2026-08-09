@@ -464,6 +464,95 @@ flowerInitDS <- function(data_symbol) {
   run_config
 }
 
+.normalizeNativeTreeConfig <- function(run_config, track) {
+  fields <- names(run_config)[startsWith(tolower(names(run_config)),
+                                          "native-tree-")]
+  expected <- c("native-tree-request-b64", "native-tree-request-sha256")
+  if (!identical(track, "native_tree")) {
+    if (length(fields)) {
+      stop("native-tree-* fields require dp-track='native_tree'.",
+           call. = FALSE)
+    }
+    return(run_config)
+  }
+  if (!identical(sort(fields), sort(expected))) {
+    stop("native_tree requires exactly native-tree-request-b64 and ",
+         "native-tree-request-sha256.", call. = FALSE)
+  }
+  if (!identical(as.integer(run_config[["num-server-rounds"]]), 1L)) {
+    stop("The native_tree track has exactly one Flower round.",
+         call. = FALSE)
+  }
+  pinned <- .validate_native_tree_request_wire(
+    run_config[["native-tree-request-b64"]],
+    run_config[["native-tree-request-sha256"]])
+  if (!identical(pinned$value$engine, "xgboost")) {
+    stop("This release has no trusted adapter for the requested tree engine.",
+         call. = FALSE)
+  }
+  run_config[["native-tree-request-b64"]] <- pinned$b64
+  run_config[["native-tree-request-sha256"]] <- pinned$sha256
+  run_config
+}
+
+.validatePreparedNativeTreeContract <- function(run_config, feature_columns,
+                                                target_column) {
+  if (!identical(run_config[["dp-track"]], "native_tree")) {
+    return(invisible(TRUE))
+  }
+  pinned <- .validate_native_tree_request_wire(
+    run_config[["native-tree-request-b64"]],
+    run_config[["native-tree-request-sha256"]])
+  schema <- pinned$value$public_schema
+  target <- schema$target
+  request_features <- as.character(unlist(schema$features, use.names = FALSE))
+  if (!identical(as.character(feature_columns), request_features) ||
+      length(target_column) != 1L ||
+      !identical(as.character(target_column), target$name)) {
+    stop("Native-tree request schema differs from the prepared columns.",
+         call. = FALSE)
+  }
+  bounds <- run_config[["feature-bounds"]]
+  if (!is.list(bounds) ||
+      !identical(as.numeric(bounds$lower), as.numeric(schema$lower)) ||
+      !identical(as.numeric(bounds$upper), as.numeric(schema$upper))) {
+    stop("Native-tree request bounds differ from the prepared public bounds.",
+         call. = FALSE)
+  }
+  if (identical(pinned$value$task, "binary")) {
+    levels <- run_config[["target-levels"]]
+    type_map <- c(character = "string", logical = "boolean", numeric = "number")
+    level_type <- if (is.list(levels)) as.character(levels$type %||% "") else ""
+    tagged_type <- unname(type_map[[level_type]] %||% "")
+    values <- if (is.list(levels)) unlist(levels$values, use.names = FALSE) else NULL
+    expected <- target$levels
+    if (!nzchar(tagged_type) || length(values) != 2L ||
+        !all(vapply(expected, function(level) {
+          identical(level$type, tagged_type)
+        }, logical(1))) ||
+        !identical(unname(values),
+                   unname(vapply(expected, `[[`, level_type, "value")))) {
+      stop("Native-tree request target levels differ from the prepared contract.",
+           call. = FALSE)
+    }
+  } else {
+    bounds <- run_config[["target-bounds"]]
+    if (!is.list(bounds) ||
+        !identical(as.numeric(bounds$lower), as.numeric(target$lower)) ||
+        !identical(as.numeric(bounds$upper), as.numeric(target$upper))) {
+      stop("Native-tree request target bounds differ from the prepared contract.",
+           call. = FALSE)
+    }
+  }
+  unit <- .dpUnitPolicy()
+  if (identical(unit$dp_unit, "patient") &&
+      unit$patient_column %in% c(feature_columns, as.character(target_column))) {
+    stop("The server patient identifier cannot be a native-tree feature or target.",
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
 .validationContractSha256 <- function(run_config, feature_columns,
                                       target_column, privacy_unit) {
   bounds <- run_config[["feature-bounds"]] %||% NULL
@@ -534,6 +623,15 @@ flowerInitDS <- function(data_symbol) {
       gamma_nll = "regression",
       poisson_nll = "count", negbin_nll = "count",
       "classification")
+  } else if (identical(track, "native_tree")) {
+    request <- .validate_native_tree_request_wire(
+      run_config[["native-tree-request-b64"]],
+      run_config[["native-tree-request-sha256"]])
+    inferred <- if (identical(request$value$task, "regression")) {
+      "regression"
+    } else {
+      "classification"
+    }
   } else {
     if (!requested %in% c("classification", "regression", "count")) {
       stop("HookApp task-type must be classification, regression, or count.",
@@ -769,8 +867,8 @@ flowerInitDS <- function(data_symbol) {
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
   if (length(track) != 1L || is.na(track) ||
-      !tolower(track) %in% c("neural", "egress", "validation")) {
-    stop("dp-track must be one of neural, egress, or validation.",
+      !tolower(track) %in% c("neural", "egress", "native_tree", "validation")) {
+    stop("dp-track must be one of neural, egress, native_tree, or validation.",
          call. = FALSE)
   }
   track <- tolower(track)
@@ -779,6 +877,7 @@ flowerInitDS <- function(data_symbol) {
   }
   run_config[["dp-track"]] <- track
   run_config <- .normalizeValidationConfig(run_config, track)
+  run_config <- .normalizeNativeTreeConfig(run_config, track)
   run_config <- .normalizePinnedTaskType(run_config, track)
   run_config <- .normalizeHookAppParams(run_config, track)
   run_config <- .normalizePublicFeatureBounds(run_config)
@@ -910,10 +1009,21 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   routed <- .takeRunDataType(run_config, expected = descriptor_data_type)
   run_config <- routed$run_config
   data_type <- routed$data_type
+  if (identical(run_config[["dp-track"]], "native_tree") &&
+      !identical(data_type, "tabular")) {
+    stop("The native_tree track accepts tabular data only.", call. = FALSE)
+  }
   columns <- .normalizePublicColumnSelection(
     target_column, feature_columns, run_config)
   target_column <- columns$target_column
   feature_columns <- columns$feature_columns
+  .validatePreparedNativeTreeContract(
+    run_config, feature_columns, target_column)
+  if (identical(run_config[["dp-track"]], "native_tree") &&
+      !.native_tree_xgboost_probe()) {
+    stop("The verified native XGBoost runtime is unavailable on this node.",
+         call. = FALSE)
+  }
   if (identical(run_config[["dp-track"]], "validation")) {
     if (!is.character(feature_columns) || !length(feature_columns) ||
         anyNA(feature_columns) || any(!nzchar(feature_columns)) ||
@@ -1330,6 +1440,7 @@ flowerGetCapabilitiesDS <- function() {
 
   privacy_policy <- .privacy_policy()
   runner_caps <- .RUNNER_PUBLIC_CAPABILITIES
+  native_tree <- .native_tree_contract_capabilities()
   hook_enabled <- isTRUE(as.logical(.dsf_option("hook_enabled", FALSE)))
   hook_sandbox <- isTRUE(as.logical(
     .dsf_option("hook_sandbox_attested", FALSE)))
@@ -1358,6 +1469,7 @@ flowerGetCapabilitiesDS <- function() {
     declarative_model_ops = runner_caps$declarative_model_ops,
     declarative_losses  = runner_caps$declarative_losses,
     aggregation_strategies = runner_caps$aggregation_strategies,
+    native_tree         = native_tree,
     max_rounds          = settings$max_rounds,
     min_samples         = 0L,
     min_clients_per_round = 1L,

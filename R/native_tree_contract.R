@@ -584,9 +584,149 @@
     sha256 = actual)
 }
 
-#' Capability payload for the public request contract (not backend availability)
+#' Decode and re-pin an exact analyst-facing native-tree request
 #' @keywords internal
-.native_tree_contract_capabilities <- function() {
+.validate_native_tree_request_wire <- function(request_b64, request_sha256) {
+  if (!is.character(request_b64) || length(request_b64) != 1L ||
+      is.na(request_b64) || !nzchar(request_b64) ||
+      nchar(request_b64, type = "bytes") >
+        4L * ceiling(.NATIVE_TREE_MANIFEST_MAX_BYTES / 3L)) {
+    stop("native-tree-request-b64 must be one bounded canonical base64 string.",
+         call. = FALSE)
+  }
+  if (!is.character(request_sha256) || length(request_sha256) != 1L ||
+      is.na(request_sha256) ||
+      !grepl("^[0-9a-f]{64}$", request_sha256)) {
+    stop("native-tree-request-sha256 must be one lowercase SHA-256 digest.",
+         call. = FALSE)
+  }
+  decoded <- tryCatch(jsonlite::base64_dec(request_b64),
+                      error = function(e) NULL)
+  canonical_b64 <- if (is.null(decoded)) NULL else
+    gsub("[\r\n]", "", jsonlite::base64_enc(decoded))
+  if (is.null(decoded) || !length(decoded) ||
+      length(decoded) > .NATIVE_TREE_MANIFEST_MAX_BYTES ||
+      !identical(canonical_b64, request_b64)) {
+    stop("native-tree-request-b64 is not canonical bounded base64.",
+         call. = FALSE)
+  }
+  json <- tryCatch(rawToChar(decoded), error = function(e) NULL)
+  if (is.null(json) || length(json) != 1L ||
+      is.na(iconv(json, from = "UTF-8", to = "UTF-8", sub = NA_character_))) {
+    stop("native-tree-request-b64 must decode to valid UTF-8 JSON.",
+         call. = FALSE)
+  }
+  manifest <- tryCatch(
+    jsonlite::fromJSON(json, simplifyVector = FALSE),
+    error = function(e) NULL)
+  if (!is.list(manifest)) {
+    stop("native-tree-request-b64 must decode to a request object.",
+         call. = FALSE)
+  }
+  pinned <- .validate_native_tree_manifest(manifest, request_sha256)
+  if (!identical(pinned$json, json) || !identical(pinned$b64, request_b64)) {
+    stop("native-tree request must use the exact canonical encoding.",
+         call. = FALSE)
+  }
+  pinned
+}
+
+.native_tree_config_path <- function(option, environment, default = "") {
+  value <- Sys.getenv(environment, "")
+  if (!nzchar(value)) value <- as.character(.dsf_option(option, default))[[1L]]
+  if (!nzchar(value)) return("")
+  normalizePath(value, winslash = "/", mustWork = FALSE)
+}
+
+.native_tree_runtime_root <- function() {
+  .native_tree_config_path(
+    "native_tree_runtime", "DSFLOWER_NATIVE_TREE_RUNTIME",
+    file.path(.venv_root(), "native-tree"))
+}
+
+.native_tree_xgboost_bundle_root <- function() {
+  .native_tree_config_path(
+    "xgboost_bundle_root", "DSFLOWER_XGBOOST_BUNDLE_ROOT")
+}
+
+.native_tree_runtime_executable <- function(root, name) {
+  bindir <- if (.Platform$OS.type == "windows") "Scripts" else "bin"
+  suffix <- if (.Platform$OS.type == "windows") ".exe" else ""
+  file.path(root, bindir, paste0(name, suffix))
+}
+
+# Operational capability probe. It has no cache or mutable history: every call
+# rechecks the dedicated app, integrity guard, runtime and verified native bytes.
+.native_tree_xgboost_probe <- function(
+    runner_dir = system.file(
+      "flower_app", "dsflower_runner", package = "dsFlower"),
+    integrity_hook = system.file(
+      "python", "sitecustomize.py", package = "dsFlower"),
+    runtime_root = .native_tree_runtime_root(),
+    bundle_root = .native_tree_xgboost_bundle_root(),
+    run_probe = processx::run) {
+  tryCatch({
+    if (!nzchar(runner_dir) || !dir.exists(runner_dir) ||
+        !nzchar(integrity_hook) || !file.exists(integrity_hook) ||
+        dir.exists(integrity_hook)) return(FALSE)
+    app_files <- file.path(
+      runner_dir,
+      c("native_tree_server_app.py", "native_tree_client_app.py"))
+    if (!all(file.exists(app_files)) || any(dir.exists(app_files))) return(FALSE)
+    guard <- readLines(integrity_hook, warn = FALSE)
+    if (!any(grepl(
+        "dsflower_runner.native_tree_client_app:app", guard, fixed = TRUE))) {
+      return(FALSE)
+    }
+    if (!nzchar(runtime_root) || !dir.exists(runtime_root) ||
+        !nzchar(bundle_root) || !dir.exists(bundle_root)) return(FALSE)
+    python <- .native_tree_runtime_executable(runtime_root, "python")
+    supernode <- .native_tree_runtime_executable(runtime_root, "flower-supernode")
+    if (!file.exists(python) || dir.exists(python) ||
+        !file.exists(supernode) || dir.exists(supernode)) return(FALSE)
+
+    code <- paste(
+      "import os, sys",
+      "os.environ['DSFLOWER_XGBOOST_BUNDLE_ROOT'] = sys.argv[2]",
+      "sys.path.insert(0, sys.argv[1])",
+      "from dsflower_runner import xgboost_bundle",
+      "bundle_probe = xgboost_bundle.probe_xgboost_bundle(sys.argv[2])",
+      "from dsflower_runner import native_tree_client_app as client_entry",
+      "from dsflower_runner import native_tree_server_app as server_entry",
+      "from flwr.clientapp import ClientApp",
+      "from flwr.serverapp import ServerApp",
+      paste0(
+        "ready = (bundle_probe.available and ",
+        "xgboost_bundle.is_verified_bundle(client_entry._NATIVE_BUNDLE) ",
+        "and isinstance(client_entry.app, ClientApp) ",
+        "and isinstance(server_entry.app, ServerApp))"),
+      "if not ready: raise SystemExit(3)",
+      "sys.stdout.write('available')",
+      sep = "\n")
+    inherited <- c("current")
+    loader_names <- names(Sys.getenv())[
+      grepl("^(LD_|DYLD_)", names(Sys.getenv()), perl = TRUE)]
+    cleared <- stats::setNames(rep.int("", length(loader_names)), loader_names)
+    env <- c(inherited, cleared,
+             PYTHONHOME = "", PYTHONPATH = "", PYTHONSTARTUP = "",
+             PYTHONINSPECT = "", PYTHONNOUSERSITE = "1",
+             DSFLOWER_MANIFEST_DIR = "", DSFLOWER_PINNED_APP_DIR = "",
+             DSFLOWER_XGBOOST_BUNDLE_ROOT = bundle_root,
+             VIRTUAL_ENV = runtime_root)
+    result <- run_probe(
+      command = python,
+      args = c("-I", "-c", code, dirname(runner_dir), bundle_root),
+      env = env, error_on_status = FALSE, timeout = 15)
+    identical(as.integer(result$status), 0L) &&
+      identical(result$stdout, "available")
+  }, error = function(e) FALSE)
+}
+
+#' Capability payload for the public request contract and operational probe
+#' @param xgboost_available Result of the fresh node-local runtime probe.
+#' @keywords internal
+.native_tree_contract_capabilities <- function(
+    xgboost_available = .native_tree_xgboost_probe()) {
   list(
     contract = .NATIVE_TREE_CONTRACT,
     engines = .NATIVE_TREE_ENGINES,
@@ -596,7 +736,7 @@
     native_tight_requires_public_cuts = TRUE,
     task_target_kinds = list(binary = "binary", regression = "continuous"),
     native_tight_forbidden_parameters = .NATIVE_TREE_TIGHT_FORBIDDEN,
-    xgboost_native_tight_available = FALSE,
+    xgboost_native_tight_available = isTRUE(xgboost_available),
     xgboost_required_parameters = .NATIVE_TREE_XGBOOST_REQUIRED_PARAMETERS,
     xgboost_optional_parameters = .NATIVE_TREE_XGBOOST_OPTIONAL_PARAMETERS,
     max_manifest_bytes = .NATIVE_TREE_MANIFEST_MAX_BYTES,

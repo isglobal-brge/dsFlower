@@ -108,7 +108,7 @@ class ParentImportBoundaryTests(unittest.TestCase):
     def test_flower_clientapp_loader_is_wrapped_after_module_exec(self):
         with tempfile.TemporaryDirectory() as root:
             with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as fh:
-                json.dump({}, fh)
+                json.dump({"dp-track": "neural"}, fh)
             hook, finder = _load_hook(root)
 
             calls = []
@@ -147,7 +147,7 @@ class ParentImportBoundaryTests(unittest.TestCase):
     def test_canonical_clientapp_ref_loads_only_after_hash_pin_activation(self):
         with tempfile.TemporaryDirectory() as root:
             with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as fh:
-                json.dump({}, fh)
+                json.dump({"dp-track": "neural"}, fh)
             hook, finder = _load_hook(root)
             runner_spec = SimpleNamespace(
                 origin="/uploaded/dsflower_runner/__init__.py",
@@ -173,6 +173,33 @@ class ParentImportBoundaryTests(unittest.TestCase):
             verify.assert_called_once_with(
                 "dsflower_runner", "/uploaded/dsflower_runner")
             self.assertIn("dsflower_runner", hook._verified_packages)
+
+    def test_node_track_selects_only_its_exact_clientapp_reference(self):
+        for track, allowed, denied in (
+                ("neural", "dsflower_runner.client_app:app",
+                 "dsflower_runner.native_tree_client_app:app"),
+                ("native_tree", "dsflower_runner.native_tree_client_app:app",
+                 "dsflower_runner.client_app:app")):
+            with self.subTest(track=track), tempfile.TemporaryDirectory() as root:
+                with open(os.path.join(root, "manifest.json"), "w",
+                          encoding="utf-8") as fh:
+                    json.dump({"dp-track": track}, fh)
+                hook, _finder = _load_hook(root)
+                hook._verified_packages.add("dsflower_runner")
+                calls = []
+
+                def original(ref, *args, **kwargs):
+                    calls.append((ref, args, kwargs))
+                    return object()
+
+                module = SimpleNamespace(load_app=original)
+                hook._install_clientapp_load_guard(module)
+                module.load_app(allowed)
+                self.assertEqual(calls, [(allowed, (), {})])
+                with (mock.patch.object(
+                        hook, "_abort", side_effect=RuntimeError("denied")),
+                      self.assertRaisesRegex(RuntimeError, "denied")):
+                    module.load_app(denied)
 
 
 if __name__ == "__main__":

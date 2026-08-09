@@ -299,6 +299,8 @@ test_that(".supernode_ensure uses --root-certificates when ca_cert_path provided
 
   mock_manifest <- file.path(tempdir(), "tls_test_manifest")
   dir.create(mock_manifest, showWarnings = FALSE)
+  writeLines('{"dp-track":"neural"}',
+             file.path(mock_manifest, "manifest.json"))
   fake_supernode <- tempfile("flower-supernode")
   file.create(fake_supernode)
 
@@ -329,6 +331,8 @@ test_that(".supernode_ensure errors when no ca_cert_path", {
 
   mock_manifest <- file.path(tempdir(), "no_cert_test_manifest")
   dir.create(mock_manifest, showWarnings = FALSE)
+  writeLines('{"dp-track":"neural"}',
+             file.path(mock_manifest, "manifest.json"))
   fake_supernode <- tempfile("flower-supernode")
   file.create(fake_supernode)
   local_mocked_bindings(

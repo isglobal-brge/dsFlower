@@ -234,8 +234,94 @@ test_that("server bounds public cuts and canonical manifest bytes", {
     "exceeds 65536 bytes")
 })
 
-test_that("native-tree contract capabilities do not claim backend availability", {
-  capabilities <- dsFlower:::.native_tree_contract_capabilities()
+test_that("native-tree request wire re-pins exact bytes and digest", {
+  pinned <- dsFlower:::.validate_native_tree_manifest(
+    .native_tree_manifest_fixture())
+  decoded <- dsFlower:::.validate_native_tree_request_wire(
+    pinned$b64, pinned$sha256)
+  expect_identical(decoded$json, pinned$json)
+  expect_identical(decoded$value, pinned$value)
+  expect_error(
+    dsFlower:::.validate_native_tree_request_wire(
+      pinned$b64, strrep("0", 64L)),
+    "SHA-256 mismatch")
+  expect_error(
+    dsFlower:::.validate_native_tree_request_wire(
+      paste0(pinned$b64, "\n"), pinned$sha256),
+    "canonical bounded base64")
+})
+
+test_that("native-tree run config preserves and binds the exact request", {
+  pinned <- dsFlower:::.validate_native_tree_manifest(
+    .native_tree_manifest_fixture())
+  config <- dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "native_tree",
+    "task-type" = "classification",
+    "num-server-rounds" = 1L,
+    "feature-bounds" = list(lower = c(0, -5), upper = c(100, 5)),
+    "target-levels" = c("control", "case"),
+    "native-tree-request-b64" = pinned$b64,
+    "native-tree-request-sha256" = pinned$sha256))
+  expect_identical(config[["native-tree-request-b64"]], pinned$b64)
+  expect_identical(config[["native-tree-request-sha256"]], pinned$sha256)
+  expect_no_error(dsFlower:::.validatePreparedNativeTreeContract(
+    config, c("age", "marker"), "outcome"))
+  expect_error(dsFlower:::.validatePreparedNativeTreeContract(
+    config, c("marker", "age"), "outcome"), "schema differs")
+
+  tampered <- config
+  tampered[["native-tree-request-sha256"]] <- strrep("0", 64L)
+  expect_error(dsFlower:::.normalizeNativeTreeConfig(
+    tampered, "native_tree"), "SHA-256 mismatch")
+  expect_error(dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "neural", "num-server-rounds" = 1L,
+    "native-tree-request-b64" = pinned$b64,
+    "native-tree-request-sha256" = pinned$sha256)),
+    "require dp-track='native_tree'")
+})
+
+test_that("native XGBoost capability is an operational fail-closed probe", {
+  root <- withr::local_tempdir()
+  runner <- file.path(root, "dsflower_runner")
+  runtime <- file.path(root, "runtime")
+  bundle <- file.path(root, "bundle")
+  dir.create(runner)
+  dir.create(bundle)
+  dir.create(dirname(dsFlower:::.native_tree_runtime_executable(
+    runtime, "python")), recursive = TRUE)
+  file.create(file.path(runner, "native_tree_server_app.py"))
+  file.create(file.path(runner, "native_tree_client_app.py"))
+  file.create(dsFlower:::.native_tree_runtime_executable(runtime, "python"))
+  file.create(dsFlower:::.native_tree_runtime_executable(
+    runtime, "flower-supernode"))
+  hook <- file.path(root, "sitecustomize.py")
+  writeLines("dsflower_runner.native_tree_client_app:app", hook)
+  calls <- 0L
+  invocation <- NULL
+  run_probe <- function(...) {
+    calls <<- calls + 1L
+    invocation <<- list(...)
+    list(status = 0L, stdout = "available", stderr = "")
+  }
+
+  expect_true(dsFlower:::.native_tree_xgboost_probe(
+    runner, hook, runtime, bundle, run_probe))
+  expect_identical(calls, 1L)
+  probe_code <- paste(invocation$args, collapse = "\n")
+  expect_match(probe_code, "native_tree_client_app", fixed = TRUE)
+  expect_match(probe_code, "native_tree_server_app", fixed = TRUE)
+  expect_match(probe_code, "is_verified_bundle", fixed = TRUE)
+  expect_identical(
+    unname(invocation$env[["DSFLOWER_XGBOOST_BUNDLE_ROOT"]]),
+    bundle)
+  unlink(file.path(runner, "native_tree_client_app.py"))
+  expect_false(dsFlower:::.native_tree_xgboost_probe(
+    runner, hook, runtime, bundle, run_probe))
+  expect_identical(calls, 1L)
+})
+
+test_that("native-tree contract capability reflects the fresh probe", {
+  capabilities <- dsFlower:::.native_tree_contract_capabilities(FALSE)
   expect_identical(capabilities$contract, "dsflower-native-tree-request-v1")
   expect_identical(capabilities$modes, "native-tight")
   expect_setequal(
@@ -251,4 +337,47 @@ test_that("native-tree contract capabilities do not claim backend availability",
     c("learning_rate", "max_delta_step", "max_depth", "min_child_weight",
       "min_split_loss", "num_boost_round", "reg_alpha", "reg_lambda"))
   expect_length(capabilities$xgboost_optional_parameters, 0L)
+  expect_true(dsFlower:::.native_tree_contract_capabilities(
+    TRUE)$xgboost_native_tight_available)
+})
+
+test_that("native-tree prepare rejects an unavailable runtime before private IO", {
+  pinned <- dsFlower:::.validate_native_tree_manifest(
+    .native_tree_manifest_fixture())
+  config <- list(
+    "dp-track" = "native_tree",
+    "task-type" = "classification",
+    "num-server-rounds" = 1L,
+    "feature-bounds" = list(lower = c(0, -5), upper = c(100, 5)),
+    "target-levels" = c("control", "case"),
+    "native-tree-request-b64" = pinned$b64,
+    "native-tree-request-sha256" = pinned$sha256)
+  dsFlower:::.setHandle(
+    "native_tree_probe_false",
+    mock_handle(data_path = "/private/data/must-not-be-read.csv"))
+  withr::defer(dsFlower:::.removeHandle("native_tree_probe_false"))
+  private_io <- FALSE
+  testthat::local_mocked_bindings(
+    .native_tree_xgboost_probe = function(...) FALSE,
+    .loadTrainingData = function(...) {
+      private_io <<- TRUE
+      stop("private data was read", call. = FALSE)
+    },
+    .stageData = function(...) {
+      private_io <<- TRUE
+      stop("private data was staged", call. = FALSE)
+    },
+    .package = "dsFlower")
+
+  expect_error(
+    flowerPrepareRunDS(
+      "native_tree_probe_false", "outcome", c("age", "marker"), config),
+    "verified native XGBoost runtime is unavailable")
+  image_config <- config
+  image_config$data_type <- "image"
+  expect_error(
+    flowerPrepareRunDS(
+      "native_tree_probe_false", "outcome", c("age", "marker"), image_config),
+    "accepts tabular data only")
+  expect_false(private_io)
 })

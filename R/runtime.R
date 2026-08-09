@@ -86,13 +86,31 @@
 #' Used for the dsFlower trusted runners (harness / tier2), which are torch apps.
 #' @keywords internal
 .resolve_framework_runtime <- function(framework) {
-  venv_path <- file.path(.venv_root(), .framework_venv(framework))
-  python <- file.path(venv_path, "bin", "python")
-  cmd <- file.path(venv_path, "bin", "flower-supernode")
+  venv_path <- if (identical(framework, "native_tree")) {
+    .native_tree_runtime_root()
+  } else {
+    file.path(.venv_root(), .framework_venv(framework))
+  }
+  python <- if (identical(framework, "native_tree")) {
+    .native_tree_runtime_executable(venv_path, "python")
+  } else {
+    bindir <- if (.Platform$OS.type == "windows") "Scripts" else "bin"
+    suffix <- if (.Platform$OS.type == "windows") ".exe" else ""
+    file.path(venv_path, bindir, paste0("python", suffix))
+  }
+  cmd <- if (identical(framework, "native_tree")) {
+    .native_tree_runtime_executable(venv_path, "flower-supernode")
+  } else {
+    bindir <- if (.Platform$OS.type == "windows") "Scripts" else "bin"
+    suffix <- if (.Platform$OS.type == "windows") ".exe" else ""
+    file.path(venv_path, bindir, paste0("flower-supernode", suffix))
+  }
   if (!dir.exists(venv_path))
     stop("Venv not found: ", venv_path, ". Run dsFlower configure.", call. = FALSE)
+  if (!file.exists(python))
+    stop("Python not found in the trusted runtime.", call. = FALSE)
   if (!file.exists(cmd))
-    stop("flower-supernode not found: ", cmd, call. = FALSE)
+    stop("flower-supernode not found in the trusted runtime.", call. = FALSE)
   list(framework = framework, venv_path = venv_path,
        supernode_cmd = cmd, python = python)
 }
@@ -108,7 +126,8 @@
 #' @keywords internal
 .build_clean_python_env <- function(venv_path, staging_dir,
                                      extra_pypath = NULL) {
-  venv_bin <- file.path(venv_path, "bin")
+  venv_bin <- file.path(
+    venv_path, if (.Platform$OS.type == "windows") "Scripts" else "bin")
   current_path <- Sys.getenv("PATH", "")
   # This is the final common boundary before trusted Python can make a private
   # release. Bootstrap here as defence in depth so a future launch path cannot
@@ -255,9 +274,28 @@
          call. = FALSE)
   }
 
+  manifest <- tryCatch(
+    jsonlite::fromJSON(
+      file.path(manifest_dir, "manifest.json"), simplifyVector = FALSE),
+    error = function(e) NULL)
+  track <- if (is.list(manifest)) {
+    as.character(manifest[["dp-track"]] %||% "")
+  } else {
+    ""
+  }
+  if (length(track) != 1L ||
+      !track %in% c("neural", "egress", "native_tree", "validation")) {
+    stop("Prepared manifest has no supported trusted execution track.",
+         call. = FALSE)
+  }
+  if (identical(track, "native_tree") && !.native_tree_xgboost_probe()) {
+    stop("The verified native XGBoost runtime is unavailable on this node.",
+         call. = FALSE)
+  }
   # The release runner is node-resident and hash-pinned. Resolve its framework
-  # directly instead of accepting an analyst-selected executable runtime.
-  runtime_desc <- .resolve_framework_runtime("pytorch")
+  # from the server-validated manifest, never from an analyst executable path.
+  runtime_desc <- .resolve_framework_runtime(
+    if (identical(track, "native_tree")) "native_tree" else "pytorch")
   supernode_cmd <- runtime_desc$supernode_cmd
 
   # Create log directory
@@ -299,6 +337,11 @@
   venv_path <- runtime_desc$venv_path
   spawn_env <- .build_clean_python_env(venv_path, manifest_dir,
                                         extra_pypath = new_pypath)
+  if (identical(track, "native_tree")) {
+    spawn_env <- c(
+      spawn_env,
+      DSFLOWER_XGBOOST_BUNDLE_ROOT = .native_tree_xgboost_bundle_root())
+  }
   if (exists("tier2_app_dir", inherits = FALSE)) {
     spawn_env <- c(spawn_env, DSFLOWER_PINNED_APP_DIR = tier2_app_dir)
   }
@@ -322,7 +365,7 @@
   # and reaps the whole subtree, so nothing can reach PID 1. Graceful fallback to a
   # direct launch if the wrapper script or venv python is missing (older install).
   reaper_py <- system.file("python", "supernode_reaper.py", package = "dsFlower")
-  venv_python <- runtime_desc$python %||% file.path(venv_path, "bin", "python")
+  venv_python <- runtime_desc$python
   use_reaper <- nzchar(reaper_py) && file.exists(reaper_py) &&
                 !is.null(venv_python) && nzchar(venv_python) && file.exists(venv_python)
 
