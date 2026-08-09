@@ -165,6 +165,59 @@ class _Grid:
                 for message in messages]
 
 
+def _bundle_failure_stage(bundle_root, verifier):
+    """Locate a bounded verifier stage without exposing native diagnostics."""
+    try:
+        root = verifier._root_path(bundle_root)
+    except Exception:
+        return "root"
+    try:
+        raw = verifier._read_file(
+            root / verifier.MANIFEST_NAME,
+            max_bytes=verifier.MANIFEST_MAX_BYTES)
+    except Exception:
+        return "manifest-bytes"
+    try:
+        manifest = verifier._canonical_manifest(raw)
+        system = verifier._validate_manifest(manifest)
+    except Exception:
+        return "manifest-contract"
+    xgboost_path = manifest["xgboost"]["path"]
+    primitive_path = manifest["dp_primitives"]["path"]
+    try:
+        verifier._verify_tree(
+            root, (verifier.MANIFEST_NAME, xgboost_path, primitive_path))
+    except Exception:
+        return "tree"
+    for stage, path, digest in (
+            ("xgboost-bytes", xgboost_path, manifest["xgboost"]["sha256"]),
+            ("primitive-bytes", primitive_path,
+             manifest["dp_primitives"]["sha256"])):
+        try:
+            verifier._read_file(root / path, expected_sha256=digest)
+        except Exception:
+            return stage
+    try:
+        xgboost, primitive = verifier._load_libraries(
+            root, xgboost_path, primitive_path, system)
+    except Exception:
+        return "libraries"
+    for stage, path, digest in (
+            ("post-xgboost-bytes", xgboost_path,
+             manifest["xgboost"]["sha256"]),
+            ("post-primitive-bytes", primitive_path,
+             manifest["dp_primitives"]["sha256"])):
+        try:
+            verifier._read_file(root / path, expected_sha256=digest)
+        except Exception:
+            return stage
+    try:
+        verifier._probe_abis(xgboost, primitive)
+    except Exception:
+        return "abi"
+    return "transient"
+
+
 def _exercise_task(work, task, client_app, server_app,
                    native_tree_request, xgboost_predictor):
     request, request_b64, request_sha256 = _request_wire(task)
@@ -262,8 +315,9 @@ def _child(bundle_root, secret_file, work):
     if not xgboost_bundle.is_verified_bundle(client_app._NATIVE_BUNDLE):
         probe = xgboost_bundle.probe_xgboost_bundle(bundle_root)
         raise AssertionError(
-            "real curated bundle was not loaded and verified: %s" %
-            probe.error_code)
+            "real curated bundle was not loaded and verified: %s/%s" % (
+                probe.error_code,
+                _bundle_failure_stage(bundle_root, xgboost_bundle)))
     _exercise_task(
         work, "binary", client_app, server_app,
         native_tree_request, xgboost_predictor)
