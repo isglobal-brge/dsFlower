@@ -6,6 +6,8 @@ per-site metrics never leave the node.
 """
 
 import base64
+import hashlib
+import json
 import math
 import os
 
@@ -19,16 +21,8 @@ _MAX_PUBLIC_ARRAYS = 256
 _MAX_PUBLIC_ELEMENTS = 8_000_000
 _MAX_PUBLIC_BYTES = 64 * 1024 * 1024
 _INFERENCE_BATCH_ROWS = 1024
-_VALIDATION_SEED_CONFIG_KEYS = frozenset({
-    "model-spec-b64", "loss-name", "num-classes", "num-labels",
-    "num-features", "feature-bounds", "target-bounds",
-    "validation-model-track", "validation-task", "validation-bins",
-    "validation-contract-sha256", "task-type", "nb-dispersion",
-    "gamma-shape", "huber-delta", "quantile-level",
-})
-_VALIDATION_SEED_PRIVACY_KEYS = frozenset({
-    "policy_hash", "epsilon", "delta", "clipping_norm", "adjacency",
-})
+_VALIDATION_MECHANISM = "validation-gaussian/v2"
+_VALIDATION_FINGERPRINT = "validation-sufficient-v2"
 
 
 def _integer(value, name, lower, upper):
@@ -70,6 +64,81 @@ def validation_layout(task, *, n_classes=2, n_labels=2, bins=32):
     if task == "count":
         return {"task": task, "size": 6, "sensitivity": math.sqrt(5.0)}
     raise ValueError("unsupported validation task %r" % task)
+
+
+def _effective_validation_layout(layout):
+    """Return the implemented layout, ignoring non-semantic representation."""
+    if not isinstance(layout, dict):
+        raise ValueError("invalid validation layout")
+    task = str(layout.get("task", "")).lower()
+    if task == "binary":
+        effective = validation_layout(
+            "classification", n_classes=2, bins=layout.get("bins"))
+    elif task == "multiclass":
+        effective = validation_layout(
+            "classification", n_classes=layout.get("classes"),
+            bins=layout.get("bins"))
+    elif task == "ordinal":
+        effective = validation_layout(
+            "ordinal", n_classes=layout.get("classes"),
+            bins=layout.get("bins"))
+    elif task == "multilabel":
+        effective = validation_layout(
+            "multilabel", n_labels=layout.get("labels"),
+            bins=layout.get("bins"))
+    elif task in ("regression", "count"):
+        effective = validation_layout(task)
+    else:
+        raise ValueError("invalid validation layout")
+    try:
+        size = _integer(layout.get("size"), "validation layout size", 1,
+                        _MAX_VECTOR)
+        sensitivity = float(layout.get("sensitivity"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("invalid validation layout") from exc
+    if (size != effective["size"] or not math.isfinite(sensitivity)
+            or sensitivity != effective["sensitivity"]):
+        raise ValueError("invalid validation layout")
+    return effective
+
+
+def _canonical_sufficient_vector(value, layout):
+    effective = _effective_validation_layout(layout)
+    vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    if (vector.shape != (effective["size"],)
+            or not bool(np.all(np.isfinite(vector)))):
+        raise ValueError("invalid validation sufficient vector")
+    canonical = np.ascontiguousarray(vector.astype("<f8", copy=False))
+    if bool(np.any(canonical == 0.0)):
+        canonical = canonical.copy()
+        canonical[canonical == 0.0] = 0.0
+    return canonical
+
+
+def _validation_noise_key(raw, layout, sigma):
+    """Bind sticky validation noise only to the effective DP release."""
+    from . import seeding
+
+    effective = _effective_validation_layout(layout)
+    canonical = _canonical_sufficient_vector(raw, effective)
+    scale = float(sigma)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("validation noise scale must be finite and positive")
+    semantics = {
+        "layout": effective,
+        "mechanism": _VALIDATION_MECHANISM,
+        "sigma": scale,
+    }
+    encoded = json.dumps(
+        semantics, allow_nan=False, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    privacy = dict(semantics)
+    privacy["policy_hash"] = hashlib.sha256(encoded).hexdigest()
+    master = seeding.master_seed(
+        _VALIDATION_MECHANISM, {"layout": effective}, privacy, 1,
+        private_arrays=(canonical,),
+        execution_fingerprint=_VALIDATION_FINGERPRINT)
+    return seeding.sub_seed(master, "validation-noise/v2")
 
 
 def layout_from_config(cfg):
@@ -310,8 +379,10 @@ def _apply_feature_bounds(X, cfg):
 def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
                              on_private_start=None):
     """Validate public inputs, then read private data and emit one DP vector."""
-    from . import seeding, task as task_module
-    from .params import get_torch_params, load_user_model, set_torch_params
+    from . import task as task_module
+    from .params import load_user_model, set_torch_params
+
+    del round_index  # Operational coordinates are not validation reroll axes.
 
     layout = layout_from_config(cfg)
     _model_track(cfg)
@@ -335,29 +406,12 @@ def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
     task_module.assert_pinned_unit_count(context, len(y), unit_ids)
     X_model = _apply_feature_bounds(X, cfg)
     predictions = neural_predictions(model, X_model, cfg.get("loss-name"))
-    canonical_units = (None if unit_ids is None else [
-        task_module._canonical_patient_id(value) for value in np.asarray(
-            unit_ids, dtype=object).tolist()
-    ])
-    master = seeding.master_seed(
-        "validation-gaussian/v1",
-        seeding.select_config(cfg, _VALIDATION_SEED_CONFIG_KEYS),
-        seeding.select_config(pcfg, _VALIDATION_SEED_PRIVACY_KEYS),
-        int(round_index),
-        public_arrays=get_torch_params(model),
-        private_arrays=(
-            np.asarray(X_model, dtype=np.float32),
-            np.asarray(y, dtype=np.float64),
-            np.asarray(predictions, dtype=np.float64),
-        ),
-        unit_ids=canonical_units)
     target_bounds = (target_bounds_from_config(cfg)
                      if layout["task"] in ("regression", "count") else None)
     released, _sigma = private_validation_vector(
         y, predictions, layout, epsilon=pcfg["epsilon"],
-        delta=pcfg["delta"],
-        rng=seeding.np_rng(seeding.sub_seed(master, "validation-noise")),
-        target_bounds=target_bounds, num_releases=1, unit_ids=unit_ids)
+        delta=pcfg["delta"], target_bounds=target_bounds, num_releases=1,
+        unit_ids=unit_ids)
     return [released.astype(np.float64)]
 
 
@@ -514,6 +568,74 @@ def _unit_contributions(contributions, unit_ids=None):
     return grouped
 
 
+def _stable_index_sum(indices, values, size):
+    """Sum sparse non-negative values in a representation-independent order."""
+    out = np.zeros(int(size), dtype=np.float64)
+    if len(indices) == 0:
+        return out
+    indices = np.asarray(indices, dtype=np.int64)
+    values = np.asarray(values, dtype=np.float64)
+    order = np.lexsort((values, indices))
+    sorted_indices = indices[order]
+    sorted_values = values[order]
+    starts = np.r_[0, np.flatnonzero(
+        sorted_indices[1:] != sorted_indices[:-1]) + 1]
+    out[sorted_indices[starts]] = np.add.reduceat(sorted_values, starts)
+    return out
+
+
+def _patient_histogram_sum(inverse, counts, indices, size):
+    """Aggregate one sparse histogram family with deterministic unit weights."""
+    if len(indices) == 0:
+        return np.zeros(int(size), dtype=np.float64)
+    indices = np.asarray(indices, dtype=np.int64)
+    order = np.lexsort((indices, inverse))
+    sorted_units = inverse[order]
+    sorted_indices = indices[order]
+    pair_starts = np.r_[0, np.flatnonzero(
+        (sorted_units[1:] != sorted_units[:-1])
+        | (sorted_indices[1:] != sorted_indices[:-1])) + 1]
+    pair_ends = np.r_[pair_starts[1:], len(indices)]
+    pair_counts = pair_ends - pair_starts
+    pair_units = sorted_units[pair_starts]
+    pair_indices = sorted_indices[pair_starts]
+
+    # Use a common dyadic denominator. Integer apportionment by histogram index
+    # gives every patient exactly one unit of mass without depending on row
+    # order or on the spelling/sort order of the patient identifier.
+    denominator = 1 << 52
+    quotient = denominator // counts
+    remainder = denominator - quotient * counts
+    unit_starts = np.cumsum(np.r_[0, counts[:-1]], dtype=np.int64)
+    rank = pair_starts - unit_starts[pair_units]
+    extra = np.minimum(
+        np.maximum(remainder[pair_units] - rank, 0), pair_counts)
+    numerators = quotient[pair_units] * pair_counts + extra
+    return _stable_index_sum(
+        pair_indices, numerators.astype(np.float64) / float(denominator),
+        size)
+
+
+def _stable_numeric_sum(contributions, inverse, counts):
+    """Sum numeric sufficient statistics independent of row and ID order."""
+    values = np.asarray(contributions, dtype=np.float64)
+    total = np.zeros(values.shape[1], dtype=np.float64)
+    if values.shape[0] == 0:
+        return total
+    for column in range(values.shape[1]):
+        coordinate = values[:, column]
+        if inverse is None:
+            total[column] = np.sum(
+                np.sort(coordinate), dtype=np.float64)
+            continue
+        order = np.lexsort((coordinate, inverse))
+        starts = np.cumsum(np.r_[0, counts[:-1]], dtype=np.int64)
+        unit_sums = np.add.reduceat(coordinate[order], starts)
+        unit_means = np.clip(unit_sums / counts, 0.0, 1.0)
+        total[column] = np.sum(np.sort(unit_means), dtype=np.float64)
+    return total
+
+
 def _summed_validation_contributions(y, predictions, layout, *,
                                      target_bounds=None, unit_ids=None):
     """Sum unit-bounded contributions without a dense row-by-layout matrix.
@@ -531,9 +653,8 @@ def _summed_validation_contributions(y, predictions, layout, *,
     if target.ndim == 0 or scores.ndim == 0 or target.shape[0] != scores.shape[0]:
         raise ValueError("validation label/prediction length mismatch")
     n_rows = int(target.shape[0])
-    weights = np.ones(n_rows, dtype=np.float64)
     inverse = None
-    unit_count = None
+    counts = None
     if unit_ids is not None:
         ids = np.asarray(unit_ids)
         if ids.ndim != 1 or ids.shape[0] != n_rows:
@@ -547,28 +668,8 @@ def _summed_validation_contributions(y, predictions, layout, *,
         except (TypeError, ValueError, UnicodeError) as exc:
             raise ValueError(
                 "validation unit identifiers are invalid") from exc
-        unique, inverse, counts = np.unique(
+        _unique, inverse, counts = np.unique(
             canonical, return_inverse=True, return_counts=True)
-        unit_count = int(unique.size)
-        if n_rows:
-            # A naïve repeated ``1 / visits`` can sum above one in float64
-            # (e.g. by 8e-12 for one million visits), invalidating the exact
-            # sensitivity bound. Allocate a common dyadic denominator instead:
-            # weights differ from the arithmetic mean by at most 2^-52 and the
-            # integer numerators sum exactly to 2^52 for every patient.
-            denominator = 1 << 52
-            quotient = denominator // counts
-            remainder = denominator - quotient * counts
-            order = np.argsort(inverse, kind="stable")
-            starts = np.cumsum(
-                np.r_[0, counts[:-1]], dtype=np.int64)
-            ranks = (np.arange(n_rows, dtype=np.int64)
-                     - np.repeat(starts, counts))
-            extra = ranks < np.repeat(remainder, counts)
-            numerators = quotient[inverse].copy()
-            numerators[order[extra]] += 1
-            weights = (numerators.astype(np.float64)
-                       / float(denominator))
 
     size = int(layout["size"])
     task = layout.get("task")
@@ -587,8 +688,9 @@ def _summed_validation_contributions(y, predictions, layout, *,
         if scores.shape[0] != n_rows:
             raise ValueError("validation label/prediction length mismatch")
         index = labels * bins + _score_bins(scores, bins)
-        total[:] = np.bincount(
-            index, weights=weights, minlength=size)[:size]
+        total[:] = (np.bincount(index, minlength=size)[:size]
+                    if inverse is None else _patient_histogram_sum(
+                        inverse, counts, index, size))
     elif task in ("multiclass", "ordinal"):
         classes = int(layout["classes"])
         if scores.shape != (n_rows, classes):
@@ -604,16 +706,21 @@ def _summed_validation_contributions(y, predictions, layout, *,
             where=denom > 0)
         pred = np.argmax(probs, axis=1)
         confusion_size = classes * classes
-        total[:confusion_size] = np.bincount(
-            labels * classes + pred, weights=weights,
-            minlength=confusion_size)[:confusion_size]
+        confusion_index = labels * classes + pred
+        total[:confusion_size] = (
+            np.bincount(
+                confusion_index, minlength=confusion_size)[:confusion_size]
+            if inverse is None else _patient_histogram_sum(
+                inverse, counts, confusion_index, confusion_size))
         stride = 2 * bins
         for cls in range(classes):
             positive = (labels == cls).astype(np.int64)
             index = positive * bins + _score_bins(probs[:, cls], bins)
             start = confusion_size + cls * stride
-            total[start:start + stride] = np.bincount(
-                index, weights=weights, minlength=stride)[:stride]
+            total[start:start + stride] = (
+                np.bincount(index, minlength=stride)[:stride]
+                if inverse is None else _patient_histogram_sum(
+                    inverse, counts, index, stride))
     elif task == "multilabel":
         labels = int(layout["labels"])
         if (target.ndim != 2 or scores.ndim != 2
@@ -628,21 +735,14 @@ def _summed_validation_contributions(y, predictions, layout, *,
             index = (truth[:, label] * bins
                      + _score_bins(probs[:, label], bins))
             start = label * stride
-            total[start:start + stride] = np.bincount(
-                index, weights=weights, minlength=stride)[:stride]
+            total[start:start + stride] = (
+                np.bincount(index, minlength=stride)[:stride]
+                if inverse is None else _patient_histogram_sum(
+                    inverse, counts, index, stride))
     elif task in ("regression", "count"):
         contribution = _numeric_contributions(
             target, scores, layout, target_bounds)
-        if inverse is None:
-            total[:] = np.einsum(
-                "i,ij->j", weights, contribution, optimize=True)
-        else:
-            units = np.zeros((unit_count, size), dtype=np.float64)
-            np.add.at(units, inverse, contribution * weights[:, None])
-            # Each numeric coordinate has public domain [0, 1]. Clipping only
-            # corrects floating-point accumulation at the boundary and makes
-            # the per-patient sensitivity argument true of the implementation.
-            total[:] = np.sum(np.clip(units, 0.0, 1.0), axis=0)
+        total[:] = _stable_numeric_sum(contribution, inverse, counts)
     else:
         raise ValueError("unsupported validation task %r" % task)
     if not bool(np.all(np.isfinite(total))):
@@ -650,19 +750,21 @@ def _summed_validation_contributions(y, predictions, layout, *,
     return total
 
 
-def private_validation_vector(y, predictions, layout, *, epsilon, delta, rng,
+def private_validation_vector(y, predictions, layout, *, epsilon, delta,
                               target_bounds=None, num_releases=1,
                               unit_ids=None):
-    """Release one Gaussian-noised sum with replace-one L2 sensitivity."""
+    """Release one semantic-sticky Gaussian sum with replace-one sensitivity."""
     from . import dp_harness, seeding
-    if not isinstance(rng, seeding.SecureNumpyRng):
-        raise RuntimeError("validation requires the release-scoped secure RNG")
+
+    effective = _effective_validation_layout(layout)
     raw = _summed_validation_contributions(
-        y, predictions, layout, target_bounds=target_bounds,
+        y, predictions, effective, target_bounds=target_bounds,
         unit_ids=unit_ids)
+    raw = _canonical_sufficient_vector(raw, effective)
     sigma = dp_harness.compute_output_sigma(
-        epsilon, delta, float(layout["sensitivity"]),
+        epsilon, delta, float(effective["sensitivity"]),
         num_releases=num_releases)
+    rng = seeding.np_rng(_validation_noise_key(raw, effective, sigma))
     noise = np.asarray(rng.normal(0.0, sigma, size=raw.shape), dtype=np.float64)
     released = raw + noise
     if released.shape != raw.shape or not bool(np.all(np.isfinite(released))):
