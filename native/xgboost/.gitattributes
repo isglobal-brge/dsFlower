@@ -1,0 +1,6 @@
+*.env text eol=lf
+*.md text eol=lf
+*.patch text eol=lf
+*.py text eol=lf
+*.sha256 text eol=lf
+*.sh text eol=lf
