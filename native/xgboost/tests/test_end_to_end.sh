@@ -68,6 +68,9 @@ esac
 # Run again after build_bundle.sh has removed all intermediate build paths.
 python3 "$ROOT/scripts/verify_bundle.py" "$BUNDLE"
 python3 "$TEST_DIR/dp_core_smoke.py" "$CORE_LIBRARY" "$DP_RUNTIME_LIBRARY"
+if [ -n "${DSFLOWER_XGB_E2E_PYTHON:-}" ]; then
+  "$DSFLOWER_XGB_E2E_PYTHON" "$TEST_DIR/real_runner_e2e.py" "$BUNDLE"
+fi
 
 cp -R "$BUNDLE" "$WORK/tampered-bundle"
 printf 'x' >> "$WORK/tampered-bundle/lib/$(basename -- "$DP_RUNTIME_LIBRARY")"
