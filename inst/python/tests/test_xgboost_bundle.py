@@ -117,8 +117,10 @@ class _BundleDirectory:
                 "icacls", str(self.root), "/inheritance:r", "/grant:r",
                 "%s:(OI)(CI)F" % identity,
             ], check=True, capture_output=True, text=True)
-        self.xgboost_bytes = b"real-xgboost-binary"
-        self.primitive_bytes = b"real-dp-primitive"
+        # Exercise Windows binary mode explicitly: text-mode CRT reads can
+        # translate CRLF and stop at Ctrl-Z before hashing a DLL.
+        self.xgboost_bytes = b"real-xgboost\r\nbinary\x1aend"
+        self.primitive_bytes = b"real-dp\r\nprimitive\x1aend"
         self.manifest = _manifest(self.xgboost_bytes, self.primitive_bytes)
         (self.root / "lib").mkdir()
         (self.root / self.manifest["xgboost"]["path"]).write_bytes(
