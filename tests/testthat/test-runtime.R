@@ -20,6 +20,14 @@ local_runtime_privacy_state <- function(.local_envir = parent.frame()) {
   invisible(state_dir)
 }
 
+test_that("torch backend selection rejects unknown or malformed values", {
+  expect_identical(dsFlower:::.resolve_backend("cpu"), "cpu")
+  expect_error(dsFlower:::.resolve_backend("rocm"), "torch_backend")
+  expect_error(dsFlower:::.resolve_backend("custom"), "torch_backend")
+  expect_error(dsFlower:::.resolve_backend(TRUE), "torch_backend")
+  expect_error(dsFlower:::.resolve_backend(c("cpu", "gpu")), "torch_backend")
+})
+
 test_that("the final Python boundary creates and repairs missing privacy state", {
   withr::with_tempdir({
     state_dir <- file.path(getwd(), "privacy")

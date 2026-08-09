@@ -230,17 +230,23 @@ _mkmod("t2_count", """
         """)
 _test_caps = {"subprocess": True, "net_lock": True, "fs_isolation": True,
               "bwrap": None}
+_hook_cfg = {
+    "app_params": {}, "round_index": 1, "num_rounds": 1,
+    "task": "classification", "num_classes": 2,
+}
 _pinned_file = lambda name: os.path.join(_T2DIR, name, "__init__.py")
 with _mock.patch.object(tier2_lib, "hook_execution_caps", return_value=_test_caps), \
         _mock.patch.object(tier2_lib, "_pinned_user_package", side_effect=_pinned_file):
     _seed = b"t" * 32
     _ex = tier2_lib.gated_local_update(
-        "t2_exfil", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+        "t2_exfil", g, Xraw, yraw, _hook_cfg, pcfg,
+        seed=_seed, hook_caps=_test_caps)
     check("Tier-2 exfil via weights DESTROYED by the gate (1e6 raw -> O(sigma))",
           np.max(np.abs(np.concatenate([(o - gg).ravel()
                                         for o, gg in zip(_ex, g)]))) < 100)
     _mk = tier2_lib.gated_local_update(
-        "t2_monkey", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+        "t2_monkey", g, Xraw, yraw, _hook_cfg, pcfg,
+        seed=_seed, hook_caps=_test_caps)
     check("Tier-2 in-process MONKEYPATCH defeated by isolation (parent DP intact, release bounded)",
           np.max(np.abs(np.concatenate([(o - gg).ravel()
                                         for o, gg in zip(_mk, g)]))) < 100)
@@ -250,32 +256,37 @@ with _mock.patch.object(tier2_lib, "hook_execution_caps", return_value=_test_cap
           isinstance(tier2_lib.seeding.np_rng(b"k" * 32),
                      tier2_lib.dp_harness.SecureNumpyRng))
     _ws = tier2_lib.gated_local_update(
-        "t2_wrongshape", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+        "t2_wrongshape", g, Xraw, yraw, _hook_cfg, pcfg,
+        seed=_seed, hook_caps=_test_caps)
     check("Tier-2 shape-mismatch NEUTRALIZED (validate-or-zero -> noisy global shape)",
           len(_ws) == len(g) and all(a.shape == o.shape for a, o in zip(_ws, g))
           and all(np.all(np.isfinite(a)) for a in _ws))
     _cr = tier2_lib.gated_local_update(
-        "t2_crash", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+        "t2_crash", g, Xraw, yraw, _hook_cfg, pcfg,
+        seed=_seed, hook_caps=_test_caps)
     check("Tier-2 crashing/data-dependent upload -> finite NOISY release",
           all(np.all(np.isfinite(a)) for a in _cr)
           and all(a.shape == o.shape for a, o in zip(_cr, g))
           and any(not np.array_equal(a, o) for a, o in zip(_cr, g)))
     _hr = tier2_lib.gated_local_update(
-        "t2_huge", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+        "t2_huge", g, Xraw, yraw, _hook_cfg, pcfg,
+        seed=_seed, hook_caps=_test_caps)
     check("Tier-2 oversized result rejected by the size cap -> noisy zero update (no parent OOM)",
           len(_hr) == len(g) and all(a.shape == o.shape for a, o in zip(_hr, g)))
     _wc = tier2_lib.gated_local_update(
-        "t2_count", g, Xraw, yraw, {}, pcfg, seed=_seed, hook_caps=_test_caps)
+        "t2_count", g, Xraw, yraw, _hook_cfg, pcfg,
+        seed=_seed, hook_caps=_test_caps)
     check("Tier-2 wrong array-count rejected before load -> noisy zero update",
           len(_wc) == len(g) and all(np.all(np.isfinite(a)) for a in _wc))
     check("gated_local_update refuses a non-str module (the node never imports an object)",
           rejects(lambda: tier2_lib.gated_local_update(
-              object(), g, Xraw, yraw, {}, pcfg, seed=_seed,
+              object(), g, Xraw, yraw, _hook_cfg, pcfg, seed=_seed,
               hook_caps=_test_caps)))
 import time as _time
 _t0 = _time.monotonic()
 _disabled = tier2_lib.gated_local_update(
-    "t2_crash", g, Xraw, yraw, {}, dict(pcfg, egress_time_pad=2.0))
+    "t2_crash", g, Xraw, yraw, _hook_cfg,
+    dict(pcfg, egress_time_pad=2.0))
 check("HookApp stays disabled when the timing envelope is shorter than timeout+guard",
       _time.monotonic() - _t0 < 1.9
       and all(np.array_equal(a, b) for a, b in zip(_disabled, g)))
@@ -322,6 +333,25 @@ class PosHead(nn.Module):
 check("gamma_nll model passes the per-sample independence probe",
       not rejects(lambda: dh.per_sample_independence_probe(
           PosHead(), gm, torch.randn(8, 3), torch.rand(8, 1) + 0.1)))
+
+# --------------------------------------------------------------------------- #
+print("== robust Huber regression (public parameter, per-sample DP-SGD) ==")
+hb = dh.loss_from_allowlist("huber", {"huber-delta": 0.5})
+hp = torch.tensor([[0.0], [2.0], [-3.0]])
+hy = torch.tensor([[0.0], [0.0], [1.0]])
+reference = nn.HuberLoss(delta=0.5, reduction="mean")(hp, hy)
+check("huber uses the exact public delta", torch.equal(hb(hp, hy), reference))
+check("changing huber-delta changes the applied loss",
+      float(hb(hp, hy)) != float(dh.loss_from_allowlist(
+          "huber", {"huber-delta": 2.0})(hp, hy)))
+check("huber rejects an invalid public delta",
+      rejects(lambda: dh.loss_from_allowlist("huber", {"huber-delta": 0.0})))
+check("huber model passes the per-sample independence probe",
+      not rejects(lambda: dh.per_sample_independence_probe(
+          PosHead(), hb, torch.randn(8, 3), torch.randn(8, 1))))
+check("huber has scalar width and the wide regression output domain",
+      model_spec.output_width("huber", {"num-classes": 2}) == 1
+      and model_spec.output_limit_for_loss("huber") == model_spec._MAX_ACTIVATION_ABS)
 
 # --------------------------------------------------------------------------- #
 print("== ordinal (CORN): node-decided K-1 width + stock per-sample BCE ==")

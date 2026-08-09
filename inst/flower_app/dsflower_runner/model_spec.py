@@ -59,7 +59,8 @@ _MAX_PUBLIC_SCALAR_ABS = 1.0e6
 
 def output_limit_for_loss(loss_name):
     """Finite head domain: wide for direct regression, tight for logits/log-links."""
-    return _MAX_ACTIVATION_ABS if str(loss_name) == "mse" else _MAX_OUTPUT_ABS
+    return (_MAX_ACTIVATION_ABS
+            if str(loss_name) in ("mse", "huber") else _MAX_OUTPUT_ABS)
 
 
 def _finite_tensor(value, limit):
@@ -93,9 +94,9 @@ def output_width(loss_name, cfg):
         return int(cfg["num-labels"])          # one independent logit per label
     if loss_name == "ordinal":
         return max(1, nc - 1)                  # K-1 cumulative-threshold logits (CORN)
-    if loss_name in ("mse", "poisson_nll", "negbin_nll", "gamma_nll"):
+    if loss_name in ("mse", "huber", "poisson_nll", "negbin_nll", "gamma_nll"):
         return 1                               # scalar regression / log-rate / log-mean
-    return 1 if nc <= 2 else nc                # bce_logits: binary, or one-vs-rest
+    return 1                                   # bce_logits is binary only
 
 
 def read_spec(cfg):

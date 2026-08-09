@@ -35,7 +35,7 @@
 # templates. Keep this list in lockstep with model_spec.py, dp_harness.py,
 # dp_gbdt.py, and server_app.py when the runner ABI changes.
 .RUNNER_PUBLIC_CAPABILITIES <- list(
-  dp_tracks = c("neural", "trees", "egress"),
+  dp_tracks = c("neural", "trees", "egress", "validation"),
   declarative_model_ops = list(
     layers = c(
       "linear", "relu", "gelu", "tanh", "sigmoid", "elu", "silu",
@@ -48,9 +48,10 @@
   ),
   declarative_losses = c(
     "bce_logits", "cross_entropy", "mse", "poisson_nll",
-    "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll"
+    "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
+    "huber"
   ),
-  tree_objectives = "binary:logistic",
+  tree_objectives = c("binary:logistic", "reg:squarederror"),
   aggregation_strategies = c(
     "fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm"
   )

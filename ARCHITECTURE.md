@@ -32,7 +32,7 @@ Secure Aggregation. A coordinator can therefore observe each already-private nod
 update. Public coordinators are rejected unless the node administrator explicitly
 sets `dsflower.allow_untrusted_coordinator = TRUE`.
 
-## 2. Two computation contracts
+## 2. Computation contracts
 
 ### Declarative DP training (recommended)
 
@@ -45,11 +45,19 @@ builds and executes the computation with the canonical runner:
   node-side Gaussian leaf-histogram noise;
 - only allowlisted, per-sample-safe operations and losses are admitted;
 - the manifest pins mechanism, model spec, loss, batch size, local epochs,
-  horizon, feature count and public preprocessing bounds before execution.
+  horizon, feature count, optimizer/scheduler configuration and public
+  preprocessing bounds before execution.
 
 This contract reaches `nn.Module`-level granularity because the trusted runner
 owns the training loop and observes per-sample gradients. Extending the
 declarative vocabulary is the safe way to add flexibility.
+
+The `xgboost` request name maps to the canonical runner's own pure-NumPy
+random-split DP-GBDT. It is not native XGBoost and currently admits only binary
+logistic and bounded squared-error objectives. Native XGBoost, LightGBM and
+CatBoost have additional data-dependent binning, topology, category and stopping
+surfaces; they need a separately reviewed mechanism/adapter and cannot be made
+formal DP by perturbing serialized model bytes after ordinary training.
 
 ### HookApp (legacy name: Tier2)
 
@@ -66,6 +74,14 @@ hash, launches a fresh isolated child with a minimal environment, validates the
 numeric result, clips the complete update to the `C` ball, and applies an
 RDP-calibrated Gaussian mechanism with sensitivity `2C`.
 
+The analyst may supply one canonical JSON-like `app_params` object, but keys
+related to privacy, paths, dependencies, secrets, runtime selection and rounds
+are rejected. The trusted parent supplies `round_index`, `num_rounds`, task and
+class count. The initial and every update array have fixed count/shape, and the
+per-round noise scale composes all `num_rounds` releases within the reserved run
+allocation. A child failure maps to the zero update and still traverses that
+numeric mechanism.
+
 When an attested Bubblewrap filesystem/network sandbox and a minimum-duration
 timing envelope are available, the node may run the hook on a fixed, public `k` disjoint,
 isolated blocks and release the clipped mean at conservative sensitivity
@@ -73,7 +89,8 @@ isolated blocks and release the clipped mean at conservative sensitivity
 administrator-pinned and never derived from private cohort size, because a
 data-dependent Gaussian variance would itself leak.
 Without all required controls, HookApps are not executed and the Flower operation
-returns the incoming public model unchanged.
+is marked unavailable; the incoming public model is not accepted as a trained
+release.
 
 The timing envelope is a defense-in-depth lower bound, not a formal
 constant-time guarantee. Cleanup, resource exhaustion and availability remain
@@ -90,11 +107,35 @@ runner.
 old independent `dsflower_tier2` runner has been removed so there is only one
 code path to audit and pin.
 
+### Private validation
+
+Validation is its own one-release DP track. The ServerApp loads a saved public
+declarative artifact and sends it to every selected node. Before opening private
+data, each ClientApp validates the model, feature/loss/task geometry and fixed
+metric layout. Each row or configured patient then contributes one bounded
+histogram/sufficient-statistic vector; the node releases only its Gaussian-noised
+sum. The ServerApp pools vectors only when every expected node returns the exact
+fixed geometry, and computes metrics as post-processing. Otherwise it writes the
+public result `available=false` with no metrics, node status or zero-filled
+substitute; this operational availability signal is outside the DP transcript.
+Exact labels, predictions, counts and node metrics are never released.
+
+The current track validates tabular neural and DP-GBDT artifacts; vision
+artifacts fail explicitly. Supported layouts cover binary, multiclass, ordinal
+and multilabel classification plus bounded regression/count outcomes. Probability
+bins are public and bounded at 512; class/label counts are public and bounded at
+1024. Validation on an independently assigned dataset is external validation;
+evaluating training data is
+resubstitution. Cross-validation is not inferred: fitting folds would require
+separate, explicitly accounted model releases and a protocol-defined
+patient-level split.
+
 ## 3. Lifetime accounting without query blocking
 
 Exact replays of a Flower message never create a second private release. The
 cached response is reused when available; otherwise the incoming public model is
-returned unchanged. Every new release is claimed transactionally before any
+marked unavailable and is not accepted as a newly trained release. Every new
+release is claimed transactionally before any
 private computation.
 
 For new run `n`, starting at one, the persistent accountant reserves:
@@ -312,7 +353,7 @@ epsilon and delta remain session/profile options.
 | `dp_sample_aggregate` | `FALSE` | Enable fixed-block HookApp sample-and-aggregate behind every sandbox gate |
 | `dp_sa_blocks` | `8` | Fixed public block count in `[2, 64]`; never private-size adaptive |
 | `dp_egress_timeout` | `900` | Hook child timeout in seconds |
-| `dp_egress_time_pad` | `0` | One release-global minimum duration across all S&A children; zero disables HookApp execution; otherwise at least `dp_egress_timeout + 5` |
+| `dp_egress_time_pad` | `0` | One release-global minimum duration across all S&A children; zero disables HookApp execution; otherwise at least `dp_egress_timeout + 5`, or `dp_sa_blocks * dp_egress_timeout + 5` for sequential S&A |
 | `dp_egress_memory_mb` | `8192` | Hook child address-space limit in MiB (`512` to `131072`) |
 | `dp_egress_file_mb` | `1024` | Per-file Hook child write limit in MiB (`16` to `16384`) |
 | `dp_egress_processes` | `128` | Hook child process/thread limit (`1` to `1024`, where supported) |
@@ -416,8 +457,8 @@ the Rock or cluster orchestrator.
 
 ## 8. Residual boundaries
 
-The formal guarantee covers numeric releases from the canonical
-mechanisms. It does not claim protection against:
+The documented computational/practical DP guarantee covers numeric releases
+from the canonical mechanisms. It does not claim protection against:
 
 - administrator or kernel compromise;
 - ledger deletion, snapshot rollback or cloning;
@@ -434,13 +475,15 @@ and runtime failures can still depend on inputs outside the supported mechanism
 domain.
 
 The ClientApp transport boundary catches ordinary Python exceptions and returns
-the same Flower record schema with a constant aggregation weight and public/no-op
-arrays; it never sends the exception reason or traceback. This prevents direct
-private-value disclosure through errors, but does not make an invalid input or a
-data-dependent failure indistinguishable from a successful model: no-op content,
-process termination, availability and execution time remain outside the formal
-valid-input transcript guarantee. Covering those channels would require total
-preprocessing and a fixed execution envelope for every declarative mechanism.
+the same Flower record schema with a constant aggregation weight, public/no-op
+arrays and a cause-free unavailable marker; it never sends the exception reason
+or traceback. The ServerApp does not aggregate that fallback or report it as a
+trained release. This prevents direct private-value disclosure through errors,
+but does not make an invalid input or a data-dependent failure indistinguishable
+from a successful model: no-op content, process termination, availability and
+execution time remain outside the formal valid-input transcript guarantee.
+Covering those channels would require total preprocessing and a fixed execution
+envelope for every declarative mechanism.
 The canonical validators and numeric gates are therefore required to make
 data-dependent exceptions unreachable throughout the declared valid-input
 domain; a runtime that violates that requirement is a mechanism bug, not a

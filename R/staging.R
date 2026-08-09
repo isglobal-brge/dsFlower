@@ -752,7 +752,7 @@
     "privacy-egress_timeout", "privacy-egress_memory_mb",
     "privacy-egress_file_mb", "privacy-egress_processes",
     "privacy-hook_enabled",
-    "privacy-allocation-index", "user-module"
+    "privacy-allocation-index", "user-module", "app-params-sha256"
   )
 }
 

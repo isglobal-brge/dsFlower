@@ -377,6 +377,155 @@ flowerInitDS <- function(data_symbol) {
   list(run_config = run_config, data_type = requested)
 }
 
+.normalizeValidationConfig <- function(run_config, track) {
+  fields <- names(run_config)[startsWith(tolower(names(run_config)),
+                                          "validation-")]
+  if (!identical(track, "validation")) {
+    if (length(fields)) {
+      stop("validation-* fields require dp-track='validation'.",
+           call. = FALSE)
+    }
+    return(run_config)
+  }
+  if (!identical(as.integer(run_config[["num-server-rounds"]]), 1L)) {
+    stop("The validation track has exactly one private release.",
+         call. = FALSE)
+  }
+  model_track <- tolower(as.character(unlist(
+    run_config[["validation-model-track"]] %||% "", use.names = FALSE)))
+  task <- tolower(as.character(unlist(
+    run_config[["validation-task"]] %||% "", use.names = FALSE)))
+  bins <- suppressWarnings(as.numeric(unlist(
+    run_config[["validation-bins"]] %||% 32L, use.names = FALSE)))
+  if (length(model_track) != 1L || is.na(model_track) ||
+      !model_track %in% c("neural", "trees")) {
+    stop("validation-model-track must be neural or trees.", call. = FALSE)
+  }
+  if (length(task) != 1L || is.na(task) ||
+      !task %in% c("binary", "multiclass", "ordinal", "multilabel",
+                   "regression", "count")) {
+    stop("validation-task is unsupported.", call. = FALSE)
+  }
+  if (length(bins) != 1L || !is.finite(bins) || bins != floor(bins) ||
+      bins < 4L || bins > 512L) {
+    stop("validation-bins must be an integer in [4, 512].", call. = FALSE)
+  }
+  if (identical(model_track, "trees") &&
+      !task %in% c("binary", "regression")) {
+    stop("The current dp_gbdt validator supports binary or regression tasks.",
+         call. = FALSE)
+  }
+  n_classes <- suppressWarnings(as.numeric(unlist(
+    run_config[["num-classes"]] %||% 2L, use.names = FALSE)))
+  n_labels <- suppressWarnings(as.numeric(unlist(
+    run_config[["num-labels"]] %||% 2L, use.names = FALSE)))
+  n_features <- suppressWarnings(as.numeric(unlist(
+    run_config[["num-features"]] %||% NA_integer_, use.names = FALSE)))
+  if (length(n_classes) != 1L || !is.finite(n_classes) ||
+      n_classes != floor(n_classes) || n_classes < 2L || n_classes > 1024L ||
+      length(n_labels) != 1L || !is.finite(n_labels) ||
+      n_labels != floor(n_labels) || n_labels < 2L || n_labels > 1024L) {
+    stop("Validation class/label counts must be integers in [2, 1024].",
+         call. = FALSE)
+  }
+  if (length(n_features) != 1L || !is.finite(n_features) ||
+      n_features != floor(n_features) || n_features < 1L ||
+      n_features > 65536L) {
+    stop("Validation num-features must be an integer in [1, 65536].",
+         call. = FALSE)
+  }
+  bounds <- run_config[["feature-bounds"]] %||% NULL
+  if (!is.null(bounds) && (!is.list(bounds) ||
+      length(unlist(bounds$lower, use.names = FALSE)) != n_features ||
+      length(unlist(bounds$upper, use.names = FALSE)) != n_features)) {
+    stop("Validation feature-bounds must match num-features exactly.",
+         call. = FALSE)
+  }
+  loss <- tolower(as.character(unlist(
+    run_config[["loss-name"]] %||% "", use.names = FALSE)))
+  if (length(loss) != 1L || is.na(loss)) {
+    stop("Validation loss-name must be one scalar value.", call. = FALSE)
+  }
+  if (identical(loss, "bce_logits") && n_classes != 2L) {
+    stop("bce_logits validation is binary; use cross_entropy for multiclass.",
+         call. = FALSE)
+  }
+  if (identical(task, "multilabel") && n_classes != 2L) {
+    stop("Multilabel validation requires binary target levels.",
+         call. = FALSE)
+  }
+  expected_task <- if (identical(model_track, "trees")) {
+    if (identical(loss, "bce_logits")) "binary" else
+      if (identical(loss, "mse")) "regression" else ""
+  } else {
+    switch(loss,
+      bce_logits = "binary",
+      cross_entropy = if (n_classes > 2L) "multiclass" else "binary",
+      hinge = if (n_classes > 2L) "multiclass" else "binary",
+      ordinal = "ordinal", multilabel_bce = "multilabel",
+      mse = "regression", huber = "regression", gamma_nll = "regression",
+      poisson_nll = "count", negbin_nll = "count", "")
+  }
+  if (!nzchar(expected_task) || !identical(task, expected_task)) {
+    stop("validation-task disagrees with the pinned model loss.",
+         call. = FALSE)
+  }
+  run_config[["validation-model-track"]] <- model_track
+  run_config[["validation-task"]] <- task
+  run_config[["validation-bins"]] <- as.integer(bins)
+  run_config[["num-classes"]] <- as.integer(n_classes)
+  run_config[["num-labels"]] <- as.integer(n_labels)
+  run_config[["num-features"]] <- as.integer(n_features)
+  run_config[["loss-name"]] <- loss
+  run_config
+}
+
+.validationContractSha256 <- function(run_config, feature_columns,
+                                      target_column, privacy_unit) {
+  bounds <- run_config[["feature-bounds"]] %||% NULL
+  target_bounds <- run_config[["target-bounds"]] %||% NULL
+  levels <- run_config[["target-levels"]] %||% NULL
+  if (is.list(levels) && !is.null(levels$type) && !is.null(levels$values)) {
+    level_type <- as.character(levels$type)
+    level_values <- unlist(levels$values, use.names = FALSE)
+  } else if (is.null(levels)) {
+    level_type <- NULL
+    level_values <- NULL
+  } else {
+    level_values <- unlist(levels, use.names = FALSE)
+    level_type <- if (is.character(level_values)) "character" else
+      if (is.logical(level_values)) "logical" else "numeric"
+  }
+  payload <- list(
+    schema = 1L,
+    privacy_unit = as.character(privacy_unit),
+    patient_id_canonicalization = if (identical(privacy_unit, "patient"))
+      "trim-utf8-v2" else NULL,
+    features = as.character(feature_columns),
+    targets = as.character(target_column),
+    feature_lower = if (is.null(bounds)) NULL else as.numeric(bounds$lower),
+    feature_upper = if (is.null(bounds)) NULL else as.numeric(bounds$upper),
+    target_level_type = level_type,
+    target_levels = level_values,
+    target_lower = if (is.null(target_bounds)) NULL else
+      as.numeric(target_bounds$lower),
+    target_upper = if (is.null(target_bounds)) NULL else
+      as.numeric(target_bounds$upper),
+    model_track = run_config[["validation-model-track"]],
+    task = run_config[["validation-task"]],
+    bins = as.integer(run_config[["validation-bins"]]),
+    loss = run_config[["loss-name"]],
+    num_features = as.integer(run_config[["num-features"]]),
+    num_classes = as.integer(run_config[["num-classes"]]),
+    num_labels = as.integer(run_config[["num-labels"]]),
+    model_spec_b64 = run_config[["model-spec-b64"]] %||% NULL)
+  canonical <- as.character(jsonlite::toJSON(
+    payload, auto_unbox = TRUE, null = "null", na = "null",
+    digits = NA, always_decimal = TRUE, pretty = FALSE))
+  digest::digest(charToRaw(enc2utf8(canonical)), algo = "sha256",
+                 serialize = FALSE)
+}
+
 .normalizePinnedTaskType <- function(run_config, track) {
   requested <- tolower(as.character(unlist(
     run_config[["task-type"]] %||% run_config[["task_type"]] %||% "",
@@ -384,8 +533,27 @@ flowerInitDS <- function(data_symbol) {
   if (length(requested) != 1L || is.na(requested)) {
     stop("task-type must be one scalar value.", call. = FALSE)
   }
-  if (identical(track, "trees")) {
-    inferred <- "classification"
+  if (identical(track, "validation")) {
+    validation_task <- run_config[["validation-task"]]
+    inferred <- if (validation_task %in% c("regression", "count")) {
+      validation_task
+    } else "classification"
+  } else if (identical(track, "trees")) {
+    spec <- run_config[["gbdt-spec"]]
+    if (!is.list(spec)) {
+      stop("The trees track requires a declarative gbdt-spec object.",
+           call. = FALSE)
+    }
+    objective <- as.character(unlist(
+      spec$objective %||% "", use.names = FALSE))
+    if (length(objective) != 1L || is.na(objective) ||
+        !objective %in% c("binary:logistic", "reg:squarederror")) {
+      stop("gbdt-spec objective must be binary:logistic or reg:squarederror.",
+           call. = FALSE)
+    }
+    inferred <- if (identical(objective, "reg:squarederror")) {
+      "regression"
+    } else "classification"
   } else if (identical(track, "neural")) {
     loss_name <- tolower(as.character(unlist(
       run_config[["loss-name"]] %||% "bce_logits", use.names = FALSE)))
@@ -394,7 +562,7 @@ flowerInitDS <- function(data_symbol) {
     }
     inferred <- switch(
       loss_name,
-      mse = "regression", gamma_nll = "regression",
+      mse = "regression", huber = "regression", gamma_nll = "regression",
       poisson_nll = "count", negbin_nll = "count",
       "classification")
   } else {
@@ -410,6 +578,296 @@ flowerInitDS <- function(data_symbol) {
   }
   run_config[["task-type"]] <- inferred
   run_config[["task_type"]] <- NULL
+  run_config
+}
+
+.normalizeGbdtConfig <- function(run_config, track) {
+  spec <- run_config[["gbdt-spec"]] %||% NULL
+  if (!identical(track, "trees")) {
+    if (!is.null(spec)) {
+      stop("gbdt-spec is only valid for the trees track.", call. = FALSE)
+    }
+    return(run_config)
+  }
+  if (!is.list(spec) || is.null(names(spec)) || any(!nzchar(names(spec))) ||
+      anyDuplicated(names(spec))) {
+    stop("gbdt-spec must be a uniquely named object.", call. = FALSE)
+  }
+  allowed <- c(
+    "objective", "max_depth", "n_trees", "learning_rate", "reg_lambda",
+    "n_bins", "feature_ranges", "target_bounds", "margin_bounds",
+    "gradient_clip")
+  unknown <- setdiff(names(spec), allowed)
+  if (length(unknown)) {
+    stop("Unknown gbdt-spec field(s): ", paste(unknown, collapse = ", "),
+         ".", call. = FALSE)
+  }
+  required <- c(
+    "objective", "max_depth", "n_trees", "learning_rate", "reg_lambda",
+    "n_bins")
+  missing <- setdiff(required, names(spec))
+  if (length(missing)) {
+    stop("gbdt-spec is missing field(s): ", paste(missing, collapse = ", "),
+         ".", call. = FALSE)
+  }
+  scalar <- function(name, lower, upper, integer = FALSE,
+                     lower_open = FALSE) {
+    value <- suppressWarnings(as.numeric(unlist(spec[[name]], use.names = FALSE)))
+    valid <- length(value) == 1L && is.finite(value) &&
+      if (lower_open) value > lower else value >= lower
+    valid <- valid && value <= upper && (!integer || value == floor(value))
+    if (!valid) {
+      stop("gbdt-spec ", name, " is outside its allowed public range.",
+           call. = FALSE)
+    }
+    if (integer) as.integer(value) else value
+  }
+  spec$max_depth <- scalar("max_depth", 1, 6, integer = TRUE)
+  spec$n_trees <- scalar("n_trees", 1, 200, integer = TRUE)
+  spec$learning_rate <- scalar("learning_rate", 0, 10, lower_open = TRUE)
+  spec$reg_lambda <- scalar("reg_lambda", 0, 1e6, lower_open = TRUE)
+  spec$n_bins <- scalar("n_bins", 2, 64, integer = TRUE)
+
+  interval <- function(value, field) {
+    value <- suppressWarnings(as.numeric(unlist(value, use.names = FALSE)))
+    if (length(value) != 2L || any(!is.finite(value)) || value[[1L]] >= value[[2L]] ||
+        any(abs(value) > .DSFLOWER_FLOAT32_SAFE_MAX)) {
+      stop("gbdt-spec ", field,
+           " must be finite [lower, upper] public bounds.", call. = FALSE)
+    }
+    unname(value)
+  }
+  if (!is.null(spec$feature_ranges)) {
+    if (!is.list(spec$feature_ranges) || !length(spec$feature_ranges) ||
+        length(spec$feature_ranges) > 65536L) {
+      stop("gbdt-spec feature_ranges must be a bounded list of intervals.",
+           call. = FALSE)
+    }
+    n_features <- suppressWarnings(as.numeric(unlist(
+      run_config[["num-features"]] %||% NA_real_, use.names = FALSE)))
+    if (length(n_features) != 1L || !is.finite(n_features) ||
+        n_features < 1 || n_features != floor(n_features) ||
+        length(spec$feature_ranges) != n_features) {
+      stop("gbdt-spec feature_ranges must match the pinned num-features.",
+           call. = FALSE)
+    }
+    spec$feature_ranges <- lapply(
+      spec$feature_ranges, interval, field = "feature_ranges")
+  }
+  objective <- as.character(spec$objective)
+  if (identical(objective, "reg:squarederror")) {
+    spec$target_bounds <- interval(spec$target_bounds, "target_bounds")
+    pinned <- run_config[["target-bounds"]]
+    pinned <- c(pinned$lower, pinned$upper)
+    if (!identical(as.numeric(spec$target_bounds), as.numeric(pinned))) {
+      stop("gbdt-spec target_bounds disagree with the pinned target-bounds.",
+           call. = FALSE)
+    }
+    spec$margin_bounds <- interval(
+      spec$margin_bounds %||% spec$target_bounds, "margin_bounds")
+    if (!is.null(spec$gradient_clip)) {
+      spec$gradient_clip <- scalar(
+        "gradient_clip", 0, 2e6, lower_open = TRUE)
+    }
+  } else if (!is.null(spec$target_bounds) || !is.null(spec$margin_bounds) ||
+             !is.null(spec$gradient_clip)) {
+    stop("Regression bounds/clips are invalid for binary:logistic.",
+         call. = FALSE)
+  }
+  run_config[["gbdt-spec"]] <- spec
+  run_config
+}
+
+.HOOK_APP_PARAMS_MAX_DEPTH <- 8L
+.HOOK_APP_PARAMS_MAX_ITEMS <- 2048L
+.HOOK_APP_PARAMS_MAX_BYTES <- 65536L
+.HOOK_APP_PARAMS_MAX_KEY_BYTES <- 128L
+.HOOK_APP_PARAMS_MAX_STRING_BYTES <- 4096L
+
+.hookAppReservedKey <- function(key) {
+  normalized <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", key, perl = TRUE)
+  normalized <- gsub("[-.]", "_", tolower(normalized))
+  startsWith(normalized, "privacy") || startsWith(normalized, "dp") ||
+    normalized %in% c(
+      "privacy", "dp", "epsilon", "delta", "clipping_norm",
+      "user_module", "app_params", "app_params_b64", "app_params_sha256",
+      "round", "round_index", "server_round", "num_rounds",
+      "num_server_rounds", "task", "task_type", "num_classes",
+      "runtime_profile", "backend", "requirements", "requirement",
+      "dependencies", "dependency", "pip", "pythonpath", "python_path"
+    ) ||
+    grepl(
+      "(^|_)(path|dir|directory|file|filename|secret|token|password|credential|requirements?|dependencies?)($|_)",
+      normalized, perl = TRUE
+    ) ||
+    grepl(
+      "(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping)($|_)",
+      normalized, perl = TRUE
+    )
+}
+
+.validateHookAppKey <- function(key) {
+  if (!is.character(key) || length(key) != 1L || is.na(key)) {
+    stop("app-params object keys must be non-missing UTF-8 strings.",
+         call. = FALSE)
+  }
+  key <- enc2utf8(key)
+  if (!nzchar(key) || is.na(iconv(key, from = "UTF-8", to = "UTF-8",
+                                  sub = NA_character_)) ||
+      nchar(key, type = "bytes") > .HOOK_APP_PARAMS_MAX_KEY_BYTES ||
+      grepl("[[:cntrl:]/\\\\]", key, perl = TRUE)) {
+    stop("app-params object keys must be safe UTF-8 strings of at most 128 bytes.",
+         call. = FALSE)
+  }
+  if (.hookAppReservedKey(key)) {
+    stop("app-params contains a reserved or path/security-related key: ", key,
+         call. = FALSE)
+  }
+  key
+}
+
+.canonicalHookAppValue <- function(value, depth, state, top = FALSE) {
+  if (depth > .HOOK_APP_PARAMS_MAX_DEPTH) {
+    stop("app-params exceeds the maximum nesting depth (8).", call. = FALSE)
+  }
+  if (is.object(value) || is.factor(value) || is.data.frame(value) ||
+      is.matrix(value) ||
+      is.array(value) || is.raw(value) || is.complex(value) ||
+      inherits(value, c("Date", "POSIXt"))) {
+    stop("app-params accepts only JSON-like null, scalar, array and object values.",
+         call. = FALSE)
+  }
+  if (is.logical(value) || is.integer(value) || is.numeric(value) ||
+      is.character(value)) {
+    if (length(value) != 1L) {
+      values <- as.list(value)
+      names(values) <- names(value)
+      return(.canonicalHookAppValue(values, depth, state, top = top))
+    }
+  }
+
+  state$items <- state$items + 1L
+  if (state$items > .HOOK_APP_PARAMS_MAX_ITEMS) {
+    stop("app-params exceeds the maximum item count (2048).", call. = FALSE)
+  }
+  if (is.null(value)) return(NULL)
+  if (is.logical(value) || is.integer(value) || is.numeric(value) ||
+      is.character(value)) {
+    if (is.na(value)) {
+      stop("app-params scalar values cannot be missing.", call. = FALSE)
+    }
+    if (is.numeric(value) && !is.finite(value)) {
+      stop("app-params numeric values must be finite.", call. = FALSE)
+    }
+    if (is.character(value)) {
+      value <- enc2utf8(value)
+      if (is.na(iconv(value, from = "UTF-8", to = "UTF-8",
+                      sub = NA_character_)) ||
+          nchar(value, type = "bytes") > .HOOK_APP_PARAMS_MAX_STRING_BYTES ||
+          grepl("[[:cntrl:]]", value, perl = TRUE) ||
+          grepl("(^~[/\\\\])|[/\\\\]|^[A-Za-z]:", value, perl = TRUE)) {
+        stop("app-params strings must be safe UTF-8 non-path values of at most 4096 bytes.",
+             call. = FALSE)
+      }
+    }
+    return(value)
+  }
+  if (!is.list(value)) {
+    stop("app-params accepts only JSON-like null, scalar, array and object values.",
+         call. = FALSE)
+  }
+
+  object_names <- names(value)
+  is_object <- isTRUE(top) ||
+    (!is.null(object_names) && length(object_names) == length(value) &&
+       all(nzchar(object_names)))
+  if (!is_object && !is.null(object_names) && any(nzchar(object_names))) {
+    stop("app-params containers cannot mix named and unnamed elements.",
+         call. = FALSE)
+  }
+  if (is_object) {
+    if (is.null(object_names)) object_names <- rep.int("", length(value))
+    if (length(value) &&
+        (any(!nzchar(object_names)) || anyDuplicated(object_names))) {
+      stop("app-params objects require unique, non-empty keys.", call. = FALSE)
+    }
+    safe_names <- vapply(object_names, .validateHookAppKey, character(1))
+    order_index <- order(safe_names, method = "radix")
+    out <- structure(vector("list", length(value)),
+                     names = unname(safe_names[order_index]))
+    for (i in seq_along(order_index)) {
+      out[i] <- list(.canonicalHookAppValue(
+        value[[order_index[[i]]]], depth + 1L, state, top = FALSE))
+    }
+    return(out)
+  }
+  out <- vector("list", length(value))
+  for (i in seq_along(value)) {
+    out[i] <- list(.canonicalHookAppValue(
+      value[[i]], depth + 1L, state, top = FALSE))
+  }
+  out
+}
+
+# Decode, validate and re-encode the public HookApp configuration before any
+# private source is opened.  The server-written digest is the authoritative pin;
+# the client-supplied Flower config must match it at node execution time.
+.normalizeHookAppParams <- function(run_config, track) {
+  app_fields <- names(run_config)[grepl(
+    "^app[-_.]?params", tolower(names(run_config)), perl = TRUE)]
+  aliases <- setdiff(app_fields, "app-params-b64")
+  if (length(aliases)) {
+    stop("Use only the canonical app-params-b64 HookApp field.", call. = FALSE)
+  }
+  supplied <- run_config[["app-params-b64"]] %||% NULL
+  if (!identical(track, "egress")) {
+    if (!is.null(supplied)) {
+      stop("app-params-b64 is only valid for the HookApp egress track.",
+           call. = FALSE)
+    }
+    return(run_config)
+  }
+  if (is.null(supplied)) {
+    supplied <- gsub("[\r\n]", "", jsonlite::base64_enc(charToRaw("{}")))
+  }
+  if (!is.character(supplied) || length(supplied) != 1L || is.na(supplied) ||
+      !nzchar(supplied) || nchar(supplied, type = "bytes") >
+        4L * ceiling(.HOOK_APP_PARAMS_MAX_BYTES / 3L)) {
+    stop("app-params-b64 must be one bounded canonical base64 string.",
+         call. = FALSE)
+  }
+  decoded <- tryCatch(jsonlite::base64_dec(supplied),
+                      error = function(e) NULL)
+  canonical_b64 <- if (is.null(decoded)) NULL else
+    gsub("[\r\n]", "", jsonlite::base64_enc(decoded))
+  if (is.null(decoded) || length(decoded) > .HOOK_APP_PARAMS_MAX_BYTES ||
+      !identical(canonical_b64, supplied)) {
+    stop("app-params-b64 is not canonical bounded base64.", call. = FALSE)
+  }
+  json <- tryCatch(rawToChar(decoded), error = function(e) NULL)
+  if (is.null(json) || length(json) != 1L ||
+      is.na(iconv(json, from = "UTF-8", to = "UTF-8", sub = NA_character_))) {
+    stop("app-params-b64 must decode to valid UTF-8 JSON.", call. = FALSE)
+  }
+  parsed <- tryCatch(jsonlite::fromJSON(json, simplifyVector = FALSE),
+                     error = function(e) NULL)
+  if (!is.list(parsed)) {
+    stop("app-params must decode to a JSON object.", call. = FALSE)
+  }
+  state <- new.env(parent = emptyenv())
+  state$items <- 0L
+  value <- .canonicalHookAppValue(parsed, 0L, state, top = TRUE)
+  canonical_json <- as.character(jsonlite::toJSON(
+    value, auto_unbox = TRUE, null = "null", na = "null",
+    digits = NA, always_decimal = TRUE, pretty = FALSE))
+  canonical_raw <- charToRaw(enc2utf8(canonical_json))
+  if (length(canonical_raw) > .HOOK_APP_PARAMS_MAX_BYTES ||
+      !identical(canonical_raw, decoded)) {
+    stop("app-params JSON must use the canonical encoding.", call. = FALSE)
+  }
+  run_config[["app-params-b64"]] <- supplied
+  run_config[["app-params-sha256"]] <- digest::digest(
+    canonical_raw, algo = "sha256", serialize = FALSE)
   run_config
 }
 
@@ -439,20 +897,24 @@ flowerInitDS <- function(data_symbol) {
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
   if (length(track) != 1L || is.na(track) ||
-      !tolower(track) %in% c("neural", "trees", "egress")) {
-    stop("dp-track must be one of neural, trees, or egress.", call. = FALSE)
+      !tolower(track) %in% c("neural", "trees", "egress", "validation")) {
+    stop("dp-track must be one of neural, trees, egress, or validation.",
+         call. = FALSE)
   }
   track <- tolower(track)
   run_config[["dp-track"]] <- track
+  run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizePinnedTaskType(run_config, track)
+  run_config <- .normalizeHookAppParams(run_config, track)
   run_config <- .normalizePublicFeatureBounds(run_config)
   run_config <- .normalizePublicTargetConfig(run_config)
+  run_config <- .normalizeGbdtConfig(run_config, track)
   run_config[["dp_enabled"]]               <- TRUE
   run_config[["allow_per_node_metrics"]]   <- FALSE
   run_config[["allow_exact_num_examples"]] <- FALSE
   run_config[["fixed_client_sampling"]]    <- TRUE
   policy <- .privacy_policy()  # validate admin policy before touching private data
-  max_releases <- if (identical(track, "trees")) 1L else
+  max_releases <- if (track %in% c("trees", "validation")) 1L else
     as.integer(run_config[["num-server-rounds"]])
   run_config[["privacy-domain"]] <- policy$domain
   run_config[["privacy-adjacency"]] <- policy$adjacency
@@ -468,10 +930,12 @@ flowerInitDS <- function(data_symbol) {
   # on a private row/patient count: changing the output variance at a threshold would
   # itself be an unbounded transcript channel. Empty blocks safely map to zero deltas.
   # Encoded numerically (1/0 for the on/off flag) for stable manifest transport.
-  run_config[["privacy-sample_aggregate"]] <- as.numeric(isTRUE(as.logical(
-                                                .dsf_option("dp_sample_aggregate", FALSE))))
-  run_config[["privacy-sa_blocks"]] <- .bounded_server_number(
+  sample_aggregate <- isTRUE(as.logical(
+    .dsf_option("dp_sample_aggregate", FALSE)))
+  sa_blocks <- .bounded_server_number(
     "dp_sa_blocks", 8L, 2L, 64L, integer = TRUE)
+  run_config[["privacy-sample_aggregate"]] <- as.numeric(sample_aggregate)
+  run_config[["privacy-sa_blocks"]] <- sa_blocks
   # Minimum-duration padding for the egress sandbox (seconds; 0 = off). Set this ABOVE
   # the egress timeout (timeout + a few seconds of kill/cleanup guard). This reduces
   # direct sleep/fast-return channels but is not a formal constant-time guarantee:
@@ -479,12 +943,15 @@ flowerInitDS <- function(data_symbol) {
   egress_timeout <- .bounded_server_number(
     "dp_egress_timeout", 900L, 1L, 3600L, integer = TRUE)
   egress_time_pad <- .bounded_server_number(
-    "dp_egress_time_pad", 0, 0, 3660, integer = FALSE)
+    "dp_egress_time_pad", 0, 0, 230405, integer = FALSE)
   # Keep this identical to tier2_lib._PAD_GUARD.  Accepting a shorter envelope
   # here would look enabled to the custodian but be rejected by the Python gate.
-  if (egress_time_pad > 0 && egress_time_pad < egress_timeout + 5) {
+  required_time_pad <- egress_timeout *
+    (if (sample_aggregate) sa_blocks else 1L) + 5
+  if (egress_time_pad > 0 && egress_time_pad < required_time_pad) {
     stop("dsflower.dp_egress_time_pad must be zero (HookApp no-op) or at ",
-         "least dsflower.dp_egress_timeout + 5 seconds.", call. = FALSE)
+         "least ", required_time_pad, " seconds for the configured HookApp ",
+         "timeout and block count.", call. = FALSE)
   }
   run_config[["privacy-egress_time_pad"]] <- egress_time_pad
   run_config[["privacy-egress_timeout"]] <- egress_timeout
@@ -583,6 +1050,37 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     target_column, feature_columns, run_config)
   target_column <- columns$target_column
   feature_columns <- columns$feature_columns
+  if (identical(run_config[["dp-track"]], "validation")) {
+    if (!is.character(feature_columns) || !length(feature_columns) ||
+        anyNA(feature_columns) || any(!nzchar(feature_columns)) ||
+        anyDuplicated(feature_columns) ||
+        length(feature_columns) != run_config[["num-features"]]) {
+      stop("Validation requires the explicit ordered public feature contract.",
+           call. = FALSE)
+    }
+    unit_policy <- .dpUnitPolicy()
+    if (identical(unit_policy$dp_unit, "patient") &&
+        unit_policy$patient_column %in%
+          c(feature_columns, as.character(target_column))) {
+      stop("The server patient identifier cannot be a validation feature or target.",
+           call. = FALSE)
+    }
+    supplied_contract <- tolower(as.character(unlist(
+      run_config[["validation-contract-sha256"]] %||% "",
+      use.names = FALSE)))
+    if (length(supplied_contract) != 1L || is.na(supplied_contract) ||
+        !grepl("^[0-9a-f]{64}$", supplied_contract)) {
+      stop("Validation requires one canonical contract SHA-256 pin.",
+           call. = FALSE)
+    }
+    actual_contract <- .validationContractSha256(
+      run_config, feature_columns, target_column, unit_policy$dp_unit)
+    if (!identical(supplied_contract, actual_contract)) {
+      stop("Validation contract SHA-256 does not match the prepared public contract.",
+           call. = FALSE)
+    }
+    run_config[["validation-contract-sha256"]] <- actual_contract
+  }
   template_name <- run_config[["template_name"]] %||% NULL
   run_token <- .generate_run_token()
   .privacy_runtime_bootstrap()
@@ -1007,6 +1505,22 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
 
   privacy_policy <- .privacy_policy()
   runner_caps <- .RUNNER_PUBLIC_CAPABILITIES
+  hook_enabled <- isTRUE(as.logical(.dsf_option("hook_enabled", FALSE)))
+  hook_sandbox <- isTRUE(as.logical(
+    .dsf_option("hook_sandbox_attested", FALSE)))
+  hook_resources <- isTRUE(as.logical(
+    .dsf_option("hook_resource_isolation_attested", FALSE)))
+  hook_timeout <- .bounded_server_number(
+    "dp_egress_timeout", 900L, 1L, 3600L, integer = TRUE)
+  hook_pad <- .bounded_server_number(
+    "dp_egress_time_pad", 0, 0, 230405, integer = FALSE)
+  hook_sample_aggregate <- isTRUE(as.logical(
+    .dsf_option("dp_sample_aggregate", FALSE)))
+  hook_sa_blocks <- .bounded_server_number(
+    "dp_sa_blocks", 8L, 2L, 64L, integer = TRUE)
+  hook_required_pad <- hook_timeout *
+    (if (hook_sample_aggregate) hook_sa_blocks else 1L) + 5
+  hook_time_ready <- hook_pad >= hook_required_pad
 
   caps <- list(
     dsflower_version    = as.character(utils::packageVersion("dsFlower")),
@@ -1038,11 +1552,17 @@ flowerGetCapabilitiesDS <- function(handle_symbol = NULL) {
     runner_sha256       = .compute_harness_hash(),
     dp_app_schema_versions = 1L,
     hook_abi            = 2L,
-    hook_enabled        = isTRUE(as.logical(.dsf_option("hook_enabled", FALSE))),
-    hook_sandbox_attested = isTRUE(as.logical(
-      .dsf_option("hook_sandbox_attested", FALSE))),
-    hook_resource_isolation_attested = isTRUE(as.logical(
-      .dsf_option("hook_resource_isolation_attested", FALSE)))
+    hook_enabled        = hook_enabled,
+    hook_sandbox_attested = hook_sandbox,
+    hook_resource_isolation_attested = hook_resources,
+    hook_sample_aggregate = hook_sample_aggregate,
+    hook_sa_blocks = hook_sa_blocks,
+    hook_timeout_seconds = hook_timeout,
+    hook_time_pad_seconds = hook_pad,
+    hook_required_time_pad_seconds = hook_required_pad,
+    hook_time_envelope_configured = hook_time_ready,
+    hook_execution_configured = hook_enabled && hook_sandbox &&
+      hook_resources && hook_time_ready
   )
 
   caps

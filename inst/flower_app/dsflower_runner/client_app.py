@@ -1,7 +1,7 @@
 """dsFlower unified trusted ClientApp (node side) — always-on enforced DP.
 
 The researcher ships only a model SPEC (a declarative nn.Module architecture, or
-an XGBoost data-spec) + hyperparameters -- DATA, never code, so nothing the
+a dsFlower DP-GBDT data spec) + hyperparameters -- DATA, never code, so nothing the
 researcher submits executes in this interpreter; this trusted, node-resident
 harness owns every DP-critical step, so the guarantee cannot be bypassed. The
 node-written, tamper-proof manifest pins the enforced-DP TRACK and all privacy +
@@ -11,15 +11,19 @@ Tracks, dispatched on the manifest's pinned ``dp-track``:
   * neural — Opacus DP-SGD over a client nn.Module (tabular, or an image sub-mode
     that trains only a head on FROZEN-backbone features). Per-sample clip + noise;
     the loss is harness-owned; the released state_dict is stash-gated.
-  * trees  — enforced DP-GBDT (S-GBDT mechanism): random-split trees with the full
+  * trees  — enforced random-split DP-GBDT: complete trees with the full
     Gaussian noise added by the node-side curator to each leaf histogram, then a
     booster the untrusted ServerApp bags by post-processing.
   * egress — the labelled-weaker fallback: the client's own local_update, wrapped
     in output-perturbation DP (whole-update clip + Gaussian noise). Admission-gated.
+  * validation — trusted inference for a public neural/DP-GBDT artifact followed
+    by one patient-bounded Gaussian release of sufficient statistics.
 """
 
 import json
 import io
+import math
+import time
 
 import numpy as np
 import torch
@@ -39,7 +43,8 @@ from .params import get_torch_params, set_torch_params, load_user_model
 # sys.path / PYTHONPATH cannot shadow dp_harness / dp_gbdt and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import dp_harness, dp_gbdt, release_guard, seeding, task as task_module
+from . import (dp_harness, dp_gbdt, release_guard, seeding,
+               task as task_module, validation)
 
 
 app = ClientApp()
@@ -51,21 +56,45 @@ _MAX_EGRESS_BYTES = 64 * 1024 * 1024
 _MAX_PUBLIC_ARRAY_ABS = dp_harness.MAX_RELEASE_ABS
 
 
-def _reply(msg, arrays):
+def _reply(msg, arrays, hook_executed=None, replay_cache_missing=False,
+           privacy_noop=False, public_preflight_unavailable=False,
+           execution_unavailable=False):
     """Return arrays with one constant, data-independent aggregation weight."""
+    metrics = {"num-examples": 1}
+    if hook_executed is not None:
+        metrics["hook-executed"] = int(bool(hook_executed))
+    if replay_cache_missing:
+        metrics["replay-cache-missing"] = 1
+    if privacy_noop:
+        metrics["privacy-noop"] = 1
+    if public_preflight_unavailable:
+        metrics["public-preflight-unavailable"] = 1
+    if execution_unavailable:
+        metrics["execution-unavailable"] = 1
     return Message(content=RecordDict({
         "arrays": ArrayRecord(numpy_ndarrays=[np.asarray(a) for a in arrays]),
-        "metrics": MetricRecord({"num-examples": 1}),
+        "metrics": MetricRecord(metrics),
     }), reply_to=msg)
 
 
-def _cache_reply(context, claim, arrays):
+def _cache_reply(context, claim, arrays, hook_executed=None,
+                 public_preflight_unavailable=False, privacy_noop=False,
+                 execution_unavailable=False):
     context.state["dsflower-last-release"] = ArrayRecord(
         numpy_ndarrays=[np.asarray(a) for a in arrays])
-    context.state["dsflower-last-release-meta"] = ConfigRecord({
+    meta = {
         "message-id": claim["message_id"],
         "release-index": int(claim["release_index"]),
-    })
+    }
+    if hook_executed is not None:
+        meta["hook-executed"] = int(bool(hook_executed))
+    if public_preflight_unavailable:
+        meta["public-preflight-unavailable"] = 1
+    if privacy_noop:
+        meta["privacy-noop"] = 1
+    if execution_unavailable:
+        meta["execution-unavailable"] = 1
+    context.state["dsflower-last-release-meta"] = ConfigRecord(meta)
 
 
 def _replay_reply(context, claim, msg):
@@ -73,13 +102,28 @@ def _replay_reply(context, claim, msg):
     arrays = context.state.get("dsflower-last-release")
     if (meta is not None and arrays is not None
             and meta.get("message-id") == claim["message_id"]):
-        return _reply(msg, arrays.to_numpy_ndarrays())
+        hook_status = meta.get("hook-executed")
+        return _reply(
+            msg, arrays.to_numpy_ndarrays(),
+            hook_executed=(bool(hook_status) if hook_status is not None else None),
+            public_preflight_unavailable=bool(meta.get(
+                "public-preflight-unavailable", 0)),
+            privacy_noop=bool(meta.get("privacy-noop", 0)),
+            execution_unavailable=bool(meta.get(
+                "execution-unavailable", 0)))
     # An old replay whose bytes are no longer cached gets no new private release.
-    return _safe_noop_reply(msg, context, claim=claim)
+    # Mark this public infrastructure condition so the ServerApp cannot aggregate
+    # the fallback and falsely report the replayed round as trained.
+    return _safe_noop_reply(
+        msg, context, claim=claim, replay_cache_missing=True)
 
 
-def _validate_public_egress_arrays(arrays, label="HookApp"):
+def _validate_public_egress_arrays(arrays, label="HookApp", max_elements=None):
     """Bound an analyst-supplied public model before any private-data read."""
+    element_cap = (_MAX_EGRESS_ELEMENTS if max_elements is None
+                   else int(max_elements))
+    if element_cap < 1:
+        raise RuntimeError("public model element cap must be positive")
     if hasattr(arrays, "to_numpy_ndarrays") and hasattr(arrays, "values"):
         encoded = list(arrays.values())
         if not (1 <= len(encoded) <= _MAX_EGRESS_ARRAYS):
@@ -117,7 +161,7 @@ def _validate_public_egress_arrays(arrays, label="HookApp"):
                     raise ValueError("array payload length mismatch")
                 metadata_elements += elements
                 metadata_bytes += expected_payload
-                if (metadata_elements > _MAX_EGRESS_ELEMENTS
+                if (metadata_elements > element_cap
                         or metadata_bytes > _MAX_EGRESS_BYTES):
                     raise ValueError("array cap exceeded")
             except Exception as exc:
@@ -143,7 +187,7 @@ def _validate_public_egress_arrays(arrays, label="HookApp"):
                 "%s initial arrays exceed the public magnitude cap" % label)
         total_elements += int(array.size)
         total_bytes += int(array.nbytes)
-        if (total_elements > _MAX_EGRESS_ELEMENTS
+        if (total_elements > element_cap
                 or total_bytes > _MAX_EGRESS_BYTES):
             raise RuntimeError("%s initial arrays exceed the public model-size cap" % label)
         validated.append(array)
@@ -275,6 +319,58 @@ def _prep_target(y, loss_name, n_classes):
     return torch.from_numpy(y).float().unsqueeze(1)    # [N, 1] (bce/mse/poisson/count/gamma)
 
 
+def _build_optimizer(model, pins):
+    """Construct only a node-trusted optimizer from the pinned public config."""
+    lr = float(pins["learning_rate"])
+    cfg = dict(pins["optimizer"])
+    name = cfg["name"]
+    common = {"lr": lr, "weight_decay": float(cfg["weight_decay"])}
+    if name == "sgd":
+        return torch.optim.SGD(
+            model.parameters(), momentum=float(cfg["momentum"]),
+            nesterov=bool(cfg["nesterov"]), **common)
+    if name in ("adam", "adamw"):
+        cls = torch.optim.Adam if name == "adam" else torch.optim.AdamW
+        return cls(
+            model.parameters(), betas=(float(cfg["beta1"]), float(cfg["beta2"])),
+            eps=float(cfg["eps"]), amsgrad=bool(cfg["amsgrad"]), **common)
+    if name == "rmsprop":
+        return torch.optim.RMSprop(
+            model.parameters(), alpha=float(cfg["rmsprop_alpha"]),
+            eps=float(cfg["eps"]), momentum=float(cfg["momentum"]), **common)
+    raise RuntimeError("optimizer is not on the trusted allowlist")
+
+
+def _scheduled_learning_rate(pins, global_epoch):
+    """Return the pinned global-epoch LR; schedules persist across rounds."""
+    cfg = dict(pins["scheduler"])
+    name = cfg["name"]
+    base = float(pins["learning_rate"])
+    local_epochs = int(pins["local_epochs"])
+    num_rounds = int(pins["num_rounds"])
+    total_epochs = local_epochs * num_rounds
+    epoch = int(global_epoch)
+    if epoch < 0 or epoch >= total_epochs:
+        raise RuntimeError("scheduler global epoch is outside the pinned horizon")
+    if name == "none":
+        value = base
+    elif name == "step":
+        value = base * math.pow(
+            float(cfg["gamma"]), epoch // int(cfg["step_size"]))
+    elif name == "exponential":
+        value = base * math.pow(float(cfg["gamma"]), epoch)
+    elif name == "cosine":
+        minimum = float(cfg["min_lr"])
+        progress = epoch / max(1, total_epochs - 1)
+        value = minimum + 0.5 * (base - minimum) * (
+            1.0 + math.cos(math.pi * progress))
+    else:
+        raise RuntimeError("scheduler is not on the trusted allowlist")
+    if not math.isfinite(value) or not 0.0 <= value <= task_module._MAX_LEARNING_RATE:
+        raise RuntimeError("scheduled learning rate is outside the trusted range")
+    return float(value)
+
+
 def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
@@ -290,20 +386,14 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
     local_epochs = int(pins["local_epochs"])
     num_rounds = int(pins["num_rounds"])
 
-    lr = float(pins["learning_rate"])
     # Penalized regression (ridge / lasso / elastic-net): L2 (weight_decay) is applied
     # INSIDE the optimizer to the NOISED grad + PUBLIC weights; L1 as a proximal
     # soft-threshold on the PUBLIC weights after the step. Both are post-processing of
     # already-DP quantities -> no privacy lever (DP is immune to post-processing).
     # Validated non-negative; both 0 -> identical to the plain path.
-    weight_decay = float(cfg.get("weight-decay", 0.0))
-    l1_penalty = float(cfg.get("l1-penalty", 0.0))
-    if not (np.isfinite(weight_decay) and 0.0 <= weight_decay <= 1.0e3
-            and np.isfinite(l1_penalty) and 0.0 <= l1_penalty <= 1.0e3):
-        raise RuntimeError(
-            "weight-decay and l1-penalty must be finite and in [0, 1000]")
+    l1_penalty = float(pins["optimizer"]["l1_penalty"])
     model = model.to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = _build_optimizer(model, pins)
     dataset = TensorDataset(torch.from_numpy(X).float(),
                             _prep_target(y, loss_name, int(pins["n_classes"])))
     # Anti-shrink: the manifest n_samples is the server-recorded count of the STAGED
@@ -323,12 +413,19 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
         n_samples=len(dataset), batch_size=batch_size,
         secure_noise_rng=seeding.np_rng(seeding.sub_seed(master, "noise")),
         secure_sampling_rng=seeding.np_rng(seeding.sub_seed(master, "sample")))
+    round_index = int(pins.get("round_index", 0))
+    if round_index < 1 or round_index > num_rounds:
+        raise RuntimeError("neural round index is outside the pinned horizon")
 
     criterion = dp_harness.loss_from_allowlist(loss_name, cfg)   # node allowlist, mean reduction
     # Deterministic dropout masks; sampling remains on its separate ChaCha stream.
     seeding.seed_torch(seeding.sub_seed(master, "train"))
     model.train()
-    for _ in range(local_epochs):
+    for local_epoch in range(local_epochs):
+        global_epoch = (round_index - 1) * local_epochs + local_epoch
+        scheduled_lr = _scheduled_learning_rate(pins, global_epoch)
+        for group in optimizer.param_groups:
+            group["lr"] = scheduled_lr
         for xb, yb in trainloader:
             xb, yb = xb.to(device), yb.to(device)
             clean = [p.detach().clone() for p in model.parameters()]
@@ -356,7 +453,8 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
                     p.clamp_(-dp_harness.MAX_PARAMETER_ABS,
                              dp_harness.MAX_PARAMETER_ABS)
                 if l1_penalty > 0.0:    # proximal on already-DP public weights
-                    thr = l1_penalty * lr
+                    current_lr = float(optimizer.param_groups[0]["lr"])
+                    thr = l1_penalty * current_lr
                     for p in model.parameters():
                         p.copy_(torch.sign(p) * torch.clamp(p.abs() - thr, min=0.0))
     # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
@@ -536,8 +634,11 @@ def _booster_to_array(booster):
     return np.frombuffer(json.dumps(public_booster).encode("utf-8"), dtype=np.uint8)
 
 
-def _train_trees(context, pcfg, cfg, private_release_id):
+def _train_trees(context, pcfg, cfg, private_release_id,
+                 on_private_start=None):
     spec = load_gbdt_spec(context)                 # validated, manifest-authoritative
+    if on_private_start is not None:
+        on_private_start()
     X, y = load_data(context)
     X = _totalize_private_features(X)
     pids = load_tabular_patient_ids(context)       # per-patient DP unit when present
@@ -549,13 +650,22 @@ def _train_trees(context, pcfg, cfg, private_release_id):
         reg_lambda=spec["reg_lambda"], feature_ranges=spec["feature_ranges"],
         n_bins=spec["n_bins"], run_token=spec["run_token"],
         epsilon=pcfg["epsilon"], delta=pcfg["delta"], patient_ids=pids,
+        target_bounds=spec.get("target_bounds"),
+        margin_bounds=spec.get("margin_bounds"),
+        gradient_clip=spec.get("gradient_clip"),
         noise_rng=seeding.np_rng(seeding.sub_seed(master, "gbdt-noise")))
     n = len(y) if pids is None else int(np.unique(pids).size)
     return [_booster_to_array(booster)], n
 
 
 def _public_noop_arrays(msg, context, track):
-    """Valid response independent of private rows when no release is available."""
+    """Bounded response independent of private rows when no release is available."""
+    if track == "validation":
+        # A standalone validator must never turn a failed/no-release node into
+        # plausible pooled metrics.  The fixed public wrong geometry makes the
+        # ServerApp publish only ``available=false``, with no exception detail,
+        # fake metric or replacement private release.
+        return [np.zeros(1, dtype=np.float64)]
     if track != "trees":
         return _validate_public_egress_arrays(
             msg.content["arrays"], label="public fallback model")
@@ -571,20 +681,38 @@ def _public_noop_arrays(msg, context, track):
             "thr": thr.tolist(),
             "w": np.zeros(1 << depth, dtype=np.float64).tolist(),
         })
+    base_margin = 0.0
+    if spec["objective"] == "reg:squarederror":
+        base_margin = sum(spec["margin_bounds"]) / 2.0
     booster = {
         "objective": spec["objective"],
         "depth": depth,
         "n_bins": spec["n_bins"],
-        "base_margin": 0.0,
+        "base_margin": base_margin,
         "learning_rate": spec["learning_rate"],
         "feature_ranges": spec["feature_ranges"],
         "trees": trees,
     }
+    if spec["objective"] == "reg:squarederror":
+        geometry = dp_gbdt.regression_geometry(
+            spec["target_bounds"], spec["margin_bounds"],
+            spec["gradient_clip"])
+        booster.update({
+            "target_bounds": spec["target_bounds"],
+            "margin_bounds": spec["margin_bounds"],
+            "gradient_clip": geometry["gradient_clip"],
+            "gradient_bounds": list(geometry["gradient_bounds"]),
+        })
     return [_booster_to_array(booster)]
 
 
 def _safe_public_noop_arrays(msg, context, track):
     """Construct a bounded fallback using public inputs/configuration only."""
+    if track is None:
+        try:
+            track = load_dp_track(context)
+        except Exception:
+            pass
     try:
         return _public_noop_arrays(msg, context, track)
     except Exception:
@@ -595,24 +723,55 @@ def _safe_public_noop_arrays(msg, context, track):
             return [np.zeros(1, dtype=np.float32)]
 
 
-def _safe_noop_reply(msg, context, claim=None, track=None):
+def _safe_noop_reply(msg, context, claim=None, track=None,
+                     hook_executed=None, replay_cache_missing=False,
+                     privacy_noop=False, public_preflight_unavailable=False,
+                     execution_unavailable=False):
     """Never expose a ClientApp exception through Flower's Error response."""
+    if track is None:
+        try:
+            track = load_dp_track(context)
+        except Exception:
+            pass
     arrays = _safe_public_noop_arrays(msg, context, track)
+    # Once a private release path has been entered, keep success/failure
+    # data-independent: a public unchanged model is still a valid no-release
+    # Hook round.  Only the explicit pre-private readiness gate reports FALSE.
+    hook_status = ((True if hook_executed is None else bool(hook_executed))
+                   if track == "egress" else None)
     if (claim is not None and claim.get("status") == "new"
             and claim.get("release_index") is not None):
         try:
-            _cache_reply(context, claim, arrays)
+            _cache_reply(
+                context, claim, arrays, hook_executed=hook_status,
+                public_preflight_unavailable=public_preflight_unavailable,
+                privacy_noop=privacy_noop,
+                execution_unavailable=execution_unavailable)
         except Exception:
             pass
     try:
-        return _reply(msg, arrays)
+        return _reply(
+            msg, arrays, hook_executed=hook_status,
+            replay_cache_missing=replay_cache_missing,
+            privacy_noop=privacy_noop,
+            public_preflight_unavailable=public_preflight_unavailable,
+            execution_unavailable=execution_unavailable)
     except Exception:
         # Arrays above are public, but keep a constant minimal last resort in case
         # their Flower encoding itself is rejected.
         return Message(content=RecordDict({
             "arrays": ArrayRecord(
                 numpy_ndarrays=[np.zeros(1, dtype=np.float32)]),
-            "metrics": MetricRecord({"num-examples": 1}),
+            "metrics": MetricRecord({
+                "num-examples": 1,
+                **({"replay-cache-missing": 1}
+                   if replay_cache_missing else {}),
+                **({"privacy-noop": 1} if privacy_noop else {}),
+                **({"public-preflight-unavailable": 1}
+                   if public_preflight_unavailable else {}),
+                **({"execution-unavailable": 1}
+                   if execution_unavailable else {}),
+            }),
         }), reply_to=msg)
 
 
@@ -624,6 +783,13 @@ def _safe_noop_reply(msg, context, claim=None, track=None):
 def train(msg: Message, context: Context) -> Message:
     claim = None
     track = None
+    hook_public_ready = None
+    private_started = False
+
+    def mark_private_started():
+        nonlocal private_started
+        private_started = True
+
     try:
         claim = release_guard.claim_release(context, msg)  # before any private read
         if claim["status"] == "replay":
@@ -636,7 +802,12 @@ def train(msg: Message, context: Context) -> Message:
         # tighter track, and the neural track only ever runs the hash-verified harness.
         track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
         if claim["status"] == "noop":
-            return _safe_noop_reply(msg, context, claim=claim, track=track)
+            if track == "egress":
+                arrays = _safe_public_noop_arrays(msg, context, track)
+                return _reply(
+                    msg, arrays, hook_executed=True, privacy_noop=True)
+            return _safe_noop_reply(
+                msg, context, claim=claim, track=track, privacy_noop=True)
 
         pcfg = load_privacy_config(context)
         # SQLite is authoritative. The manifest copy is validated for structure,
@@ -645,11 +816,27 @@ def train(msg: Message, context: Context) -> Message:
         pcfg["delta"] = float(claim["delta"])
         private_release_id = release_guard.release_id(claim)
 
-        if track == "trees":
-            new_arrays, _n = _train_trees(context, pcfg, cfg, private_release_id)
+        if track == "validation":
+            if int(claim["max_releases"]) != 1:
+                raise RuntimeError("validation release horizon must be exactly one")
+            public_arrays = _validate_public_egress_arrays(
+                msg.content["arrays"], label="public validation model",
+                max_elements=(_MAX_EGRESS_BYTES if str(cfg.get(
+                    "validation-model-track", "")).lower() == "trees"
+                    else _MAX_EGRESS_ELEMENTS))
+            new_arrays = validation.private_model_validation(
+                context, cfg, pcfg, private_release_id, public_arrays,
+                on_private_start=mark_private_started)
+        elif track == "trees":
+            new_arrays, _n = _train_trees(
+                context, pcfg, cfg, private_release_id,
+                on_private_start=mark_private_started)
         elif track == "egress":
             from . import tier2_lib
+            hook_public_ready = False
             old = _validate_public_egress_arrays(msg.content["arrays"])
+            public_hook_cfg = tier2_lib.public_hook_config(
+                cfg, round_index=int(claim["release_index"]))
             # Compose all Gaussian Hook releases jointly through the closed RDP
             # bound. Per-release sigma scales with sqrt(R), which is much tighter
             # than splitting epsilon and delta linearly while preserving the same
@@ -662,33 +849,52 @@ def train(msg: Message, context: Context) -> Message:
                 # Policy/sandbox no-op: no private file is opened and no private
                 # randomness is needed.  The incoming arrays are already public.
                 new_arrays = [np.asarray(a, dtype=np.float32) for a in old]
-                _cache_reply(context, claim, new_arrays)
-                return _reply(msg, new_arrays)
+                _cache_reply(
+                    context, claim, new_arrays, hook_executed=False,
+                    public_preflight_unavailable=True)
+                return _reply(
+                    msg, new_arrays, hook_executed=False,
+                    public_preflight_unavailable=True)
 
+            hook_public_ready = True
             module_name = str(cfg["user-module"])
-            X, y = load_data(context)
-            unit_ids = load_tabular_patient_ids(context)
-            task_module.assert_pinned_unit_count(context, len(y), unit_ids)
-            master = seeding.master_seed(cfg, X, y, private_release_id)
-            new_arrays = tier2_lib.gated_local_update(
-                module_name, old, X, y, cfg, pcfg_round,
-                seed=seeding.sub_seed(master, "egress"),
-                hook_caps=hook_caps, unit_ids=unit_ids)
+            hook_started = time.monotonic()
+            try:
+                mark_private_started()
+                X, y = load_data(context)
+                unit_ids = load_tabular_patient_ids(context)
+                task_module.assert_pinned_unit_count(context, len(y), unit_ids)
+                master = seeding.master_seed(cfg, X, y, private_release_id)
+                new_arrays = tier2_lib.gated_local_update(
+                    module_name, old, X, y, public_hook_cfg, pcfg_round,
+                    seed=seeding.sub_seed(master, "egress"),
+                    hook_caps=hook_caps, unit_ids=unit_ids,
+                    release_started=hook_started, pad_release=False)
+            finally:
+                tier2_lib.pad_hook_release(hook_started, pcfg_round)
         else:  # neural (tabular or image)
             pins = load_run_pins(context)
             if int(pins["num_rounds"]) != int(claim["max_releases"]):
                 raise RuntimeError(
                     "neural calibration horizon does not match release guard")
+            pins = dict(pins)
+            pins["round_index"] = int(claim["release_index"])
             model, master, input_dim, manifest_image = _prepare_neural_model(
                 msg, context, cfg, pins, private_release_id)
+            mark_private_started()
             new_arrays, _n = _train_neural(
                 context, cfg, pcfg, pins, model, master, input_dim,
                 manifest_image)
 
-        _cache_reply(context, claim, new_arrays)
-        return _reply(msg, new_arrays)
+        hook_status = True if track == "egress" else None
+        _cache_reply(context, claim, new_arrays, hook_executed=hook_status)
+        return _reply(msg, new_arrays, hook_executed=hook_status)
     except Exception:
         # Flower serializes uncaught exception strings into Error.reason. Those
         # strings can contain private values (for example pandas conversion errors),
         # so the trusted boundary must return content and never propagate/log them.
-        return _safe_noop_reply(msg, context, claim=claim, track=track)
+        return _safe_noop_reply(
+            msg, context, claim=claim, track=track,
+            hook_executed=hook_public_ready,
+            public_preflight_unavailable=not private_started,
+            execution_unavailable=private_started)

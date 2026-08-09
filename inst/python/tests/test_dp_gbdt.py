@@ -69,9 +69,41 @@ check("replace_one > sqrt(2)*sqrt(g^2+h^2) (the under-noising constant)",
       d2 > math.sqrt(2) * math.sqrt(1 + 0.0625))
 check("binary:logistic -> (1,0.25)", G.clip_bounds("binary:logistic") == (1.0, 0.25))
 try:
-    G.clip_bounds("reg:squarederror"); check("reject unbounded objective", False)
+    G.clip_bounds("reg:squarederror"); check("regression requires target bounds", False)
 except ValueError:
-    check("reject unbounded objective", True)
+    check("regression requires target bounds", True)
+
+reg_geometry = G.regression_geometry((0.0, 1.0))
+check("bounded regression derives (g*,h*)=(1,1)",
+      G.clip_bounds("reg:squarederror", (0.0, 1.0)) == (1.0, 1.0))
+check("unit-range regression sensitivity covers same/different leaf at 2",
+      abs(reg_geometry["delta2"] - 2.0) < 1e-12)
+narrow_delta = G.regression_replace_one_sensitivity((-0.1, 0.1))
+check("narrow gradients still pay Hessian routing sensitivity",
+      abs(narrow_delta - math.sqrt(2.02)) < 1e-12 and narrow_delta > 0.2)
+asym_geometry = G.regression_geometry(
+    (0.0, 2.0), margin_bounds=(1.0, 3.0))
+check("asymmetric gradient support uses the larger cross-leaf geometry",
+      asym_geometry["gradient_bounds"] == (-1.0, 3.0)
+      and abs(asym_geometry["delta2"] - math.sqrt(20.0)) < 1e-12)
+
+# Exhaust the interval endpoints and both routing cases. This independently
+# checks the closed form used to calibrate the Gaussian mechanism.
+observed = 0.0
+for g0 in asym_geometry["gradient_bounds"]:
+    for g1 in asym_geometry["gradient_bounds"]:
+        observed = max(observed, abs(g0 - g1))
+        observed = max(observed, math.sqrt(g0 * g0 + g1 * g1 + 2.0))
+check("regression sensitivity equals exhaustive endpoint geometry",
+      abs(observed - asym_geometry["delta2"]) < 1e-12)
+check("explicit gradient clip tightens the public gradient support",
+      G.regression_geometry((0.0, 10.0), gradient_clip=0.5)["gradient_bounds"]
+      == (-0.5, 0.5))
+check("oversized gradient clip normalizes to the public raw-gradient bound",
+      G.regression_geometry((0.0, 1.0), gradient_clip=1e100)["gradient_clip"]
+      == 1.0)
+check("unknown objective remains fail-closed", raises_value_error(
+      lambda: G.clip_bounds("reg:absoluteerror", (0.0, 1.0))))
 
 print("== accountant: calibrate achieves <= target epsilon, tight ==")
 for eps in (0.5, 1.0, 3.0, 8.0):
@@ -165,6 +197,16 @@ def _guarded_fit(X_arg=X, y_arg=y, **overrides):
     return G.fit_dp_gbdt(X_arg, y_arg, **args)
 
 
+def _guarded_reg_fit(X_arg=X, y_arg=y, **overrides):
+    args = dict(objective="reg:squarederror", depth=3, n_trees=2,
+                learning_rate=0.3, reg_lambda=1.0, feature_ranges=fr,
+                n_bins=16, run_token="reg-guard", epsilon=2.0, delta=1e-5,
+                target_bounds=(0.0, 1.0), margin_bounds=(0.0, 1.0),
+                gradient_clip=0.5, noise_rng=_BombRng())
+    args.update(overrides)
+    return G.fit_dp_gbdt(X_arg, y_arg, **args)
+
+
 print("== finite-data + bounded-spec gates precede the DP mechanism ==")
 for label, X_bad, y_bad in (
         ("NaN X", np.where(np.arange(X.size).reshape(X.shape) == 0, math.nan, X), y),
@@ -192,6 +234,23 @@ check("feature-range count mismatch rejected before noise draw", raises_value_er
       lambda: _guarded_fit(feature_ranges=fr[:-1])))
 check("non-finite feature range rejected before noise draw", raises_value_error(
       lambda: _guarded_fit(feature_ranges=[(0.0, math.inf)] * 4)))
+for bad_bounds in (None, (0.0, 0.0), (1.0, 0.0), (math.nan, 1.0),
+                   (0.0, math.inf), (-G._MAX_PUBLIC_BOUND_ABS - 1.0, 1.0),
+                   "0,1"):
+    check("invalid regression target bounds rejected before noise draw",
+          raises_value_error(
+              lambda bounds=bad_bounds: _guarded_reg_fit(
+                  target_bounds=bounds)))
+for bad_bounds in ((0.0, 0.0), (1.0, 0.0), (math.nan, 1.0),
+                   (0.0, math.inf), (0.0, G._MAX_PUBLIC_BOUND_ABS + 1.0)):
+    check("invalid regression margin bounds rejected before noise draw",
+          raises_value_error(
+              lambda bounds=bad_bounds: _guarded_reg_fit(
+                  margin_bounds=bounds)))
+for bad_clip in (0.0, -1.0, math.nan, math.inf, True):
+    check("invalid regression gradient clip rejected before noise draw",
+          raises_value_error(
+              lambda clip=bad_clip: _guarded_reg_fit(gradient_clip=clip)))
 check("fit refuses a missing secure RNG",
       rejects(lambda: _guarded_fit(noise_rng=None)))
 check("fit refuses an explicitly injected statistical PRNG",
@@ -208,6 +267,38 @@ check("histogram primitive refuses a statistical PRNG", rejects(
           X, y, np.zeros(n), probe_feat, probe_thr, 2,
           sigma=1.0, delta2=1.0, g_star=1.0, h_star=0.25,
           n_leaves=4, rng=np.random.default_rng(8))))
+
+reg_probe = G.regression_geometry(
+    (0.0, 1.0), margin_bounds=(0.0, 1.0), gradient_clip=0.2)
+check("regression histogram refuses an understated sensitivity before noise",
+      raises_value_error(lambda: G.node_noised_histogram(
+          X, y, np.zeros(n), probe_feat, probe_thr, 2,
+          sigma=1.0, delta2=reg_probe["delta2"] - 1e-6,
+          g_star=reg_probe["g_star"], h_star=reg_probe["h_star"],
+          n_leaves=4, rng=_BombRng(), objective="reg:squarederror",
+          target_bounds=(0.0, 1.0), margin_bounds=(0.0, 1.0),
+          gradient_clip=0.2)))
+
+class _ZeroRng(G.SecureNumpyRng):
+    def __init__(self):
+        pass
+
+    def normal(self, loc, scale, size):
+        return np.zeros(size, dtype=np.float64)
+
+
+probe_X = np.array([[0.0], [1.0], [0.25], [0.75]])
+probe_y = np.array([-5.0, 5.0, 0.75, 0.25])
+probe_margin = np.array([-10.0, 10.0, 10.0, -10.0])
+probe_release = G.node_noised_histogram(
+    probe_X, probe_y, probe_margin, np.array([0]), np.array([0.5]), 1,
+    sigma=1.0, delta2=reg_probe["delta2"],
+    g_star=reg_probe["g_star"], h_star=reg_probe["h_star"],
+    n_leaves=2, rng=_ZeroRng(), objective="reg:squarederror",
+    target_bounds=(0.0, 1.0), margin_bounds=(0.0, 1.0),
+    gradient_clip=0.2)
+check("regression clips targets, margins and gradients before histogramming",
+      np.allclose(probe_release, np.array([0.2, -0.2, 2.0, 2.0])))
 
 b_hi = G.fit_dp_gbdt(X, y, objective="binary:logistic", depth=3, n_trees=30,
                      learning_rate=0.3, reg_lambda=1.0, feature_ranges=fr, n_bins=32,
@@ -228,6 +319,63 @@ check("returned booster has only finite thresholds/weights",
 check("entire returned booster serializes with allow_nan=False",
       not rejects(lambda: json.dumps(b_hi, allow_nan=False)))
 
+# --------------------------------------------------------------------------- #
+print("== bounded squared-error regression ==")
+rs_reg = np.random.RandomState(314)
+X_reg = rs_reg.rand(2400, 4)
+y_reg = np.clip(0.1 + 0.55 * X_reg[:, 0] + 0.25 * X_reg[:, 1]
+                + rs_reg.normal(0.0, 0.03, len(X_reg)), 0.0, 1.0)
+reg_args = dict(
+    objective="reg:squarederror", depth=3, n_trees=50,
+    learning_rate=0.2, reg_lambda=2.0, feature_ranges=fr, n_bins=32,
+    run_token="reg-utility", epsilon=12.0, delta=1e-5,
+    target_bounds=(0.0, 1.0), margin_bounds=(0.0, 1.0),
+    gradient_clip=0.5, base_score=0.5)
+b_reg = G.fit_dp_gbdt(
+    X_reg, y_reg, noise_rng=_test_secure_rng(9001), **reg_args)
+p_reg = G.predict_value(b_reg, X_reg)
+baseline_mse = float(np.mean((y_reg - y_reg.mean()) ** 2))
+reg_mse = float(np.mean((y_reg - p_reg) ** 2))
+check("bounded regression beats the constant baseline",
+      reg_mse < 0.8 * baseline_mse)
+check("regression predictions obey public margin bounds",
+      bool(np.all(p_reg >= 0.0) and np.all(p_reg <= 1.0)))
+check("regression composes all tree releases within target epsilon",
+      G.gbdt_epsilon(b_reg["sigma"], b_reg["delta"],
+                     len(b_reg["trees"])) <= b_reg["epsilon"] + 1e-9)
+b_reg_retry = G.fit_dp_gbdt(
+    X_reg, y_reg, noise_rng=_test_secure_rng(9001), **reg_args)
+check("bounded regression is byte-deterministic for the same release seed",
+      json.dumps(b_reg, sort_keys=True, separators=(",", ":"))
+      == json.dumps(b_reg_retry, sort_keys=True, separators=(",", ":")))
+
+# Public clipping is total: out-of-domain private labels cannot select a
+# success/error path and are equivalent to their clipped representation.
+y_reg_outside = y_reg.copy()
+y_reg_outside[:4] = (-100.0, 100.0, -1.0, 2.0)
+clip_args = dict(reg_args)
+clip_args.update(n_trees=3, run_token="reg-target-clip")
+b_reg_outside = G.fit_dp_gbdt(
+    X_reg, y_reg_outside, noise_rng=_test_secure_rng(77), **clip_args)
+b_reg_clipped = G.fit_dp_gbdt(
+    X_reg, np.clip(y_reg_outside, 0.0, 1.0),
+    noise_rng=_test_secure_rng(77), **clip_args)
+check("out-of-bound regression targets equal their public clipped form",
+      json.dumps(b_reg_outside, sort_keys=True)
+      == json.dumps(b_reg_clipped, sort_keys=True))
+check("bounded regression booster serializes without NaN/Inf",
+      not rejects(lambda: json.dumps(b_reg, allow_nan=False)))
+default_base_args = dict(reg_args)
+default_base_args.update(n_trees=1, run_token="reg-public-base",
+                         target_bounds=(10.0, 20.0),
+                         margin_bounds=(10.0, 20.0))
+default_base_args.pop("base_score")
+b_reg_default_base = G.fit_dp_gbdt(
+    X_reg, y_reg + 10.0, noise_rng=_test_secure_rng(78),
+    **default_base_args)
+check("regression default base score is the public margin midpoint",
+      b_reg_default_base["base_margin"] == 15.0)
+
 class _InfRng(G.SecureNumpyRng):
     def __init__(self):
         pass
@@ -244,6 +392,13 @@ check("non-finite mechanism draw is refused, never serialized in a booster",
 check("non-finite aggregated histogram cannot produce leaf weights",
       raises_value_error(lambda: G.grow_tree_from_histograms(
           np.array([0.0] * 7 + [math.inf]), 4, 1.0, 0.3)))
+check("finite extreme leaf weights are saturated to the public model cap",
+      np.array_equal(
+          G.grow_tree_from_histograms(
+              np.array([-1.0e12, 1.0e12, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 0.0]),
+              4, 1.0e-6, 1.0),
+          np.array([1.0e6, -1.0e6, 0.0, 0.0])))
 check("finite-but-overflowing leaf arithmetic is refused",
       rejects(lambda: G.grow_tree_from_histograms(
           np.array([0.0] * 4 + [np.finfo(np.float64).max] * 4),
@@ -290,6 +445,13 @@ print("== per-patient pooling ==")
 pids = np.repeat(np.arange(125), 8)
 Xp, yp = G.pool_by_patient(X, y, pids)
 check("pooled to 125 patient-rows", Xp.shape == (125, 4))
+Xp_reg, yp_reg = G.pool_by_patient(
+    np.array([[0.0], [1.0], [2.0], [3.0]]),
+    np.array([0.1, 0.3, 0.8, 1.2]), np.array(["a", "a", "b", "b"]),
+    objective="reg:squarederror", target_bounds=(0.0, 1.0))
+check("regression pools one bounded mean outcome per patient",
+      np.allclose(Xp_reg.ravel(), (0.5, 2.5))
+      and np.allclose(yp_reg, (0.2, 0.9)))
 bp = G.fit_dp_gbdt(X, y, objective="binary:logistic", depth=2, n_trees=10,
                    learning_rate=0.3, reg_lambda=1.0, feature_ranges=fr, n_bins=16,
                    run_token="pat", epsilon=5.0, delta=1e-5, patient_ids=pids,

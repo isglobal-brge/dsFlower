@@ -363,7 +363,7 @@ def resolve_dp_track(run_config, manifest_track):
     ever runs the hash-verified harness, so foreign code cannot impersonate it)."""
     if run_config.get("user-module"):
         return "egress"
-    if manifest_track in ("neural", "trees", "egress"):
+    if manifest_track in ("neural", "trees", "egress", "validation"):
         return manifest_track
     return "egress"
 
@@ -808,6 +808,15 @@ def _gamma_nll_factory(cfg):
     return gamma_nll
 
 
+def _huber_factory(cfg):
+    """Stock per-sample Huber regression loss with a pinned public transition."""
+    delta = float(cfg.get("huber-delta", 1.0))
+    if not math.isfinite(delta) or not 1.0e-6 <= delta <= 1.0e6:
+        raise ValueError("huber-delta must be in [1e-6, 1e6], got %r" % (delta,))
+    import torch.nn as nn
+    return nn.HuberLoss(delta=delta, reduction="mean")
+
+
 # Custom TRUSTED per-sample losses (node code, never client code): name -> factory(cfg).
 # Each MUST decompose per sample with mean reduction so the DP-SGD sensitivity bound
 # holds; enforced by per_sample_independence_probe + the DP safety suite. Hyperparams
@@ -816,6 +825,7 @@ def _gamma_nll_factory(cfg):
 _CUSTOM_LOSS_FACTORY = {
     "negbin_nll": _negbin_nll_factory,
     "gamma_nll": _gamma_nll_factory,
+    "huber": _huber_factory,
 }
 
 
