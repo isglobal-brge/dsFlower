@@ -404,6 +404,32 @@
     "CHECK(length(key_fingerprint) = 64 AND",
     "key_fingerprint NOT GLOB '*[^0-9a-f]*'),",
     "created_at TEXT NOT NULL)"))
+  DBI::dbExecute(con, paste(
+    "CREATE TABLE IF NOT EXISTS privacy_semantic_releases (",
+    "domain TEXT NOT NULL,",
+    "semantic_key TEXT NOT NULL",
+    "CHECK(length(semantic_key) = 64 AND",
+    "semantic_key NOT GLOB '*[^0-9a-f]*'),",
+    "mechanism TEXT NOT NULL,",
+    "generation INTEGER NOT NULL CHECK(generation >= 1),",
+    "policy_hash TEXT NOT NULL",
+    "CHECK(length(policy_hash) = 64 AND",
+    "policy_hash NOT GLOB '*[^0-9a-f]*'),",
+    "run_token TEXT NOT NULL UNIQUE,",
+    "status TEXT NOT NULL CHECK(status IN ('reserved','committed','lost')),",
+    "artifact_relpath TEXT,",
+    "artifact_sha256 TEXT",
+    "CHECK(artifact_sha256 IS NULL OR (length(artifact_sha256) = 64 AND",
+    "artifact_sha256 NOT GLOB '*[^0-9a-f]*')),",
+    "artifact_bytes INTEGER CHECK(artifact_bytes IS NULL OR artifact_bytes >= 0),",
+    "created_at TEXT NOT NULL,",
+    "committed_at TEXT,",
+    "lost_at TEXT,",
+    "PRIMARY KEY(domain, semantic_key, mechanism, generation))"))
+  DBI::dbExecute(con, paste(
+    "CREATE UNIQUE INDEX IF NOT EXISTS privacy_semantic_one_active",
+    "ON privacy_semantic_releases(domain, semantic_key, mechanism)",
+    "WHERE status IN ('reserved','committed')"))
   ok <- TRUE
   con
 }
