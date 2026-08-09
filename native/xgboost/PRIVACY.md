@@ -14,14 +14,17 @@ V1 keeps two mechanism identities separate:
   a keyed binary64 Box--Muller stream is not the ideal Gaussian distribution.
 - `fixed-point-discrete-v1` is a mathematical fixed-point discrete-Gaussian
   profile with exact integer sensitivity and rational budget allocation.  The
-  repository contains a pinned minimal CKS20 source port and C ABI under
-  `native/dp_primitives`, but it is not yet connected to this updater and does
-  not make the end-to-end tree mechanism complete.
+  repository contains a pinned minimal CKS20 source port and deterministic C
+  ABI under `native/dp_primitives`.  Patch 0003 connects it only to the
+  compile-time-isolated test core; that does not make the end-to-end tree
+  mechanism complete or enable a capability.
 
 One profile's semantic randomness identity is never valid for the other. The
-mechanism ID, fixed-point scale or floating-point profile,
-accountant version, all public bounds, cuts and training parameters belong in
-the canonical mechanism configuration hash.
+mechanism ID, effective fixed-point/noise scales or floating-point profile,
+accountant version, effective cuts and base score, training shape,
+privacy-unit contract, and canonical binned matrix/target belong in the
+semantic key derivation. Admission bounds that leave those effective values
+unchanged do not create a fresh noise stream.
 
 The independent executable oracle is
 `reference/mechanism_v1.py`.  It has no updater dependency and can be checked
@@ -48,35 +51,39 @@ matrix.  Row multiplicity, weights or duplicated unit identifiers are not
 accepted.
 
 Sticky randomness protects an identical semantic training from averaging. Its
-authenticated PRF input binds the mechanism and runtime versions, complete
-public configuration, per-training privacy contract, round coordinate, public
-model input and the effective bounded private statistic. Tree, depth, node,
-feature, bin and component additionally domain-separate coordinates. The same
-training therefore recomputes the same model without persistent query state;
-any effective semantic change derives a different stream. The guarantee is
-per training, and the accountant composes only that training's fixed tree and
-depth schedule.
+authenticated key derivation binds the mechanism and runtime versions,
+effective public configuration, per-training privacy contract, public model
+input and the effective bounded private statistic. The native core then
+domain-separates release kind, tree and depth; coordinates within each joint
+vector consume that stream sequentially. The same training therefore
+recomputes the same model without persistent query state; any effective
+semantic change derives a different stream. The guarantee is per training, and
+the accountant composes only that training's fixed tree and depth schedule.
 
-The current discrete primitive still consumes operating-system entropy and is
-therefore not activatable under this stateless contract. Its production ABI
-must first accept a deterministic, domain-separated PRF byte stream. Doing so
-makes the operational claim computational, even though the fixed-point sampler
+The discrete primitive consumes a deterministic HMAC-SHA256 byte stream keyed
+by a 32-byte context-derived key. The core supplies the canonical binary domain
+`label-with-NUL || release-kind-u8 || tree-index-u64be || depth-u32be`;
+coordinates within one joint vector consume the stream sequentially. This makes
+the operational claim computational, even though the fixed-point sampler
 arithmetic remains exact conditional on uniform bytes.
 
 ## V1 training domain
 
 The proof applies only to all of the following restrictions:
 
-- binary logistic classification with labels clipped to `{0, 1}`, or bounded
-  squared-error regression with targets clipped to public bounds;
+- binary logistic classification restricted to labels in `{0, 1}`, or bounded
+  squared-error regression restricted to targets inside public bounds; the
+  adapter rejects out-of-domain values and the native boundary revalidates
+  them rather than clipping labels or targets;
 - CPU, in-memory, single-process training, one output and one tree per round;
 - a public, fixed number `T >= 1` of trees and `D >= 1` histogram levels per
   tree, depthwise construction and a worst-case `T * D` release schedule;
 - exactly one materialized DMatrix row per privacy unit;
 - a complete public feature schema, public finite feature/target bounds and
   complete public cuts; a sketch over the private training matrix is forbidden;
-- a public binary base score of `0.5`, or the midpoint of the public target
-  bounds for regression; private-label base-score estimation is forbidden;
+- a public binary base score in `(0, 1)`, or a server-pinned value inside the
+  public target bounds for regression (the midpoint is the default);
+  private-label base-score estimation is forbidden;
 - server-owned objectives, gradient and Hessian clipping, learning rate,
   regularization, finite positive denominator protection and leaf clipping;
 - every stopping, split, missing-direction, topology, weight, gain and cover
@@ -218,15 +225,14 @@ not silently inherit the information-theoretic formal label.
 `native/dp_primitives` ports the exact CKS20 arithmetic and rejection rules from
 pinned OpenDP 0.15.1 source. It takes an integer scale directly, adds noise in
 arbitrary precision and applies saturating `i64` post-processing. It does not
-link OpenDP or OpenSSL and deliberately exposes no seed. Its current random
-bits come from a fail-closed, buffered operating-system source, so this ABI is
-incompatible with dsFlower's stateless sticky contract and must remain
-disconnected. Before use, it must accept the deterministic semantic PRF byte
-stream described above. OpenDP labels the upstream pre-1.0 constructor
-`contrib`, so source pinning and a passing ABI test are necessary but not
-sufficient: dsFlower still requires an independent proof/code review,
-known-issue audit and Linux/macOS/Windows test matrix before treating the
-sampler gate as closed.
+link OpenDP or OpenSSL and exposes neither the custodial root nor a public seed.
+ABI v2 requires a nonzero 32-byte derived key and a bounded caller domain, then
+expands uniform bytes as HMAC-SHA256 blocks with a fixed primitive-level prefix,
+domain length and big-endian counter. OpenDP labels the upstream pre-1.0
+constructor `contrib`, so source pinning and passing ABI/integration tests are
+necessary but not sufficient: dsFlower still requires an independent
+proof/code review and known-issue audit before treating the sampler gate as
+closed.
 
 The discrete oracle avoids transcendental calibration.  Represent public
 `epsilon` and `delta` as exact rationals and set
@@ -280,7 +286,7 @@ histograms.  The sanitizer and adapter must ensure all of the following:
 - no raw histogram, gradient, Hessian, count, sketch, row prediction, leaf
   assignment, per-row error, training metric or private validation metric;
 - no feature/target names, unit identifiers, dataset paths, stack traces,
-  seeds, keys, key IDs, sampler state or native debug dumps;
+  seeds, keys, sampler state or native debug dumps;
 - no partial model or data-dependent diagnostic on failure;
 - no raw-data-dependent logs, callbacks, timing-controlled output, model
   attributes or objective/base-score estimation;

@@ -2,11 +2,11 @@
 % Please edit documentation in R/native_tree_contract.R
 \name{.native_tree_target_schema}
 \alias{.native_tree_target_schema}
-\title{Canonicalise the public target schema}
+\title{Canonicalise the public target schema and typed binary labels}
 \usage{
 .native_tree_target_schema(target, task, features)
 }
 \description{
-Canonicalise the public target schema
+Canonicalise the public target schema and typed binary labels
 }
 \keyword{internal}

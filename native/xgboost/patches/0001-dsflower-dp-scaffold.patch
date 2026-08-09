@@ -2,20 +2,17 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 index cc4ef46de59fa7c563c67bfc34760036789081c1..0bcd975b11360bb03203343358041494aee5c4d6 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -113,6 +113,7 @@ address, leak, undefined and thread.")
- ## Plugins
+@@ -114,4 +114,5 @@ address, leak, undefined and thread.")
  option(PLUGIN_RMM "Build with RAPIDS Memory Manager (RMM)" OFF)
  option(PLUGIN_FEDERATED "Build with Federated Learning" OFF)
 +option(PLUGIN_DSFLOWER_DP "Build the fail-closed dsFlower DP histogram scaffold" OFF)
  ## TODO: 1. Add check if DPC++ compiler is used for building
  option(PLUGIN_SYCL "SYCL plugin" OFF)
- option(ADD_PKGCONFIG "Add xgboost.pc into system." ON)
 diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
-index 24c7afc35374fdec9007067be01141b4e5608f5b..6a73dbad92b5e0a1f30ca4d912201f3ae5dc2115 100644
+index 24c7afc35374fdec9007067be01141b4e5608f5b..d74051dcadd9b364ee894d5e3249fd134d878abf 100644
 --- a/include/xgboost/c_api.h
 +++ b/include/xgboost/c_api.h
-@@ -89,6 +89,67 @@ XGB_DLL int XGBuildInfo(char const **out);
-  */
+@@ -90,4 +90,57 @@ XGB_DLL int XGBuildInfo(char const **out);
  XGB_DLL const char *XGBGetLastError();
 
 +/**
@@ -33,8 +30,9 @@ index 24c7afc35374fdec9007067be01141b4e5608f5b..6a73dbad92b5e0a1f30ca4d912201f3a
 + * XGBDsFlowerSetPrivacyContext.  The implementation copies validated values
 + * and never serializes noise_key into a model or XGBoost configuration.  The
 + * caller must pass a context-derived key, never its durable noise root.
-+ * ABI v1 also requires a DMatrix already materialized as exactly one row per
-+ * declared privacy unit; the updater never performs patient canonicalization.
++ * ABI v1 carries the basic contribution contract only. The adapter must
++ * materialize exactly one row per declared privacy unit before training; the
++ * updater never performs patient canonicalization.
 + */
 +typedef struct XGBDsFlowerPrivacyContext {
 +  uint32_t struct_size;
@@ -42,19 +40,10 @@ index 24c7afc35374fdec9007067be01141b4e5608f5b..6a73dbad92b5e0a1f30ca4d912201f3a
 +  const unsigned char *noise_key;
 +  size_t noise_key_size;
 +  const char *mechanism_id;
-+  const char *noise_key_id;
-+  const char *node_id_hash;
-+  const char *dataset_snapshot_hash;
-+  const char *cohort_hash;
-+  const char *query_hash;
-+  const char *mechanism_config_hash;
-+  const char *allocation_hash;
 +  const char *privacy_unit;
 +  const char *adjacency;
 +  const char *unit_canonicalization;
 +  const char *contribution_strategy;
-+  double epsilon;
-+  double delta;
 +  double gradient_clip;
 +  double hessian_clip;
 +  uint64_t max_rows_per_unit;
@@ -81,13 +70,11 @@ index 24c7afc35374fdec9007067be01141b4e5608f5b..6a73dbad92b5e0a1f30ca4d912201f3a
 +
  /**
   * @brief register callback function for LOG(INFO) messages -- helpful messages
-  *        that are not errors.
 diff --git a/plugin/CMakeLists.txt b/plugin/CMakeLists.txt
 index a11916eb9814cd4285640e8f9322f2add4685928..eb96eb603b10d4b2784d646fe82ff75c46e5e559 100644
 --- a/plugin/CMakeLists.txt
 +++ b/plugin/CMakeLists.txt
-@@ -34,3 +34,9 @@ endif()
- if(PLUGIN_FEDERATED)
+@@ -35,2 +35,8 @@ if(PLUGIN_FEDERATED)
    add_subdirectory(federated)
  endif()
 +
@@ -112,7 +99,7 @@ index 0000000000000000000000000000000000000000..3ff2eb344a3a45aad8a3cee6aab6129b
 +target_compile_definitions(objxgboost PUBLIC XGBOOST_USE_DSFLOWER_DP=1)
 diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..fb265eb2a7c788270ee76030be51a8800618796b
+index 0000000000000000000000000000000000000000..c066066c8fcb8ac33b72b390ca9d713c48b520b3
 --- /dev/null
 +++ b/plugin/dsflower/README.md
 @@ -0,0 +1,27 @@
@@ -126,8 +113,8 @@ index 0000000000000000000000000000000000000000..fb265eb2a7c788270ee76030be51a880
 +The v1 adapter boundary accepts only `privacy_unit=row|patient`,
 +`adjacency=replace_one`, `unit_canonicalization=trim-utf8-v2`,
 +`contribution_strategy=one-record-per-unit-v1`, and `max_rows_per_unit=1`.
-+The server must materialize the DMatrix as one row per privacy unit before it
-+crosses this ABI; this scaffold does not canonicalize or pool patients itself.
++The adapter must materialize exactly one row per privacy unit before training;
++this scaffold does not canonicalize or pool patients itself.
 +
 +The updater must remain unavailable to production integration until a later
 +patch implements and proves all of the following before any data-dependent
@@ -145,10 +132,10 @@ index 0000000000000000000000000000000000000000..fb265eb2a7c788270ee76030be51a880
 +`grow_dsflower_dp_hist` always fails closed in this patch.
 diff --git a/plugin/dsflower/dsflower_context.cc b/plugin/dsflower/dsflower_context.cc
 new file mode 100644
-index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b076eb241
+index 0000000000000000000000000000000000000000..2c850beada9e8963cee36efe0e4d70170a8c051d
 --- /dev/null
 +++ b/plugin/dsflower/dsflower_context.cc
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,140 @@
 +/**
 + * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
 + * SPDX-License-Identifier: Apache-2.0
@@ -165,8 +152,6 @@ index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b
 +
 +namespace xgboost::tree::dsflower {
 +namespace {
-+
-+constexpr std::size_t kHashSize = 64;
 +
 +void SecureZero(unsigned char* ptr, std::size_t size) {
 +  volatile unsigned char* out = ptr;
@@ -189,17 +174,6 @@ index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b
 +};
 +
 +thread_local ContextSlot g_context;
-+
-+bool IsLowerHexHash(const char* value) {
-+  if (value == nullptr) {
-+    return false;
-+  }
-+  std::string_view text{value};
-+  return text.size() == kHashSize &&
-+         std::all_of(text.cbegin(), text.cend(), [](char c) {
-+           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-+         });
-+}
 +
 +bool Reject(std::string message, std::string* error) {
 +  if (error != nullptr) {
@@ -231,13 +205,6 @@ index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b
 +      std::string_view{input.mechanism_id} != kScaffoldMechanismId) {
 +    return Reject("dsFlower mechanism_id does not match this scaffold", error);
 +  }
-+  if (!IsLowerHexHash(input.noise_key_id) || !IsLowerHexHash(input.node_id_hash) ||
-+      !IsLowerHexHash(input.dataset_snapshot_hash) || !IsLowerHexHash(input.cohort_hash) ||
-+      !IsLowerHexHash(input.query_hash) || !IsLowerHexHash(input.mechanism_config_hash) ||
-+      !IsLowerHexHash(input.allocation_hash)) {
-+    return Reject("every dsFlower identity/configuration pin must be a lowercase SHA-256 hex digest",
-+                  error);
-+  }
 +  if (input.privacy_unit == nullptr ||
 +      (std::string_view{input.privacy_unit} != "row" &&
 +       std::string_view{input.privacy_unit} != "patient")) {
@@ -254,12 +221,6 @@ index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b
 +      std::string_view{input.contribution_strategy} != "one-record-per-unit-v1") {
 +    return Reject("dsFlower contribution_strategy must be one-record-per-unit-v1", error);
 +  }
-+  if (!std::isfinite(input.epsilon) || input.epsilon <= 0.0) {
-+    return Reject("dsFlower epsilon must be finite and positive", error);
-+  }
-+  if (!std::isfinite(input.delta) || input.delta <= 0.0 || input.delta >= 1.0) {
-+    return Reject("dsFlower delta must be finite and strictly between zero and one", error);
-+  }
 +  if (!std::isfinite(input.gradient_clip) || input.gradient_clip <= 0.0 ||
 +      !std::isfinite(input.hessian_clip) || input.hessian_clip <= 0.0) {
 +    return Reject("dsFlower gradient and hessian clips must be finite and positive", error);
@@ -269,19 +230,10 @@ index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b
 +  }
 +
 +  PrivacyContext next;
-+  next.noise_key_id = input.noise_key_id;
-+  next.node_id_hash = input.node_id_hash;
-+  next.dataset_snapshot_hash = input.dataset_snapshot_hash;
-+  next.cohort_hash = input.cohort_hash;
-+  next.query_hash = input.query_hash;
-+  next.mechanism_config_hash = input.mechanism_config_hash;
-+  next.allocation_hash = input.allocation_hash;
 +  next.privacy_unit = input.privacy_unit;
 +  next.adjacency = input.adjacency;
 +  next.unit_canonicalization = input.unit_canonicalization;
 +  next.contribution_strategy = input.contribution_strategy;
-+  next.epsilon = input.epsilon;
-+  next.delta = input.delta;
 +  next.gradient_clip = input.gradient_clip;
 +  next.hessian_clip = input.hessian_clip;
 +  next.max_rows_per_unit = input.max_rows_per_unit;
@@ -326,10 +278,10 @@ index 0000000000000000000000000000000000000000..f676a6954ddba7ae3ba384a0c5ef856b
 +}
 diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_context.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..1b99a79a7ae622e36f2aa7ac106439cfcc0722bc
+index 0000000000000000000000000000000000000000..ef9fff81cbf196a6bab8aafeb67714ad5c42c65d
 --- /dev/null
 +++ b/plugin/dsflower/dsflower_context.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,38 @@
 +/**
 + * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
 + * SPDX-License-Identifier: Apache-2.0
@@ -352,19 +304,10 @@ index 0000000000000000000000000000000000000000..1b99a79a7ae622e36f2aa7ac106439cf
 +
 +struct PrivacyContext {
 +  std::array<unsigned char, kNoiseKeySize> noise_key{};
-+  std::string noise_key_id;
-+  std::string node_id_hash;
-+  std::string dataset_snapshot_hash;
-+  std::string cohort_hash;
-+  std::string query_hash;
-+  std::string mechanism_config_hash;
-+  std::string allocation_hash;
 +  std::string privacy_unit;
 +  std::string adjacency;
 +  std::string unit_canonicalization;
 +  std::string contribution_strategy;
-+  double epsilon{0.0};
-+  double delta{0.0};
 +  double gradient_clip{0.0};
 +  double hessian_clip{0.0};
 +  std::uint64_t max_rows_per_unit{0};

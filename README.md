@@ -106,8 +106,9 @@ or HookApp controls. The custodian pins one positive epsilon/delta pair for each
 training, and its accountant composes that contract across the training's own
 rounds. There is no historical database, quota or resource-specific balance.
 Distinct trainings are independent releases and compose in the standard way
-when an analyst chooses to reason about them together. HPO over one released DP
-model or synopsis is ordinary post-processing.
+when an analyst chooses to reason about them together. Metric and threshold
+selection over one released DP model is ordinary post-processing; training a
+different model is a new per-training release.
 
 The guarantee is accounted independently at each node. If one person can occur
 at `m` observed nodes, their federation-wide guarantee composes across those
@@ -339,8 +340,9 @@ options(
 ```
 
 The epsilon/delta pair describes one training. Its rounds are calibrated as one
-mechanism; later trainings do not consume a stored balance. HPO/CV over one
-released DP synopsis or model is post-processing.
+mechanism; later trainings do not consume a stored balance. Metric and threshold
+selection over one released DP model is post-processing; HPO or CV that trains
+new models creates new per-training releases.
 
 The Python privacy runtime is constrained to the audited compatibility families:
 Flower 1.31.x, Torch 2.x, Opacus 1.x and torchvision 0.x. Provisioning writes the

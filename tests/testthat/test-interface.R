@@ -301,6 +301,13 @@ test_that("HookApp manifest rejects aliases, tampering, and unsafe JSON", {
 })
 
 test_that("validation config is pinned to one well-typed release", {
+  expect_error(dsFlower:::.addDpConfigToRunConfig(list(
+    "dp-track" = "validation", "validation-model-track" = "native_tree",
+    "validation-task" = "binary", "task-type" = "classification",
+    "loss-name" = "bce_logits", "num-server-rounds" = 1L,
+    "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L)),
+    "validation-model-track must be neural")
+
   config <- dsFlower:::.addDpConfigToRunConfig(list(
     "dp-track" = "validation", "validation-model-track" = "neural",
     "validation-task" = "multiclass", "validation-bins" = 24L,

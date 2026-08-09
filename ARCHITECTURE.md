@@ -336,7 +336,9 @@ options(
 ```
 
 Every semantically new training uses the same server-owned per-training
-contract. HPO/CV over one DP synopsis or model is post-processing.
+contract. Metric and threshold selection over one released DP model is
+post-processing; HPO or CV that trains new models creates new per-training
+releases.
 
 Seed loss, malformation or an unsafe mode causes automatic CSPRNG rotation and
 never blocks because of query history. Administrators can select a

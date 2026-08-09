@@ -28,7 +28,7 @@ def main() -> None:
     assert metadata["DSFLOWER_XGB_UPSTREAM_COMMIT"] == PINNED_COMMIT
     assert len(metadata["DSFLOWER_XGB_UPSTREAM_SOURCE_SHA256"]) == 64
     assert len(metadata["DSFLOWER_DMLC_CORE_COMMIT"]) == 40
-    assert metadata["DSFLOWER_XGB_PATCHSET_VERSION"] == "2"
+    assert metadata["DSFLOWER_XGB_PATCHSET_VERSION"] == "3"
 
     checksums: dict[str, str] = {}
     for line in (ROOT / "PATCHES.sha256").read_text(encoding="utf-8").splitlines():
@@ -52,7 +52,7 @@ def main() -> None:
         "trim-utf8-v2",
         "one-record-per-unit-v1",
         "max_rows_per_unit",
-        "XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 2U",
+        "XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 3U",
         "DMatrixHandle dmatrix",
         "data::SimpleDMatrix",
         "binary:logistic",
@@ -61,6 +61,9 @@ def main() -> None:
         "base_score",
         "max_trees",
         "max_depth",
+        "fixed_point_scale",
+        "root_noise_scale",
+        "level_noise_scale",
         "cut_ptrs",
         "cut_values",
         "SnapshotPrivacyContextForDMatrix",
@@ -72,11 +75,19 @@ def main() -> None:
         "changed since updater configuration",
         "std::atomic<std::uint64_t> g_context_generation",
         "boost_from_average must remain disabled",
+        "boost_from_average must be explicitly disabled",
         "requires the exclusive trusted updater",
         "requires CPU execution",
         "requires one tree per boosting round",
         "fail-closed scaffold",
         "privatization has not been implemented or proven",
+        "DSFLOWER_DP_CORE_TESTING",
+        "cks20-discrete-gaussian-i64-hmac-sha256-v1",
+        "MakeReleaseDomain",
+        "TryGetNextTreeIndex",
+        "RecordSuccessfulTree",
+        "test-only:fixed-point-core:no-production-capability",
+        "dsflower_dp_add_discrete_gaussian_i64",
     )
     for guard in required_guards:
         assert guard in patch_text, f"missing fail-closed guard: {guard}"
@@ -88,6 +99,9 @@ def main() -> None:
         "privacy_epoch_hash",
         "fresh entropy",
         "persisting the committed artifact",
+        "system-random-v1",
+        "No seed or noise key crosses",
+        "durable ledger",
     )
     for contract in forbidden_contracts:
         assert contract not in patch_text
