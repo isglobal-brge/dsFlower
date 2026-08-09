@@ -275,19 +275,24 @@ def _harden_windows(path):
         text=True).stdout.strip()
     if not identity:
         raise RuntimeError("Windows test identity is unavailable")
-    subprocess.run([
-        "icacls", str(path), "/inheritance:r", "/grant:r",
-        "%s:(OI)(CI)F" % identity,
-    ], check=True, capture_output=True, text=True)
+    targets = [path]
+    for current, directories, files in os.walk(path):
+        root = Path(current)
+        targets.extend(root / name for name in directories)
+        targets.extend(root / name for name in files)
+    for target in targets:
+        grant = "%s:%s" % (
+            identity, "(OI)(CI)F" if target.is_dir() else "F")
+        subprocess.run([
+            "icacls", str(target), "/inheritance:r", "/grant:r", grant,
+        ], check=True, capture_output=True, text=True)
 
 
 def _parent(bundle_source):
     root = Path(tempfile.mkdtemp(
         prefix="dsflower-real-xgb-e2e-", dir=Path.home())).resolve()
     try:
-        if os.name == "nt":
-            _harden_windows(root)
-        else:
+        if os.name != "nt":
             root.chmod(0o700)
         bundle = root / "bundle"
         shutil.copytree(bundle_source, bundle)
@@ -297,6 +302,11 @@ def _parent(bundle_source):
             secret.chmod(0o600)
         work = root / "work"
         work.mkdir()
+        if os.name == "nt":
+            # Model a provisioned custodial root exactly.  Copying prebuilt
+            # DLLs may retain protected source ACLs, so secure every existing
+            # entry instead of assuming inheritance repaired the full tree.
+            _harden_windows(root)
         environment = {
             name: value for name, value in os.environ.items()
             if not name.upper().startswith(("LD_", "DYLD_"))
