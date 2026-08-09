@@ -26,7 +26,7 @@ def main() -> None:
     metadata = parse_env(ROOT / "UPSTREAM.env")
     assert metadata["DSFLOWER_XGB_UPSTREAM_TAG"] == "v3.4.0"
     assert metadata["DSFLOWER_XGB_UPSTREAM_COMMIT"] == PINNED_COMMIT
-    assert len(metadata["DSFLOWER_XGB_UPSTREAM_ARCHIVE_SHA256"]) == 64
+    assert len(metadata["DSFLOWER_XGB_UPSTREAM_SOURCE_SHA256"]) == 64
     assert len(metadata["DSFLOWER_DMLC_CORE_COMMIT"]) == 40
     assert metadata["DSFLOWER_XGB_PATCHSET_VERSION"] == "2"
 
@@ -98,6 +98,11 @@ def main() -> None:
         "scripts",
         "tests",
     }
+    canonical_hasher = (ROOT / "scripts" / "canonical_tree_sha256.py").read_text(
+        encoding="utf-8"
+    )
+    assert "dsflower-git-source-sha256-v1" in canonical_hasher
+    assert '"cat-file", "--batch"' in canonical_hasher
     assert {path.name for path in ROOT.iterdir()} <= allowed_top_level
     print("XGBoost patch metadata: ok")
 
