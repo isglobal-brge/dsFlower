@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Offline integrity and fail-closed-shape tests for the XGBoost patchset."""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PINNED_COMMIT = "06335b125dccb859aacef142675506bfb84401b3"
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+    return values
+
+
+def main() -> None:
+    metadata = parse_env(ROOT / "UPSTREAM.env")
+    assert metadata["DSFLOWER_XGB_UPSTREAM_TAG"] == "v3.4.0"
+    assert metadata["DSFLOWER_XGB_UPSTREAM_COMMIT"] == PINNED_COMMIT
+    assert len(metadata["DSFLOWER_XGB_UPSTREAM_ARCHIVE_SHA256"]) == 64
+    assert len(metadata["DSFLOWER_DMLC_CORE_COMMIT"]) == 40
+
+    checksums: dict[str, str] = {}
+    for line in (ROOT / "PATCHES.sha256").read_text(encoding="utf-8").splitlines():
+        digest, name = line.split()
+        checksums[name] = digest
+    patches = sorted((ROOT / "patches").glob("*.patch"))
+    assert patches, "the patchset must not be empty"
+    assert set(checksums) == {f"patches/{path.name}" for path in patches}
+    for path in patches:
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert actual == checksums[f"patches/{path.name}"]
+
+    patch_text = "\n".join(path.read_text(encoding="utf-8") for path in patches)
+    required_guards = (
+        "option(PLUGIN_DSFLOWER_DP",
+        "grow_dsflower_dp_hist",
+        "XGBDsFlowerSetPrivacyContext",
+        "XGBDsFlowerClearPrivacyContext",
+        "privacy_unit",
+        "replace_one",
+        "trim-utf8-v2",
+        "one-record-per-unit-v1",
+        "max_rows_per_unit",
+        "fail-closed scaffold",
+        "privatization has not been implemented or proven",
+    )
+    for guard in required_guards:
+        assert guard in patch_text, f"missing fail-closed guard: {guard}"
+
+    forbidden_claims = ("production-ready DP", "DP guarantee is complete")
+    for claim in forbidden_claims:
+        assert claim not in patch_text
+
+    allowed_top_level = {
+        "LICENSES.md",
+        "PATCHES.sha256",
+        "PROVENANCE.md",
+        "README.md",
+        "UPSTREAM.env",
+        "patches",
+        "scripts",
+        "tests",
+    }
+    assert {path.name for path in ROOT.iterdir()} <= allowed_top_level
+    print("XGBoost patch metadata: ok")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,465 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cc4ef46..0bcd975 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -113,6 +113,7 @@ address, leak, undefined and thread.")
+ ## Plugins
+ option(PLUGIN_RMM "Build with RAPIDS Memory Manager (RMM)" OFF)
+ option(PLUGIN_FEDERATED "Build with Federated Learning" OFF)
++option(PLUGIN_DSFLOWER_DP "Build the fail-closed dsFlower DP histogram scaffold" OFF)
+ ## TODO: 1. Add check if DPC++ compiler is used for building
+ option(PLUGIN_SYCL "SYCL plugin" OFF)
+ option(ADD_PKGCONFIG "Add xgboost.pc into system." ON)
+diff --git a/include/xgboost/c_api.h b/include/xgboost/c_api.h
+index 24c7afc..3e584dd 100644
+--- a/include/xgboost/c_api.h
++++ b/include/xgboost/c_api.h
+@@ -89,6 +89,68 @@ XGB_DLL int XGBuildInfo(char const **out);
+  */
+ XGB_DLL const char *XGBGetLastError();
+
++/**
++ * @brief ABI version for the opt-in dsFlower privacy context.
++ *
++ * @warning This ABI belongs to a fail-closed development scaffold.  It does
++ * not make XGBoost training differentially private.
++ */
++#define XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION 1U
++
++/**
++ * @brief Server-authoritative pins required by the dsFlower updater scaffold.
++ *
++ * Every pointer is borrowed only for the duration of
++ * XGBDsFlowerSetPrivacyContext.  The implementation copies validated values
++ * and never serializes noise_key into a model or XGBoost configuration.  The
++ * caller must pass a context-derived key, never its durable noise root.
++ * ABI v1 also requires a DMatrix already materialized as exactly one row per
++ * declared privacy unit; the updater never performs patient canonicalization.
++ */
++typedef struct XGBDsFlowerPrivacyContext {
++  uint32_t struct_size;
++  uint32_t abi_version;
++  const unsigned char *noise_key;
++  size_t noise_key_size;
++  const char *mechanism_id;
++  const char *noise_key_id;
++  const char *privacy_epoch;
++  const char *node_id_hash;
++  const char *dataset_snapshot_hash;
++  const char *cohort_hash;
++  const char *query_hash;
++  const char *mechanism_config_hash;
++  const char *allocation_hash;
++  const char *privacy_unit;
++  const char *adjacency;
++  const char *unit_canonicalization;
++  const char *contribution_strategy;
++  double epsilon;
++  double delta;
++  double gradient_clip;
++  double hessian_clip;
++  uint64_t max_rows_per_unit;
++} XGBDsFlowerPrivacyContext;
++
++/**
++ * @brief Install a validated privacy context on the calling thread.
++ *
++ * A second install fails until XGBDsFlowerClearPrivacyContext is called.
++ * This API returning success does not authorize training: the scaffold updater
++ * still rejects every update until histogram privatization is implemented and
++ * independently verified.
++ */
++XGB_DLL int XGBDsFlowerSetPrivacyContext(const XGBDsFlowerPrivacyContext *context);
++
++/** @brief Wipe and remove the calling thread's dsFlower privacy context. */
++XGB_DLL int XGBDsFlowerClearPrivacyContext(void);
++
++/** @brief Report whether every required context pin is present and valid. */
++XGB_DLL int XGBDsFlowerPrivacyContextReady(int *out_ready);
++
++/** @brief Return a static status string for deployment guards. */
++XGB_DLL int XGBDsFlowerPrivacyScaffoldStatus(const char **out_status);
++
+ /**
+  * @brief register callback function for LOG(INFO) messages -- helpful messages
+  *        that are not errors.
+diff --git a/plugin/CMakeLists.txt b/plugin/CMakeLists.txt
+index a11916e..eb96eb6 100644
+--- a/plugin/CMakeLists.txt
++++ b/plugin/CMakeLists.txt
+@@ -34,3 +34,9 @@ endif()
+ if(PLUGIN_FEDERATED)
+   add_subdirectory(federated)
+ endif()
++
++# dsFlower's private histogram updater is maintained as an explicit opt-in
++# patchset.  The current implementation is a fail-closed scaffold.
++if(PLUGIN_DSFLOWER_DP)
++  add_subdirectory(dsflower)
++endif()
+diff --git a/plugin/dsflower/CMakeLists.txt b/plugin/dsflower/CMakeLists.txt
+new file mode 100644
+index 0000000..3ff2eb3
+--- /dev/null
++++ b/plugin/dsflower/CMakeLists.txt
+@@ -0,0 +1,8 @@
++# Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
++# SPDX-License-Identifier: Apache-2.0
++
++target_sources(objxgboost PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_context.cc
++  ${CMAKE_CURRENT_SOURCE_DIR}/dsflower_updater.cc)
++
++target_compile_definitions(objxgboost PUBLIC XGBOOST_USE_DSFLOWER_DP=1)
+diff --git a/plugin/dsflower/README.md b/plugin/dsflower/README.md
+new file mode 100644
+index 0000000..7bd2cee
+--- /dev/null
++++ b/plugin/dsflower/README.md
+@@ -0,0 +1,27 @@
++# dsFlower DP histogram updater scaffold
++
++This opt-in plugin is deliberately **not a DP implementation**.  It reserves a
++TreeUpdater name and a C ABI for server-authoritative privacy context.  It
++validates all required context pins, keeps the noise key out of serialized
++XGBoost configuration, and then rejects every training update.
++
++The v1 adapter boundary accepts only `privacy_unit=row|patient`,
++`adjacency=replace_one`, `unit_canonicalization=trim-utf8-v2`,
++`contribution_strategy=one-record-per-unit-v1`, and `max_rows_per_unit=1`.
++The server must materialize the DMatrix as one row per privacy unit before it
++crosses this ABI; this scaffold does not canonicalize or pool patients itself.
++
++The updater must remain unavailable to production integration until a later
++patch implements and proves all of the following before any data-dependent
++split, topology, leaf, metric, log, or model artifact can leave the trusted
++process:
++
++- patient-level contribution bounding;
++- public or privately selected bins;
++- cryptographically keyed, domain-separated noise;
++- privatized gradient/hessian histograms before split selection;
++- explicit composition accounting and replay-stable release identity;
++- tests covering every egress and failure path.
++
++Build only for scaffold verification with `-DPLUGIN_DSFLOWER_DP=ON`.  Selecting
++`grow_dsflower_dp_hist` always fails closed in this patch.
+diff --git a/plugin/dsflower/dsflower_context.cc b/plugin/dsflower/dsflower_context.cc
+new file mode 100644
+index 0000000..78bb734
+--- /dev/null
++++ b/plugin/dsflower/dsflower_context.cc
+@@ -0,0 +1,193 @@
++/**
++ * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#include "dsflower_context.h"
++
++#include <algorithm>
++#include <cmath>
++#include <string_view>
++#include <utility>
++
++#include "../../src/c_api/c_api_error.h"
++#include "xgboost/logging.h"
++
++namespace xgboost::tree::dsflower {
++namespace {
++
++constexpr std::size_t kHashSize = 64;
++constexpr std::size_t kMaxTokenSize = 128;
++
++void SecureZero(unsigned char* ptr, std::size_t size) {
++  volatile unsigned char* out = ptr;
++  while (size-- != 0) {
++    *out++ = 0;
++  }
++}
++
++struct ContextSlot {
++  PrivacyContext value;
++  bool ready{false};
++
++  ~ContextSlot() { Reset(); }
++
++  void Reset() {
++    SecureZero(value.noise_key.data(), value.noise_key.size());
++    value = PrivacyContext{};
++    ready = false;
++  }
++};
++
++thread_local ContextSlot g_context;
++
++bool IsLowerHexHash(const char* value) {
++  if (value == nullptr) {
++    return false;
++  }
++  std::string_view text{value};
++  return text.size() == kHashSize &&
++         std::all_of(text.cbegin(), text.cend(), [](char c) {
++           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
++         });
++}
++
++bool IsToken(const char* value) {
++  if (value == nullptr) {
++    return false;
++  }
++  std::string_view text{value};
++  return !text.empty() && text.size() <= kMaxTokenSize &&
++         std::all_of(text.cbegin(), text.cend(), [](char c) {
++           return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                  (c >= '0' && c <= '9') || c == '.' || c == '_' ||
++                  c == ':' || c == '-';
++         });
++}
++
++bool Reject(std::string message, std::string* error) {
++  if (error != nullptr) {
++    *error = std::move(message);
++  }
++  return false;
++}
++
++}  // namespace
++
++bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error) {
++  if (g_context.ready) {
++    return Reject("dsFlower privacy context is already installed on this thread", error);
++  }
++  if (input.struct_size != sizeof(XGBDsFlowerPrivacyContext)) {
++    return Reject("dsFlower privacy context struct_size mismatch", error);
++  }
++  if (input.abi_version != XGB_DSFLOWER_PRIVACY_CONTEXT_ABI_VERSION) {
++    return Reject("unsupported dsFlower privacy context ABI version", error);
++  }
++  if (input.noise_key == nullptr || input.noise_key_size != kNoiseKeySize) {
++    return Reject("dsFlower noise_key must contain exactly 32 bytes", error);
++  }
++  if (std::all_of(input.noise_key, input.noise_key + input.noise_key_size,
++                  [](unsigned char value) { return value == 0; })) {
++    return Reject("dsFlower noise_key must not be all zero", error);
++  }
++  if (input.mechanism_id == nullptr ||
++      std::string_view{input.mechanism_id} != kScaffoldMechanismId) {
++    return Reject("dsFlower mechanism_id does not match this scaffold", error);
++  }
++  if (!IsLowerHexHash(input.noise_key_id) || !IsLowerHexHash(input.node_id_hash) ||
++      !IsLowerHexHash(input.dataset_snapshot_hash) || !IsLowerHexHash(input.cohort_hash) ||
++      !IsLowerHexHash(input.query_hash) || !IsLowerHexHash(input.mechanism_config_hash) ||
++      !IsLowerHexHash(input.allocation_hash)) {
++    return Reject("every dsFlower identity/configuration pin must be a lowercase SHA-256 hex digest",
++                  error);
++  }
++  if (!IsToken(input.privacy_epoch)) {
++    return Reject("dsFlower privacy_epoch is missing or malformed", error);
++  }
++  if (input.privacy_unit == nullptr ||
++      (std::string_view{input.privacy_unit} != "row" &&
++       std::string_view{input.privacy_unit} != "patient")) {
++    return Reject("dsFlower privacy_unit must be row or patient", error);
++  }
++  if (input.adjacency == nullptr || std::string_view{input.adjacency} != "replace_one") {
++    return Reject("dsFlower adjacency must be replace_one", error);
++  }
++  if (input.unit_canonicalization == nullptr ||
++      std::string_view{input.unit_canonicalization} != "trim-utf8-v2") {
++    return Reject("dsFlower unit_canonicalization must be trim-utf8-v2", error);
++  }
++  if (input.contribution_strategy == nullptr ||
++      std::string_view{input.contribution_strategy} != "one-record-per-unit-v1") {
++    return Reject("dsFlower contribution_strategy must be one-record-per-unit-v1", error);
++  }
++  if (!std::isfinite(input.epsilon) || input.epsilon <= 0.0) {
++    return Reject("dsFlower epsilon must be finite and positive", error);
++  }
++  if (!std::isfinite(input.delta) || input.delta <= 0.0 || input.delta >= 1.0) {
++    return Reject("dsFlower delta must be finite and strictly between zero and one", error);
++  }
++  if (!std::isfinite(input.gradient_clip) || input.gradient_clip <= 0.0 ||
++      !std::isfinite(input.hessian_clip) || input.hessian_clip <= 0.0) {
++    return Reject("dsFlower gradient and hessian clips must be finite and positive", error);
++  }
++  if (input.max_rows_per_unit != 1) {
++    return Reject("dsFlower max_rows_per_unit must equal one", error);
++  }
++
++  PrivacyContext next;
++  next.noise_key_id = input.noise_key_id;
++  next.privacy_epoch = input.privacy_epoch;
++  next.node_id_hash = input.node_id_hash;
++  next.dataset_snapshot_hash = input.dataset_snapshot_hash;
++  next.cohort_hash = input.cohort_hash;
++  next.query_hash = input.query_hash;
++  next.mechanism_config_hash = input.mechanism_config_hash;
++  next.allocation_hash = input.allocation_hash;
++  next.privacy_unit = input.privacy_unit;
++  next.adjacency = input.adjacency;
++  next.unit_canonicalization = input.unit_canonicalization;
++  next.contribution_strategy = input.contribution_strategy;
++  next.epsilon = input.epsilon;
++  next.delta = input.delta;
++  next.gradient_clip = input.gradient_clip;
++  next.hessian_clip = input.hessian_clip;
++  next.max_rows_per_unit = input.max_rows_per_unit;
++  g_context.value = std::move(next);
++  std::copy_n(input.noise_key, kNoiseKeySize, g_context.value.noise_key.begin());
++  g_context.ready = true;
++  return true;
++}
++
++void ClearPrivacyContext() { g_context.Reset(); }
++
++bool PrivacyContextReady() { return g_context.ready; }
++
++}  // namespace xgboost::tree::dsflower
++
++XGB_DLL int XGBDsFlowerSetPrivacyContext(const XGBDsFlowerPrivacyContext* context) {
++  API_BEGIN();
++  xgboost_CHECK_C_ARG_PTR(context);
++  std::string error;
++  CHECK(xgboost::tree::dsflower::TrySetPrivacyContext(*context, &error)) << error;
++  API_END();
++}
++
++XGB_DLL int XGBDsFlowerClearPrivacyContext(void) {
++  API_BEGIN();
++  xgboost::tree::dsflower::ClearPrivacyContext();
++  API_END();
++}
++
++XGB_DLL int XGBDsFlowerPrivacyContextReady(int* out_ready) {
++  API_BEGIN();
++  xgboost_CHECK_C_ARG_PTR(out_ready);
++  *out_ready = xgboost::tree::dsflower::PrivacyContextReady() ? 1 : 0;
++  API_END();
++}
++
++XGB_DLL int XGBDsFlowerPrivacyScaffoldStatus(const char** out_status) {
++  API_BEGIN();
++  xgboost_CHECK_C_ARG_PTR(out_status);
++  *out_status = "scaffold-only:no-dp-histogram-privatization";
++  API_END();
++}
+diff --git a/plugin/dsflower/dsflower_context.h b/plugin/dsflower/dsflower_context.h
+new file mode 100644
+index 0000000..ca0cbcd
+--- /dev/null
++++ b/plugin/dsflower/dsflower_context.h
+@@ -0,0 +1,48 @@
++/**
++ * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#ifndef XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
++#define XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++#include "xgboost/c_api.h"
++
++namespace xgboost::tree::dsflower {
++
++inline constexpr char kScaffoldMechanismId[] =
++    "dsflower.xgboost.dp_hist.v0-scaffold";
++inline constexpr std::size_t kNoiseKeySize = 32;
++
++struct PrivacyContext {
++  std::array<unsigned char, kNoiseKeySize> noise_key{};
++  std::string noise_key_id;
++  std::string privacy_epoch;
++  std::string node_id_hash;
++  std::string dataset_snapshot_hash;
++  std::string cohort_hash;
++  std::string query_hash;
++  std::string mechanism_config_hash;
++  std::string allocation_hash;
++  std::string privacy_unit;
++  std::string adjacency;
++  std::string unit_canonicalization;
++  std::string contribution_strategy;
++  double epsilon{0.0};
++  double delta{0.0};
++  double gradient_clip{0.0};
++  double hessian_clip{0.0};
++  std::uint64_t max_rows_per_unit{0};
++};
++
++bool TrySetPrivacyContext(const XGBDsFlowerPrivacyContext& input, std::string* error);
++void ClearPrivacyContext();
++bool PrivacyContextReady();
++
++}  // namespace xgboost::tree::dsflower
++
++#endif  // XGBOOST_PLUGIN_DSFLOWER_CONTEXT_H_
+diff --git a/plugin/dsflower/dsflower_updater.cc b/plugin/dsflower/dsflower_updater.cc
+new file mode 100644
+index 0000000..1ea2fea
+--- /dev/null
++++ b/plugin/dsflower/dsflower_updater.cc
+@@ -0,0 +1,60 @@
++/**
++ * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#include "dsflower_context.h"
++
++#include <vector>
++
++#include "xgboost/gradient.h"
++#include "xgboost/json.h"
++#include "xgboost/logging.h"
++#include "xgboost/tree_updater.h"
++
++namespace xgboost::tree {
++
++DMLC_REGISTRY_FILE_TAG(dsflower_dp_hist_scaffold);
++
++class DsFlowerDpHistUpdater final : public TreeUpdater {
++ public:
++  explicit DsFlowerDpHistUpdater(Context const* ctx) : TreeUpdater{ctx} {}
++
++  void Configure(Args const&) override {
++    CHECK(dsflower::PrivacyContextReady())
++        << "dsFlower DP histogram updater requires a complete server-authoritative "
++           "privacy context on the calling thread";
++    configured_ = true;
++  }
++
++  void LoadConfig(Json const&) override {
++    // Context is intentionally neither serialized nor restored from a model.
++    configured_ = false;
++  }
++
++  void SaveConfig(Json* out) const override {
++    (*out)["name"] = String{Name()};
++    (*out)["status"] = String{"scaffold-only"};
++  }
++
++  [[nodiscard]] char const* Name() const override { return "grow_dsflower_dp_hist"; }
++
++  void Update(TrainParam const*, GradientContainer*, DMatrix*,
++              common::Span<HostDeviceVector<bst_node_t>>,
++              std::vector<RegTree*> const&) override {
++    CHECK(configured_ && dsflower::PrivacyContextReady())
++        << "dsFlower DP histogram updater was not configured with a complete privacy context";
++    LOG(FATAL) << "grow_dsflower_dp_hist is a fail-closed scaffold: histogram "
++                  "privatization has not been implemented or proven";
++  }
++
++ private:
++  bool configured_{false};
++};
++
++XGBOOST_REGISTER_TREE_UPDATER(DsFlowerDpHistUpdater, "grow_dsflower_dp_hist")
++    .describe("Fail-closed dsFlower DP histogram updater scaffold.")
++    .set_body([](Context const* ctx, ObjInfo const*) {
++      return new DsFlowerDpHistUpdater{ctx};
++    });
++
++}  // namespace xgboost::tree

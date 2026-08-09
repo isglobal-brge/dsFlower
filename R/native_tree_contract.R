@@ -1,0 +1,445 @@
+# Module: Native tree manifest contract
+# Internal analyst-to-server request ABI only. After validation, the server
+# enriches it with node-owned privacy and data-scope state for the separate
+# trusted Python ABI (including binary -> binary_classification). It is not a
+# declaration that any native backend is installed or available.
+
+.NATIVE_TREE_CONTRACT <- "dsflower-native-tree-request-v1"
+.NATIVE_TREE_ENGINES <- c(
+  "catboost", "lightgbm", "random_forest", "xgboost")
+.NATIVE_TREE_MODES <- c("native-tight", "synopsis-flex")
+.NATIVE_TREE_TASKS <- c("binary", "regression")
+.NATIVE_TREE_PARAMETER_TYPES <- c(
+  "boolean", "integer", "number", "string",
+  "boolean_array", "integer_array", "number_array", "string_array")
+.NATIVE_TREE_TIGHT_FORBIDDEN <- c(
+  "custom_eval", "custom_metric", "early_stop", "early_stop_rounds",
+  "early_stopping", "early_stopping_round", "early_stopping_rounds", "eval",
+  "eval_fn", "eval_metric", "eval_set", "evals", "evaluation", "feval",
+  "fobj", "loss_function", "metric", "metrics", "obj", "objective",
+  "objective_fn", "random_seed", "random_state", "seed", "tree_method",
+  "use_best_model")
+.NATIVE_TREE_RESOURCE_DEFAULTS <- list(
+  max_features = 4096L,
+  max_trees = 4096L,
+  max_depth = 32L,
+  max_bins = 4096L,
+  max_threads = 32L,
+  memory_mb = 32768L,
+  timeout_seconds = 21600L)
+.NATIVE_TREE_RESOURCE_LIMITS <- list(
+  max_features = 8192L,
+  max_trees = 10000L,
+  max_depth = 32L,
+  max_bins = 65536L,
+  max_threads = 64L,
+  memory_mb = 65536L,
+  timeout_seconds = 21600L)
+.NATIVE_TREE_MAX_FLOAT_ABS <- 1e12
+.NATIVE_TREE_MAX_TOTAL_CUTS <- 16384L
+.NATIVE_TREE_MANIFEST_MAX_BYTES <- 65536L
+
+#' Canonical JSON bytes for the native-tree cross-runtime ABI
+#' @keywords internal
+.native_tree_json <- function(value) {
+  json <- as.character(jsonlite::toJSON(
+    value, auto_unbox = TRUE, null = "null", na = "null",
+    digits = NA, always_decimal = TRUE, pretty = FALSE))
+  charToRaw(enc2utf8(json))
+}
+
+#' Validate one canonical scalar string
+#' @keywords internal
+.native_tree_string <- function(value, name, pattern = NULL,
+                                max_bytes = 256L) {
+  if (is.list(value)) value <- unlist(value, recursive = FALSE, use.names = FALSE)
+  if (!is.character(value) || length(value) != 1L || is.na(value)) {
+    stop(name, " must be one non-missing string.", call. = FALSE)
+  }
+  value <- enc2utf8(value)
+  if (!nzchar(value) ||
+      is.na(iconv(value, from = "UTF-8", to = "UTF-8", sub = NA_character_)) ||
+      nchar(value, type = "bytes") > max_bytes ||
+      grepl("[[:cntrl:]]", value, perl = TRUE) ||
+      (!is.null(pattern) && !grepl(pattern, value, perl = TRUE))) {
+    stop(name, " is not a canonical safe string.", call. = FALSE)
+  }
+  value
+}
+
+#' Validate one numeric vector and normalise negative zero
+#' @keywords internal
+.native_tree_number_vector <- function(value, name, integer = FALSE) {
+  if (inherits(value, "AsIs")) value <- unclass(value)
+  if (is.list(value)) {
+    valid <- vapply(value, function(x) {
+      (is.integer(x) || is.numeric(x)) && length(x) == 1L &&
+        !is.object(x) && !is.na(x) && is.finite(x)
+    }, logical(1))
+    if (!all(valid)) stop(name, " must contain only finite numbers.", call. = FALSE)
+    value <- unlist(value, use.names = FALSE)
+  }
+  if (!(is.integer(value) || is.numeric(value)) || !length(value) ||
+      is.object(value) || anyNA(value) || any(!is.finite(value))) {
+    stop(name, " must be a non-empty finite numeric vector.", call. = FALSE)
+  }
+  if (any(abs(value) > .NATIVE_TREE_MAX_FLOAT_ABS)) {
+    stop(name, " exceeds the supported numeric range.", call. = FALSE)
+  }
+  if (isTRUE(integer) && any(value != floor(value))) {
+    stop(name, " must contain only integers.", call. = FALSE)
+  }
+  if (isTRUE(integer) && any(abs(value) > .Machine$integer.max)) {
+    stop(name, " exceeds the supported integer range.", call. = FALSE)
+  }
+  value[value == 0] <- 0
+  if (isTRUE(integer)) as.integer(value) else as.numeric(value)
+}
+
+#' Canonicalise the public target schema
+#' @keywords internal
+.native_tree_target_schema <- function(target, task, features) {
+  if (!is.list(target) ||
+      !identical(sort(names(target)), c("kind", "lower", "name", "upper"))) {
+    stop("target must contain exactly name, kind, lower and upper.",
+         call. = FALSE)
+  }
+  name <- .native_tree_string(target$name, "target name",
+                              "^[^/\\\\]+$", 256L)
+  if (name %in% features) {
+    stop("target name must differ from every feature name.", call. = FALSE)
+  }
+  kind <- .native_tree_string(target$kind, "target kind", "^[a-z]+$", 16L)
+  lower <- .native_tree_number_vector(target$lower, "target$lower")
+  upper <- .native_tree_number_vector(target$upper, "target$upper")
+  if (length(lower) != 1L || length(upper) != 1L) {
+    stop("target lower and upper must be scalar.", call. = FALSE)
+  }
+  lower <- lower[[1L]]
+  upper <- upper[[1L]]
+  if (identical(task, "binary")) {
+    if (!identical(kind, "binary") || lower != 0 || upper != 1) {
+      stop("binary task requires target kind binary with public bounds 0 and 1.",
+           call. = FALSE)
+    }
+  } else if (!identical(kind, "continuous") || lower >= upper) {
+    stop("regression task requires continuous target with lower < upper.",
+         call. = FALSE)
+  }
+  list(name = name, kind = kind, lower = lower, upper = upper)
+}
+
+#' Canonicalise and hash the public feature and target schema
+#' @keywords internal
+.native_tree_public_schema <- function(features, bounds, cuts, target, task,
+                                       schema_sha256) {
+  if (inherits(features, "AsIs")) features <- unclass(features)
+  if (is.list(features)) {
+    valid <- vapply(features, function(x) {
+      is.character(x) && length(x) == 1L && !is.na(x)
+    }, logical(1))
+    if (!all(valid)) stop("features must contain only strings.", call. = FALSE)
+    features <- unlist(features, use.names = FALSE)
+  }
+  if (!is.character(features) || !length(features) || length(features) > 8192L ||
+      anyNA(features) || anyDuplicated(features)) {
+    stop("features must be a non-empty unique character vector.", call. = FALSE)
+  }
+  features <- vapply(features, .native_tree_string, character(1),
+                     name = "feature name", pattern = "^[^/\\\\]+$",
+                     max_bytes = 256L)
+  if (!is.list(bounds) || !identical(sort(names(bounds)), c("lower", "upper"))) {
+    stop("bounds must contain exactly lower and upper.", call. = FALSE)
+  }
+  lower <- .native_tree_number_vector(bounds$lower, "bounds$lower")
+  upper <- .native_tree_number_vector(bounds$upper, "bounds$upper")
+  if (length(lower) != length(features) || length(upper) != length(features) ||
+      any(lower >= upper)) {
+    stop("bounds must match features and satisfy lower < upper.", call. = FALSE)
+  }
+
+  canonical_cuts <- NULL
+  if (!is.null(cuts)) {
+    if (!is.list(cuts) || length(cuts) != length(features)) {
+      stop("cuts must be NULL or one numeric vector per feature.", call. = FALSE)
+    }
+    canonical_cuts <- vector("list", length(cuts))
+    for (i in seq_along(cuts)) {
+      if (length(cuts[[i]]) > .NATIVE_TREE_MAX_TOTAL_CUTS) {
+        stop("public cuts exceed the 16384-cut contract cap.", call. = FALSE)
+      }
+      one <- .native_tree_number_vector(cuts[[i]], "feature cuts")
+      if (any(diff(one) <= 0) || any(one <= lower[[i]]) ||
+          any(one >= upper[[i]])) {
+        stop("feature cuts must be strictly increasing inside public bounds.",
+             call. = FALSE)
+      }
+      canonical_cuts[[i]] <- I(one)
+    }
+    if (sum(vapply(canonical_cuts, length, integer(1))) >
+        .NATIVE_TREE_MAX_TOTAL_CUTS) {
+      stop("public cuts exceed the 16384-cut contract cap.", call. = FALSE)
+    }
+  }
+  canonical_target <- .native_tree_target_schema(target, task, features)
+  core <- list(
+    version = 1L,
+    features = I(unname(features)),
+    lower = I(lower),
+    upper = I(upper),
+    cuts = canonical_cuts,
+    target = canonical_target)
+  actual <- digest::digest(.native_tree_json(core), algo = "sha256",
+                           serialize = FALSE)
+  if (!is.null(schema_sha256) &&
+      (!is.character(schema_sha256) || length(schema_sha256) != 1L ||
+       is.na(schema_sha256) || !identical(schema_sha256, actual))) {
+    stop("public schema SHA-256 does not match its canonical content.",
+         call. = FALSE)
+  }
+  c(core, list(sha256 = actual))
+}
+
+#' Whether a parameter name could alter privacy or execute external code
+#' @keywords internal
+.native_tree_reserved_parameter <- function(name) {
+  name %in% c(
+    "accountant", "adjacency", "allow_writing_files", "callbacks", "clip_norm",
+    "clipping_norm", "config", "custom_objective", "data", "delta",
+    "dependencies", "dependency", "device", "devices", "dp", "epsilon",
+    "forcedsplits_filename", "gpu_device_id", "input_model", "logging_level",
+    "machine_list_file", "machines", "max_rows_per_unit", "model_file", "n_jobs", "noise",
+    "noise_multiplier", "noise_root", "noise_seed", "nthread", "num_threads",
+    "output_model", "patient_column", "privacy", "privacy_budget", "requirements", "requirement",
+    "sensitivity", "snapshot_file", "task_type", "thread_count", "train_dir",
+    "unit", "unit_canonicalization", "updater", "verbose", "verbosity") ||
+    startsWith(name, "contribution_") || startsWith(name, "dp_") ||
+    startsWith(name, "privacy_") || startsWith(name, "unit_") ||
+    grepl("(^|_)custom_objective($|_)", name, perl = TRUE) ||
+    grepl("(^|_)(callback|code|host|log|machine|network|plugin|port|script|socket)($|_)",
+          name, perl = TRUE) ||
+    grepl("(_dir|_file|_filename|_path)$", name, perl = TRUE)
+}
+
+#' Canonicalise one explicitly typed public parameter record
+#' @keywords internal
+.native_tree_parameter_record <- function(record) {
+  if (!is.list(record) ||
+      !identical(sort(names(record)), c("name", "type", "value"))) {
+    stop("Each parameter record must contain exactly name, type and value.",
+         call. = FALSE)
+  }
+  name <- .native_tree_string(
+    record$name, "parameter name", "^[a-z][a-z0-9_]{0,63}$", 64L)
+  if (.native_tree_reserved_parameter(name)) {
+    stop("Parameter '", name, "' is reserved by the server.", call. = FALSE)
+  }
+  type <- .native_tree_string(record$type, "parameter type",
+                              "^[a-z_]+$", 32L)
+  if (!type %in% .NATIVE_TREE_PARAMETER_TYPES) {
+    stop("Unsupported public parameter type.", call. = FALSE)
+  }
+  value <- record$value
+  array <- endsWith(type, "_array")
+  scalar_type <- sub("_array$", "", type)
+  if (inherits(value, "AsIs")) value <- unclass(value)
+  if (isTRUE(array)) {
+    if (length(value) > 256L) {
+      stop("Array parameters must contain between 1 and 256 scalars.",
+           call. = FALSE)
+    }
+    if (is.list(value)) value <- unlist(value, recursive = FALSE, use.names = FALSE)
+    if (!is.atomic(value) || !length(value) || length(value) > 256L) {
+      stop("Array parameters must contain between 1 and 256 scalars.",
+           call. = FALSE)
+    }
+  } else if (is.list(value)) {
+    value <- unlist(value, recursive = FALSE, use.names = FALSE)
+  }
+  expected_length <- if (isTRUE(array)) NULL else 1L
+  if (!is.null(expected_length) && length(value) != expected_length) {
+    stop("Scalar parameter records must contain one value.", call. = FALSE)
+  }
+  if (is.object(value) || anyNA(value)) {
+    stop("Parameter values must be plain non-missing scalars.", call. = FALSE)
+  }
+  if (identical(scalar_type, "boolean")) {
+    if (!is.logical(value)) stop("boolean parameters must be logical.", call. = FALSE)
+    value <- as.logical(value)
+  } else if (identical(scalar_type, "integer")) {
+    value <- .native_tree_number_vector(value, "integer parameter", integer = TRUE)
+  } else if (identical(scalar_type, "number")) {
+    value <- .native_tree_number_vector(value, "number parameter")
+  } else {
+    if (!is.character(value)) stop("string parameters must be character.", call. = FALSE)
+    value <- vapply(value, .native_tree_string, character(1),
+                    name = "string parameter", max_bytes = 512L)
+  }
+  if (!isTRUE(array)) value <- value[[1L]]
+  list(name = name, type = type,
+       value = if (isTRUE(array)) I(unname(value)) else unname(value))
+}
+
+#' Canonicalise the typed public parameter array
+#' @keywords internal
+.native_tree_parameters <- function(parameters, mode) {
+  if (!is.list(parameters)) {
+    stop("parameters must be an array of typed records.", call. = FALSE)
+  }
+  if (length(parameters) > 128L) {
+    stop("parameters exceeds the 128-parameter contract cap.", call. = FALSE)
+  }
+  out <- lapply(parameters, .native_tree_parameter_record)
+  names <- vapply(out, `[[`, character(1), "name")
+  if (anyDuplicated(names)) stop("Parameter names must be unique.", call. = FALSE)
+  out <- out[order(names, method = "radix")]
+  names <- sort(names, method = "radix")
+  if (identical(mode, "native-tight")) {
+    forbidden <- intersect(names, .NATIVE_TREE_TIGHT_FORBIDDEN)
+    if (length(forbidden)) {
+      stop("native-tight forbids callbacks, objectives, evaluation and early stopping: ",
+           paste(forbidden, collapse = ", "), ".", call. = FALSE)
+    }
+  }
+  unname(out)
+}
+
+#' Canonicalise hard execution ceilings
+#' @keywords internal
+.native_tree_resources <- function(resources) {
+  if (!is.list(resources) ||
+      !identical(sort(names(resources)), sort(names(.NATIVE_TREE_RESOURCE_DEFAULTS)))) {
+    stop("resources must contain every canonical resource cap exactly once.",
+         call. = FALSE)
+  }
+  out <- .NATIVE_TREE_RESOURCE_DEFAULTS
+  for (name in names(out)) {
+    value <- .native_tree_number_vector(resources[[name]],
+                                        paste0("resources$", name), TRUE)
+    if (length(value) != 1L || value < 1L ||
+        value > .NATIVE_TREE_RESOURCE_LIMITS[[name]]) {
+      stop("resources$", name, " exceeds its hard server limit.", call. = FALSE)
+    }
+    out[[name]] <- value[[1L]]
+  }
+  out
+}
+
+#' Enforce common parameter-to-resource ceilings
+#' @keywords internal
+.native_tree_parameter_resource_check <- function(parameters, resources) {
+  aliases <- list(
+    max_trees = c("iterations", "n_estimators", "num_boost_round",
+                  "num_iterations", "num_trees"),
+    max_depth = c("depth", "max_depth"),
+    max_bins = c("border_count", "max_bin", "max_bins"),
+    max_threads = c("n_jobs", "nthread", "num_threads", "thread_count"))
+  by_name <- stats::setNames(parameters,
+                             vapply(parameters, `[[`, character(1), "name"))
+  for (cap in names(aliases)) {
+    for (name in intersect(names(by_name), aliases[[cap]])) {
+      record <- by_name[[name]]
+      if (record$type %in% c("integer", "number") &&
+          record$value > resources[[cap]]) {
+        stop("Parameter '", name, "' exceeds resources$", cap, ".",
+             call. = FALSE)
+      }
+    }
+  }
+  invisible(TRUE)
+}
+
+#' Validate and canonicalise one native-tree manifest
+#' @keywords internal
+.canonical_native_tree_manifest <- function(manifest) {
+  expected <- c(
+    "contract", "engine", "mode", "parameters", "public_schema",
+    "resources", "task")
+  if (!is.list(manifest) || !identical(sort(names(manifest)), expected)) {
+    stop("Native-tree manifest fields do not match contract v1.", call. = FALSE)
+  }
+  contract <- .native_tree_string(manifest$contract, "contract")
+  if (!identical(contract, .NATIVE_TREE_CONTRACT)) {
+    stop("Unsupported native-tree contract.", call. = FALSE)
+  }
+  engine <- .native_tree_string(manifest$engine, "engine", "^[a-z_]+$")
+  mode <- .native_tree_string(manifest$mode, "mode", "^[a-z-]+$")
+  task <- .native_tree_string(manifest$task, "task", "^[a-z]+$")
+  if (!engine %in% .NATIVE_TREE_ENGINES) stop("Unsupported tree engine.", call. = FALSE)
+  if (!mode %in% .NATIVE_TREE_MODES) stop("Unsupported tree mode.", call. = FALSE)
+  if (!task %in% .NATIVE_TREE_TASKS) stop("Unsupported tree task.", call. = FALSE)
+  schema <- manifest$public_schema
+  schema_version <- if (is.list(schema)) schema$version else NULL
+  if (!is.list(schema) ||
+      !identical(sort(names(schema)),
+                 c("cuts", "features", "lower", "sha256", "target", "upper",
+                   "version")) ||
+      !(is.integer(schema_version) || is.numeric(schema_version)) ||
+      is.logical(schema_version) || length(schema_version) != 1L ||
+      is.na(schema_version) || !is.finite(schema_version) ||
+      schema_version != 1) {
+    stop("Invalid public feature schema.", call. = FALSE)
+  }
+  schema <- .native_tree_public_schema(
+    schema$features, list(lower = schema$lower, upper = schema$upper),
+    schema$cuts, schema$target, task, schema$sha256)
+  if (identical(mode, "native-tight") && is.null(schema$cuts)) {
+    stop("native-tight requires public cuts for every feature.", call. = FALSE)
+  }
+  parameters <- .native_tree_parameters(manifest$parameters, mode)
+  resources <- .native_tree_resources(manifest$resources)
+  if (length(schema$features) > resources$max_features) {
+    stop("Feature count exceeds resources$max_features.", call. = FALSE)
+  }
+  if (!is.null(schema$cuts) &&
+      max(vapply(schema$cuts, length, integer(1)) + 1L) > resources$max_bins) {
+    stop("Public cut count exceeds resources$max_bins.", call. = FALSE)
+  }
+  .native_tree_parameter_resource_check(parameters, resources)
+  list(
+    contract = contract,
+    engine = engine,
+    mode = mode,
+    task = task,
+    public_schema = schema,
+    parameters = parameters,
+    resources = resources)
+}
+
+#' Validate and pin a native-tree manifest
+#' @keywords internal
+.validate_native_tree_manifest <- function(manifest, expected_sha256 = NULL) {
+  value <- .canonical_native_tree_manifest(manifest)
+  bytes <- .native_tree_json(value)
+  if (length(bytes) > .NATIVE_TREE_MANIFEST_MAX_BYTES) {
+    stop("Canonical native-tree manifest exceeds 65536 bytes.", call. = FALSE)
+  }
+  actual <- digest::digest(bytes, algo = "sha256", serialize = FALSE)
+  if (!is.null(expected_sha256) &&
+      (!is.character(expected_sha256) || length(expected_sha256) != 1L ||
+       is.na(expected_sha256) || !identical(expected_sha256, actual))) {
+    stop("Native-tree manifest SHA-256 mismatch.", call. = FALSE)
+  }
+  list(
+    value = value,
+    json = rawToChar(bytes),
+    b64 = gsub("[\r\n]", "", jsonlite::base64_enc(bytes)),
+    sha256 = actual)
+}
+
+#' Capability payload for the public request contract (not backend availability)
+#' @keywords internal
+.native_tree_contract_capabilities <- function() {
+  list(
+    contract = .NATIVE_TREE_CONTRACT,
+    engines = .NATIVE_TREE_ENGINES,
+    modes = .NATIVE_TREE_MODES,
+    tasks = .NATIVE_TREE_TASKS,
+    parameter_types = .NATIVE_TREE_PARAMETER_TYPES,
+    native_tight_requires_public_cuts = TRUE,
+    task_target_kinds = list(binary = "binary", regression = "continuous"),
+    native_tight_forbidden_parameters = .NATIVE_TREE_TIGHT_FORBIDDEN,
+    max_manifest_bytes = .NATIVE_TREE_MANIFEST_MAX_BYTES,
+    max_total_public_cuts = .NATIVE_TREE_MAX_TOTAL_CUTS,
+    resource_hard_limits = .NATIVE_TREE_RESOURCE_LIMITS)
+}
