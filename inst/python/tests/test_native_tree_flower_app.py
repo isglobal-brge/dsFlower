@@ -24,8 +24,8 @@ from dsflower_runner import native_tree_client_app as client_app  # noqa: E402
 from dsflower_runner import native_tree_engine  # noqa: E402
 from dsflower_runner import native_tree_request  # noqa: E402
 from dsflower_runner import native_tree_server_app as server_app  # noqa: E402
-from dsflower_runner import (resampling, seeding, task, validation,
-                             xgboost_predictor)  # noqa: E402
+from dsflower_runner import (release_guard, resampling, seeding, task, validation,
+                             xgboost_bundle, xgboost_predictor)  # noqa: E402
 
 
 def _canonical(value):
@@ -200,6 +200,48 @@ def _run_config(request_b64, request_sha256, results_dir=None, nodes=2,
     return value
 
 
+def _cv_manifest(request_b64, request_sha256, *, folds=2, unit="row",
+                 nodes=2):
+    contract = resampling.cross_validation_contract(folds, unit)
+    value = _node_manifest(request_b64, request_sha256)
+    value.update({
+        **resampling.cross_validation_manifest_fields(contract),
+        "cv-job-sha256": "c" * 64,
+        "cv-n-nodes": nodes,
+        "cv-validation-bins": 4,
+        "num-features": 2,
+        "privacy-cv-training-epsilon": 0.8,
+        "privacy-cv-training-delta": 8.0e-7,
+        "privacy-cv-fold-epsilon": 0.8 / folds,
+        "privacy-cv-fold-delta": 8.0e-7 / folds,
+        "privacy-cv-oof-epsilon": 0.2,
+        "privacy-cv-oof-delta": 2.0e-7,
+        "run_token": "run_" + "2" * 32,
+    })
+    if unit == "patient":
+        value.update({
+            "dp-unit": "patient", "patient_column": "patient",
+            "n_units": 2,
+        })
+    return value, contract
+
+
+def _cv_run_config(request_b64, request_sha256, results_dir=None, *,
+                   folds=2, unit="row", nodes=2):
+    _manifest, contract = _cv_manifest(
+        request_b64, request_sha256, folds=folds, unit=unit, nodes=nodes)
+    return {
+        **_run_config(
+            request_b64, request_sha256, results_dir=results_dir, nodes=nodes),
+        **resampling.cross_validation_manifest_fields(contract),
+        "cv-job-sha256": "c" * 64,
+        "cv-n-nodes": nodes,
+        "cv-validation-bins": 4,
+        "data-kind": "tabular", "task-type": "classification",
+        "num-features": 2,
+    }
+
+
 def _request_message(node_id, request_b64, request_sha256, holdout=None):
     return Message(content=RecordDict({
         "config": ConfigRecord({
@@ -260,6 +302,64 @@ class NativeTreeClientTests(unittest.TestCase):
 
     def tearDown(self):
         self.root.cleanup()
+
+    def test_cv_partitions_totalize_empty_train_and_oof_sides(self):
+        features = np.asarray([[1.0, 2.0], [3.0, 4.0]])
+        target = np.asarray([0.0, 1.0])
+        units = np.asarray(["p1", "p2"])
+        assigned = np.asarray([1, 1], dtype=np.int16)
+        with mock.patch.object(
+                resampling, "cross_validation_folds_from_context",
+                return_value=assigned):
+            empty_train = client_app._cv_partition(
+                self.context, features, target, units, fold=1, test=False)
+            empty_test = client_app._cv_partition(
+                self.context, features, target, units, fold=2, test=True)
+        for partition in (empty_train, empty_test):
+            self.assertEqual(partition[0].shape, (0, 2))
+            self.assertEqual(partition[1].shape, (0,))
+            self.assertEqual(partition[2].shape, (0,))
+
+    def test_cv_empty_train_reaches_the_real_xgboost_materializer(self):
+        manifest, contract = _cv_manifest(
+            self.request_b64, self.request_sha256, folds=2, nodes=1)
+        with open(os.path.join(self.root.name, "manifest.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        self.context.run_config = _cv_run_config(
+            self.request_b64, self.request_sha256, folds=2, nodes=1)
+        message = server_app._request_messages(
+            (1,), self.request_b64, self.request_sha256,
+            cross_validation=dict(
+                contract, bins=4, job_sha256="c" * 64), fold=1)[0]
+        bundle = xgboost_bundle.TrustedXGBoostBundle(
+            token=xgboost_bundle._CONSTRUCTION_TOKEN,
+            bundle_sha256="f" * 64, xgboost=object(),
+            dp_primitives=object())
+        captured = {}
+
+        def native(prepared):
+            captured["features"] = prepared.features.copy()
+            captured["target"] = prepared.target.copy()
+            captured["epsilon"] = prepared.manifest["privacy"]["epsilon"]
+            return _native_artifact()
+
+        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", bundle),
+              mock.patch.object(
+                  resampling, "cross_validation_folds_from_context",
+                  return_value=np.asarray([1, 1], dtype=np.int16)),
+              mock.patch.object(seeding, "_node_secret", return_value=b"k" * 32),
+              mock.patch.object(
+                  client_app.xgboost_adapter, "train_xgboost_native",
+                  side_effect=native)):
+            reply = client_app.train(message, self.context)
+
+        self.assertEqual(dict(reply.content["metrics"]), {
+            "available": 1, "num-examples": 1})
+        self.assertEqual(captured["features"].shape, (1, 2))
+        self.assertTrue(bool(np.all(np.isnan(captured["features"]))))
+        np.testing.assert_array_equal(captured["target"], np.zeros(1))
+        self.assertAlmostEqual(captured["epsilon"], 0.4)
 
     def test_manifest_mismatch_fails_before_private_data_and_is_constant(self):
         message = _request_message(1, self.request_b64, "0" * 64)
@@ -489,6 +589,128 @@ class NativeTreeClientTests(unittest.TestCase):
         self.assertIs(
             noise_only.call_args.kwargs["include_zero_neighbor"], True)
 
+    def test_cv_exact_retry_replays_and_changed_ensemble_is_pre_private(self):
+        manifest, contract = _cv_manifest(
+            self.request_b64, self.request_sha256, folds=2, nodes=1)
+        with open(os.path.join(self.root.name, "manifest.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        self.context.run_config = _cv_run_config(
+            self.request_b64, self.request_sha256, folds=2, nodes=1)
+        assigned = np.asarray([1, 2], dtype=np.int16)
+        train_message = server_app._request_messages(
+            (1,), self.request_b64, self.request_sha256,
+            cross_validation=dict(contract, bins=4, job_sha256="c" * 64),
+            fold=1)[0]
+        public_manifest = native_tree_request.public_backend_manifest(
+            self.request)
+
+        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+              mock.patch.object(client_app.xgboost_bundle,
+                                "is_verified_bundle", return_value=True),
+              mock.patch.object(
+                  resampling, "cross_validation_folds_from_context",
+                  return_value=assigned),
+              mock.patch.object(client_app.xgboost_adapter,
+                                "prepare_xgboost_training",
+                                return_value=object()),
+              mock.patch.object(client_app.xgboost_adapter,
+                                "train_xgboost_native",
+                                return_value=_native_artifact())):
+            trained = client_app.train(train_message, self.context)
+        member = trained.content["arrays"].to_numpy_ndarrays()[0].tobytes()
+        ensemble, digest = native_tree_engine.build_ensemble(
+            public_manifest, [member])
+        cv = dict(contract, bins=4, job_sha256="c" * 64)
+        accumulate = server_app._cv_messages(
+            (1,), self.request, self.request_b64, self.request_sha256,
+            cv, "cv-accumulate", 1, ensemble, digest)[0]
+
+        original_load = task.load_native_tree_data
+        with (mock.patch.object(
+                  resampling, "cross_validation_folds_from_context",
+                  return_value=assigned),
+              mock.patch.object(task, "load_native_tree_data",
+                                wraps=original_load) as load):
+            first = client_app.train(accumulate, self.context)
+            replay = client_app.train(accumulate, self.context)
+            changed, changed_digest = native_tree_engine.build_ensemble(
+                public_manifest, [_native_artifact(0.2)])
+            changed_message = server_app._cv_messages(
+                (1,), self.request, self.request_b64, self.request_sha256,
+                cv, "cv-accumulate", 1, changed, changed_digest)[0]
+            rejected = client_app.train(changed_message, self.context)
+            bad_nodes = server_app._cv_messages(
+                (1,), self.request, self.request_b64, self.request_sha256,
+                cv, "cv-accumulate", 1, ensemble, digest)[0]
+            bad_nodes.content["config"]["native-tree-n-nodes"] = True
+            rejected_nodes = client_app.train(bad_nodes, self.context)
+
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(dict(first.content["metrics"]), {
+            "available": 1, "num-examples": 1})
+        np.testing.assert_array_equal(
+            first.content["arrays"].to_numpy_ndarrays()[0],
+            replay.content["arrays"].to_numpy_ndarrays()[0])
+        self.assertEqual(dict(rejected.content["metrics"]), {
+            "available": 0, "num-examples": 1})
+        self.assertEqual(dict(rejected_nodes.content["metrics"]), {
+            "available": 0, "num-examples": 1})
+        self.assertEqual(
+            self.context.state[client_app._CV_OOF_META]["completed-folds"], 1)
+
+    def test_cv_abort_purges_raw_and_patient_release_matches_row_sensitivity(self):
+        manifest, contract = _cv_manifest(
+            self.request_b64, self.request_sha256,
+            folds=2, unit="patient", nodes=1)
+        with open(os.path.join(self.root.name, "manifest.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        self.context.run_config = _cv_run_config(
+            self.request_b64, self.request_sha256,
+            folds=2, unit="patient", nodes=1)
+        layout = validation.validation_layout(
+            "classification", n_classes=2, bins=4)
+        for fold in (1, 2):
+            client_app._mark_cv_training(
+                self.context, self.request, manifest, fold,
+                _native_artifact(0.1 * fold))
+            client_app._store_cv_sufficient(
+                self.context, self.request, layout, fold,
+                str(fold) * 64, np.zeros(layout["size"]))
+        cv = dict(contract, bins=4, job_sha256="c" * 64)
+        release = server_app._cv_messages(
+            (1,), self.request, self.request_b64, self.request_sha256,
+            cv, "cv-release", 3)[0]
+        expected = np.arange(layout["size"], dtype=np.float64)
+        with mock.patch.object(
+                validation, "private_sufficient_vector",
+                return_value=(expected, 1.0)) as gaussian:
+            reply = client_app.train(release, self.context)
+        gaussian.assert_called_once()
+        self.assertAlmostEqual(gaussian.call_args.kwargs["epsilon"], 0.2)
+        self.assertAlmostEqual(gaussian.call_args.kwargs["delta"], 2.0e-7)
+        self.assertIs(
+            gaussian.call_args.kwargs["include_zero_neighbor"], False)
+        np.testing.assert_array_equal(
+            reply.content["arrays"].to_numpy_ndarrays()[0], expected)
+        self.assertNotIn(client_app._CV_OOF_META, self.context.state)
+        self.assertNotIn(client_app._CV_OOF_TOTAL, self.context.state)
+
+        # Abort is zero-budget and clears any later partial state as well.
+        self.context.state[client_app._CV_OOF_META] = ConfigRecord({
+            "private": "must disappear"})
+        self.context.state[client_app._CV_OOF_TOTAL] = ArrayRecord(
+            numpy_ndarrays=[np.ones(1)])
+        abort = server_app._cv_messages(
+            (1,), self.request, self.request_b64, self.request_sha256,
+            cv, "cv-abort", 3)[0]
+        aborted = client_app.train(abort, self.context)
+        self.assertEqual(dict(aborted.content["metrics"]), {
+            "available": 1, "num-examples": 1})
+        self.assertNotIn(client_app._CV_OOF_META, self.context.state)
+        self.assertNotIn(client_app._CV_OOF_TOTAL, self.context.state)
+
 
 class _EndToEndGrid:
     def __init__(self, context):
@@ -521,6 +743,155 @@ class _HoldoutGrid:
 
 
 class NativeTreeServerTests(unittest.TestCase):
+    def test_cv_uses_the_same_exact_ensemble_dispatch_for_all_five_engines(self):
+        cross_validation = dict(
+            resampling.cross_validation_contract(2, "row"),
+            bins=4, job_sha256="c" * 64)
+        for engine in (
+                "xgboost", "extra_trees", "random_forest",
+                "lightgbm", "catboost"):
+            with self.subTest(engine=engine):
+                request = {
+                    "engine": engine, "task": "binary",
+                    "public_schema": {
+                        "sha256": "d" * 64,
+                        "features": ["x"],
+                        "target": {"lower": 0.0, "upper": 1.0},
+                    },
+                }
+                manifest = {
+                    "engine": engine,
+                    "resources": {"max_artifact_bytes": 1024},
+                }
+                built = []
+
+                def build(inner_manifest, artifacts):
+                    built.append((inner_manifest["engine"], list(artifacts)))
+                    artifact = (engine + "-ensemble").encode("ascii")
+                    return artifact, hashlib.sha256(artifact).hexdigest()
+
+                layout = validation.validation_layout(
+                    "classification", n_classes=2, bins=4)
+                with (mock.patch.object(
+                          server_app, "_exact_roster", return_value=(1,)),
+                      mock.patch.object(server_app, "_require_exact_roster"),
+                      mock.patch.object(
+                          server_app, "_collect_artifacts",
+                          return_value=[b"member"]),
+                      mock.patch.object(
+                          native_tree_engine, "build_ensemble",
+                          side_effect=build),
+                      mock.patch.object(server_app, "_cv_accumulate"),
+                      mock.patch.object(
+                          server_app, "_cv_release",
+                          return_value=[np.ones(layout["size"])]),
+                      mock.patch.object(server_app, "_save_cross_validation")):
+                    server_app._run_cross_validation(
+                        object(), request, "request", "e" * 64, manifest,
+                        cross_validation, 1, 1.0, "/unused")
+                self.assertEqual(
+                    built, [(engine, [b"member"]), (engine, [b"member"])])
+
+    def test_native_cv_runs_atomic_folds_and_writes_only_pooled_cv(self):
+        request, request_b64, request_sha256 = _request_wire()
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as results_dir:
+            pd.DataFrame({
+                "age": [10.0, 20.0, 60.0, 70.0],
+                "marker": [-1.0, -0.5, 0.5, 1.0],
+                "outcome": [0, 1, 0, 1],
+            }).to_csv(os.path.join(root, "train.csv"), index=False)
+            manifest, contract = _cv_manifest(
+                request_b64, request_sha256, folds=2, nodes=2)
+            manifest["n_units"] = 4
+            with open(os.path.join(root, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            cfg = _cv_run_config(
+                request_b64, request_sha256, results_dir,
+                folds=2, nodes=2)
+            contexts = {
+                node_id: SimpleNamespace(
+                    node_config={"manifest-dir": root},
+                    run_config=cfg, state=RecordDict())
+                for node_id in (11, 22)
+            }
+            grid = _HoldoutGrid(contexts)
+            assigned = np.asarray([1, 1, 2, 2], dtype=np.int16)
+            original_load = task.load_native_tree_data
+
+            def deterministic_release(raw, layout, **kwargs):
+                return np.asarray(raw, dtype=np.float64), 0.0
+
+            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+                  mock.patch.object(client_app.xgboost_bundle,
+                                    "is_verified_bundle", return_value=True),
+                  mock.patch.object(
+                      resampling, "cross_validation_folds_from_context",
+                      return_value=assigned),
+                  mock.patch.object(task, "load_native_tree_data",
+                                    wraps=original_load) as load,
+                  mock.patch.object(client_app.xgboost_adapter,
+                                    "prepare_xgboost_training",
+                                    return_value=object()) as prepare,
+                  mock.patch.object(client_app.xgboost_adapter,
+                                    "train_xgboost_native",
+                                    return_value=_native_artifact()),
+                  mock.patch.object(
+                      validation, "private_sufficient_vector",
+                      side_effect=deterministic_release) as release):
+                server_app.main(grid, SimpleNamespace(run_config=cfg))
+
+            self.assertEqual(grid.send_calls, 5)
+            self.assertEqual(load.call_count, 8)
+            self.assertEqual(prepare.call_count, 4)
+            self.assertEqual(release.call_count, 2)
+            for call in prepare.call_args_list:
+                self.assertEqual(call.args[1].shape, (2, 2))
+                self.assertAlmostEqual(
+                    call.args[0]["privacy"]["epsilon"], 0.4)
+            self.assertEqual(os.listdir(results_dir), ["cv.json"])
+            with open(os.path.join(results_dir, "cv.json"),
+                      encoding="ascii") as handle:
+                payload = json.load(handle)
+            self.assertEqual(payload["cv_contract_sha256"], contract["sha256"])
+            self.assertEqual(payload["cv_job_sha256"], "c" * 64)
+            self.assertEqual(payload["folds"], 2)
+            self.assertEqual(payload["n_nodes"], 2)
+            self.assertTrue(payload["pooled_only"])
+            self.assertNotIn("models", payload)
+            self.assertNotIn("fold_metrics", payload)
+
+    def test_native_cv_partial_roster_aborts_without_any_output(self):
+        request, request_b64, request_sha256 = _request_wire()
+        with tempfile.TemporaryDirectory() as results_dir:
+            cfg = _cv_run_config(
+                request_b64, request_sha256, results_dir,
+                folds=2, nodes=2)
+            parsed = server_app._run_contract(cfg)
+            self.assertEqual(parsed[8]["folds"], 2)
+            malformed = dict(cfg, **{"cv-n-nodes": True})
+            with self.assertRaisesRegex(ValueError, "roster"):
+                server_app._run_contract(malformed)
+
+            class Grid:
+                calls = 0
+
+                @classmethod
+                def get_node_ids(cls):
+                    return [1, 2] if cls.calls == 0 else [1]
+
+                @classmethod
+                def send_and_receive(cls, messages, timeout):
+                    cls.calls += 1
+                    return [
+                        _release_reply(messages[0], _native_artifact()),
+                        _release_reply(messages[1], _native_artifact(0.2)),
+                    ]
+
+            server_app.main(Grid(), SimpleNamespace(run_config=cfg))
+            self.assertEqual(os.listdir(results_dir), [])
+
     def test_holdout_vector_wire_is_exact_float64_and_finite(self):
         _request, request_b64, request_sha256 = _request_wire()
         message = _request_message(1, request_b64, request_sha256)
@@ -562,6 +933,23 @@ class NativeTreeServerTests(unittest.TestCase):
         self.assertEqual(
             server_app._holdout_layout(request, 4)["task"], "regression")
         changed = dict(config, **{"holdout-target-lower": -9.0})
+        with self.assertRaisesRegex(ValueError, "bounds differ"):
+            server_app._run_contract(changed)
+
+    def test_regression_cv_requires_exact_public_target_bounds(self):
+        request, request_b64, request_sha256 = _regression_request_wire()
+        config = _cv_run_config(
+            request_b64, request_sha256, "/tmp/results", folds=2, nodes=2)
+        config.update({
+            "cv-target-lower": -10.0,
+            "cv-target-upper": 10.0,
+        })
+        parsed = server_app._run_contract(config)
+        self.assertEqual(parsed[0], request)
+        self.assertEqual(parsed[8]["folds"], 2)
+        self.assertEqual(
+            server_app._holdout_layout(request, 4)["task"], "regression")
+        changed = dict(config, **{"cv-target-upper": 9.0})
         with self.assertRaisesRegex(ValueError, "bounds differ"):
             server_app._run_contract(changed)
 

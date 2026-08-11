@@ -10,6 +10,7 @@
 Conversion is strict UTF-8 followed by trimming only ASCII space, tab, CR,
 and LF.  The exact trim set is intentionally narrower than R's
 \code{trimws()} and Python's \code{str.strip()} so both runtimes agree for
-every Unicode string. Invalid encodings become missing record values.
+every Unicode string. Invalid encodings become missing record values, and
+identifiers over 4096 UTF-8 bytes map to the runner's fixed missing unit.
 }
 \keyword{internal}

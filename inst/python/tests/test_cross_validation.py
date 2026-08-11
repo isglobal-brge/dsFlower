@@ -272,6 +272,14 @@ class CvClientTests(unittest.TestCase):
         self.assertEqual(len(train[1]) + len(test[1]), len(y))
         self.assertEqual(set(train[1]).intersection(set(test[1])), set())
 
+        with mock.patch.object(
+                client_app.resampling, "cross_validation_folds_from_context",
+                return_value=np.ones(len(y), dtype=np.int64)):
+            empty = client_app._cross_validation_partition(
+                None, X, y, None, fold=2, subset="test")
+        self.assertEqual(empty[0].shape, (0, 2))
+        self.assertEqual(empty[1].shape, (0,))
+
     def test_cv_training_keeps_one_fold_horizon_and_excludes_oof(self):
         import torch
 
@@ -330,6 +338,67 @@ class CvClientTests(unittest.TestCase):
         seed_contract.assert_called_once_with(
             {"cv-contract-sha256": "a" * 64},
             pins, pcfg, geometry_n_units=len(y))
+
+    def test_empty_cv_train_side_runs_the_pinned_noise_schedule(self):
+        import torch
+
+        X = np.arange(8, dtype=np.float32).reshape(4, 2)
+        y = np.asarray([0, 1, 0, 1], dtype=np.float32)
+        model = torch.nn.Linear(2, 1)
+        pins = {
+            "loss_name": "bce_logits", "n_classes": 2,
+            "num_rounds": 1, "round_index": 1, "fold_index": 2,
+            "batch_size": 2, "local_epochs": 1,
+        }
+        pcfg = {
+            "epsilon": 0.2, "delta": 1e-6, "clipping_norm": 1.0,
+            "n_samples": len(y),
+        }
+        captured = {}
+
+        def noise_only_fit(
+                _model, values, target, _pcfg, _pins, _n_staged, _cfg,
+                master, noise_multiplier, geometry_n_units=None,
+                public_zero_gradient=False):
+            captured.update(
+                X=values.copy(), y=target.copy(), master=master,
+                noise_multiplier=noise_multiplier,
+                geometry_n_units=geometry_n_units,
+                public_zero_gradient=public_zero_gradient)
+            return [np.asarray([9.0])], 1
+
+        with (mock.patch.object(
+                  client_app, "load_data", return_value=(X, y, None)),
+              mock.patch.object(client_app.task_module, "_load_manifest",
+                                return_value={"n_units": len(y)}),
+              mock.patch.object(client_app.task_module,
+                                "assert_pinned_unit_count"),
+              mock.patch.object(
+                  client_app.resampling, "cross_validation_folds_from_context",
+                  return_value=np.full(len(y), 2, dtype=np.int64)),
+              mock.patch.object(client_app, "_neural_seed_contract",
+                                return_value=({}, {})),
+              mock.patch.object(
+                  client_app.dp_harness, "effective_dpsgd_mechanism",
+                  return_value={"noise_multiplier": 2.25}),
+              mock.patch.object(
+                  client_app.seeding, "master_seed",
+                  return_value=b"\x47" * 32) as seed,
+              mock.patch.object(client_app, "_dp_fit",
+                                side_effect=noise_only_fit) as fit):
+            arrays, n_examples = client_app._train_neural(
+                None, {"cv-contract-sha256": "a" * 64}, pcfg, pins,
+                model, input_dim=2, manifest_image=False, cv_fold=2)
+
+        self.assertEqual(n_examples, 1)
+        np.testing.assert_array_equal(arrays[0], np.asarray([9.0]))
+        fit.assert_called_once()
+        seed.assert_called_once()
+        np.testing.assert_array_equal(captured["X"], np.zeros((1, 2)))
+        np.testing.assert_array_equal(captured["y"], np.zeros(1))
+        self.assertEqual(captured["noise_multiplier"], 2.25)
+        self.assertEqual(captured["geometry_n_units"], len(y))
+        self.assertTrue(captured["public_zero_gradient"])
 
     def test_patient_replacement_changes_fold_size_not_training_geometry(self):
         import torch
@@ -413,6 +482,34 @@ class CvClientTests(unittest.TestCase):
                 None, cfg, {"loss_name": "bce_logits"}, object(), 2, 2)
         self.assertEqual(captured["fold"], 2)
         self.assertEqual(captured["raw"].shape, (8,))
+        np.testing.assert_array_equal(ack[0], np.zeros(1))
+
+    def test_empty_oof_fold_accumulates_a_zero_vector_without_release(self):
+        import torch
+
+        X = np.arange(8, dtype=np.float32).reshape(4, 2)
+        y = np.asarray([0, 1, 0, 1], dtype=np.float32)
+        captured = {}
+        cfg = {"loss-name": "bce_logits", "task-type": "classification",
+               "num-classes": 2, "cv-validation-bins": 4}
+        with (mock.patch.object(client_app, "is_image_run", return_value=False),
+              mock.patch.object(
+                  client_app, "load_data", return_value=(X, y, None)),
+              mock.patch.object(client_app.task_module,
+                                "assert_pinned_unit_count"),
+              mock.patch.object(
+                  client_app.resampling, "cross_validation_folds_from_context",
+                  return_value=np.ones(len(y), dtype=np.int64)),
+              mock.patch.object(client_app, "_store_cv_sufficient",
+                                side_effect=lambda context, fold, raw, layout:
+                                captured.update(raw=raw.copy())),
+              mock.patch.object(validation, "private_sufficient_vector",
+                                side_effect=AssertionError("release called"))):
+            ack = client_app._cross_validation_neural_accumulate(
+                None, cfg, {"loss_name": "bce_logits"},
+                torch.nn.Linear(2, 1), 2, 2)
+
+        np.testing.assert_array_equal(captured["raw"], np.zeros(8))
         np.testing.assert_array_equal(ack[0], np.zeros(1))
 
     def test_context_state_round_trips_between_tasks_and_release_consumes_it(self):

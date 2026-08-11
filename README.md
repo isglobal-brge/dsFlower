@@ -103,8 +103,8 @@ a clean install: a custodian must separately build, verify and configure the
 platform-specific curated bundle. The installer does not compile or download
 that native trust artifact implicitly.
 
-Private validation loads an already public declarative, first-party vision or
-sanitized native-tree model before opening the staged validation data.
+Private validation loads an already public declarative, native dsFlower vision,
+or sanitized native-tree model before opening the staged validation data.
 Each row or configured patient contributes one bounded
 histogram/sufficient-statistic vector. The node releases its sum once through the
 Gaussian mechanism; exact predictions, labels, counts and per-node metrics never
@@ -117,10 +117,12 @@ If any expected node does not provide the fixed private release, the pooled
 artifact reports `available=false` and omits metrics. It never substitutes exact
 or zero-filled metrics, and this does not introduce a query-count lockout.
 
-Atomic tabular holdout is available for neural and native-tree training. Nodes
-derive the same secret-keyed row/patient split before training, spend the fixed
-80/20 job budget on training and one pooled test release, and publish the model
-plus metrics only after the exact roster completes both phases.
+Atomic holdout is available for tabular neural/native-tree training and native
+dsFlower 2D/3D vision models. Nodes derive the same secret-keyed row/patient
+split before training, spend the fixed 80/20 job budget on training and one
+pooled test release, and publish the model plus metrics only after the exact
+roster completes both phases. Vision paths and patient IDs are partitioned
+before pixel decode, so the backbone extracts only the selected side.
 
 ## Per-training privacy
 

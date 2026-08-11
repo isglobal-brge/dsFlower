@@ -31,6 +31,10 @@ _CV_EXECUTION_FIELDS = (
     "num-classes", "num-labels", "num-features", "local-epochs",
     "batch-size", "num-server-rounds",
 )
+_NATIVE_CV_EXECUTION_FIELDS = (
+    "dp-track", "task-type", "num-features", "num-server-rounds",
+    "native-tree-request-b64", "native-tree-request-sha256",
+)
 _CV_TRAINING_FIELDS = (
     "learning-rate", "weight-decay", "l1-penalty",
     "optimizer-name", "scheduler-name",
@@ -57,7 +61,8 @@ _CV_LOSS_FIELDS = {
     "quantile": ("quantile-level",),
 }
 _CV_KNOWN_EXECUTION_FIELDS = frozenset(
-    _CV_EXECUTION_FIELDS + _CV_TRAINING_FIELDS + ("data-kind",)
+    _CV_EXECUTION_FIELDS + _NATIVE_CV_EXECUTION_FIELDS
+    + _CV_TRAINING_FIELDS + ("data-kind",)
     + tuple(field for fields in _CV_OPTIMIZER_FIELDS.values()
             for field in fields)
     + tuple(field for fields in _CV_SCHEDULER_FIELDS.values()
@@ -744,6 +749,19 @@ def load_run_pins(context=None):
 
 def _cv_execution_contract(manifest):
     """Return every Flower scalar that can change one pinned CV execution."""
+    if str(manifest.get("dp-track", "")).lower() == "native_tree":
+        missing = [field for field in _NATIVE_CV_EXECUTION_FIELDS
+                   if field not in manifest]
+        if "data_type" not in manifest:
+            missing.append("data_type")
+        if missing:
+            raise ValueError(
+                "manifest is missing cross-validation execution pin '%s'"
+                % sorted(missing)[0])
+        expected = {
+            field: manifest[field] for field in _NATIVE_CV_EXECUTION_FIELDS}
+        expected["data-kind"] = manifest["data_type"]
+        return expected
     optimizer = str(manifest.get("optimizer-name", "")).lower()
     scheduler = str(manifest.get("scheduler-name", "")).lower()
     loss = str(manifest.get("loss-name", "")).lower()
@@ -944,9 +962,13 @@ def load_pinned_run_config(context=None):
         manifest_strategy = {
             key for key in strategy_fields if key in manifest}
         flower_strategy = {key for key in strategy_fields if key in cfg}
-        if (manifest_strategy != flower_strategy
-                or "strategy" not in manifest_strategy
-                or any(cfg[key] != manifest[key] for key in manifest_strategy)):
+        native_cv = str(manifest.get("dp-track", "")).lower() == "native_tree"
+        if ((native_cv and (manifest_strategy or flower_strategy))
+                or (not native_cv and (
+                    manifest_strategy != flower_strategy
+                    or "strategy" not in manifest_strategy
+                    or any(cfg[key] != manifest[key]
+                           for key in manifest_strategy)))):
             raise ValueError(
                 "Flower cross-validation strategy does not match manifest pin")
     elif supplied_cv:

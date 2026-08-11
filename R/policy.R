@@ -33,12 +33,12 @@
     holdout = list(
       available = TRUE,
       tracks = c("neural", "native_tree"),
-      data_kinds = "tabular",
+      data_kinds = c("tabular", "image"),
       assignment = "hmac-sha256-threshold-v1",
       pooled_only = TRUE),
     cross_validation = list(
       available = TRUE,
-      tracks = "neural",
+      tracks = c("neural", "native_tree"),
       data_kinds = "tabular",
       folds = c(2L, 10L),
       assignment = "hmac-sha256-score-v1",

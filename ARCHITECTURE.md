@@ -129,9 +129,10 @@ artifacts and sanitized native-tree ensembles. Supported layouts cover binary,
 multiclass, ordinal and multilabel classification plus bounded regression/count
 outcomes. Probability bins are public and bounded at 512; class/label counts are
 public and bounded at 1024. Validation on an independently assigned dataset is
-external validation; evaluating training data is resubstitution. Tabular neural
-and native-tree training have an atomic holdout workflow; K-fold remains neural
-only. K-fold runs use a
+external validation; evaluating training data is resubstitution. Tabular
+neural/native-tree and native dsFlower vision training have an atomic holdout
+workflow. K-fold is tabular-only and supports neural models plus native-tree
+binary classification and bounded regression. K-fold runs use a
 canonical secret-keyed patient/row assignment, cleanly initialize and train all
 fold models inside one job, keep raw OOF sufficient statistics in node memory,
 release one final DP vector per node only when every fold succeeds, and publish
@@ -140,8 +141,9 @@ metrics are never released.
 
 ### Atomic training holdout
 
-Tabular neural and native-tree training may opt into one holdout fraction. The
-client encodes that fraction exactly as integer millionths and the node combines
+Tabular neural/native-tree and native dsFlower vision training may opt into one
+holdout fraction. The client encodes that fraction exactly as integer
+millionths and the node combines
 the canonical contract with its custodial secret in an HMAC-SHA256 PRF. There is
 no submitted seed, run identifier, clock, database, counter or history input.
 Row mode hashes the stable staged row ordinal; patient mode hashes the canonical
@@ -175,12 +177,14 @@ also binds the exact resampling contract, request, public schema, sanitized
 artifact and node count. A failed evaluation therefore yields neither an
 accepted model nor metrics.
 
-This release implements atomic holdout only for tabular declarative neural and
-native-tree models. Image and HookApp backends fail explicitly before private
-preparation and are not advertised as holdout-capable. K-fold cross-validation
-also remains neural-only. Extending the same engine-agnostic resampling contract
-to another backend requires a reviewed backend-specific training/evaluation
-adapter; accepting a contract without executing both sides is forbidden.
+This release implements atomic holdout for tabular declarative neural/native-tree
+models and native dsFlower vision models with their exact extractor profile.
+HookApp backends fail explicitly before private preparation and are not
+advertised as holdout-capable. K-fold cross-validation remains tabular-only for
+neural models and native-tree binary classification or bounded regression.
+Extending the same engine-agnostic resampling contract to another backend
+requires a reviewed backend-specific training/evaluation adapter; accepting a
+contract without executing both sides is forbidden.
 
 ## 3. Per-training privacy
 

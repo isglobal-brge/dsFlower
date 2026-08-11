@@ -766,8 +766,11 @@ def _run_fedavg(grid, cfg, track):
     result = strategy.start(grid=grid, initial_arrays=initial, num_rounds=num_rounds)
     holdout_metrics = None
     if has_holdout:
-        if track != "neural" or str(cfg.get("data-kind", "")).lower() != "tabular":
-            raise RuntimeError("atomic holdout is implemented only for tabular neural runs")
+        if (track != "neural"
+                or str(cfg.get("data-kind", "")).lower()
+                not in ("tabular", "image")):
+            raise RuntimeError(
+                "atomic holdout is implemented only for neural runs")
         if strategy.available_rounds != set(range(1, num_rounds + 1)):
             raise RuntimeError("atomic holdout requires every training round")
         holdout_metrics = _run_holdout(
