@@ -83,7 +83,7 @@ def sanitize_forest_json(
         public_schema_sha256, target_lower, target_upper,
         max_artifact_bytes):
     """Validate and return canonical prediction-only forest JSON bytes."""
-    if expected_engine != "extra_trees":
+    if expected_engine not in ("extra_trees", "random_forest"):
         raise ValueError("forest sanitizer engine is unsupported")
     if expected_task not in ("binary_classification", "regression"):
         raise ValueError("forest sanitizer task is unsupported")
