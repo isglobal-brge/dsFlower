@@ -67,13 +67,15 @@ test_that("Windows private ACL and atomic replacement round-trip", {
     wrapped <- paste0(
       "$stage='PATH';$code='';try{", script, "}",
       "catch{$safe='';if(([string]$code) -match '^[0-9]{1,10}$')",
-      "{$safe=[string]$code};Write-Output ('FAIL|'+$stage+'|'+$safe)}"
+      "{$safe=[string]$code};$bits='';",
+      "if(([string]$diag) -match '^[01]{9}$'){$bits=[string]$diag};",
+      "Write-Output ('FAIL|'+$stage+'|'+$safe+'|'+$bits)}"
     )
     result <- paste(dsFlower:::.run_windows_powershell(wrapped), collapse = "")
     if (!identical(result, "OK")) {
-      if (!grepl("^FAIL\\|(PATH|ADD_TYPE|NATIVE)\\|[0-9]{0,10}$",
+      if (!grepl("^FAIL\\|(PATH|ADD_TYPE|NATIVE)\\|[0-9]{0,10}\\|[01]{0,9}$",
                  result, perl = TRUE)) {
-        result <- "FAIL|OUTPUT|"
+        result <- "FAIL|OUTPUT||"
       }
       stop("Windows replacement diagnostic: ", result, call. = FALSE)
     }
@@ -130,8 +132,12 @@ test_that("Windows path and ACL command boundaries are strict and injectable", {
   expect_match(replace_command, "GetDirectoryName($d)", fixed = TRUE)
   expect_match(replace_command, "$stage='ADD_TYPE'", fixed = TRUE)
   expect_match(replace_command, "$stage='NATIVE'", fixed = TRUE)
-  expect_match(
-    replace_command, "ReplaceFileW($d,$s,$null,[uint32]2,", fixed = TRUE)
+  expect_match(replace_command, "private static extern bool ReplaceFileW(",
+               fixed = TRUE)
+  expect_match(replace_command, "return Marshal.GetLastWin32Error()",
+               fixed = TRUE)
+  expect_match(replace_command, "$code=[DsFlower.NativeFile]::Replace($d,$s)",
+               fixed = TRUE)
   expect_false(grepl("[IO.File]::Replace", replace_command, fixed = TRUE))
   expect_error(
     dsFlower:::.windows_replace_file_atomic(
