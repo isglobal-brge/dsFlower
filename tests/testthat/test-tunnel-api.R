@@ -438,7 +438,9 @@ test_that("the forwarder compacts both streams and fences a concurrent reconnect
     python,
     c(script, "--listen", paste0("127.0.0.1:", port), "--spool", spool),
     env = c(
-      "current", DSFLOWER_RELAY_TTL = "60",
+      # This test targets compaction/reconnect, not heartbeat expiry. Leave
+      # enough headroom for slow Windows file-lock and process scheduling.
+      "current", DSFLOWER_RELAY_TTL = "300",
       DSFLOWER_TUNNEL_SPOOL_MAX_BYTES = as.character(128 * 1024)
     ),
     stdout = "|", stderr = "|", cleanup = TRUE, cleanup_tree = TRUE
