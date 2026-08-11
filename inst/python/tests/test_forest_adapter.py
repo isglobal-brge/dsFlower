@@ -232,6 +232,20 @@ class ExtraTreesAccountingTests(unittest.TestCase):
 
 
 class ExtraTreesStickyTests(unittest.TestCase):
+    def test_empty_input_is_replayable_and_predictable(self):
+        manifest = _manifest(trees=3, depth=2, features=2)
+        features = np.empty((0, 2), dtype=np.float64)
+        target = np.empty((0,), dtype=np.float64)
+        first = _train(manifest, features, target)
+        second = _train(manifest, features, target)
+        self.assertEqual(first, second)
+        ensemble, _digest = adapter.build_extra_trees_ensemble(
+            manifest, [first])
+        model = predictor.parse_forest_ensemble(ensemble, manifest)
+        predictions = model.predict([[0.0, 0.0]])
+        self.assertEqual(len(predictions), 1)
+        self.assertTrue(math.isfinite(predictions[0]))
+
     def setUp(self):
         self.X = np.asarray([
             [-1.7, -0.8], [-0.2, 0.2], [0.2, -0.1], [1.7, 0.8],

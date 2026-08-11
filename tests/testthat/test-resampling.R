@@ -22,7 +22,7 @@ test_that("holdout contract is canonical and has no analyst seed axis", {
     contract$sha256))
 })
 
-test_that("holdout normalization is neural-only and hash pinned", {
+test_that("holdout normalization is track-exact and hash pinned", {
   withr::local_options(list(
     dsflower.dp_unit = "row",
     dsflower.dp_per_training_epsilon = 2,
@@ -60,10 +60,18 @@ test_that("holdout normalization is neural-only and hash pinned", {
     })),
     "contract SHA-256"
   )
-  expect_error(
-    dsFlower:::.normalizeResamplingConfig(base, "native_tree"),
-    "neural"
-  )
+  native <- base
+  native[["dp-track"]] <- "native_tree"
+  expect_identical(
+    dsFlower:::.normalizeResamplingConfig(native, "native_tree")[[
+      "resampling-contract-sha256"]],
+    contract$sha256)
+  expect_error(dsFlower:::.normalizeResamplingConfig(base, "egress"),
+               "neural and native_tree")
+  image <- base
+  image$data_type <- "image"
+  expect_error(dsFlower:::.normalizeResamplingConfig(image, "neural"),
+               "tabular")
 })
 
 test_that("prepared manifest pins the complete job allocation and contract", {

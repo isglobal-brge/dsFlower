@@ -124,14 +124,14 @@ public result `available=false` with no metrics, node status or zero-filled
 substitute; this operational availability signal is outside the DP transcript.
 Exact labels, predictions, counts and node metrics are never released.
 
-The current track validates tabular neural artifacts and sanitized native-tree
-ensembles; vision artifacts fail explicitly. Supported layouts cover binary,
-multiclass, ordinal
-and multilabel classification plus bounded regression/count outcomes. Probability
-bins are public and bounded at 512; class/label counts are public and bounded at
-1024. Validation on an independently assigned dataset is external validation;
-evaluating training data is resubstitution. Tabular declarative neural training
-also has explicit atomic holdout and K-fold workflows. K-fold runs use a
+The current track validates tabular neural artifacts, saved first-party vision
+artifacts and sanitized native-tree ensembles. Supported layouts cover binary,
+multiclass, ordinal and multilabel classification plus bounded regression/count
+outcomes. Probability bins are public and bounded at 512; class/label counts are
+public and bounded at 1024. Validation on an independently assigned dataset is
+external validation; evaluating training data is resubstitution. Tabular neural
+and native-tree training have an atomic holdout workflow; K-fold remains neural
+only. K-fold runs use a
 canonical secret-keyed patient/row assignment, cleanly initialize and train all
 fold models inside one job, keep raw OOF sufficient statistics in node memory,
 release one final DP vector per node only when every fold succeeds, and publish
@@ -140,15 +140,15 @@ metrics are never released.
 
 ### Atomic training holdout
 
-Tabular neural training may opt into one holdout fraction. The client encodes
-that fraction exactly as integer millionths and the node combines the canonical
-contract with its custodial secret in an HMAC-SHA256 PRF. There is no submitted
-seed, run identifier, clock, database, counter or history input. Row mode hashes
-the stable staged row ordinal; patient mode hashes the canonical patient
-identifier, so every row for one patient is assigned to the same side. Repeating
-the same contract under the same node secret recreates the same partition. The
-fraction changes only the PRF threshold, not its domain, so fractions are nested
-instead of acting as analyst-controlled partition rerolls.
+Tabular neural and native-tree training may opt into one holdout fraction. The
+client encodes that fraction exactly as integer millionths and the node combines
+the canonical contract with its custodial secret in an HMAC-SHA256 PRF. There is
+no submitted seed, run identifier, clock, database, counter or history input.
+Row mode hashes the stable staged row ordinal; patient mode hashes the canonical
+patient identifier, so every row for one patient is assigned to the same side.
+Repeating the same contract under the same node secret recreates the same
+partition. The fraction changes only the PRF threshold, not its domain, so
+fractions are nested instead of acting as analyst-controlled partition rerolls.
 Assignments are intentionally node-owned; duplicate people observed at different
 nodes are not linkable or jointly assigned without a separately governed
 cross-site identity protocol.
@@ -156,28 +156,31 @@ Row ordinals are stable only for the staged dataset contract: reordering rows
 constitutes a different dataset and can therefore change row-level assignments.
 
 Assignment happens before patient pooling and before any training step. Every
-round trains only on the complement. After all configured rounds complete, the
-ServerApp sends the final aggregate once to the exact training roster. Each node
-evaluates only its test units and releases one fixed-layout DP sufficient-statistic
-vector. The ServerApp retains those vectors only in memory, pools them, and
-derives the task-appropriate metrics as post-processing. Labels, predictions,
-unit assignments, per-node metrics and per-node vectors are never written to the
-result.
+neural round, or the single native-tree round, trains only on the complement.
+After training completes, the ServerApp sends the final aggregate once to the
+exact training roster. Each node validates that public artifact before reading
+the test side, permits only one artifact identity with exact in-memory replay,
+and releases one fixed-layout DP sufficient-statistic vector. The ServerApp
+retains those vectors only in memory, pools them, and derives the task-appropriate
+metrics as post-processing. Labels, predictions, unit assignments, per-node
+metrics and per-node vectors are never written to the result.
 
 The custodian's per-training epsilon/delta pair is the total job budget. The
-manifest applies the fixed 80/20 split between the composed DP-SGD training and
-the one holdout vector; this is ephemeral composition within that job, not a
+manifest applies the fixed 80/20 split between the training mechanism and the
+one holdout vector; this is ephemeral composition within that job, not a
 lifetime or resource balance. The result directory uses `history.json` as its
 commit marker: the trained model and pooled `holdout.json` are accepted by the R
-client only when both have been produced in the same run. A failed evaluation
-therefore yields neither an accepted model nor metrics.
+client only when both have been produced in the same run. Native-tree acceptance
+also binds the exact resampling contract, request, public schema, sanitized
+artifact and node count. A failed evaluation therefore yields neither an
+accepted model nor metrics.
 
-This release implements atomic holdout only for tabular declarative neural
-models. Image, HookApp and tree backends fail explicitly before private
-preparation and are not advertised as holdout-capable. Extending the same
-engine-agnostic resampling contract to another backend requires a reviewed
-backend-specific training/evaluation adapter; accepting a contract without
-executing both sides is forbidden.
+This release implements atomic holdout only for tabular declarative neural and
+native-tree models. Image and HookApp backends fail explicitly before private
+preparation and are not advertised as holdout-capable. K-fold cross-validation
+also remains neural-only. Extending the same engine-agnostic resampling contract
+to another backend requires a reviewed backend-specific training/evaluation
+adapter; accepting a contract without executing both sides is forbidden.
 
 ## 3. Per-training privacy
 

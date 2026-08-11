@@ -105,6 +105,26 @@ def _effective_validation_layout(layout):
     return effective
 
 
+def _validation_release_sensitivity(layout, *, include_zero_neighbor=False):
+    """Bound replacement, plus absence from a keyed patient partition."""
+    effective = _effective_validation_layout(layout)
+    if type(include_zero_neighbor) is not bool:
+        raise ValueError("zero-neighbor validation flag must be boolean")
+    sensitivity = float(effective["sensitivity"])
+    if not include_zero_neighbor:
+        return sensitivity
+    task = effective["task"]
+    if task == "binary":
+        absent = 1.0
+    elif task in ("multiclass", "ordinal"):
+        absent = math.sqrt(float(effective["classes"] + 1))
+    elif task == "multilabel":
+        absent = math.sqrt(float(effective["labels"]))
+    else:
+        absent = math.sqrt(float(effective["size"]))
+    return max(sensitivity, absent)
+
+
 def _canonical_sufficient_vector(value, layout):
     effective = _effective_validation_layout(layout)
     vector = np.asarray(value, dtype=np.float64).reshape(-1)
@@ -970,15 +990,17 @@ def validation_sufficient_vector(y, predictions, layout, *,
 
 
 def private_sufficient_vector(raw, layout, *, epsilon, delta,
-                              num_releases=1):
+                              num_releases=1,
+                              include_zero_neighbor=False):
     """Apply the one semantic-sticky Gaussian release to a sufficient vector."""
     from . import dp_harness, seeding
 
     effective = _effective_validation_layout(layout)
     raw = _canonical_sufficient_vector(raw, effective)
+    sensitivity = _validation_release_sensitivity(
+        effective, include_zero_neighbor=include_zero_neighbor)
     sigma = dp_harness.compute_output_sigma(
-        epsilon, delta, float(effective["sensitivity"]),
-        num_releases=num_releases)
+        epsilon, delta, sensitivity, num_releases=num_releases)
     rng = seeding.np_rng(_validation_noise_key(raw, effective, sigma))
     noise = np.asarray(rng.normal(0.0, sigma, size=raw.shape), dtype=np.float64)
     released = raw + noise
@@ -989,14 +1011,15 @@ def private_sufficient_vector(raw, layout, *, epsilon, delta,
 
 def private_validation_vector(y, predictions, layout, *, epsilon, delta,
                               target_bounds=None, num_releases=1,
-                              unit_ids=None):
-    """Release one semantic-sticky Gaussian sum with replace-one sensitivity."""
+                              unit_ids=None, include_zero_neighbor=False):
+    """Release one semantic-sticky Gaussian sum with its exact DP bound."""
     raw = validation_sufficient_vector(
         y, predictions, layout, target_bounds=target_bounds,
         unit_ids=unit_ids)
     return private_sufficient_vector(
         raw, layout, epsilon=epsilon, delta=delta,
-        num_releases=num_releases)
+        num_releases=num_releases,
+        include_zero_neighbor=include_zero_neighbor)
 
 
 def _safe_ratio(a, b):
@@ -1073,7 +1096,8 @@ def _binary_metrics(hist):
     treat_all = ((float(prevalence) - (1.0 - float(prevalence)) * threshold_odds)
                  if prevalence is not None else np.zeros_like(threshold))
     return {
-        "n": float(total), "accuracy": _safe_ratio(tp + tn, total),
+        "n": float(total), "accuracy": (
+            0.0 if total <= 0.0 else _safe_ratio(tp + tn, total)),
         "sensitivity": recall, "specificity": specificity,
         "precision": precision, "negative_predictive_value": npv,
         "f1": f1, "balanced_accuracy": (
@@ -1161,10 +1185,10 @@ def validation_metrics(released, layout, *, target_bounds=None):
     denominator = sum_y2 - (sum_y * sum_y / n) if n > 0 else 0.0
     out = {
         "n": float(n), "mae": (
-            None if n <= 0 else float(abs_error / n * scale)),
-        "mse": (None if mse_normalized is None
+            0.0 if n <= 0 else float(abs_error / n * scale)),
+        "mse": (0.0 if mse_normalized is None
                 else float(mse_normalized * scale * scale)),
-        "rmse": (None if mse_normalized is None
+        "rmse": (0.0 if mse_normalized is None
                  else float(math.sqrt(max(0.0, mse_normalized)) * scale)),
         "r_squared": (None if denominator <= 0
                       else float(1.0 - squared_error / denominator)),

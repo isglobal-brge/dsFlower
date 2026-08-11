@@ -215,6 +215,33 @@ class TrainingTests(unittest.TestCase):
                     with self.subTest(engine=engine):
                         self.assertEqual(first, second)
 
+    def test_empty_input_is_replayable_and_predictable(self):
+        if importlib.util.find_spec("cryptography") is None:
+            self.skipTest("cryptography is not installed in this interpreter")
+        features = np.empty((0, 2), dtype=np.float64)
+        target = np.empty((0,), dtype=np.float64)
+        with mock.patch(
+                "dsflower_runner.seeding._node_secret",
+                return_value=bytes(range(32))):
+            for engine, module in (
+                    ("lightgbm", lightgbm_artifact),
+                    ("catboost", catboost_artifact)):
+                manifest = _training_manifest(engine, trees=2)
+                first = boosting_adapter.train_boosting(
+                    boosting_adapter.prepare_boosting_training(
+                        manifest, features, target))
+                second = boosting_adapter.train_boosting(
+                    boosting_adapter.prepare_boosting_training(
+                        manifest, features, target))
+                ensemble, _digest = boosting_adapter.build_boosting_ensemble(
+                    manifest, [first])
+                predictions = module.parse_ensemble(
+                    ensemble, manifest).predict([[0.0, 0.0]])
+                with self.subTest(engine=engine):
+                    self.assertEqual(first, second)
+                    self.assertEqual(len(predictions), 1)
+                    self.assertTrue(math.isfinite(predictions[0]))
+
 
 if __name__ == "__main__":
     unittest.main()
