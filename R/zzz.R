@@ -71,7 +71,7 @@
     "$b=New-Object byte[] ", as.integer(n), ";",
     "$r=[Security.Cryptography.RandomNumberGenerator]::Create();",
     "try{$r.GetBytes($b);",
-    "[Console]::Out.Write(([BitConverter]::ToString($b)).Replace('-',''))}",
+    "Write-Output (([BitConverter]::ToString($b)).Replace('-',''))}",
     "finally{$r.Dispose()}"
   )
   encoded <- paste(runner(script), collapse = "")
@@ -113,7 +113,7 @@
     "$found=$false;while($null -ne $i){",
     "if(($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)",
     "{$found=$true;break};$i=$i.Parent};",
-    "if($found){[Console]::Out.Write('1')}else{[Console]::Out.Write('0')}"
+    "if($found){Write-Output '1'}else{Write-Output '0'}"
   )
   result <- paste(runner(script), collapse = "")
   if (!result %in% c("0", "1")) {
@@ -154,7 +154,7 @@
     "[Security.AccessControl.PropagationFlags]::None,",
     "[Security.AccessControl.AccessControlType]::Allow);",
     "[void]$acl.AddAccessRule($rule);Set-Acl -LiteralPath $p -AclObject $acl;",
-    "[Console]::Out.Write('OK')"
+    "Write-Output 'OK'"
   )
   result <- paste(runner(script), collapse = "")
   if (!identical(result, "OK")) {
@@ -179,8 +179,8 @@
     "if($sid -eq $me -and (($r.FileSystemRights -band ",
     "[Security.AccessControl.FileSystemRights]::FullControl) -eq ",
     "[Security.AccessControl.FileSystemRights]::FullControl)){$mine=$true}}};",
-    "if($ok -and $mine){[Console]::Out.Write('OK')}",
-    "else{[Console]::Out.Write('UNSAFE')}"
+    "if($ok -and $mine){Write-Output 'OK'}",
+    "else{Write-Output 'UNSAFE'}"
   )
   result <- paste(runner(script), collapse = "")
   if (!identical(result, "OK")) {
@@ -195,7 +195,7 @@
   script <- paste0(
     "[IO.File]::Replace(", .powershell_literal(replacement), ",",
     .powershell_literal(destination), ",$null);",
-    "[Console]::Out.Write('OK')"
+    "Write-Output 'OK'"
   )
   result <- paste(runner(script), collapse = "")
   if (!identical(result, "OK")) {
