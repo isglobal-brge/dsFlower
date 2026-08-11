@@ -203,6 +203,33 @@ def holdout_layout_from_config(cfg):
     raise ValueError("loss/task has no trusted holdout validation semantics")
 
 
+def cross_validation_layout_from_config(cfg):
+    """Fixed full-metric layout for one pooled OOF release."""
+    if not isinstance(cfg, dict):
+        raise ValueError("cross-validation configuration must be an object")
+    nested = dict(cfg)
+    nested["holdout-validation-bins"] = cfg.get("cv-validation-bins", 32)
+    if "target-bounds" not in nested and (
+            "cv-target-lower" in cfg or "cv-target-upper" in cfg):
+        nested["target-bounds"] = {
+            "lower": cfg.get("cv-target-lower"),
+            "upper": cfg.get("cv-target-upper"),
+        }
+    return holdout_layout_from_config(nested)
+
+
+def cross_validation_target_bounds_from_config(cfg):
+    bounds = cfg.get("target-bounds")
+    if isinstance(bounds, dict):
+        lower, upper = _target_bounds(bounds)
+    else:
+        lower, upper = _target_bounds({
+            "lower": cfg.get("cv-target-lower"),
+            "upper": cfg.get("cv-target-upper"),
+        })
+    return {"lower": lower, "upper": upper}
+
+
 def holdout_target_bounds_from_config(cfg):
     bounds = cfg.get("target-bounds")
     if isinstance(bounds, dict):
@@ -790,16 +817,22 @@ def _summed_validation_contributions(y, predictions, layout, *,
     return total
 
 
-def private_validation_vector(y, predictions, layout, *, epsilon, delta,
-                              target_bounds=None, num_releases=1,
-                              unit_ids=None):
-    """Release one semantic-sticky Gaussian sum with replace-one sensitivity."""
-    from . import dp_harness, seeding
-
+def validation_sufficient_vector(y, predictions, layout, *,
+                                 target_bounds=None, unit_ids=None):
+    """Return the canonical bounded sufficient vector without releasing it."""
     effective = _effective_validation_layout(layout)
     raw = _summed_validation_contributions(
         y, predictions, effective, target_bounds=target_bounds,
         unit_ids=unit_ids)
+    return _canonical_sufficient_vector(raw, effective)
+
+
+def private_sufficient_vector(raw, layout, *, epsilon, delta,
+                              num_releases=1):
+    """Apply the one semantic-sticky Gaussian release to a sufficient vector."""
+    from . import dp_harness, seeding
+
+    effective = _effective_validation_layout(layout)
     raw = _canonical_sufficient_vector(raw, effective)
     sigma = dp_harness.compute_output_sigma(
         epsilon, delta, float(effective["sensitivity"]),
@@ -810,6 +843,18 @@ def private_validation_vector(y, predictions, layout, *, epsilon, delta,
     if released.shape != raw.shape or not bool(np.all(np.isfinite(released))):
         raise RuntimeError("private validation release is non-finite")
     return released, float(sigma)
+
+
+def private_validation_vector(y, predictions, layout, *, epsilon, delta,
+                              target_bounds=None, num_releases=1,
+                              unit_ids=None):
+    """Release one semantic-sticky Gaussian sum with replace-one sensitivity."""
+    raw = validation_sufficient_vector(
+        y, predictions, layout, target_bounds=target_bounds,
+        unit_ids=unit_ids)
+    return private_sufficient_vector(
+        raw, layout, epsilon=epsilon, delta=delta,
+        num_releases=num_releases)
 
 
 def _safe_ratio(a, b):
@@ -956,8 +1001,12 @@ def validation_metrics(released, layout, *, target_bounds=None):
             "labels": per_label,
             "macro_roc_auc": float(np.mean(valid_auc)) if valid_auc else None,
             "macro_f1": float(np.mean(valid_f1)) if valid_f1 else None})
-    stats = np.maximum(value, 0.0)
-    n, abs_error, squared_error, sum_y, sum_y2 = stats[:5]
+    n = max(float(value[0]), 0.0)
+    # Each remaining numeric coordinate is the sum of per-unit contributions
+    # already bounded to [0, 1]. Project noisy pooled coordinates back onto that
+    # public feasible interval before deriving researcher-facing metrics.
+    stats = np.clip(value[1:], 0.0, n)
+    abs_error, squared_error, sum_y, sum_y2 = stats[:4]
     if isinstance(target_bounds, dict):
         lower, upper = _target_bounds(target_bounds)
     elif isinstance(target_bounds, (list, tuple)) and len(target_bounds) == 2:
@@ -979,5 +1028,5 @@ def validation_metrics(released, layout, *, target_bounds=None):
                       else float(1.0 - squared_error / denominator)),
     }
     if task == "count":
-        out["mean_poisson_deviance_normalized"] = _safe_ratio(stats[5], n)
+        out["mean_poisson_deviance_normalized"] = _safe_ratio(stats[4], n)
     return _finite_metric_tree(out)

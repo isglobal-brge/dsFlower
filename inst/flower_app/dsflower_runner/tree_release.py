@@ -59,7 +59,9 @@ def joint_gaussian_release(
     profile.  Adaptive multi-stage tree mechanisms put a canonical
     ``release_index`` in ``layout`` and call this function exactly that many
     times.  This primitive owns canonicalization, RDP sigma calibration and PRF
-    identity; adapters own sensitivity proofs and transcript geometry.
+    identity; adapters own sensitivity proofs and transcript geometry.  Raw
+    calibration inputs affect that identity only through the exact effective
+    sigma.
     """
     if not isinstance(mechanism, str) or not mechanism or \
             not isinstance(layout, dict) or \
@@ -75,20 +77,17 @@ def joint_gaussian_release(
     if not math.isfinite(sensitivity) or sensitivity <= 0.0:
         raise ValueError("tree release sensitivity is invalid")
     canonical = _canonical_vector(value)
-    sigma = dp_harness.compute_output_sigma(
-        epsilon, delta, sensitivity, num_releases=num_releases)
+    sigma = float(dp_harness.compute_output_sigma(
+        epsilon, delta, sensitivity, num_releases=num_releases))
     semantics = {
         "layout": layout,
         "mechanism": mechanism,
-        "num_releases": num_releases,
-        "sensitivity": sensitivity,
         "sigma": sigma,
     }
-    # Raw policy inputs calibrate sigma but are not independent reroll axes.
-    # If two policies produce the exact same effective sigma, their mechanism
-    # pins and sufficient vector intentionally derive the same noise stream.
+    # Raw policy inputs calibrate and validate sigma but are not independent
+    # reroll axes.  Equal effective semantics derive the same noise stream.
     privacy = dict(semantics)
-    privacy["policy_hash"] = _policy_hash(privacy)
+    privacy["policy_hash"] = _policy_hash(semantics)
     execution = {
         "adapter": execution_fingerprint,
         "numeric": numeric_execution_profile(),

@@ -315,6 +315,33 @@ class NeuralSemanticConfigTests(unittest.TestCase):
             pins, privacy)
         self.assertEqual(first, second)
 
+    def test_resampling_geometry_is_a_sticky_seed_axis_only_when_present(self):
+        cfg = {"model-spec-b64": "e30=", "loss-name": "bce_logits"}
+        pins = {"round_index": 1, "batch_size": 2}
+        privacy = {"policy_hash": "1" * 64, "n_samples": 8}
+        public = (np.asarray([0.25, -0.5], dtype=np.float32),)
+        private = (np.asarray([[1.0, 2.0]], dtype=np.float32),)
+
+        plain, _ = client_app._neural_seed_contract(cfg, pins, privacy)
+        self.assertNotIn("resampling-geometry-n-units", plain)
+
+        def derive(geometry):
+            config, effective_privacy = client_app._neural_seed_contract(
+                cfg, pins, privacy, geometry_n_units=geometry)
+            return seeding.master_seed(
+                "neural-dpsgd/v1", config, effective_privacy, 1,
+                public_arrays=public, private_arrays=private,
+                execution_fingerprint={"runtime": "fixed-test"})
+
+        with mock.patch.object(
+                seeding, "_node_secret", return_value=b"\x51" * 32):
+            first = derive(4)
+            replay = derive(4)
+            changed = derive(5)
+
+        self.assertEqual(first, replay)
+        self.assertNotEqual(first, changed)
+
 
 class DpSgdAccountingTests(unittest.TestCase):
     def test_calibration_cache_reuses_only_the_exact_public_horizon(self):
@@ -394,7 +421,7 @@ class DpSgdAccountingTests(unittest.TestCase):
 
         with mock.patch.object(
                 dp_harness, "calibrate_noise_multiplier", return_value=1.0) as calibrate:
-            _, _, private_loader, _ = dp_harness.make_private_dpsgd(
+            _, private_optimizer, private_loader, _ = dp_harness.make_private_dpsgd(
                 model, optimizer, loader,
                 clipping_norm=1.0, epsilon=1.0, delta=1e-5,
                 local_epochs=local_epochs, num_rounds=num_rounds,
@@ -410,6 +437,10 @@ class DpSgdAccountingTests(unittest.TestCase):
         self.assertEqual(
             args["total_steps"], steps_per_epoch * local_epochs * num_rounds)
         self.assertEqual(len(private_loader), steps_per_epoch)
+        self.assertEqual(
+            private_optimizer.expected_batch_size,
+            int(n_samples / steps_per_epoch))
+        self.assertEqual(private_loader.batch_sampler.num_samples, n_samples)
         self.assertIsInstance(
             private_loader.batch_sampler,
             dp_harness._SecurePoissonBatchSampler,
@@ -835,6 +866,33 @@ class StrictNeuralInitializationTests(unittest.TestCase):
                 node_config={"manifest-dir": manifest_dir})
             self.assertEqual(
                 client_app._neural_input_dim(context, {}, False), 2)
+
+    def test_prepare_neural_model_uses_the_original_public_seed_contract(self):
+        model = torch.nn.Linear(2, 1)
+        msg = SimpleNamespace(content=RecordDict({
+            "arrays": ArrayRecord(numpy_ndarrays=self._model_arrays(model)),
+        }))
+        cfg = {"data-kind": "tabular", "model-spec-b64": "e30="}
+        pcfg = {"policy_hash": "1" * 64, "n_samples": 4}
+        pins = {"round_index": 1, "loss_name": "mse"}
+        original_contract = client_app._neural_seed_contract
+
+        with (mock.patch.object(client_app, "is_image_run", return_value=False),
+              mock.patch.object(client_app, "_neural_input_dim", return_value=2),
+              mock.patch.object(client_app, "_neural_seed_contract",
+                                wraps=original_contract) as seed_contract,
+              mock.patch.object(client_app.seeding, "master_seed",
+                                return_value=b"\x61" * 32),
+              mock.patch.object(client_app.seeding, "seed_torch"),
+              mock.patch.object(client_app, "load_user_model",
+                                return_value=model)):
+            prepared, input_dim, manifest_image = client_app._prepare_neural_model(
+                msg, None, cfg, pcfg, pins)
+
+        self.assertIs(prepared, model)
+        self.assertEqual(input_dim, 2)
+        self.assertFalse(manifest_image)
+        seed_contract.assert_called_once_with(cfg, pins, pcfg)
 
     def test_invalid_neural_initial_model_is_rejected_before_private_read(self):
         # Shapes and dtype match a Linear(2,1), but magnitude is hostile.

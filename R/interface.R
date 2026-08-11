@@ -472,7 +472,7 @@ flowerInitDS <- function(data_symbol) {
     if (!identical(task, if (identical(loss, "bce_logits")) "binary" else
                    if (identical(loss, "mse")) "regression" else "") ||
         !identical(sort(present_native), sort(native_fields))) {
-      stop("Native-tree validation requires the exact XGBoost binary or ",
+      stop("Native-tree validation requires the exact binary or ",
            "regression public pin set.", call. = FALSE)
     }
     if (!is.null(run_config[["model-spec-b64"]])) {
@@ -484,13 +484,14 @@ flowerInitDS <- function(data_symbol) {
       run_config[["validation-native-tree-request-sha256"]])
     expected_request_task <- if (identical(task, "binary")) "binary" else
       "regression"
-    if (!identical(request$value$engine, "xgboost") ||
+    if (!request$value$engine %in% .NATIVE_TREE_ENGINES ||
         !identical(request$value$task, expected_request_task) ||
         !identical(request$value$public_schema$sha256,
                    run_config[["validation-public-schema-sha256"]])) {
       stop("Native-tree validation request differs from its public pins.",
            call. = FALSE)
     }
+    release_spec <- .native_tree_release_spec(request$value$engine)
     digests <- c(
       run_config[["validation-artifact-sha256"]],
       run_config[["validation-profile-sha256"]],
@@ -511,7 +512,7 @@ flowerInitDS <- function(data_symbol) {
         !is.finite(profile_size) || profile_size != floor(profile_size) ||
         profile_size < 1 || profile_size > 128 * 1024L ||
         !identical(run_config[["validation-artifact-format"]],
-                   "dsflower-xgboost-ensemble-json-v1")) {
+                   release_spec$artifact_format)) {
       stop("Native-tree validation artifact/profile pins are outside their ",
            "public bounds.", call. = FALSE)
     }
@@ -552,7 +553,7 @@ flowerInitDS <- function(data_symbol) {
   pinned <- .validate_native_tree_request_wire(
     run_config[["native-tree-request-b64"]],
     run_config[["native-tree-request-sha256"]])
-  if (!identical(pinned$value$engine, "xgboost")) {
+  if (!pinned$value$engine %in% .NATIVE_TREE_ENGINES) {
     stop("This release has no trusted adapter for the requested tree engine.",
          call. = FALSE)
   }
@@ -690,6 +691,29 @@ flowerInitDS <- function(data_symbol) {
     digits = NA, always_decimal = TRUE, pretty = FALSE))
   digest::digest(charToRaw(enc2utf8(canonical)), algo = "sha256",
                  serialize = FALSE)
+}
+
+.verifyCrossValidationJob <- function(run_config, feature_columns,
+                                      target_column) {
+  if (is.null(run_config[["cv-contract-sha256"]])) return(run_config)
+  supplied <- .cv_job_sha(
+    run_config[["cv-job-sha256"]], "cv-job-sha256")
+  runner_hash <- .compute_harness_hash()
+  if (!grepl("^[0-9a-f]{64}$", runner_hash)) {
+    stop("The canonical runner is unavailable for CV provenance.",
+         call. = FALSE)
+  }
+  actual <- .cv_job_sha256(
+    run_config, feature_columns, target_column,
+    runner_abi = 3L, runner_sha256 = runner_hash,
+    privacy_policy_sha256 = run_config[["privacy-policy-sha256"]],
+    privacy_clipping_norm = run_config[["privacy-clipping_norm"]])
+  if (!identical(supplied, actual)) {
+    stop("cv-job-sha256 does not match the normalized public CV recipe.",
+         call. = FALSE)
+  }
+  run_config[["cv-job-sha256"]] <- actual
+  run_config
 }
 
 .normalizePinnedTaskType <- function(run_config, track) {
@@ -954,6 +978,20 @@ flowerInitDS <- function(data_symbol) {
   if (isTRUE(integer)) as.integer(value) else value
 }
 
+.serverDpClippingNorm <- function() {
+  value <- suppressWarnings(as.numeric(unlist(
+    .dsf_option("dp_clipping_norm", 1.0), use.names = FALSE)))
+  ceiling <- suppressWarnings(as.numeric(unlist(
+    .dsf_option("dp_clip_ceiling", 100), use.names = FALSE)))
+  if (length(value) != 1L || !is.finite(value) || value <= 0 ||
+      length(ceiling) != 1L || !is.finite(ceiling) || ceiling <= 0 ||
+      value > min(ceiling, 100)) {
+    stop("Server DP clipping_norm must be finite, positive, and no greater ",
+         "than the node ceiling.", call. = FALSE)
+  }
+  value
+}
+
 .addDpConfigToRunConfig <- function(run_config) {
   run_config <- .validate_client_run_config(run_config)
   run_config <- .normalizeRunRounds(run_config)
@@ -965,13 +1003,11 @@ flowerInitDS <- function(data_symbol) {
          call. = FALSE)
   }
   track <- tolower(track)
-  if (!is.null(run_config[["gbdt-spec"]])) {
-    stop("gbdt-spec is no longer a supported runner contract.", call. = FALSE)
-  }
   run_config[["dp-track"]] <- track
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
   run_config <- .normalizeResamplingConfig(run_config, track)
+  run_config <- .normalizeCrossValidationConfig(run_config, track)
   run_config <- .normalizePinnedTaskType(run_config, track)
   run_config <- .normalizeHookAppParams(run_config, track)
   run_config <- .normalizePublicFeatureBounds(run_config)
@@ -986,7 +1022,8 @@ flowerInitDS <- function(data_symbol) {
   run_config[["privacy-epsilon"]] <- policy$per_training_epsilon
   run_config[["privacy-delta"]] <- policy$per_training_delta
   run_config <- .applyHoldoutPrivacyAllocation(run_config)
-  run_config[["privacy-clipping_norm"]] <- as.numeric(.dsf_option("dp_clipping_norm", 1.0))
+  run_config <- .applyCrossValidationPrivacyAllocation(run_config)
+  run_config[["privacy-clipping_norm"]] <- .serverDpClippingNorm()
   # Improved Tier-2 floor policy (sample-and-aggregate): the node may split its private
   # data into a FIXED, administrator-pinned k, run the uploaded black-box update per
   # block, and release the clipped mean at sensitivity min(2C, 4C/k). k must not depend
@@ -1046,12 +1083,12 @@ flowerInitDS <- function(data_symbol) {
   }
   # The stateless per-training policy was validated before private staging. The
   # clipping bound is likewise server-owned and cannot come from the analyst.
-  dp_clip <- as.numeric(run_config[["privacy-clipping_norm"]] %||% 1.0)
-  clip_ceiling  <- suppressWarnings(as.numeric(.dsf_option("dp_clip_ceiling", 100)))
+  dp_clip <- suppressWarnings(as.numeric(unlist(
+    run_config[["privacy-clipping_norm"]], use.names = FALSE)))
   if (length(dp_clip) != 1L || !is.finite(dp_clip) || dp_clip <= 0 ||
-      (!is.na(clip_ceiling) && dp_clip > clip_ceiling)) {
-    stop("Server DP clipping_norm must be finite, positive, and no greater than ",
-         clip_ceiling, ".", call. = FALSE)
+      !identical(dp_clip, .serverDpClippingNorm())) {
+    stop("Server DP clipping_norm differs from the node-owned contract.",
+         call. = FALSE)
   }
   invisible(NULL)
 }
@@ -1122,10 +1159,17 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   feature_columns <- columns$feature_columns
   .validatePreparedNativeTreeContract(
     run_config, feature_columns, target_column)
-  if (identical(run_config[["dp-track"]], "native_tree") &&
-      !.native_tree_xgboost_probe()) {
-    stop("The verified native XGBoost runtime is unavailable on this node.",
-         call. = FALSE)
+  if (native_tabular) {
+    engine <- .native_tree_engine_from_config(run_config)
+    available <- if (identical(run_config[["dp-track"]], "native_tree")) {
+      .native_tree_engine_probe(engine)
+    } else {
+      .native_tree_validation_probe(engine)
+    }
+    if (!available) {
+      stop("The trusted native-tree runtime for '", engine,
+           "' is unavailable on this node.", call. = FALSE)
+    }
   }
   if (identical(run_config[["dp-track"]], "validation")) {
     if (!is.character(feature_columns) || !length(feature_columns) ||
@@ -1158,6 +1202,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
     run_config[["validation-contract-sha256"]] <- actual_contract
   }
+  # CV provenance is entirely public and must be verified before a run token is
+  # created or any table/descriptor is opened.
+  run_config <- .verifyCrossValidationJob(
+    run_config, feature_columns, target_column)
   run_token <- .generate_run_token()
   .privacy_runtime_bootstrap()
   num_rounds <- as.integer(run_config[["num-server-rounds"]])
@@ -1531,11 +1579,16 @@ flowerPingDS <- function() {
 #' DataSHIELD AGGREGATE method. Returns information about the server's
 #' Flower capabilities including Python version, the hash-pinned declarative
 #' runner vocabulary, and disclosure settings. The response is independent of
-#' cohort contents, handle state, filesystem paths, and other sessions.
+#' cohort contents, handle state, and other sessions, and does not disclose
+#' filesystem paths. Native-tree availability is probed only when requested.
 #'
+#' @param native_tree_probe Exactly \code{"none"} (the default), \code{"all"},
+#'   or one implemented native-tree engine name. This controls an operational
+#'   readiness check only; it is not a privacy permission or operation catalog.
 #' @return Named list of capabilities.
 #' @export
-flowerGetCapabilitiesDS <- function() {
+flowerGetCapabilitiesDS <- function(native_tree_probe = "none") {
+  native_tree_probe <- .validate_native_tree_probe(native_tree_probe)
   runtime <- .python_runtime_capabilities()
 
   # Disclosure settings
@@ -1543,7 +1596,7 @@ flowerGetCapabilitiesDS <- function() {
 
   privacy_policy <- .privacy_policy()
   runner_caps <- .RUNNER_PUBLIC_CAPABILITIES
-  native_tree <- .native_tree_contract_capabilities()
+  native_tree <- .native_tree_contract_capabilities(native_tree_probe)
   hook_enabled <- isTRUE(as.logical(.dsf_option("hook_enabled", FALSE)))
   hook_sandbox <- isTRUE(as.logical(
     .dsf_option("hook_sandbox_attested", FALSE)))
@@ -1582,6 +1635,8 @@ flowerGetCapabilitiesDS <- function() {
     privacy_scope       = "per-training",
     privacy_per_training_epsilon = privacy_policy$per_training_epsilon,
     privacy_per_training_delta = privacy_policy$per_training_delta,
+    privacy_policy_sha256 = privacy_policy$policy_hash,
+    privacy_clipping_norm = .serverDpClippingNorm(),
     privacy_unit        = privacy_policy$dp_unit,
     privacy_patient_column = privacy_policy$patient_column,
     runner_abi          = 3L,

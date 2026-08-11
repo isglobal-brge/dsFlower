@@ -7,6 +7,7 @@ import json
 import math
 import re
 
+from . import forest_accounting
 from . import native_tree_contract as tree_contract
 
 
@@ -31,8 +32,6 @@ _TYPE_MAP = {
     "number_array": "float_list",
     "string_array": "string_list",
 }
-
-
 def _object_without_duplicates(pairs):
     result = {}
     for key, value in pairs:
@@ -118,7 +117,8 @@ def backend_manifest(request, *, epsilon, delta, unit,
     request = _exact(request, _REQUEST_FIELDS, "native-tree request")
     if request["contract"] != REQUEST_CONTRACT or \
             request["engine"] not in (
-                "xgboost", "extra_trees", "lightgbm", "catboost") or \
+                "xgboost", "extra_trees", "random_forest", "lightgbm",
+                "catboost") or \
             request["mode"] != "native-tight" or \
             request["task"] not in ("binary", "regression"):
         raise ValueError("native-tree request is unsupported")
@@ -166,11 +166,7 @@ def backend_manifest(request, *, epsilon, delta, unit,
             },
             "hessian_clip": {"type": "float", "value": 1.0},
         }
-    else:
-        # Keep request parsing and the local XGBoost predictor stdlib-only.
-        # Forest accounting depends on NumPy through the shared DP harness and
-        # is needed only when enriching an ExtraTrees training request.
-        from . import forest_accounting
+    elif engine == "extra_trees":
         mechanism = "dp-forest-v1"
         mechanism_params = {
             "leaf_release": {
@@ -180,6 +176,30 @@ def backend_manifest(request, *, epsilon, delta, unit,
             "topology": {
                 "type": "string",
                 "value": forest_accounting.TOPOLOGY_PROFILE,
+            },
+        }
+    else:
+        mechanism = "dp-forest-v1"
+        mechanism_params = {
+            "candidate_schedule": {
+                "type": "string",
+                "value": forest_accounting.RANDOM_FOREST_CANDIDATE_PROFILE,
+            },
+            "histogram_release": {
+                "type": "string",
+                "value": forest_accounting.RANDOM_FOREST_HISTOGRAM_PROFILE,
+            },
+            "leaf_release": {
+                "type": "string",
+                "value": forest_accounting.RANDOM_FOREST_LEAF_PROFILE,
+            },
+            "partition": {
+                "type": "string",
+                "value": forest_accounting.RANDOM_FOREST_PARTITION_PROFILE,
+            },
+            "transcript": {
+                "type": "string",
+                "value": forest_accounting.RANDOM_FOREST_TRANSCRIPT_PROFILE,
             },
         }
     result = {

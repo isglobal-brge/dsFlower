@@ -35,6 +35,13 @@
       tracks = "neural",
       data_kinds = "tabular",
       assignment = "hmac-sha256-threshold-v1",
+      pooled_only = TRUE),
+    cross_validation = list(
+      available = TRUE,
+      tracks = "neural",
+      data_kinds = "tabular",
+      folds = c(2L, 10L),
+      assignment = "hmac-sha256-score-v1",
       pooled_only = TRUE)
   )
 )

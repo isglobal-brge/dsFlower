@@ -306,7 +306,7 @@ test_that("validation config is pinned to one well-typed release", {
     "validation-task" = "binary", "task-type" = "classification",
     "loss-name" = "bce_logits", "num-server-rounds" = 1L,
     "num-features" = 2L, "num-classes" = 2L, "num-labels" = 2L)),
-    "exact XGBoost.*pin set")
+    "exact binary or regression.*pin set")
 
   config <- dsFlower:::.addDpConfigToRunConfig(list(
     "dp-track" = "validation", "validation-model-track" = "neural",
@@ -747,8 +747,17 @@ test_that("flowerCleanupRunDS stops associated SuperNode before reset", {
 })
 
 test_that("flowerGetCapabilitiesDS returns expected structure", {
+  xgboost_calls <- 0L
+  pure_calls <- list()
   local_mocked_bindings(
-    .native_tree_xgboost_probe = function(...) FALSE,
+    .native_tree_xgboost_probe = function(...) {
+      xgboost_calls <<- xgboost_calls + 1L
+      FALSE
+    },
+    .native_tree_pure_probes = function(engines, ...) {
+      pure_calls[[length(pure_calls) + 1L]] <<- engines
+      stats::setNames(rep.int(FALSE, length(engines)), engines)
+    },
     .package = "dsFlower")
   caps <- flowerGetCapabilitiesDS()
   expect_type(caps, "list")
@@ -759,6 +768,8 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true("opacus_version" %in% names(caps))
   expect_true("runtime_versions_sha256" %in% names(caps))
   expect_identical(caps$runner_abi, 3L)
+  expect_match(caps$privacy_policy_sha256, "^[0-9a-f]{64}$")
+  expect_identical(caps$privacy_clipping_norm, 1)
   expect_identical(caps$dp_tracks,
                    c("neural", "egress", "validation"))
   expect_setequal(
@@ -782,7 +793,11 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_false("tree_objectives" %in% names(caps))
   expect_identical(caps$native_tree$contract,
                    "dsflower-native-tree-request-v1")
-  expect_false(caps$native_tree$xgboost_native_tight_available)
+  expect_identical(caps$native_tree$probed_engines, character())
+  expect_false(any(grepl(
+    "_native_tight_available$", names(caps$native_tree))))
+  expect_identical(xgboost_calls, 0L)
+  expect_length(pure_calls, 0L)
   expect_setequal(
     caps$aggregation_strategies,
     c("fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm")
@@ -790,14 +805,32 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_identical(caps$resampling$holdout$tracks, "neural")
   expect_identical(caps$resampling$holdout$data_kinds, "tabular")
   expect_true(caps$resampling$holdout$pooled_only)
-  expect_false("cross_validation" %in% names(caps$resampling))
+  expect_true(caps$resampling$cross_validation$available)
+  expect_identical(caps$resampling$cross_validation$tracks, "neural")
+  expect_identical(caps$resampling$cross_validation$data_kinds, "tabular")
+  expect_identical(caps$resampling$cross_validation$folds, c(2L, 10L))
+  expect_true(caps$resampling$cross_validation$pooled_only)
   expect_true("max_rounds" %in% names(caps))
   expect_true("min_samples" %in% names(caps))
   expect_false("secure_aggregation_supported" %in% names(caps))
   expect_false(caps$hook_execution_configured)
+
+  targeted <- flowerGetCapabilitiesDS("random_forest")
+  expect_identical(targeted$native_tree$probed_engines, "random_forest")
+  expect_false(targeted$native_tree$random_forest_native_tight_available)
+  expect_false("xgboost_native_tight_available" %in%
+                 names(targeted$native_tree))
+  expect_identical(xgboost_calls, 0L)
+  expect_identical(pure_calls, list("random_forest"))
+  expect_error(flowerGetCapabilitiesDS("Random_Forest"),
+               "native_tree_probe must be exactly")
 })
 
-test_that("retired tree contracts fail before private preparation", {
+test_that("unsupported run configuration fails before private preparation", {
+  expect_identical(
+    dsFlower:::.validate_client_run_config(list(label_set = "clinical")),
+    list(label_set = "clinical")
+  )
   expect_error(
     dsFlower:::.addDpConfigToRunConfig(list(
       "dp-track" = "trees", "num-server-rounds" = 1L)),
@@ -805,8 +838,8 @@ test_that("retired tree contracts fail before private preparation", {
   expect_error(
     dsFlower:::.addDpConfigToRunConfig(list(
       "dp-track" = "neural", "num-server-rounds" = 1L,
-      "gbdt-spec" = list(objective = "binary:logistic"))),
-    "gbdt-spec is no longer")
+      "unexpected-field" = "value")),
+    "unsupported field.*unexpected-field")
 })
 
 test_that("Hook readiness capability reflects every public admin gate", {

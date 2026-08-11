@@ -7,6 +7,44 @@
 .NATIVE_TREE_CONTRACT <- "dsflower-native-tree-request-v1"
 .NATIVE_TREE_ENGINES <- c(
   "catboost", "extra_trees", "lightgbm", "random_forest", "xgboost")
+.NATIVE_TREE_PURE_ENGINES <- c(
+  "catboost", "extra_trees", "lightgbm", "random_forest")
+.NATIVE_TREE_RELEASE_SPECS <- list(
+  xgboost = list(
+    artifact_contract = "dsflower-xgboost-ensemble-v1",
+    artifact_format = "dsflower-xgboost-ensemble-json-v1",
+    artifact_file = "model.xgboost-ensemble.json",
+    profile_contract = "dsflower-xgboost-prediction-profile-v1",
+    profile_file = "model.xgboost-ensemble.profile.json",
+    profile_version = 1L),
+  extra_trees = list(
+    artifact_contract = "dsflower-forest-ensemble-v1",
+    artifact_format = "dsflower-forest-ensemble-json-v1",
+    artifact_file = "model.extra-trees-ensemble.json",
+    profile_contract = "dsflower-native-tree-prediction-profile-v2",
+    profile_file = "model.extra-trees-ensemble.profile.json",
+    profile_version = 2L),
+  random_forest = list(
+    artifact_contract = "dsflower-forest-ensemble-v1",
+    artifact_format = "dsflower-forest-ensemble-json-v1",
+    artifact_file = "model.random-forest-ensemble.json",
+    profile_contract = "dsflower-native-tree-prediction-profile-v2",
+    profile_file = "model.random-forest-ensemble.profile.json",
+    profile_version = 2L),
+  lightgbm = list(
+    artifact_contract = "dsflower-lightgbm-safe-ensemble-v1",
+    artifact_format = "dsflower-lightgbm-ensemble-json-v1",
+    artifact_file = "model.lightgbm-ensemble.json",
+    profile_contract = "dsflower-native-tree-prediction-profile-v2",
+    profile_file = "model.lightgbm-ensemble.profile.json",
+    profile_version = 2L),
+  catboost = list(
+    artifact_contract = "dsflower-catboost-safe-ensemble-v1",
+    artifact_format = "dsflower-catboost-ensemble-json-v1",
+    artifact_file = "model.catboost-ensemble.json",
+    profile_contract = "dsflower-native-tree-prediction-profile-v2",
+    profile_file = "model.catboost-ensemble.profile.json",
+    profile_version = 2L))
 .NATIVE_TREE_MODES <- "native-tight"
 .NATIVE_TREE_TASKS <- c("binary", "regression")
 .NATIVE_TREE_PARAMETER_TYPES <- c(
@@ -58,6 +96,12 @@
   "max_depth", "n_estimators")
 .NATIVE_TREE_EXTRA_TREES_PARAMETER_TYPES <- c(
   max_depth = "integer", n_estimators = "integer")
+.NATIVE_TREE_RANDOM_FOREST_MAX_DEPTH <- 12L
+.NATIVE_TREE_RANDOM_FOREST_MAX_TREES <- 512L
+.NATIVE_TREE_RANDOM_FOREST_REQUIRED_PARAMETERS <- c(
+  "max_depth", "max_features", "n_estimators")
+.NATIVE_TREE_RANDOM_FOREST_PARAMETER_TYPES <- c(
+  max_depth = "integer", max_features = "integer", n_estimators = "integer")
 .NATIVE_TREE_LIGHTGBM_MAX_DEPTH <- 32L
 .NATIVE_TREE_LIGHTGBM_MAX_LEAVES <- 256L
 .NATIVE_TREE_LIGHTGBM_REQUIRED_PARAMETERS <- c(
@@ -75,6 +119,28 @@
 .NATIVE_TREE_CATBOOST_PARAMETER_TYPES <- c(
   depth = "integer", iterations = "integer", l2_leaf_reg = "number",
   learning_rate = "number", max_delta_step = "number")
+
+.native_tree_release_spec <- function(engine) {
+  engine <- as.character(engine)
+  if (length(engine) != 1L || is.na(engine) ||
+      !engine %in% names(.NATIVE_TREE_RELEASE_SPECS)) {
+    stop("This release has no executable adapter for the requested tree engine.",
+         call. = FALSE)
+  }
+  .NATIVE_TREE_RELEASE_SPECS[[engine]]
+}
+
+.native_tree_engine_from_config <- function(run_config) {
+  native_training <- identical(run_config[["dp-track"]], "native_tree")
+  native_validation <- identical(run_config[["dp-track"]], "validation") &&
+    identical(run_config[["validation-model-track"]], "native_tree")
+  if (!native_training && !native_validation) return("")
+  prefix <- if (native_training) "native-tree" else "validation-native-tree"
+  request <- .validate_native_tree_request_wire(
+    run_config[[paste0(prefix, "-request-b64")]],
+    run_config[[paste0(prefix, "-request-sha256")]])
+  request$value$engine
+}
 
 #' Canonical JSON bytes for the native-tree cross-runtime ABI
 #' @keywords internal
@@ -545,6 +611,73 @@
   invisible(TRUE)
 }
 
+#' Enforce the adaptive private Random Forest parameter profile
+#' @keywords internal
+.native_tree_random_forest_parameters <- function(parameters, schema, mode) {
+  if (!identical(mode, "native-tight")) {
+    stop("Random Forest request v1 supports native-tight mode only.",
+         call. = FALSE)
+  }
+  by_name <- stats::setNames(
+    parameters, vapply(parameters, `[[`, character(1), "name"))
+  actual <- names(by_name)
+  unknown <- setdiff(actual, .NATIVE_TREE_RANDOM_FOREST_REQUIRED_PARAMETERS)
+  missing <- setdiff(.NATIVE_TREE_RANDOM_FOREST_REQUIRED_PARAMETERS, actual)
+  if (length(unknown)) {
+    stop("Unsupported Random Forest parameter(s): ",
+         paste(unknown, collapse = ", "), ".", call. = FALSE)
+  }
+  if (length(missing)) {
+    stop("Missing required Random Forest parameter(s): ",
+         paste(missing, collapse = ", "), ".", call. = FALSE)
+  }
+  for (name in actual) {
+    if (!identical(by_name[[name]]$type,
+                   unname(.NATIVE_TREE_RANDOM_FOREST_PARAMETER_TYPES[[name]]))) {
+      stop("Random Forest parameter '", name,
+           "' has the wrong declared type.", call. = FALSE)
+    }
+  }
+  depth <- by_name$max_depth$value
+  trees <- by_name$n_estimators$value
+  max_features <- by_name$max_features$value
+  feature_count <- length(schema$features)
+  if (length(depth) != 1L || depth < 1L ||
+      depth > .NATIVE_TREE_RANDOM_FOREST_MAX_DEPTH) {
+    stop("Random Forest parameter 'max_depth' is outside its supported range.",
+         call. = FALSE)
+  }
+  if (length(trees) != 1L || trees < 1L ||
+      trees > .NATIVE_TREE_RANDOM_FOREST_MAX_TREES) {
+    stop("Random Forest parameter 'n_estimators' is outside its supported range.",
+         call. = FALSE)
+  }
+  if (length(max_features) != 1L || max_features < 1L ||
+      feature_count < 1L || max_features > feature_count) {
+    stop("Random Forest parameter 'max_features' must be within the public feature count.",
+         call. = FALSE)
+  }
+  if (!is.null(schema$lower) && !is.null(schema$upper) &&
+      !is.null(schema$cuts)) {
+    lower <- .native_tree_float32(schema$lower, "public feature lower bounds")
+    upper <- .native_tree_float32(schema$upper, "public feature upper bounds")
+    cuts <- lapply(schema$cuts, .native_tree_float32,
+                   name = "public feature cuts")
+    valid <- lower < upper
+    for (i in seq_along(cuts)) {
+      valid[[i]] <- valid[[i]] && all(diff(cuts[[i]]) > 0) &&
+        all(cuts[[i]] > lower[[i]]) && all(cuts[[i]] < upper[[i]])
+    }
+    target <- .native_tree_float32(
+      c(schema$target$lower, schema$target$upper), "public target bounds")
+    if (!all(valid) || target[[1L]] >= target[[2L]]) {
+      stop("Random Forest public cuts and bounds must remain strict as float32.",
+           call. = FALSE)
+    }
+  }
+  invisible(TRUE)
+}
+
 #' Enforce the dsFlower asymmetric public-bin boosting profile
 #' @keywords internal
 .native_tree_lightgbm_parameters <- function(parameters, schema, mode) {
@@ -745,6 +878,8 @@
     .native_tree_xgboost_parameters(parameters, schema, mode)
   } else if (identical(engine, "extra_trees")) {
     .native_tree_extra_trees_parameters(parameters, schema, mode)
+  } else if (identical(engine, "random_forest")) {
+    .native_tree_random_forest_parameters(parameters, schema, mode)
   } else if (identical(engine, "lightgbm")) {
     .native_tree_lightgbm_parameters(parameters, schema, mode)
   } else if (identical(engine, "catboost")) {
@@ -869,7 +1004,8 @@
         dir.exists(integrity_hook)) return(FALSE)
     app_files <- file.path(
       runner_dir,
-      c("native_tree_server_app.py", "native_tree_client_app.py"))
+      c("native_tree_server_app.py", "native_tree_client_app.py",
+        "native_tree_runtime_probe.py"))
     if (!all(file.exists(app_files)) || any(dir.exists(app_files))) return(FALSE)
     guard <- readLines(integrity_hook, warn = FALSE)
     if (!any(grepl(
@@ -889,12 +1025,14 @@
       "sys.path.insert(0, sys.argv[1])",
       "from dsflower_runner import xgboost_bundle",
       "bundle_probe = xgboost_bundle.probe_xgboost_bundle(sys.argv[2])",
+      "from dsflower_runner import native_tree_runtime_probe as probe",
       "from dsflower_runner import native_tree_client_app as client_entry",
       "from dsflower_runner import native_tree_server_app as server_entry",
       "from flwr.clientapp import ClientApp",
       "from flwr.serverapp import ServerApp",
+      "training_ready = probe.probe_xgboost_engine(client_entry._NATIVE_BUNDLE)",
       paste0(
-        "ready = (bundle_probe.available and ",
+        "ready = (bundle_probe.available and training_ready and ",
         "xgboost_bundle.is_verified_bundle(client_entry._NATIVE_BUNDLE) ",
         "and isinstance(client_entry.app, ClientApp) ",
         "and isinstance(server_entry.app, ServerApp))"),
@@ -914,42 +1052,241 @@
     result <- run_probe(
       command = python,
       args = c("-I", "-c", code, dirname(runner_dir), bundle_root),
+      env = env, error_on_status = FALSE, timeout = 30)
+    identical(as.integer(result$status), 0L) &&
+      identical(result$stdout, "available")
+  }, error = function(e) FALSE)
+}
+
+# Probe dsFlower's pure engines through their exact trusted Flower runtime.
+# The fixed synthetic data never touch the node secret or private storage.
+.native_tree_pure_probes <- function(
+    engines = .NATIVE_TREE_PURE_ENGINES,
+    runner_dir = system.file(
+      "flower_app", "dsflower_runner", package = "dsFlower"),
+    integrity_hook = system.file(
+      "python", "sitecustomize.py", package = "dsFlower"),
+    runtime_root = .native_tree_runtime_root(),
+    run_probe = processx::run) {
+  engines <- as.character(engines)
+  unavailable <- stats::setNames(rep.int(FALSE, length(engines)), engines)
+  if (!length(engines) || anyNA(engines) || any(!nzchar(engines)) ||
+      anyDuplicated(engines) ||
+      any(!engines %in% .NATIVE_TREE_PURE_ENGINES)) return(unavailable)
+  tryCatch({
+    if (!nzchar(runner_dir) || !dir.exists(runner_dir) ||
+        !nzchar(integrity_hook) || !file.exists(integrity_hook) ||
+        dir.exists(integrity_hook)) return(unavailable)
+    app_files <- file.path(runner_dir, c(
+      "native_tree_server_app.py", "native_tree_client_app.py",
+      "native_tree_runtime_probe.py"))
+    if (!all(file.exists(app_files)) || any(dir.exists(app_files))) {
+      return(unavailable)
+    }
+    guard <- readLines(integrity_hook, warn = FALSE)
+    if (!any(grepl(
+        "dsflower_runner.native_tree_client_app:app", guard, fixed = TRUE))) {
+      return(unavailable)
+    }
+    if (!nzchar(runtime_root) || !dir.exists(runtime_root)) return(unavailable)
+    python <- .native_tree_runtime_executable(runtime_root, "python")
+    supernode <- .native_tree_runtime_executable(runtime_root, "flower-supernode")
+    if (!file.exists(python) || dir.exists(python) ||
+        !file.exists(supernode) || dir.exists(supernode)) return(unavailable)
+
+    code <- paste(
+      "import json, sys",
+      "sys.path.insert(0, sys.argv[1])",
+      "from dsflower_runner import native_tree_runtime_probe as probe",
+      "from dsflower_runner import native_tree_client_app as client_entry",
+      "from dsflower_runner import native_tree_server_app as server_entry",
+      "from flwr.clientapp import ClientApp",
+      "from flwr.serverapp import ServerApp",
+      "requested = sys.argv[2].split(',')",
+      paste0(
+        "if not (isinstance(client_entry.app, ClientApp) and ",
+        "isinstance(server_entry.app, ServerApp)): raise SystemExit(3)"),
+      "result = probe.probe_pure_engines(requested)",
+      paste0(
+        "sys.stdout.write(json.dumps(result, sort_keys=True, ",
+        "separators=(',', ':')))"),
+      sep = "\n")
+    inherited <- c("current")
+    loader_names <- names(Sys.getenv())[
+      grepl("^(LD_|DYLD_)", names(Sys.getenv()), perl = TRUE)]
+    cleared <- stats::setNames(rep.int("", length(loader_names)), loader_names)
+    env <- c(inherited, cleared,
+             PYTHONHOME = "", PYTHONPATH = "", PYTHONSTARTUP = "",
+             PYTHONINSPECT = "", PYTHONNOUSERSITE = "1",
+             DSFLOWER_MANIFEST_DIR = "", DSFLOWER_PINNED_APP_DIR = "",
+             DSFLOWER_XGBOOST_BUNDLE_ROOT = "", VIRTUAL_ENV = runtime_root)
+    result <- run_probe(
+      command = python,
+      args = c("-I", "-c", code, dirname(runner_dir),
+               paste(engines, collapse = ",")),
+      env = env, error_on_status = FALSE, timeout = 30)
+    if (!identical(as.integer(result$status), 0L)) return(unavailable)
+    parsed <- jsonlite::fromJSON(result$stdout, simplifyVector = TRUE)
+    if (!is.list(parsed) || !identical(sort(names(parsed)), sort(engines)) ||
+        any(!vapply(parsed, function(value) {
+          is.logical(value) && length(value) == 1L && !is.na(value)
+        }, logical(1)))) {
+      return(unavailable)
+    }
+    stats::setNames(vapply(engines, function(engine) {
+      isTRUE(parsed[[engine]])
+    }, logical(1)), engines)
+  }, error = function(e) unavailable)
+}
+
+.native_tree_pure_probe <- function(engine, ...) {
+  result <- .native_tree_pure_probes(engine, ...)
+  isTRUE(unname(result[[engine]]))
+}
+
+.native_tree_engine_probe <- function(engine) {
+  engine <- as.character(engine)
+  if (length(engine) != 1L || is.na(engine)) return(FALSE)
+  if (identical(engine, "xgboost")) return(.native_tree_xgboost_probe())
+  if (engine %in% .NATIVE_TREE_PURE_ENGINES) {
+    return(.native_tree_pure_probe(engine))
+  }
+  FALSE
+}
+
+# Validation uses only data-only predictors and must not depend on an upstream
+# training bundle. The artifact itself is re-sanitized in the ClientApp before
+# its first private read; this probe verifies that exact trusted app/runtime.
+.native_tree_validation_probe <- function(
+    engine,
+    runner_dir = system.file(
+      "flower_app", "dsflower_runner", package = "dsFlower"),
+    integrity_hook = system.file(
+      "python", "sitecustomize.py", package = "dsFlower"),
+    runtime_root = .native_tree_runtime_root(),
+    run_probe = processx::run) {
+  engine <- as.character(engine)
+  if (length(engine) != 1L || is.na(engine) ||
+      !engine %in% .NATIVE_TREE_ENGINES) return(FALSE)
+  tryCatch({
+    if (!nzchar(runner_dir) || !dir.exists(runner_dir) ||
+        !nzchar(integrity_hook) || !file.exists(integrity_hook) ||
+        dir.exists(integrity_hook)) return(FALSE)
+    app_files <- file.path(runner_dir, c(
+      "native_tree_validation_server_app.py",
+      "native_tree_validation_client_app.py",
+      "native_tree_runtime_probe.py"))
+    if (!all(file.exists(app_files)) || any(dir.exists(app_files))) return(FALSE)
+    guard <- readLines(integrity_hook, warn = FALSE)
+    if (!any(grepl(
+        "dsflower_runner.native_tree_validation_client_app:app",
+        guard, fixed = TRUE))) return(FALSE)
+    if (!nzchar(runtime_root) || !dir.exists(runtime_root)) return(FALSE)
+    python <- .native_tree_runtime_executable(runtime_root, "python")
+    supernode <- .native_tree_runtime_executable(runtime_root, "flower-supernode")
+    if (!file.exists(python) || dir.exists(python) ||
+        !file.exists(supernode) || dir.exists(supernode)) return(FALSE)
+    code <- paste(
+      "import sys",
+      "sys.path.insert(0, sys.argv[1])",
+      "from dsflower_runner import native_tree_runtime_probe as probe",
+      paste0(
+        "from dsflower_runner import native_tree_validation_client_app ",
+        "as client_entry"),
+      paste0(
+        "from dsflower_runner import native_tree_validation_server_app ",
+        "as server_entry"),
+      "from flwr.clientapp import ClientApp",
+      "from flwr.serverapp import ServerApp",
+      "prediction_ready = probe.probe_validation_engine(sys.argv[2])",
+      paste0(
+        "ready = (prediction_ready and ",
+        "isinstance(client_entry.app, ClientApp) and ",
+        "isinstance(server_entry.app, ServerApp))"),
+      "if not ready: raise SystemExit(3)",
+      "sys.stdout.write('available')",
+      sep = "\n")
+    inherited <- c("current")
+    loader_names <- names(Sys.getenv())[
+      grepl("^(LD_|DYLD_)", names(Sys.getenv()), perl = TRUE)]
+    cleared <- stats::setNames(rep.int("", length(loader_names)), loader_names)
+    env <- c(inherited, cleared,
+             PYTHONHOME = "", PYTHONPATH = "", PYTHONSTARTUP = "",
+             PYTHONINSPECT = "", PYTHONNOUSERSITE = "1",
+             DSFLOWER_MANIFEST_DIR = "", DSFLOWER_PINNED_APP_DIR = "",
+             DSFLOWER_XGBOOST_BUNDLE_ROOT = "", VIRTUAL_ENV = runtime_root)
+    result <- run_probe(
+      command = python,
+      args = c("-I", "-c", code, dirname(runner_dir), engine),
       env = env, error_on_status = FALSE, timeout = 15)
     identical(as.integer(result$status), 0L) &&
       identical(result$stdout, "available")
   }, error = function(e) FALSE)
 }
 
-#' Capability payload for the public request contract and operational probe
-#' @param xgboost_available Result of the fresh node-local runtime probe.
+#' Validate the explicit native-tree capability probe request
+#' @param native_tree_probe Exactly \code{"none"}, \code{"all"}, or one
+#'   implemented engine name.
 #' @keywords internal
-.native_tree_contract_capabilities <- function(
-    xgboost_available = .native_tree_xgboost_probe()) {
-  list(
+.validate_native_tree_probe <- function(native_tree_probe = "none") {
+  if (!is.character(native_tree_probe) || length(native_tree_probe) != 1L ||
+      is.na(native_tree_probe) ||
+      !native_tree_probe %in% c("none", "all", .NATIVE_TREE_ENGINES)) {
+    stop("native_tree_probe must be exactly 'none', 'all', or one implemented ",
+         "native-tree engine name.", call. = FALSE)
+  }
+  native_tree_probe
+}
+
+#' Capability payload for the public request contract and targeted probe
+#' @param native_tree_probe Validated explicit probe request.
+#' @keywords internal
+.native_tree_contract_capabilities <- function(native_tree_probe = "none") {
+  native_tree_probe <- .validate_native_tree_probe(native_tree_probe)
+  probed_engines <- if (identical(native_tree_probe, "none")) {
+    character()
+  } else if (identical(native_tree_probe, "all")) {
+    .NATIVE_TREE_ENGINES
+  } else {
+    native_tree_probe
+  }
+  availability <- list()
+  if ("xgboost" %in% probed_engines) {
+    availability$xgboost_native_tight_available <-
+      isTRUE(.native_tree_xgboost_probe())
+  }
+  pure_engines <- intersect(.NATIVE_TREE_PURE_ENGINES, probed_engines)
+  if (length(pure_engines)) {
+    pure_ready <- .native_tree_pure_probes(pure_engines)
+    for (engine in pure_engines) {
+      availability[[paste0(engine, "_native_tight_available")]] <-
+        isTRUE(pure_ready[[engine]])
+    }
+  }
+  capabilities <- list(
     contract = .NATIVE_TREE_CONTRACT,
     engines = .NATIVE_TREE_ENGINES,
+    engine_list_semantics = "implemented-request-syntax-not-privacy-permission",
+    availability_semantics = "fresh-executable-node-probe",
+    probed_engines = probed_engines,
     modes = .NATIVE_TREE_MODES,
     tasks = .NATIVE_TREE_TASKS,
     parameter_types = .NATIVE_TREE_PARAMETER_TYPES,
     native_tight_requires_public_cuts = TRUE,
     task_target_kinds = list(binary = "binary", regression = "continuous"),
     native_tight_forbidden_parameters = .NATIVE_TREE_TIGHT_FORBIDDEN,
-    xgboost_native_tight_available = isTRUE(xgboost_available),
     xgboost_required_parameters = .NATIVE_TREE_XGBOOST_REQUIRED_PARAMETERS,
     xgboost_optional_parameters = .NATIVE_TREE_XGBOOST_OPTIONAL_PARAMETERS,
-    # Deliberately hard-off until the dedicated Flower E2E release gate lands.
-    extra_trees_native_tight_available = FALSE,
     extra_trees_required_parameters =
       .NATIVE_TREE_EXTRA_TREES_REQUIRED_PARAMETERS,
-    # Safe reference trainers exist, but neither engine is advertised before
-    # its dedicated Flower end-to-end release gate is complete.
-    lightgbm_native_tight_available = FALSE,
+    random_forest_required_parameters =
+      .NATIVE_TREE_RANDOM_FOREST_REQUIRED_PARAMETERS,
     lightgbm_required_parameters =
       .NATIVE_TREE_LIGHTGBM_REQUIRED_PARAMETERS,
-    catboost_native_tight_available = FALSE,
     catboost_required_parameters =
       .NATIVE_TREE_CATBOOST_REQUIRED_PARAMETERS,
     max_manifest_bytes = .NATIVE_TREE_MANIFEST_MAX_BYTES,
     max_total_public_cuts = .NATIVE_TREE_MAX_TOTAL_CUTS,
     resource_hard_limits = .NATIVE_TREE_RESOURCE_LIMITS)
+  c(capabilities, availability)
 }

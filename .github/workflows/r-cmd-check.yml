@@ -1,0 +1,66 @@
+name: R package check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/r-cmd-check.yml"
+      - ".Rbuildignore"
+      - "DESCRIPTION"
+      - "NAMESPACE"
+      - "configure"
+      - "configure.win"
+      - "R/**"
+      - "tests/**"
+      - "man/**"
+      - "inst/flower_app/dsflower_runner/**"
+      - "inst/python/**"
+      - "README.md"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/r-cmd-check.yml"
+      - ".Rbuildignore"
+      - "DESCRIPTION"
+      - "NAMESPACE"
+      - "configure"
+      - "configure.win"
+      - "R/**"
+      - "tests/**"
+      - "man/**"
+      - "inst/flower_app/dsflower_runner/**"
+      - "inst/python/**"
+      - "README.md"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }} (R release)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      R_KEEP_PKG_SOURCE: yes
+      DSFLOWER_SKIP_PYTHON_SETUP: "1"
+      _R_CHECK_FORCE_SUGGESTS_: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: r-lib/actions/setup-r@5cc1f0d89c5281319eaa97952fe65a6d55e6f816 # v2
+        with:
+          r-version: release
+          use-public-rspm: true
+      - uses: r-lib/actions/setup-r-dependencies@5cc1f0d89c5281319eaa97952fe65a6d55e6f816 # v2
+        with:
+          dependencies: '"all"'
+          extra-packages: |
+            any::rcmdcheck
+            dsImaging=?ignore
+          needs: check
+          cache: true
+      - uses: r-lib/actions/check-r-package@5cc1f0d89c5281319eaa97952fe65a6d55e6f816 # v2

@@ -66,7 +66,8 @@ test_that("native XGBoost validation requires and canonicalizes every public pin
 
   missing <- .native_validation_config_fixture()
   missing[["validation-profile-sha256"]] <- NULL
-  expect_error(dsFlower:::.addDpConfigToRunConfig(missing), "exact XGBoost")
+  expect_error(dsFlower:::.addDpConfigToRunConfig(missing),
+               "exact binary or regression")
   tampered <- .native_validation_config_fixture()
   tampered[["validation-public-schema-sha256"]] <- strrep("0", 64L)
   expect_error(dsFlower:::.addDpConfigToRunConfig(tampered), "differs")
@@ -102,6 +103,12 @@ test_that("native validation preparation stages only the bounded public pins", {
       normalized, c("age", "marker"), "outcome",
       dsFlower:::.dpUnitPolicy()$dp_unit)
 
+  local_mocked_bindings(
+    .native_tree_validation_probe = function(engine, ...) {
+      expect_identical(engine, "xgboost")
+      TRUE
+    },
+    .package = "dsFlower")
   expect_no_error(flowerPrepareRunDS(
     name, "outcome", c("age", "marker"), config))
   handle <- dsFlower:::.getHandle(name)
@@ -144,14 +151,16 @@ test_that("native validation selects the dependency-light runtime without a trai
     rm(list = ls(registry), envir = registry)
   })
   manifest_dir <- withr::local_tempdir()
-  jsonlite::write_json(list(
-    "dp-track" = "validation",
-    "validation-model-track" = "native_tree"),
+  jsonlite::write_json(.native_validation_config_fixture(),
     file.path(manifest_dir, "manifest.json"), auto_unbox = TRUE)
   selected <- NULL
   local_mocked_bindings(
     .native_tree_xgboost_probe = function(...) {
       stop("native validation must not require the training bundle")
+    },
+    .native_tree_validation_probe = function(engine, ...) {
+      expect_identical(engine, "xgboost")
+      TRUE
     },
     .resolve_framework_runtime = function(framework) {
       selected <<- framework

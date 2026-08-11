@@ -10,11 +10,20 @@
 
 # --- Framework dependency map ---
 
-.BASE_PYTHON_DEPS <- c("flwr>=1.31.0,<1.32.0", "numpy>=1.21.0", "pandas>=1.3.0",
+.BASE_PYTHON_DEPS <- c("flwr==1.31.0", "numpy>=1.21.0", "pandas>=1.3.0",
                         "pyarrow>=10.0.0", "cryptography>=42.0.0")
 
-# Provisioned framework: one PyTorch/Opacus environment for neural and imaging
-# tracks. Native tree learners are not part of this runner ABI.
+# Dedicated dependency-light runtime for trusted native-tree training,
+# validation and portable data-only predictor probes. XGBoost itself remains in
+# its separately verified native bundle; no upstream tree package is installed
+# here. Exact pins keep this runtime identical to the three-OS contract suite.
+.NATIVE_TREE_PYTHON_DEPS <- c(
+  "flwr==1.31.0", "numpy==2.4.6", "pandas==3.0.3",
+  "pyarrow==23.0.1", "cryptography==46.0.7"
+)
+
+# Provisioned frameworks: one PyTorch/Opacus environment for neural and imaging
+# tracks plus the dependency-light native-tree runtime declared above.
 # sklearn was dropped: its linear models are redundant with pytorch_logreg (and
 # torch gives rigorous Opacus DP-SGD), and its tree models have no federated
 # protocol. Each torch build is GPU- or CPU-adaptive (see .gpu_present).
@@ -27,7 +36,8 @@
   pytorch = c("torch>=2.0.0,<3.0.0", "opacus>=1.4.0,<2.0.0",
               "torchvision>=0.15.0,<1.0.0",
               "Pillow>=9.0.0", "nibabel>=5.0.0", "pydicom>=2.4.0",
-              "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0")
+              "pynrrd>=1.0.0", "SimpleITK>=2.2.0", "monai>=1.3.0"),
+  `native-tree` = character()
 )
 
 .FRAMEWORK_HEALTH_IMPORT <- list(
@@ -37,7 +47,10 @@
     "flwr", "numpy", "pandas", "pyarrow", "cryptography", "torch",
     "opacus", "torchvision", "PIL", "nibabel", "pydicom", "nrrd",
     "SimpleITK", "monai"
-  ), collapse = ", ")
+  ), collapse = ", "),
+  `native-tree` = paste(
+    c("flwr", "numpy", "pandas", "pyarrow", "cryptography"),
+    collapse = ", ")
 )
 
 #' Resolve the effective torch backend for THIS run. GPU presence is detected at
@@ -91,7 +104,10 @@
 #' (run time) so a GPU added AFTER install is usable with just a re-provision (to
 #' build pytorch-gpu) -- no code change, no install-time backend lock-in.
 #' @keywords internal
-.framework_venv <- function(framework, backend = .resolve_backend()) {
+.framework_venv <- function(framework, backend = NULL) {
+  if (identical(framework, "native_tree") ||
+      identical(framework, "native-tree")) return("native-tree")
+  if (is.null(backend)) backend <- .resolve_backend()
   if (identical(backend, "gpu")) "pytorch-gpu" else "pytorch"
 }
 
@@ -101,10 +117,34 @@
 # Public API
 # ---------------------------------------------------------------------------
 
+.default_venv_root <- function(os_type = .Platform$OS.type) {
+  if (identical(os_type, "windows")) {
+    user_data <- Sys.getenv("LOCALAPPDATA", "")
+    if (!nzchar(user_data)) user_data <- Sys.getenv("APPDATA", "")
+    if (!nzchar(user_data)) {
+      profile <- Sys.getenv("USERPROFILE", "")
+      if (nzchar(profile)) user_data <- file.path(profile, "AppData", "Local")
+    }
+    if (!nzchar(user_data)) user_data <- path.expand("~")
+    return(file.path(user_data, "dsflower", "venvs"))
+  }
+  "/var/lib/dsflower/venvs"
+}
+
+.venv_executable <- function(venv_path, name,
+                             os_type = .Platform$OS.type) {
+  windows <- identical(os_type, "windows")
+  file.path(
+    venv_path,
+    if (windows) "Scripts" else "bin",
+    paste0(name, if (windows) ".exe" else "")
+  )
+}
+
 #' Get the venv root directory
 #' @keywords internal
 .venv_root <- function() {
-  .dsf_option("venv_root", "/var/lib/dsflower/venvs")
+  .dsf_option("venv_root", .default_venv_root())
 }
 
 #' TRUE when a usable NVIDIA GPU is visible to this process.
@@ -148,6 +188,10 @@
 #' Get all pip dependencies for a framework (GPU/CPU-adaptive)
 #' @keywords internal
 .python_deps_for_framework <- function(framework) {
+  if (identical(framework, "native_tree") ||
+      identical(framework, "native-tree")) {
+    return(.NATIVE_TREE_PYTHON_DEPS)
+  }
   # cpu and gpu venvs share the SAME dependency set (torch etc.); the backend is a
   # uv install FLAG, not a dep, so the deps-hash marker stays backend-independent
   # and identical across pytorch / pytorch-gpu (matches the configure's deps_hash).
@@ -163,24 +207,44 @@
 
 # Optional administrator-owned, fully hashed requirements file. When present it
 # replaces range resolution and uv enforces hashes for every transitive package.
-.python_lock_required <- function() {
-  value <- Sys.getenv("DSFLOWER_REQUIRE_PYTHON_LOCK", "")
+.python_lock_required <- function(framework = NULL) {
+  native_tree <- identical(framework, "native_tree") ||
+    identical(framework, "native-tree")
+  environment <- if (native_tree) {
+    "DSFLOWER_NATIVE_TREE_REQUIRE_PYTHON_LOCK"
+  } else {
+    "DSFLOWER_REQUIRE_PYTHON_LOCK"
+  }
+  option <- if (native_tree) {
+    "native_tree_require_python_lock"
+  } else {
+    "require_python_lock"
+  }
+  value <- Sys.getenv(environment, "")
   if (nzchar(value)) {
     value <- tolower(value)
     if (value %in% c("1", "true", "yes")) return(TRUE)
     if (value %in% c("0", "false", "no")) return(FALSE)
-    stop("DSFLOWER_REQUIRE_PYTHON_LOCK must be true or false.", call. = FALSE)
+    stop(environment, " must be true or false.", call. = FALSE)
   }
-  isTRUE(as.logical(.dsf_option("require_python_lock", FALSE)))
+  isTRUE(as.logical(.dsf_option(option, FALSE)))
 }
 
-.python_lock_path <- function(must_exist = FALSE) {
-  path <- Sys.getenv("DSFLOWER_PYTHON_LOCK", "")
-  if (!nzchar(path)) path <- as.character(.dsf_option("python_lock", ""))[1]
+.python_lock_path <- function(must_exist = FALSE, framework = NULL) {
+  native_tree <- identical(framework, "native_tree") ||
+    identical(framework, "native-tree")
+  environment <- if (native_tree) {
+    "DSFLOWER_NATIVE_TREE_PYTHON_LOCK"
+  } else {
+    "DSFLOWER_PYTHON_LOCK"
+  }
+  option <- if (native_tree) "native_tree_python_lock" else "python_lock"
+  path <- Sys.getenv(environment, "")
+  if (!nzchar(path)) path <- as.character(.dsf_option(option, ""))[1]
   if (!nzchar(path)) {
-    if (must_exist && .python_lock_required()) {
+    if (must_exist && .python_lock_required(framework)) {
       stop("A hash-locked Python environment is required, but ",
-           "DSFLOWER_PYTHON_LOCK/dsflower.python_lock is unset.", call. = FALSE)
+           environment, "/dsflower.", option, " is unset.", call. = FALSE)
     }
     return("")
   }
@@ -205,8 +269,8 @@
 
 .python_env_spec_hash <- function(framework) {
   python_spec <- paste0("python=", .python_version_spec())
-  lock <- .python_lock_path()
-  if (!nzchar(lock) && .python_lock_required()) return(NA_character_)
+  lock <- .python_lock_path(framework = framework)
+  if (!nzchar(lock) && .python_lock_required(framework)) return(NA_character_)
   if (nzchar(lock)) {
     if (!file.exists(lock) || dir.exists(lock) || file.access(lock, 4L) != 0L) {
       return(NA_character_)
@@ -269,7 +333,7 @@
   # system()/system2() hang in Rserve child processes (Rock DS sessions).
   # The configure script writes .dsflower_ready after verifying imports,
   # so if the marker + binaries exist, the venv is healthy.
-  python <- file.path(venv_path, "bin", "python")
+  python <- .venv_executable(venv_path, "python")
   if (!file.exists(python)) return(FALSE)
   marker <- file.path(venv_path, ".dsflower_ready")
   if (!file.exists(marker)) return(FALSE)
@@ -277,7 +341,7 @@
   current_hash <- tryCatch(readLines(marker, warn = FALSE, n = 1),
                            error = function(e) "")
   if (!identical(current_hash, expected_hash)) return(FALSE)
-  supernode <- file.path(venv_path, "bin", "flower-supernode")
+  supernode <- .venv_executable(venv_path, "flower-supernode")
   if (!file.exists(supernode)) return(FALSE)
   TRUE
 }
@@ -307,8 +371,8 @@
   venv_path <- file.path(root, framework)
   if (.venv_is_healthy(venv_path, framework)) {
     return(list(
-      python = file.path(venv_path, "bin", "python"),
-      flower_supernode = file.path(venv_path, "bin", "flower-supernode"),
+      python = .venv_executable(venv_path, "python"),
+      flower_supernode = .venv_executable(venv_path, "flower-supernode"),
       source = "venv"
     ))
   }
@@ -330,8 +394,8 @@
   # Fast path: existing healthy venv
   if (.venv_is_healthy(venv_path, framework)) {
     return(list(
-      python = file.path(venv_path, "bin", "python"),
-      flower_supernode = file.path(venv_path, "bin", "flower-supernode"),
+      python = .venv_executable(venv_path, "python"),
+      flower_supernode = .venv_executable(venv_path, "flower-supernode"),
       source = "venv"
     ))
   }
@@ -365,8 +429,8 @@
 
       if (.venv_is_healthy(venv_path, framework)) {
         return(list(
-          python = file.path(venv_path, "bin", "python"),
-          flower_supernode = file.path(venv_path, "bin", "flower-supernode"),
+          python = .venv_executable(venv_path, "python"),
+          flower_supernode = .venv_executable(venv_path, "flower-supernode"),
           source = "venv"
         ))
       }
@@ -377,8 +441,8 @@
     # We hold the lock. Double-check.
     if (.venv_is_healthy(venv_path, framework)) {
       return(list(
-        python = file.path(venv_path, "bin", "python"),
-        flower_supernode = file.path(venv_path, "bin", "flower-supernode"),
+        python = .venv_executable(venv_path, "python"),
+        flower_supernode = .venv_executable(venv_path, "flower-supernode"),
         source = "venv"
       ))
     }
@@ -402,7 +466,7 @@
     # visible, else CPU; see .torch_backend). CPU avoids the CUDA build's unused
     # ~3.5 GB nvidia/triton libs on GPU-less nodes.
     deps <- .python_deps_for_framework(framework)
-    lock <- .python_lock_path(must_exist = TRUE)
+    lock <- .python_lock_path(must_exist = TRUE, framework = framework)
     torch_flag <- if (any(grepl("torch", deps, fixed = TRUE)))
       c("--torch-backend", .torch_backend()) else character(0)
     install_spec <- if (nzchar(lock)) c("--require-hashes", "-r", lock) else deps
@@ -411,7 +475,7 @@
     } else {
       message("  Installing: ", paste(deps, collapse = ", "))
     }
-    venv_python <- file.path(venv_path, "bin", "python")
+    venv_python <- .venv_executable(venv_path, "python")
     result <- processx::run(
       command = uv,
       args = c("pip", "install", "--python", venv_python, "--quiet",
@@ -428,15 +492,20 @@
 
     # Verify
     check_mod <- .FRAMEWORK_HEALTH_IMPORT[[framework]] %||% "flwr"
-    venv_python <- file.path(venv_path, "bin", "python")
-    cmd <- paste0(shQuote(venv_python), " -c ", shQuote(paste0("import ", check_mod)))
-    rc <- suppressWarnings(system(cmd, ignore.stdout = TRUE, ignore.stderr = TRUE))
-    if (rc != 0L) {
+    venv_python <- .venv_executable(venv_path, "python")
+    verified <- tryCatch(
+      processx::run(
+        venv_python, c("-c", paste0("import ", check_mod)),
+        error_on_status = FALSE, timeout = timeout_secs
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(verified) || !identical(verified$status, 0L)) {
       unlink(venv_path, recursive = TRUE)
       stop("'", check_mod, "' import failed after install.", call. = FALSE)
     }
 
-    supernode <- file.path(venv_path, "bin", "flower-supernode")
+    supernode <- .venv_executable(venv_path, "flower-supernode")
     if (!file.exists(supernode)) {
       unlink(venv_path, recursive = TRUE)
       stop("flower-supernode not found in venv.", call. = FALSE)
@@ -527,13 +596,16 @@
 #' Locate site-packages directories inside a virtual environment
 #' @keywords internal
 .venv_site_packages_dirs <- function(venv_path) {
-  lib_root <- file.path(venv_path, "lib")
-  if (!dir.exists(lib_root)) return(character())
-  lib_dirs <- tryCatch(
-    list.dirs(lib_root, recursive = TRUE, full.names = TRUE),
-    error = function(e) character()
-  )
-  lib_dirs[basename(lib_dirs) == "site-packages"]
+  lib_roots <- unique(file.path(venv_path, c("lib", "Lib")))
+  lib_roots <- lib_roots[dir.exists(lib_roots)]
+  if (!length(lib_roots)) return(character())
+  lib_dirs <- unique(unlist(lapply(lib_roots, function(lib_root) {
+    tryCatch(
+      list.dirs(lib_root, recursive = TRUE, full.names = TRUE),
+      error = function(e) character()
+    )
+  }), use.names = FALSE))
+  lib_dirs[tolower(basename(lib_dirs)) == "site-packages"]
 }
 
 #' Summarise provisioned Python runtime without spawning subprocesses
@@ -552,7 +624,9 @@
     ))
   }
 
-  first <- healthy$path[1]
+  torch <- healthy[healthy$framework %in% c("pytorch", "pytorch-gpu"),
+                   , drop = FALSE]
+  first <- if (nrow(torch)) torch$path[[1L]] else healthy$path[[1L]]
   list(
     python_version = .read_venv_python_version(first),
     flower_version = .read_venv_package_version(first, "flwr"),
@@ -571,6 +645,33 @@
 # uv bootstrap
 # ---------------------------------------------------------------------------
 
+.uv_release_asset <- function(sysname = Sys.info()[["sysname"]],
+                              machine = Sys.info()[["machine"]]) {
+  sysname <- tolower(sysname)
+  machine <- tolower(machine)
+  os <- switch(sysname,
+    darwin = "apple-darwin",
+    linux = "unknown-linux-gnu",
+    windows = "pc-windows-msvc",
+    stop("Unsupported OS: ", sysname,
+         ". Install uv: https://docs.astral.sh/uv/", call. = FALSE)
+  )
+  arch <- switch(machine,
+    x86_64 = "x86_64", amd64 = "x86_64", `x86-64` = "x86_64",
+    aarch64 = "aarch64", arm64 = "aarch64",
+    stop("Unsupported arch: ", machine, call. = FALSE)
+  )
+  windows <- identical(os, "pc-windows-msvc")
+  triple <- paste(arch, os, sep = "-")
+  executable <- if (windows) "uv.exe" else "uv"
+  list(
+    triple = triple,
+    archive_ext = if (windows) ".zip" else ".tar.gz",
+    executable = executable,
+    member = paste0("uv-", triple, "/", executable)
+  )
+}
+
 #' Ensure uv is available (find or download)
 #' @keywords internal
 .ensure_uv <- function() {
@@ -582,17 +683,18 @@
   if (nzchar(uv)) { .dsflower_runtime$uv_path <- uv; return(uv) }
 
   # Common locations
+  asset <- .uv_release_asset()
   home <- Sys.getenv("HOME", "~")
-  for (p in c(file.path(home, ".local", "bin", "uv"),
-              file.path(home, ".cargo", "bin", "uv"),
-              "/usr/local/bin/uv")) {
+  for (p in c(file.path(home, ".local", "bin", asset$executable),
+              file.path(home, ".cargo", "bin", asset$executable),
+              file.path("/usr/local/bin", asset$executable))) {
     if (file.exists(p)) { .dsflower_runtime$uv_path <- p; return(p) }
   }
 
   # Download one immutable, administrator-pinned standalone archive.
   tools_dir <- file.path(.venv_root(), ".tools")
   dir.create(tools_dir, recursive = TRUE, showWarnings = FALSE)
-  uv_path <- file.path(tools_dir, "uv")
+  uv_path <- file.path(tools_dir, asset$executable)
   if (file.exists(uv_path)) {
     .dsflower_runtime$uv_path <- uv_path
     return(uv_path)
@@ -600,21 +702,10 @@
 
   bootstrap <- .uv_bootstrap_config()
   message("dsFlower: downloading pinned uv ", bootstrap$version, "...")
-  sysname <- tolower(Sys.info()[["sysname"]])
-  machine <- tolower(Sys.info()[["machine"]])
-  os <- switch(sysname,
-    darwin = "apple-darwin", linux = "unknown-linux-gnu",
-    stop("Unsupported OS: ", sysname, ". Install uv: https://docs.astral.sh/uv/",
-         call. = FALSE))
-  arch <- switch(machine,
-    x86_64 = "x86_64", amd64 = "x86_64",
-    aarch64 = "aarch64", arm64 = "aarch64",
-    stop("Unsupported arch: ", machine, call. = FALSE))
-
-  triple <- paste(arch, os, sep = "-")
   url <- paste0("https://github.com/astral-sh/uv/releases/download/",
-                bootstrap$version, "/uv-", triple, ".tar.gz")
-  tmp <- tempfile(fileext = ".tar.gz")
+                bootstrap$version, "/uv-", asset$triple,
+                asset$archive_ext)
+  tmp <- tempfile(fileext = asset$archive_ext)
   tmp_dir <- tempfile()
   on.exit({ unlink(tmp); unlink(tmp_dir, recursive = TRUE) }, add = TRUE)
 
@@ -631,11 +722,20 @@
   }
 
   dir.create(tmp_dir, showWarnings = FALSE)
-  member <- paste0("uv-", triple, "/uv")
-  entries <- utils::untar(tmp, list = TRUE)
-  if (!member %in% entries) stop("uv binary not found in verified archive.", call. = FALSE)
-  utils::untar(tmp, files = member, exdir = tmp_dir)
-  source <- file.path(tmp_dir, member)
+  entries <- if (identical(asset$archive_ext, ".zip")) {
+    utils::unzip(tmp, list = TRUE)$Name
+  } else {
+    utils::untar(tmp, list = TRUE)
+  }
+  if (!asset$member %in% entries) {
+    stop("uv binary not found in verified archive.", call. = FALSE)
+  }
+  if (identical(asset$archive_ext, ".zip")) {
+    utils::unzip(tmp, files = asset$member, exdir = tmp_dir)
+  } else {
+    utils::untar(tmp, files = asset$member, exdir = tmp_dir)
+  }
+  source <- file.path(tmp_dir, asset$member)
   install_tmp <- tempfile(pattern = ".uv-", tmpdir = tools_dir)
   if (!file.copy(source, install_tmp, overwrite = TRUE)) {
     stop("Could not stage verified uv binary.", call. = FALSE)

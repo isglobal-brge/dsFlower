@@ -50,11 +50,22 @@ This contract reaches `nn.Module`-level granularity because the trusted runner
 owns the training loop and observes per-sample gradients. Extending the
 declarative vocabulary is the safe way to add flexibility.
 
-No tree learner is exposed by this runner ABI. Native XGBoost, LightGBM and
-CatBoost have data-dependent binning, topology, category and stopping surfaces;
-they need separately reviewed node-owned mechanisms and cannot be made formal DP
-by validating public parameters or perturbing serialized model bytes after
-ordinary training.
+The separate native-tree ABI exposes only reviewed node-owned mechanisms:
+curated native XGBoost, data-independent ExtraTrees, adaptive private Random
+Forest, and dsFlower's LightGBM-style and CatBoost-style numeric boosters.
+Random Forest assigns every effective privacy unit to exactly one tree through
+a node-owned disjoint partition; it is not upstream bootstrap/bagging Random
+Forest, so small cohorts can have fewer effective units per tree. Its public
+defaults are benchmark-oriented, never a private-count admission rule.
+Public bounds, cuts and the exact typed profile are validated before private
+reads. Each engine has its own accounting and sanitized data-only artifact;
+LightGBM-style and CatBoost-style deliberately do not load or emit the upstream
+binary formats. Runtime availability is a fresh executable probe, not a
+server-side model catalogue or privacy permission list.
+The standard installer provisions the four pure dsFlower engines. XGBoost stays
+fail-closed until a custodian explicitly configures its separately built,
+platform-specific verified bundle; `configure` never downloads or compiles that
+native trust artifact implicitly.
 
 ### HookApp
 
@@ -113,15 +124,19 @@ public result `available=false` with no metrics, node status or zero-filled
 substitute; this operational availability signal is outside the DP transcript.
 Exact labels, predictions, counts and node metrics are never released.
 
-The current track validates tabular neural artifacts; vision artifacts fail
-explicitly. Supported layouts cover binary, multiclass, ordinal
+The current track validates tabular neural artifacts and sanitized native-tree
+ensembles; vision artifacts fail explicitly. Supported layouts cover binary,
+multiclass, ordinal
 and multilabel classification plus bounded regression/count outcomes. Probability
 bins are public and bounded at 512; class/label counts are public and bounded at
 1024. Validation on an independently assigned dataset is external validation;
-evaluating training data is
-resubstitution. Cross-validation is not inferred: fitting folds would require
-separate, explicitly accounted model releases and a protocol-defined
-patient-level split.
+evaluating training data is resubstitution. Tabular declarative neural training
+also has explicit atomic holdout and K-fold workflows. K-fold runs use a
+canonical secret-keyed patient/row assignment, cleanly initialize and train all
+fold models inside one job, keep raw OOF sufficient statistics in node memory,
+release one final DP vector per node only when every fold succeeds, and publish
+one pooled metrics artifact. Fold models, predictions and per-fold/per-node
+metrics are never released.
 
 ### Atomic training holdout
 
@@ -260,7 +275,9 @@ rest of that run's staged inputs. Losing it after cleanup cannot change sticky
 randomness; an equivalent new training reconstructs the same semantic PRF input.
 
 The node pins the recursive runner hash. The client's bundled runner must be
-byte-identical, and `tools/check-runner-sync.py` provides a CI check. Uploaded
+byte-identical. The coordinated release check
+`dsFlowerClient/tools/check-runner-sync.py --server ../dsFlower` verifies both
+working trees before promotion. Uploaded
 archives are capped while streaming, SHA-256 verified, safely extracted without
 path traversal/symlinks/devices/ZIP bombs, scanned, re-hashed immediately before
 execution and mounted read-only in the HookApp sandbox.
@@ -339,7 +356,7 @@ session/profile options.
 | `dp_unit` | `row` | Adjacency unit (`row` or `patient`) |
 | `patient_column` | unset | Required explicit stable ID column in patient mode |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound |
-| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV takes precedence when it selects another path |
+| `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV takes precedence when it selects another path |
 | `tunnel_chunk_bytes` | `524288` | Per-exchange decoded tunnel payload cap (16--512 KiB); larger streams use multiple exact chunks below DSI's expression-parser limit |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; TCP backpressure when full |
 | `tunnel_loss_tolerance` | `180` | Relay-heartbeat timeout in seconds (`5`--`86400`) |
@@ -364,7 +381,7 @@ The timing pad wraps one complete Hook release, not every S&A block, while every
 child retains its own timeout. It remains a minimum-duration mitigation rather
 than a constant-time or availability guarantee.
 
-Example node policy:
+Example Unix node policy (Windows services should pin an absolute secret path):
 
 ```r
 options(
@@ -413,15 +430,18 @@ chunk geometry.
 
 ### Deployment reproducibility and state
 
-The provisioner admits Flower 1.31.x, Torch 2.x, Opacus 1.x and torchvision 0.x,
-then records the exact resolved environment in `.dsflower_versions.txt`. The
+The provisioner admits Flower 1.31.0 exactly, Torch 2.x, Opacus 1.x and
+torchvision 0.x, and provisions the exact dependency-light native-tree runtime
+separately. It records each resolved environment in `.dsflower_versions.txt`. The
 capability response includes the core versions and that manifest's SHA-256. This
 records a range-based resolution but cannot reproduce it later. Production nodes
 should instead provide a complete, root-owned `DSFLOWER_PYTHON_LOCK` whose every
-transitive artifact is pinned and hashed; `uv pip install --require-hashes` then
-fails closed
-on an incomplete lock. `DSFLOWER_REQUIRE_PYTHON_LOCK=true` prevents accidental
-fallback to range resolution. `DSFLOWER_PYTHON_VERSION` should also name an exact
+transitive PyTorch artifact is pinned and hashed, plus a separate
+`DSFLOWER_NATIVE_TREE_PYTHON_LOCK` for the tree dependency graph. `uv pip install
+--require-hashes` then fails closed on an incomplete lock. The locks are never
+reused across environments. `DSFLOWER_REQUIRE_PYTHON_LOCK=true` and
+`DSFLOWER_NATIVE_TREE_REQUIRE_PYTHON_LOCK=true` prevent accidental fallback to
+unlocked resolution. `DSFLOWER_PYTHON_VERSION` should also name an exact
 patch release to prevent patch drift (the default `3.11` is a compatibility
 selector); the immutable container digest remains the exact deployment identity.
 Missing `uv` is bootstrapped only from an exact release

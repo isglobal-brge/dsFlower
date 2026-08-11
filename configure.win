@@ -1,0 +1,5 @@
+#!/bin/sh
+# Windows uses configure.win rather than configure. Keep one provisioning
+# implementation so dependency pins, lock handling and health markers cannot
+# drift between platforms.
+exec sh ./configure "$@"

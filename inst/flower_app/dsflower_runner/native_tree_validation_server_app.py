@@ -1,4 +1,4 @@
-"""Dedicated coordinator ServerApp for private XGBoost validation."""
+"""Dedicated coordinator ServerApp for private native-tree validation."""
 
 import base64
 import hashlib
@@ -14,14 +14,12 @@ from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 from flwr.serverapp import Grid, ServerApp
 
-from . import native_tree_request, validation, xgboost_predictor
+from . import native_tree_engine, native_tree_request, validation
 
 
 app = ServerApp()
 HISTORY_FILE = "history.json"
 RESULT_FILE = "validation.json"
-_PREDICTION_PROFILE = "dsflower-xgboost-prediction-profile-v1"
-_ARTIFACT_FORMAT = "dsflower-xgboost-ensemble-json-v1"
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
 _REPLY_FIELDS = frozenset(("arrays", "metrics"))
 _METRIC_FIELDS = frozenset(("available", "num-examples"))
@@ -86,55 +84,16 @@ def _canonical_json(value):
     ).encode("ascii")
 
 
-def _object_without_duplicates(pairs):
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError("duplicate JSON key")
-        value[key] = item
-    return value
-
-
 def _validate_profile(profile_bytes, cfg, request, artifact):
-    try:
-        profile = json.loads(
-            profile_bytes.decode("ascii"),
-            object_pairs_hook=_object_without_duplicates,
-            parse_constant=lambda _value: (_ for _ in ()).throw(
-                ValueError("non-finite JSON number")),
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
-            RecursionError) as exc:
-        raise ValueError("native validation profile JSON is invalid") from exc
-    fields = frozenset((
-        "artifact", "contract", "native_tree_request_b64",
-        "native_tree_request_sha256", "public_schema_sha256", "task",
-        "version",
-    ))
-    artifact_fields = frozenset(("format", "sha256", "size_bytes"))
-    binding = profile.get("artifact") if isinstance(profile, dict) else None
-    if not isinstance(profile, dict) or frozenset(profile) != fields or \
-            not isinstance(binding, dict) or \
-            frozenset(binding) != artifact_fields or \
-            profile.get("contract") != _PREDICTION_PROFILE or \
-            type(profile.get("version")) is not int or profile["version"] != 1 or \
-            profile.get("native_tree_request_b64") != \
-            cfg["validation-native-tree-request-b64"] or \
-            profile.get("native_tree_request_sha256") != \
-            cfg["validation-native-tree-request-sha256"] or \
-            profile.get("public_schema_sha256") != \
-            cfg["validation-public-schema-sha256"] or \
-            profile.get("task") != cfg["validation-task"] or \
-            binding.get("format") != cfg["validation-artifact-format"] or \
-            binding.get("sha256") != cfg["validation-artifact-sha256"] or \
-            binding.get("size_bytes") != \
-            cfg["validation-artifact-size-bytes"]:
+    spec = native_tree_engine.validate_prediction_profile(
+        profile_bytes, request,
+        cfg["validation-native-tree-request-b64"],
+        cfg["validation-native-tree-request-sha256"], artifact)
+    if cfg["validation-artifact-format"] != spec["ensemble_format"] or \
+            cfg["validation-artifact-sha256"] != \
+            hashlib.sha256(artifact).hexdigest() or \
+            cfg["validation-artifact-size-bytes"] != len(artifact):
         raise ValueError("native validation profile bindings are invalid")
-    if request["public_schema"]["sha256"] != profile["public_schema_sha256"] or \
-            hashlib.sha256(artifact).hexdigest() != binding["sha256"] or \
-            len(artifact) != binding["size_bytes"] or \
-            _canonical_json(profile) != profile_bytes:
-        raise ValueError("native validation profile is not exact canonical JSON")
 
 
 def _run_contract(cfg):
@@ -150,8 +109,7 @@ def _run_contract(cfg):
     task_name = cfg.get("validation-task")
     loss = cfg.get("loss-name")
     if task_name not in ("binary", "regression") or \
-            loss != ("bce_logits" if task_name == "binary" else "mse") or \
-            cfg.get("validation-artifact-format") != _ARTIFACT_FORMAT:
+            loss != ("bce_logits" if task_name == "binary" else "mse"):
         raise ValueError("native validation task profile is invalid")
     for key in (
             "validation-artifact-sha256", "validation-contract-sha256",
@@ -162,6 +120,10 @@ def _run_contract(cfg):
     request = native_tree_request.parse_request_wire(
         cfg.get("validation-native-tree-request-b64"),
         cfg.get("validation-native-tree-request-sha256"))
+    release_spec = native_tree_engine.release_spec(request["engine"])
+    if cfg.get("validation-artifact-format") != \
+            release_spec["ensemble_format"]:
+        raise ValueError("native validation artifact format is unsupported")
     public_manifest = native_tree_request.public_backend_manifest(request)
     expected_task = "binary" if request["task"] == "binary" else "regression"
     features = _positive_integer(
@@ -204,8 +166,7 @@ def _run_contract(cfg):
         profile_size, cfg["validation-profile-sha256"], 128 * 1024,
         "profile")
     _validate_profile(profile, cfg, request, artifact)
-    parsed = xgboost_predictor.parse_xgboost_ensemble(
-        artifact, public_manifest)
+    parsed = native_tree_engine.parse_ensemble(public_manifest, artifact)
     if parsed.task != task_name or parsed.num_features != features:
         raise ValueError("native validation predictor geometry is invalid")
     timeout = cfg.get("round-timeout", request["resources"]["timeout_seconds"])

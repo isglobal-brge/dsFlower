@@ -4,7 +4,12 @@
 \alias{flowerGetCapabilitiesDS}
 \title{Get Server Capabilities}
 \usage{
-flowerGetCapabilitiesDS()
+flowerGetCapabilitiesDS(native_tree_probe = "none")
+}
+\arguments{
+\item{native_tree_probe}{Exactly \code{"none"} (the default), \code{"all"},
+or one implemented native-tree engine name. This controls an operational
+readiness check only; it is not a privacy permission or operation catalog.}
 }
 \value{
 Named list of capabilities.
@@ -13,5 +18,6 @@ Named list of capabilities.
 DataSHIELD AGGREGATE method. Returns information about the server's
 Flower capabilities including Python version, the hash-pinned declarative
 runner vocabulary, and disclosure settings. The response is independent of
-cohort contents, handle state, filesystem paths, and other sessions.
+cohort contents, handle state, and other sessions, and does not disclose
+filesystem paths. Native-tree availability is probed only when requested.
 }

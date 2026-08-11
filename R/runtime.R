@@ -288,14 +288,27 @@
     stop("Prepared manifest has no supported trusted execution track.",
          call. = FALSE)
   }
-  if (identical(track, "native_tree") && !.native_tree_xgboost_probe()) {
-    stop("The verified native XGBoost runtime is unavailable on this node.",
-         call. = FALSE)
-  }
   native_validation <- identical(track, "validation") &&
     is.list(manifest) &&
     identical(as.character(
       manifest[["validation-model-track"]] %||% ""), "native_tree")
+  native_execution <- identical(track, "native_tree") || native_validation
+  native_engine <- if (native_execution) {
+    .native_tree_engine_from_config(manifest)
+  } else {
+    ""
+  }
+  native_ready <- if (identical(track, "native_tree")) {
+    .native_tree_engine_probe(native_engine)
+  } else if (native_validation) {
+    .native_tree_validation_probe(native_engine)
+  } else {
+    TRUE
+  }
+  if (!native_ready) {
+    stop("The trusted native-tree runtime for '", native_engine,
+         "' is unavailable on this node.", call. = FALSE)
+  }
   # The release runner is node-resident and hash-pinned. Resolve its framework
   # from the server-validated manifest, never from an analyst executable path.
   runtime_desc <- .resolve_framework_runtime(
@@ -345,7 +358,7 @@
   venv_path <- runtime_desc$venv_path
   spawn_env <- .build_clean_python_env(venv_path, manifest_dir,
                                         extra_pypath = new_pypath)
-  if (identical(track, "native_tree")) {
+  if (native_execution && identical(native_engine, "xgboost")) {
     spawn_env <- c(
       spawn_env,
       DSFLOWER_XGBOOST_BUNDLE_ROOT = .native_tree_xgboost_bundle_root())

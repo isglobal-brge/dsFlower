@@ -1,16 +1,17 @@
-# Federated cross-validation protocol (design; not yet an API)
+# Federated cross-validation protocol
 
-This document fixes the protocol that a future `cross_validate(recipe, spec)`
-operation must implement. It is intentionally not exported yet: wrapping the
-existing fit and validation calls would expose fold artifacts and would not be
-honest out-of-fold validation.
+The client exports this protocol as `ds.flower.cross_validate()`. It is a
+dedicated metrics-only job; it does not wrap repeated fit or validation calls.
+The default is three folds, while values from 2 through 10 are supported.
 
 ## Public job contract
 
-One dedicated Flower app owns one cross-validation job. Its canonical contract
-contains the resampling protocol version, `K`, task/metric layout, model and
-training recipe, common node-owned privacy unit, and the fixed job-level privacy
-allocation. It contains no analyst seed, run token, timestamp or retry counter.
+One dedicated Flower app owns one cross-validation job. Its canonical resampling
+contract contains the protocol version, `K`, and the common node-owned privacy
+unit; its SHA-256 is carried through the manifest and final `cv.json`. The wider
+node manifest independently pins the task/metric layout, model and training
+recipe, and fixed job-level privacy allocation. Neither contract contains an
+analyst seed, timestamp or retry counter.
 The node derives one stable secret-keyed score from the resampling version, unit
 semantics and row ordinal or canonical patient identifier, then maps that score
 to one of `K` folds. Model, training and metric parameters do not enter this
@@ -32,9 +33,11 @@ initialized federated training:
 2. Every configured round must complete on the exact roster.
 3. The final fold aggregate is sent once to those nodes for prediction only on
    units assigned to `f`.
-4. Each node adds the bounded sufficient statistics to an in-memory OOF
-   accumulator and acknowledges without returning a vector, prediction, metric
-   or model.
+4. Each node adds the bounded sufficient statistics to namespaced
+   `Context.state` records carried by Flower's in-memory node runtime and
+   acknowledges without returning a vector, prediction, metric or model. The
+   records are bound to the public CV-job hash, contract, layout and fold
+   digests; they never use a file or database.
 5. The fold model is discarded in memory and is never persisted or returned.
 
 After all folds finish, each node makes exactly one DP release of its accumulated
@@ -45,22 +48,28 @@ requires a separate explicit `fit`; cross-validation itself returns metrics only
 
 ## Privacy and failure contract
 
-The custodian-provided epsilon/delta pair is the total CV-job budget. A fixed,
-server-owned allocation composes all `K` training mechanisms plus the single OOF
-release; no fold or client parameter may expand it. This accounting exists only
-inside the active job. There is no lifetime/global/resource budget, call counter,
-rate limit or operation-catalog authorization.
+The custodian-provided epsilon/delta pair is the total CV-job budget. The node
+reserves 80 percent for training and assigns `0.8 / K` of the pair to each fold;
+the remaining 20 percent is used by the single OOF release. This conservative
+allocation remains valid when replace-one adjacency changes a unit's fold.
+Larger `K` therefore gives each DP-SGD training less budget and can reduce
+utility. This accounting exists only inside the active job. There is no
+lifetime/global/resource budget, call counter, rate limit or operation-catalog
+authorization.
 
 The app is all-or-nothing. Any roster drift, missing training round, failed fold,
 invalid acknowledgement, accumulator loss or malformed final vector prevents a
-metrics artifact. Intermediate state is RAM-only and restart means deterministic
-recomputation of the entire job. The implementation must bind fold index and the
+metrics artifact. Intermediate state is RAM-only and is consumed before the
+final reply or by every abort message the node receives. A node unreachable
+during abort can retain only its in-memory record until that runtime exits; it
+cannot persist or return it. Restart means deterministic recomputation of the
+entire job. The implementation must bind fold index and the
 exact train tensors into each training's semantic PRF identity while binding the
 canonical OOF sufficient vector, layout and noise scale into the final release.
 
-## Release gate
+## Verified invariants
 
-The client API remains unavailable until tests demonstrate all of the following:
+The implementation tests all of the following:
 
 - `K` genuine federated training cycles and held-out evaluation on every fold;
 - patient/row assignment invariance and train/test disjointness;
@@ -68,4 +77,5 @@ The client API remains unavailable until tests demonstrate all of the following:
 - no persisted/returned fold model, prediction, fold metric or node transcript;
 - exact fixed job-budget composition and deterministic retry semantics;
 - all-or-nothing output under failures at every fold boundary; and
-- byte-identical server/client runners on every supported platform.
+- byte-identical server/client runners in the coordinated pre-promotion release
+  check; each copy then runs its platform matrix independently.

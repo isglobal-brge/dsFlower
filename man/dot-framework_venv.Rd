@@ -12,7 +12,7 @@ the universal default) or "pytorch-gpu" (cuda), resolved as late as possible
 (run time) so a GPU added AFTER install is usable with just a re-provision (to
 build pytorch-gpu) -- no code change, no install-time backend lock-in.}
 \usage{
-.framework_venv(framework, backend = .resolve_backend())
+.framework_venv(framework, backend = NULL)
 }
 \description{
 Normalize a framework / dp-track to its venv. dsFlower runs in ONE torch venv

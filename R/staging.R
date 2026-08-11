@@ -747,10 +747,49 @@
     "privacy-delta", "privacy-clipping_norm", "privacy-sample_aggregate",
     "privacy-training-epsilon", "privacy-training-delta",
     "privacy-holdout-epsilon", "privacy-holdout-delta",
+    "privacy-cv-training-epsilon", "privacy-cv-training-delta",
+    "privacy-cv-fold-epsilon", "privacy-cv-fold-delta",
+    "privacy-cv-oof-epsilon", "privacy-cv-oof-delta",
     "privacy-sa_blocks", "privacy-egress_time_pad",
     "privacy-egress_timeout", "privacy-egress_memory_mb",
     "privacy-egress_file_mb", "privacy-egress_processes",
     "privacy-hook_enabled", "user-module", "app-params-sha256"
+  )
+}
+
+# Exact public run-config syntax accepted from the current dsFlowerClient wire.
+# This is input validation, not an authorization or privacy-permission catalogue.
+.client_run_config_fields <- function() {
+  c(
+    "dp-track", "data_type", "task-type", "task_type", "label_set",
+    "num-server-rounds", "num-features", "num-classes", "num-labels",
+    "feature-bounds", "target-bounds", "target-levels",
+    "model-spec-b64", "loss-name", "local-epochs", "batch-size",
+    "learning-rate", "weight-decay", "l1-penalty",
+    "nb-dispersion", "gamma-shape", "huber-delta", "quantile-level",
+    "optimizer-name", "optimizer-momentum", "optimizer-nesterov",
+    "optimizer-beta1", "optimizer-beta2", "optimizer-eps",
+    "optimizer-amsgrad", "optimizer-rmsprop-alpha",
+    "scheduler-name", "scheduler-step-size", "scheduler-gamma",
+    "scheduler-min-lr",
+    "strategy", "strategy-eta", "strategy-eta-l", "strategy-beta-1",
+    "strategy-beta-2", "strategy-tau", "strategy-server-learning-rate",
+    "strategy-server-momentum",
+    "native-tree-request-b64", "native-tree-request-sha256",
+    "validation-model-track", "validation-task", "validation-bins",
+    "validation-contract-sha256", "validation-native-tree-request-b64",
+    "validation-native-tree-request-sha256", "validation-artifact-format",
+    "validation-artifact-sha256", "validation-artifact-size-bytes",
+    "validation-profile-sha256", "validation-profile-size-bytes",
+    "validation-public-schema-sha256",
+    "resampling-version", "resampling-method", "resampling-assignment",
+    "resampling-test-numerator", "resampling-test-denominator",
+    "resampling-privacy-unit", "resampling-unit-canonicalization",
+    "resampling-contract-sha256", "holdout-validation-bins",
+    "cv-version", "cv-method", "cv-assignment", "cv-folds",
+    "cv-privacy-unit", "cv-unit-canonicalization", "cv-contract-sha256",
+    "cv-validation-bins", "cv-n-nodes", "cv-job-sha256",
+    "app-params-b64"
   )
 }
 
@@ -780,6 +819,11 @@
   if ("num_rounds" %in% keys) {
     stop("run_config must use the canonical 'num-server-rounds' field.",
          call. = FALSE)
+  }
+  unsupported <- setdiff(keys, .client_run_config_fields())
+  if (length(unsupported)) {
+    stop("run_config contains unsupported field(s): ",
+         paste(unsupported, collapse = ", "), ".", call. = FALSE)
   }
   run_config
 }

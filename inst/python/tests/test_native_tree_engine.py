@@ -26,6 +26,30 @@ from dsflower_runner import native_tree_server_app as server_app  # noqa: E402
 from test_boosting_adapter import _data  # noqa: E402
 from test_boosting_artifacts import _public_request as boosting_request  # noqa: E402
 from test_forest_adapter import _public_request as forest_request  # noqa: E402
+from test_random_forest_adapter import _manifest as rf_manifest  # noqa: E402
+
+
+def random_forest_request(*, trees=2, depth=1, max_features=1):
+    manifest = rf_manifest(
+        trees=trees, depth=depth, max_features=max_features, features=2)
+    return {
+        "contract": native_tree_request.REQUEST_CONTRACT,
+        "engine": "random_forest",
+        "mode": "native-tight",
+        "parameters": [
+            {"name": "max_depth", "type": "integer", "value": depth},
+            {"name": "max_features", "type": "integer",
+             "value": max_features},
+            {"name": "n_estimators", "type": "integer", "value": trees},
+        ],
+        "public_schema": manifest["public_schema"],
+        "resources": {
+            "max_features": 2, "max_trees": trees, "max_depth": depth,
+            "max_bins": 8, "max_threads": 4, "memory_mb": 4096,
+            "timeout_seconds": 900,
+        },
+        "task": "binary",
+    }
 
 
 def _manifest(request):
@@ -83,7 +107,8 @@ class NativeTreeEngineTests(unittest.TestCase):
         self.assertEqual(xgboost["model_file"],
                          "model.xgboost-ensemble.json")
         self.assertEqual(xgboost["profile_version"], 1)
-        for engine in ("extra_trees", "lightgbm", "catboost"):
+        for engine in (
+                "extra_trees", "random_forest", "lightgbm", "catboost"):
             spec = native_tree_engine.release_spec(engine)
             with self.subTest(engine=engine):
                 self.assertEqual(spec["engine"], engine)
@@ -96,6 +121,7 @@ class NativeTreeEngineTests(unittest.TestCase):
         features, target = _data()
         cases = (
             ("extra_trees", forest_request(trees=2, depth=1)),
+            ("random_forest", random_forest_request()),
             ("lightgbm", boosting_request("lightgbm")),
             ("catboost", boosting_request("catboost")),
         )
@@ -118,6 +144,14 @@ class NativeTreeEngineTests(unittest.TestCase):
                         hashlib.sha256(ensemble).hexdigest(), digest)
                     self.assertEqual(predictions.shape, target.shape)
                     self.assertTrue(np.all(np.isfinite(predictions)))
+
+    def test_real_pure_training_fails_closed_without_custodial_root(self):
+        features, target = _data()
+        manifest = _manifest(forest_request(trees=1, depth=1))
+        with mock.patch.dict(
+                os.environ, {"DSFLOWER_NODE_SECRET_FILE": ""}, clear=False), \
+                self.assertRaisesRegex(RuntimeError, "node-secret path"):
+            native_tree_engine.train_model(manifest, features, target)
 
     def test_v2_sidecar_is_canonical_bound_and_engine_specific(self):
         request = boosting_request("catboost")
@@ -144,6 +178,7 @@ class NativeTreeEngineTests(unittest.TestCase):
     def test_pure_engines_complete_one_flower_round_and_reopen(self):
         cases = (
             forest_request(trees=2, depth=1),
+            random_forest_request(),
             boosting_request("lightgbm"),
             boosting_request("catboost"),
         )

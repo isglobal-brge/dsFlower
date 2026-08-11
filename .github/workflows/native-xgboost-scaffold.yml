@@ -1,30 +1,86 @@
-name: Native XGBoost curated bundle
+name: Native tree engines and curated XGBoost bundle
 
 on:
   push:
     paths:
       - ".github/workflows/native-xgboost-scaffold.yml"
       - "inst/flower_app/dsflower_runner/native_tree_*.py"
+      - "inst/flower_app/dsflower_runner/boosting_*.py"
+      - "inst/flower_app/dsflower_runner/*boost_artifact.py"
+      - "inst/flower_app/dsflower_runner/lightgbm_artifact.py"
+      - "inst/flower_app/dsflower_runner/forest_*.py"
+      - "inst/flower_app/dsflower_runner/random_forest_adapter.py"
+      - "inst/flower_app/dsflower_runner/tree_release.py"
+      - "inst/flower_app/dsflower_runner/epi_association.py"
+      - "inst/flower_app/dsflower_runner/client_app.py"
+      - "inst/flower_app/dsflower_runner/dp_harness.py"
+      - "inst/flower_app/dsflower_runner/server_app.py"
+      - "inst/flower_app/dsflower_runner/release_guard.py"
+      - "inst/flower_app/dsflower_runner/resampling.py"
+      - "inst/flower_app/dsflower_runner/validation.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
       - "inst/python/tests/test_native_tree_*.py"
+      - "inst/python/tests/test_boosting_*.py"
+      - "inst/python/tests/test_forest_adapter.py"
+      - "inst/python/tests/test_random_forest_adapter.py"
+      - "inst/python/tests/test_tree_release.py"
+      - "inst/python/tests/test_cross_validation.py"
+      - "inst/python/tests/test_dpsgd_guards.py"
+      - "inst/python/tests/test_holdout.py"
+      - "inst/python/tests/test_epi_association.py"
+      - "inst/python/tests/test_validation_dp.py"
       - "inst/python/tests/test_sitecustomize.py"
       - "inst/python/tests/test_xgboost_*.py"
       - "native/xgboost/**"
       - "native/dp_primitives/**"
+      - "R/native_tree_contract.R"
+      - "R/python_env.R"
+      - "configure"
+      - "configure.win"
+      - "tests/testthat/test-native-tree-*.R"
+      - "tests/testthat/test-python-dependency-contract.R"
   pull_request:
     paths:
       - ".github/workflows/native-xgboost-scaffold.yml"
       - "inst/flower_app/dsflower_runner/native_tree_*.py"
+      - "inst/flower_app/dsflower_runner/boosting_*.py"
+      - "inst/flower_app/dsflower_runner/*boost_artifact.py"
+      - "inst/flower_app/dsflower_runner/lightgbm_artifact.py"
+      - "inst/flower_app/dsflower_runner/forest_*.py"
+      - "inst/flower_app/dsflower_runner/random_forest_adapter.py"
+      - "inst/flower_app/dsflower_runner/tree_release.py"
+      - "inst/flower_app/dsflower_runner/epi_association.py"
+      - "inst/flower_app/dsflower_runner/client_app.py"
+      - "inst/flower_app/dsflower_runner/dp_harness.py"
+      - "inst/flower_app/dsflower_runner/server_app.py"
+      - "inst/flower_app/dsflower_runner/release_guard.py"
+      - "inst/flower_app/dsflower_runner/resampling.py"
+      - "inst/flower_app/dsflower_runner/validation.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
       - "inst/python/tests/test_native_tree_*.py"
+      - "inst/python/tests/test_boosting_*.py"
+      - "inst/python/tests/test_forest_adapter.py"
+      - "inst/python/tests/test_random_forest_adapter.py"
+      - "inst/python/tests/test_tree_release.py"
+      - "inst/python/tests/test_cross_validation.py"
+      - "inst/python/tests/test_dpsgd_guards.py"
+      - "inst/python/tests/test_holdout.py"
+      - "inst/python/tests/test_epi_association.py"
+      - "inst/python/tests/test_validation_dp.py"
       - "inst/python/tests/test_sitecustomize.py"
       - "inst/python/tests/test_xgboost_*.py"
       - "native/xgboost/**"
       - "native/dp_primitives/**"
+      - "R/native_tree_contract.R"
+      - "R/python_env.R"
+      - "configure"
+      - "configure.win"
+      - "tests/testthat/test-native-tree-*.R"
+      - "tests/testthat/test-python-dependency-contract.R"
 
 permissions:
   contents: read
@@ -75,11 +131,24 @@ jobs:
             numpy==2.4.6 \
             pandas==3.0.3 \
             pyarrow==23.0.1 \
-            cryptography==46.0.7
+            cryptography==46.0.7 \
+            'torch>=2.0.0,<3.0.0' \
+            'opacus>=1.4.0,<2.0.0'
           "$contract_python" -m unittest -v \
             inst/python/tests/test_native_tree_contract.py \
+            inst/python/tests/test_native_tree_engine.py \
             inst/python/tests/test_native_tree_flower_app.py \
             inst/python/tests/test_native_tree_validation_app.py \
+            inst/python/tests/test_boosting_adapter.py \
+            inst/python/tests/test_boosting_artifacts.py \
+            inst/python/tests/test_forest_adapter.py \
+            inst/python/tests/test_random_forest_adapter.py \
+            inst/python/tests/test_tree_release.py \
+            inst/python/tests/test_cross_validation.py \
+            inst/python/tests/test_dpsgd_guards.py \
+            inst/python/tests/test_holdout.py \
+            inst/python/tests/test_epi_association.py \
+            inst.python.tests.test_validation_dp.ValidationReleaseTests \
             inst/python/tests/test_sitecustomize.py \
             inst/python/tests/test_xgboost_accounting.py \
             inst/python/tests/test_xgboost_adapter.py \

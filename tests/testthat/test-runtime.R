@@ -402,6 +402,37 @@ test_that("hash-locked Python requirements bind the venv marker", {
   expect_equal(dsFlower:::.python_env_spec_hash("pytorch"), expected)
 })
 
+test_that("native-tree and PyTorch locks are independent", {
+  torch_lock <- withr::local_tempfile()
+  native_lock <- withr::local_tempfile()
+  writeLines("torch-example==1.0 --hash=sha256:aaaaaaaa", torch_lock)
+  writeLines("tree-example==1.0 --hash=sha256:bbbbbbbb", native_lock)
+  withr::local_envvar(c(
+    DSFLOWER_PYTHON_LOCK = torch_lock,
+    DSFLOWER_NATIVE_TREE_PYTHON_LOCK = native_lock,
+    DSFLOWER_REQUIRE_PYTHON_LOCK = "",
+    DSFLOWER_NATIVE_TREE_REQUIRE_PYTHON_LOCK = ""
+  ))
+  withr::local_options(list(
+    dsflower.python_version = "3.11",
+    dsflower.python_lock = "",
+    dsflower.native_tree_python_lock = ""
+  ))
+
+  expect_equal(
+    dsFlower:::.python_lock_path(framework = "pytorch"),
+    normalizePath(torch_lock, winslash = "/", mustWork = FALSE)
+  )
+  expect_equal(
+    dsFlower:::.python_lock_path(framework = "native-tree"),
+    normalizePath(native_lock, winslash = "/", mustWork = FALSE)
+  )
+  expect_false(identical(
+    dsFlower:::.python_env_spec_hash("pytorch"),
+    dsFlower:::.python_env_spec_hash("native-tree")
+  ))
+})
+
 test_that("strict Python provisioning fails closed without a lock", {
   withr::local_envvar(c(
     DSFLOWER_PYTHON_LOCK = "",

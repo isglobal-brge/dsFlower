@@ -189,11 +189,17 @@
   invisible(destination)
 }
 
+# Default the sticky secret beside the platform-specific runtime root. Services
+# can select a different absolute path through DSFLOWER_NODE_SECRET_FILE.
+.default_node_secret_path <- function(os_type = .Platform$OS.type) {
+  file.path(dirname(.default_venv_root(os_type)), "privacy", "noise_root")
+}
+
 #' Resolve the dedicated dsFlower node-secret path
 #' @keywords internal
 .node_secret_path <- function() {
   configured <- .dsf_option(
-    "node_secret_path", "/var/lib/dsflower/privacy/noise_root")
+    "node_secret_path", .default_node_secret_path())
   from_env <- Sys.getenv("DSFLOWER_NODE_SECRET_FILE", unset = "")
   # Process-level configuration is authoritative and is also what the runtime
   # wrapper can see before a DataSHIELD session injects profile R options.
@@ -456,7 +462,7 @@
   # This fallback handles API installs where configure doesn't run.
   venv_root <- Sys.getenv(
     "DSFLOWER_VENV_ROOT",
-    unset = getOption("dsflower.venv_root", "/var/lib/dsflower/venvs")
+    unset = getOption("dsflower.venv_root", .default_venv_root())
   )
 
   if (!dir.exists(venv_root)) {
@@ -469,10 +475,14 @@
     # first, then a user-space dir. This makes a plain `install_github` install
     # (as the unprivileged Rock R user) work without a root configure step.
     if (!isTRUE(created) && !dir.exists(venv_root)) {
-      fallbacks <- c(
-        "/srv/dsflower/venvs",
+      fallbacks <- if (identical(.Platform$OS.type, "windows")) {
         file.path(tools::R_user_dir("dsFlower", "data"), "venvs")
-      )
+      } else {
+        c(
+          "/srv/dsflower/venvs",
+          file.path(tools::R_user_dir("dsFlower", "data"), "venvs")
+        )
+      }
       for (fb in fallbacks) {
         ok <- tryCatch(
           dir.create(fb, recursive = TRUE, showWarnings = FALSE),

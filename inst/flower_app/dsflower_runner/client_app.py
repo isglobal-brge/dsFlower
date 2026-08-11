@@ -17,9 +17,11 @@ Tracks, dispatched on the manifest's pinned ``dp-track``:
     by one patient-bounded Gaussian release of sufficient statistics.
 """
 
-import json
+import hashlib
 import io
+import json
 import math
+import os
 import time
 
 import numpy as np
@@ -62,8 +64,19 @@ _NEURAL_SEED_PRIVACY_KEYS = frozenset({
     "n_samples",
 })
 
+# Flower 1.31 carries Context.state between isolated ClientApp tasks through its
+# in-memory NodeState. These two namespaced records are the only CV accumulator;
+# no file, database, process global, or reply transcript is used.
+_CV_OOF_META_KEY = "dsflower-cv-oof-meta-v1"
+_CV_OOF_TOTAL_KEY = "dsflower-cv-oof-total-v1"
 
-def _neural_seed_contract(cfg, pins, pcfg):
+
+def _reply_cache_allowed(claim):
+    """CV replies are deterministic and must not become persisted fold state."""
+    return not str(claim.get("operation", "train")).startswith("cv-")
+
+
+def _neural_seed_contract(cfg, pins, pcfg, geometry_n_units=None):
     """Exact public inputs which can affect trusted neural execution."""
     run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
     bounds = _effective_feature_bounds(cfg)
@@ -72,10 +85,13 @@ def _neural_seed_contract(cfg, pins, pcfg):
         run["feature-bounds"] = bounds
     if cfg.get("backbone") is not None:
         run.pop("model", None)
-    return ({
+    config = {
         "run": run,
         "pins": dict(pins),
-    }, seeding.select_config(pcfg, _NEURAL_SEED_PRIVACY_KEYS))
+    }
+    if geometry_n_units is not None:
+        config["resampling-geometry-n-units"] = int(geometry_n_units)
+    return (config, seeding.select_config(pcfg, _NEURAL_SEED_PRIVACY_KEYS))
 
 
 def _reply(msg, arrays, hook_executed=None,
@@ -104,6 +120,7 @@ def _cache_reply(context, claim, arrays, hook_executed=None,
         "message-id": claim["message_id"],
         "release-index": int(claim["release_index"]),
         "operation": str(claim.get("operation", "train")),
+        "fold": int(claim.get("fold", 0)),
     }
     if claim.get("request_id"):
         meta["request-id"] = str(claim["request_id"])
@@ -122,10 +139,12 @@ def _replay_reply(context, claim, msg):
     cached_request = (meta.get("request-id") if meta is not None else None)
     cached_operation = (meta.get("operation", "train")
                         if meta is not None else None)
+    cached_fold = (meta.get("fold", 0) if meta is not None else None)
     exact_request = (
         bool(claim.get("request_id"))
         and cached_request == claim.get("request_id")
         and cached_operation == str(claim.get("operation", "train"))
+        and cached_fold == int(claim.get("fold", 0))
         and meta.get("release-index") == int(claim["release_index"])
     ) if meta is not None else False
     if (meta is not None and arrays is not None
@@ -290,6 +309,23 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
     return model, input_dim, manifest_image
 
 
+def _prepare_neural_evaluation_model(msg, context, cfg, pins):
+    """Load a public fold model without consulting the custodial PRF."""
+    manifest_image = is_image_run(context)
+    cfg_image = str(cfg.get("data-kind", "")).lower() == "image"
+    if manifest_image != cfg_image:
+        raise RuntimeError("cross-validation data-kind does not match its manifest")
+    input_dim = _neural_input_dim(context, cfg, manifest_image)
+    # Initial values are overwritten by the complete public ArrayRecord. A fixed
+    # public seed keeps construction deterministic without making accumulation a
+    # privacy-randomness operation.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = load_user_model(cfg, input_dim, pins["loss_name"])
+    _validate_public_neural_arrays(msg.content["arrays"], model)
+    return model, input_dim, manifest_image
+
+
 def _assert_finite_private_inputs(X, y):
     """Fail closed before non-finite values can invalidate gradient clipping."""
     if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
@@ -387,7 +423,8 @@ def _scheduled_learning_rate(pins, global_epoch):
     return float(value)
 
 
-def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
+def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master,
+            geometry_n_units=None):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
@@ -414,9 +451,9 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
                             _prep_target(y, loss_name, int(pins["n_classes"])))
     # Anti-shrink: the manifest n_samples is the server-recorded count of the STAGED
     # (pre-pool) frame; assert it matches so the client can't shrink the accountant
-    # denominator. The accountant below uses len(dataset) (POST-pool = per-patient DP
-    # unit), the correct DP n; n_staged is pre-pool and equals the manifest, so legit
-    # per-patient pooling (which reduces len(dataset)) does not trip this check.
+    # denominator. n_staged is pre-pool and equals the manifest, so legitimate
+    # per-patient pooling does not trip this check. Resampling separately pins the
+    # mechanism geometry to the manifest's total privacy-unit census.
     if pcfg.get("n_samples") and int(pcfg["n_samples"]) != int(n_staged):
         raise RuntimeError("staged sample count != manifest n_samples (fail closed)")
     # This loader pins the horizon only. The harness replaces it with independent
@@ -426,7 +463,8 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master):
         model, optimizer, trainloader,
         clipping_norm=pcfg["clipping_norm"], epsilon=pcfg["epsilon"],
         delta=pcfg["delta"], local_epochs=local_epochs, num_rounds=num_rounds,
-        n_samples=len(dataset), batch_size=batch_size,
+        n_samples=(len(dataset) if geometry_n_units is None
+                   else int(geometry_n_units)), batch_size=batch_size,
         secure_noise_rng=seeding.np_rng(seeding.sub_seed(master, "noise")),
         secure_sampling_rng=seeding.np_rng(seeding.sub_seed(master, "sample")))
     round_index = int(pins.get("round_index", 0))
@@ -612,12 +650,27 @@ def _apply_feature_bounds(X, cfg):
     return _totalize_private_features(X)
 
 
-def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
+def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
+                  cv_fold=None):
     n_classes = int(pins["n_classes"])
     has_holdout = cfg.get("resampling-contract-sha256") is not None
-    if has_holdout and manifest_image:
+    has_cv = cfg.get("cv-contract-sha256") is not None
+    if has_holdout and has_cv:
+        raise RuntimeError("holdout and cross-validation cannot be combined")
+    if (has_holdout or has_cv) and manifest_image:
         raise RuntimeError(
-            "atomic holdout currently supports tabular neural data only")
+            "resampling currently supports tabular neural data only")
+    if has_cv != (cv_fold is not None):
+        raise RuntimeError("cross-validation fold coordinate is unavailable")
+    geometry_n_units = None
+    resampling_manifest = None
+    if has_holdout or has_cv:
+        resampling_manifest = task_module._load_manifest(context)
+        geometry_n_units = task_module.pinned_unit_count_from_manifest(
+            resampling_manifest)
+        if geometry_n_units < 1:
+            raise ValueError(
+                "resampling requires a positive pinned privacy-unit count")
 
     if manifest_image:
         from . import vision
@@ -638,10 +691,13 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
         groups = load_tabular_patient_ids(context)
 
     task_module.assert_pinned_unit_count(
-        context, len(y), patient_ids=groups)
+        context, len(y), patient_ids=groups, manifest=resampling_manifest)
     if has_holdout:
         X, y, groups = _holdout_partition(
             context, X, y, groups, subset="train")
+    elif has_cv:
+        X, y, groups = _cross_validation_partition(
+            context, X, y, groups, fold=int(cv_fold), subset="train")
     if not manifest_image:
         X = _apply_feature_bounds(X, cfg)
     X = _totalize_private_features(X)
@@ -658,14 +714,17 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image):
         seed_target = np.asarray(y, dtype=np.int64)
     else:
         seed_target = np.asarray(y, dtype=np.float32)
-    seed_config, seed_privacy = _neural_seed_contract(cfg, pins, pcfg)
+    seed_config, seed_privacy = _neural_seed_contract(
+        cfg, pins, pcfg, geometry_n_units=geometry_n_units)
     master = seeding.master_seed(
         "neural-dpsgd/v1", seed_config, seed_privacy,
         int(pins["round_index"]),
         public_arrays=get_torch_params(model),
         private_arrays=(np.asarray(X, dtype=np.float32), seed_target))
 
-    return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master)
+    return _dp_fit(
+        model, X, y, pcfg, pins, n_staged, cfg, master=master,
+        geometry_n_units=geometry_n_units)
 
 
 def _holdout_partition(context, X, y, unit_ids, *, subset):
@@ -684,6 +743,168 @@ def _holdout_partition(context, X, y, unit_ids, *, subset):
     selected_units = (None if unit_ids is None
                       else np.asarray(unit_ids)[selected])
     return values[selected], target[selected], selected_units
+
+
+def _cross_validation_partition(context, X, y, unit_ids, *, fold, subset):
+    """Select one HMAC-assigned fold side before any model computation."""
+    if subset not in ("train", "test"):
+        raise ValueError("cross-validation subset must be train or test")
+    values = np.asarray(X)
+    target = np.asarray(y)
+    if values.ndim < 1 or target.ndim < 1 or values.shape[0] != target.shape[0]:
+        raise RuntimeError("cross-validation inputs must share one row axis")
+    assigned = resampling.cross_validation_folds_from_context(
+        context, n_rows=int(target.shape[0]), unit_ids=unit_ids)
+    fold = int(fold)
+    selected = assigned == fold
+    if subset == "train":
+        selected = ~selected
+    if not bool(np.any(selected)):
+        raise RuntimeError("cross-validation partition is unavailable")
+    selected_units = (None if unit_ids is None
+                      else np.asarray(unit_ids)[selected])
+    return values[selected], target[selected], selected_units
+
+
+def _cv_state_binding(context, layout):
+    manifest = task_module._load_manifest(context)
+    contract = resampling.cross_validation_contract_from_manifest(manifest)
+    job_hash = manifest.get("cv-job-sha256")
+    if (not isinstance(job_hash, str) or len(job_hash) != 64
+            or any(value not in "0123456789abcdef" for value in job_hash)):
+        raise RuntimeError("cross-validation manifest has no public job pin")
+    effective = validation._effective_validation_layout(layout)
+    layout_wire = json.dumps(
+        effective, allow_nan=False, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return {
+        "version": "dsflower-cv-oof-state-v1",
+        "cv-job-sha256": job_hash,
+        "cv-contract-sha256": contract["sha256"],
+        "folds": int(contract["folds"]),
+        "layout-sha256": hashlib.sha256(layout_wire).hexdigest(),
+        "size": int(effective["size"]),
+    }
+
+
+def _cv_vector_sha256(value):
+    return hashlib.sha256(
+        np.ascontiguousarray(value, dtype="<f8").tobytes(order="C")).hexdigest()
+
+
+def _read_cv_state(context, binding, layout):
+    meta = context.state.get(_CV_OOF_META_KEY)
+    arrays = context.state.get(_CV_OOF_TOTAL_KEY)
+    if meta is None and arrays is None:
+        return None
+    if not isinstance(meta, ConfigRecord) or not isinstance(arrays, ArrayRecord):
+        raise RuntimeError("cross-validation OOF state is incomplete")
+    expected_fields = set(binding) | {"fold-digests", "total-sha256"}
+    if set(meta.keys()) != expected_fields or any(
+            meta.get(key) != value for key, value in binding.items()):
+        raise RuntimeError("cross-validation OOF state binding changed")
+    digests = meta.get("fold-digests")
+    total_digest = meta.get("total-sha256")
+    if (not isinstance(digests, list) or not digests
+            or len(digests) > binding["folds"]
+            or any(not isinstance(value, str) or len(value) != 64
+                   or any(char not in "0123456789abcdef" for char in value)
+                   for value in digests)
+            or not isinstance(total_digest, str) or len(total_digest) != 64):
+        raise RuntimeError("cross-validation OOF state metadata is invalid")
+    values = arrays.to_numpy_ndarrays()
+    if len(values) != 1:
+        raise RuntimeError("cross-validation OOF state geometry changed")
+    total = validation._canonical_sufficient_vector(values[0], layout)
+    if _cv_vector_sha256(total) != total_digest:
+        raise RuntimeError("cross-validation OOF state digest changed")
+    return list(digests), total
+
+
+def _store_cv_sufficient(context, fold, raw, layout):
+    binding = _cv_state_binding(context, layout)
+    folds = binding["folds"]
+    fold = int(fold)
+    canonical = validation._canonical_sufficient_vector(raw, layout)
+    digest = _cv_vector_sha256(canonical)
+    state = _read_cv_state(context, binding, layout)
+    if state is None:
+        if fold != 1:
+            raise RuntimeError("cross-validation folds must accumulate in order")
+        digests = []
+        total = np.zeros_like(canonical)
+    else:
+        digests, total = state
+        if fold <= len(digests):
+            if digests[fold - 1] != digest:
+                raise RuntimeError("cross-validation fold replay changed")
+            return
+        if fold != len(digests) + 1:
+            raise RuntimeError("cross-validation folds must accumulate in order")
+    if not 1 <= fold <= folds:
+        raise RuntimeError("cross-validation fold is outside its contract")
+    total = np.asarray(total, dtype=np.float64) + canonical
+    if not bool(np.all(np.isfinite(total))):
+        raise RuntimeError("cross-validation sufficient statistics overflowed")
+    total = validation._canonical_sufficient_vector(total, layout)
+    digests.append(digest)
+    context.state[_CV_OOF_TOTAL_KEY] = ArrayRecord(
+        numpy_ndarrays=[total])
+    context.state[_CV_OOF_META_KEY] = ConfigRecord({
+        **binding,
+        "fold-digests": digests,
+        "total-sha256": _cv_vector_sha256(total),
+    })
+
+
+def _load_complete_cv_sufficient(context, layout):
+    binding = _cv_state_binding(context, layout)
+    state = _read_cv_state(context, binding, layout)
+    if state is None or len(state[0]) != binding["folds"]:
+        raise RuntimeError("cross-validation OOF accumulation is incomplete")
+    return validation._canonical_sufficient_vector(state[1].copy(), layout)
+
+
+def _forget_cv_sufficient(context):
+    context.state.pop(_CV_OOF_META_KEY, None)
+    context.state.pop(_CV_OOF_TOTAL_KEY, None)
+
+
+def _cross_validation_neural_accumulate(context, cfg, pins, model,
+                                        input_dim, fold):
+    """Evaluate one held-out fold and retain only its raw vector in node RAM."""
+    if is_image_run(context):
+        raise RuntimeError("cross-validation supports tabular neural data only")
+    X, y = load_data(context)
+    if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
+        raise RuntimeError("staged feature width changed before CV evaluation")
+    unit_ids = load_tabular_patient_ids(context)
+    task_module.assert_pinned_unit_count(
+        context, len(y), patient_ids=unit_ids)
+    X, y, unit_ids = _cross_validation_partition(
+        context, X, y, unit_ids, fold=int(fold), subset="test")
+    X = _apply_feature_bounds(X, cfg)
+    layout = validation.cross_validation_layout_from_config(cfg)
+    predictions = validation.neural_predictions(model, X, pins["loss_name"])
+    bounds = (validation.cross_validation_target_bounds_from_config(cfg)
+              if layout["task"] in ("regression", "count") else None)
+    raw = validation.validation_sufficient_vector(
+        y, predictions, layout, target_bounds=bounds, unit_ids=unit_ids)
+    _store_cv_sufficient(context, int(fold), raw, layout)
+    return [np.zeros(1, dtype=np.float64)]
+
+
+def _cross_validation_release(context, cfg, pcfg):
+    """Apply the sole OOF Gaussian release and consume its in-memory state."""
+    layout = validation.cross_validation_layout_from_config(cfg)
+    try:
+        raw = _load_complete_cv_sufficient(context, layout)
+        released, _sigma = validation.private_sufficient_vector(
+            raw, layout, epsilon=pcfg["epsilon"], delta=pcfg["delta"],
+            num_releases=1)
+        return [released.astype(np.float64)]
+    finally:
+        _forget_cv_sufficient(context)
 
 
 def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim):
@@ -748,13 +969,18 @@ def _safe_fallback_reply(msg, context, claim=None, track=None,
             track = load_dp_track(context)
         except Exception:
             pass
-    arrays = _safe_public_fallback_arrays(msg, context, track)
+    if (claim is not None
+            and str(claim.get("operation", "")).startswith("cv-")):
+        arrays = [np.zeros(1, dtype=np.float64)]
+    else:
+        arrays = _safe_public_fallback_arrays(msg, context, track)
     # Once a private release path has been entered, keep success/failure
     # data-independent: a public unchanged model is still a valid no-release
     # Hook round.  Only the explicit pre-private readiness gate reports FALSE.
     hook_status = ((True if hook_executed is None else bool(hook_executed))
                    if track == "egress" else None)
-    if (claim is not None and claim.get("status") == "new"
+    if (claim is not None and _reply_cache_allowed(claim)
+            and claim.get("status") == "new"
             and claim.get("release_index") is not None):
         try:
             _cache_reply(
@@ -815,7 +1041,37 @@ def train(msg: Message, context: Context) -> Message:
         # its fixed policy and returns those exact per-training values.
         pcfg["epsilon"] = float(claim["epsilon"])
         pcfg["delta"] = float(claim["delta"])
-        if claim.get("operation", "train") == "holdout-evaluate":
+        operation = claim.get("operation", "train")
+        if operation == "cv-abort":
+            if track != "neural":
+                raise RuntimeError("cross-validation abort requires the neural track")
+            _forget_cv_sufficient(context)
+            new_arrays = [np.zeros(1, dtype=np.float64)]
+        elif operation == "cv-release":
+            if track != "neural":
+                raise RuntimeError("cross-validation release requires the neural track")
+            mark_private_started()
+            new_arrays = _cross_validation_release(context, cfg, pcfg)
+        elif operation == "cv-accumulate":
+            if track != "neural":
+                raise RuntimeError(
+                    "cross-validation accumulation requires the neural track")
+            pins = dict(load_run_pins(context))
+            if int(pins["num_rounds"]) != int(claim["num_rounds"]):
+                raise RuntimeError(
+                    "neural calibration horizon does not match release guard")
+            pins["round_index"] = int(pins["num_rounds"])
+            pins["fold_index"] = int(claim["fold"])
+            pins["operation"] = "cv-accumulate"
+            model, input_dim, manifest_image = _prepare_neural_evaluation_model(
+                msg, context, cfg, pins)
+            if manifest_image:
+                raise RuntimeError(
+                    "cross-validation supports tabular neural data only")
+            mark_private_started()
+            new_arrays = _cross_validation_neural_accumulate(
+                context, cfg, pins, model, input_dim, int(claim["fold"]))
+        elif operation == "holdout-evaluate":
             if track != "neural":
                 raise RuntimeError("holdout evaluation requires the neural track")
             pins = dict(load_run_pins(context))
@@ -888,20 +1144,28 @@ def train(msg: Message, context: Context) -> Message:
             finally:
                 tier2_lib.pad_hook_release(hook_started, pcfg_round)
         else:  # neural (tabular or image)
+            if operation not in ("train", "cv-train"):
+                raise RuntimeError("unsupported neural release operation")
             pins = load_run_pins(context)
             if int(pins["num_rounds"]) != int(claim["num_rounds"]):
                 raise RuntimeError(
                     "neural calibration horizon does not match release guard")
             pins = dict(pins)
             pins["round_index"] = int(claim["release_index"])
+            if operation == "cv-train":
+                pins["fold_index"] = int(claim["fold"])
+                pins["operation"] = "cv-train"
             model, input_dim, manifest_image = _prepare_neural_model(
                 msg, context, cfg, pcfg, pins)
             mark_private_started()
             new_arrays, _n = _train_neural(
-                context, cfg, pcfg, pins, model, input_dim, manifest_image)
+                context, cfg, pcfg, pins, model, input_dim, manifest_image,
+                cv_fold=(int(claim["fold"])
+                         if operation == "cv-train" else None))
 
         hook_status = True if track == "egress" else None
-        _cache_reply(context, claim, new_arrays, hook_executed=hook_status)
+        if _reply_cache_allowed(claim):
+            _cache_reply(context, claim, new_arrays, hook_executed=hook_status)
         return _reply(msg, new_arrays, hook_executed=hook_status)
     except Exception:
         # Flower serializes uncaught exception strings into Error.reason. Those

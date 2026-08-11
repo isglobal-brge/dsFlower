@@ -21,7 +21,7 @@ FLOWER_APP = os.path.join(TESTS, "..", "..", "flower_app")
 sys.path.insert(0, TESTS)
 sys.path.insert(0, FLOWER_APP)
 
-from dsflower_runner import native_tree_request, task, xgboost_predictor
+from dsflower_runner import native_tree_engine, native_tree_request, task
 from dsflower_runner import native_tree_validation_client_app as client_app
 from dsflower_runner import native_tree_validation_server_app as server_app
 
@@ -256,7 +256,7 @@ class NativeTreeValidationClientTests(unittest.TestCase):
                 node_config={"manifest-dir": root}, run_config=cfg)
             message = server_app._request_messages((1,), cfg, artifact)[0]
             events = []
-            original_parse = xgboost_predictor.parse_xgboost_ensemble
+            original_parse = native_tree_engine.parse_ensemble
             original_load = task.load_native_tree_data
 
             def parsed(*args, **kwargs):
@@ -268,7 +268,7 @@ class NativeTreeValidationClientTests(unittest.TestCase):
                 return original_load(*args, **kwargs)
 
             with (mock.patch.object(
-                    client_app.xgboost_predictor, "parse_xgboost_ensemble",
+                    client_app.native_tree_engine, "parse_ensemble",
                     side_effect=parsed),
                   mock.patch.object(
                     task, "load_native_tree_data", side_effect=loaded),
