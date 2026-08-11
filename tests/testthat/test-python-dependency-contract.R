@@ -99,6 +99,15 @@ test_that("venv and pinned uv paths are portable to Windows", {
   )
 })
 
+test_that("runtime venv root honors the documented environment precedence", {
+  environment_root <- file.path(tempdir(), "dsflower-env-venvs")
+  option_root <- file.path(tempdir(), "dsflower-option-venvs")
+  withr::local_envvar(DSFLOWER_VENV_ROOT = environment_root)
+  withr::local_options(dsflower.venv_root = option_root)
+
+  expect_identical(dsFlower:::.venv_root(), environment_root)
+})
+
 test_that("venv metadata discovery accepts Unix and Windows layouts", {
   root <- withr::local_tempdir()
   unix <- file.path(root, "lib", "python3.11", "site-packages")
