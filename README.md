@@ -103,10 +103,8 @@ a clean install: a custodian must separately build, verify and configure the
 platform-specific curated bundle. The installer does not compile or download
 that native trust artifact implicitly.
 
-Private validation loads an already public declarative or sanitized native-tree
-model before opening the staged validation frame. The current validation track
-accepts tabular neural and native-tree artifacts; vision validation is not yet
-implemented and fails explicitly.
+Private validation loads an already public declarative, first-party vision or
+sanitized native-tree model before opening the staged validation data.
 Each row or configured patient contributes one bounded
 histogram/sufficient-statistic vector. The node releases its sum once through the
 Gaussian mechanism; exact predictions, labels, counts and per-node metrics never
@@ -118,6 +116,11 @@ not relabel reuse as cross-validation.
 If any expected node does not provide the fixed private release, the pooled
 artifact reports `available=false` and omits metrics. It never substitutes exact
 or zero-filled metrics, and this does not introduce a query-count lockout.
+
+Atomic tabular holdout is available for neural and native-tree training. Nodes
+derive the same secret-keyed row/patient split before training, spend the fixed
+80/20 job budget on training and one pooled test release, and publish the model
+plus metrics only after the exact roster completes both phases.
 
 ## Per-training privacy
 

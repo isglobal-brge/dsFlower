@@ -69,14 +69,14 @@
          if (length(detail)) paste0(" (", paste(detail, collapse = "; "), ")") else "",
          ".", call. = FALSE)
   }
-  if (!identical(track, "neural")) {
-    stop("Atomic holdout is currently implemented only for the neural track.",
+  if (!track %in% c("neural", "native_tree")) {
+    stop("Atomic holdout is implemented only for neural and native_tree tracks.",
          call. = FALSE)
   }
   requested_type <- tolower(as.character(unlist(
     run_config[["data_type"]] %||% "tabular", use.names = FALSE)))
   if (length(requested_type) != 1L || !identical(requested_type, "tabular")) {
-    stop("Atomic neural holdout currently supports tabular data only.",
+    stop("Atomic holdout supports tabular data only.",
          call. = FALSE)
   }
 

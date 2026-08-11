@@ -199,6 +199,26 @@ def _exercise_task(work, task, client_app, server_app, native_tree_engine,
     if first != replay:
         raise AssertionError("native semantic replay was not byte-identical")
 
+    empty_node = work / (task + "-empty-node")
+    _write_node(empty_node, task, request_b64, request_sha256, [])
+    empty_context = _context(empty_node, request_b64, request_sha256)
+    empty_first = _single_release(
+        client_app, server_app, empty_context, request_b64, request_sha256)
+    empty_replay = _single_release(
+        client_app, server_app, empty_context, request_b64, request_sha256)
+    if empty_first != empty_replay:
+        raise AssertionError("empty native release was not byte-identical")
+    public_manifest = native_tree_request.public_backend_manifest(request)
+    empty_ensemble, empty_digest = native_tree_engine.build_ensemble(
+        public_manifest, [empty_first])
+    if hashlib.sha256(empty_ensemble).hexdigest() != empty_digest:
+        raise AssertionError("empty native ensemble digest is inconsistent")
+    empty_predictions = native_tree_engine.parse_ensemble(
+        public_manifest, empty_ensemble).predict([[20.0, -0.5]])
+    if len(empty_predictions) != 1 or not math.isfinite(
+            empty_predictions[0]):
+        raise AssertionError("empty native ensemble prediction is invalid")
+
     if equivalent_rows is not None:
         _write_node(
             node_one, task, request_b64, request_sha256, equivalent_rows)

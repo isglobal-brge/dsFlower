@@ -27,5 +27,6 @@ Flower capabilities including Python version, the hash-pinned declarative
 runner vocabulary, and disclosure settings. The response is independent of
 cohort contents, handle state, and other sessions, and does not disclose
 filesystem paths. Native-tree and association availability are probed only
-when explicitly requested.
+when explicitly requested. Resampling advertises atomic tabular holdout for
+exactly the neural and native-tree tracks.
 }

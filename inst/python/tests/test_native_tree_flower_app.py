@@ -24,7 +24,8 @@ from dsflower_runner import native_tree_client_app as client_app  # noqa: E402
 from dsflower_runner import native_tree_engine  # noqa: E402
 from dsflower_runner import native_tree_request  # noqa: E402
 from dsflower_runner import native_tree_server_app as server_app  # noqa: E402
-from dsflower_runner import seeding, task, xgboost_predictor  # noqa: E402
+from dsflower_runner import (resampling, seeding, task, validation,
+                             xgboost_predictor)  # noqa: E402
 
 
 def _canonical(value):
@@ -74,6 +75,25 @@ def _request_wire():
             "timeout_seconds": 900,
         },
     }
+    raw = _canonical(request)
+    return (request, base64.b64encode(raw).decode("ascii"),
+            hashlib.sha256(raw).hexdigest())
+
+
+def _regression_request_wire():
+    request, _request_b64, _request_sha256 = _request_wire()
+    request = json.loads(json.dumps(request))
+    core = {
+        key: value for key, value in request["public_schema"].items()
+        if key != "sha256"
+    }
+    core["target"] = {
+        "name": "outcome", "kind": "continuous", "levels": None,
+        "lower": -10.0, "upper": 10.0,
+    }
+    request["task"] = "regression"
+    request["public_schema"] = dict(
+        core, sha256=hashlib.sha256(_canonical(core)).hexdigest())
     raw = _canonical(request)
     return (request, base64.b64encode(raw).decode("ascii"),
             hashlib.sha256(raw).hexdigest())
@@ -133,8 +153,8 @@ def _native_artifact(leaf=0.1):
     return _canonical(model)
 
 
-def _node_manifest(request_b64, request_sha256):
-    return {
+def _node_manifest(request_b64, request_sha256, holdout=None):
+    value = {
         "data_type": "tabular", "data_file": "train.csv",
         "data_format": "csv", "dp-track": "native_tree",
         "num-server-rounds": 1, "target-preencoded": True,
@@ -150,24 +170,45 @@ def _node_manifest(request_b64, request_sha256):
         "native-tree-request-b64": request_b64,
         "native-tree-request-sha256": request_sha256,
     }
+    if holdout is not None:
+        value.update(resampling.manifest_fields(holdout))
+        value.update({
+            "holdout-validation-bins": 4,
+            "privacy-training-epsilon": 0.8,
+            "privacy-training-delta": 8.0e-7,
+            "privacy-holdout-epsilon": 0.2,
+            "privacy-holdout-delta": 2.0e-7,
+            "run_token": "run_" + "1" * 32,
+        })
+    return value
 
 
-def _run_config(request_b64, request_sha256, results_dir=None, nodes=2):
-    return {
+def _run_config(request_b64, request_sha256, results_dir=None, nodes=2,
+                holdout=None):
+    value = {
         "dp-track": "native_tree", "num-server-rounds": 1,
         "min-train-nodes": nodes,
         "native-tree-request-b64": request_b64,
         "native-tree-request-sha256": request_sha256,
         **({"results-dir": results_dir} if results_dir is not None else {}),
     }
+    if holdout is not None:
+        value.update({
+            **resampling.manifest_fields(holdout),
+            "holdout-validation-bins": 4,
+        })
+    return value
 
 
-def _request_message(node_id, request_b64, request_sha256):
+def _request_message(node_id, request_b64, request_sha256, holdout=None):
     return Message(content=RecordDict({
         "config": ConfigRecord({
+            "dsflower-operation": "train",
             "native-tree-request-b64": request_b64,
             "native-tree-request-sha256": request_sha256,
             "server-round": 1,
+            **({"resampling-contract-sha256": holdout["sha256"]}
+               if holdout is not None else {}),
         }),
     }), message_type="train", dst_node_id=node_id)
 
@@ -214,6 +255,7 @@ class NativeTreeClientTests(unittest.TestCase):
             node_config={"manifest-dir": self.root.name},
             run_config=_run_config(
                 self.request_b64, self.request_sha256, nodes=2),
+            state=RecordDict(),
         )
 
     def tearDown(self):
@@ -312,7 +354,140 @@ class NativeTreeClientTests(unittest.TestCase):
         manifest = _node_manifest(self.request_b64, self.request_sha256)
         manifest["privacy-epsilon"] = True
         with self.assertRaisesRegex(ValueError, "privacy parameters"):
-            client_app._node_privacy(manifest)
+            client_app._node_privacy(manifest, self.context, "train")
+
+    def test_holdout_replays_exact_ensemble_and_rejects_a_second_identity(self):
+        holdout = resampling.holdout_contract(500_000, "row")
+        manifest = _node_manifest(
+            self.request_b64, self.request_sha256, holdout=holdout)
+        with open(os.path.join(self.root.name, "manifest.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        self.context.run_config = _run_config(
+            self.request_b64, self.request_sha256, nodes=1,
+            holdout=holdout)
+        holdout_profile = dict(holdout, bins=4)
+        train_message = server_app._request_messages(
+            (1,), self.request_b64, self.request_sha256,
+            holdout=holdout_profile)[0]
+        original_load = task.load_native_tree_data
+
+        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+              mock.patch.object(client_app.xgboost_bundle,
+                                "is_verified_bundle", return_value=True),
+              mock.patch.object(
+                  resampling, "holdout_mask_from_context",
+                  return_value=np.array([False, True])),
+              mock.patch.object(task, "load_native_tree_data",
+                                wraps=original_load) as load,
+              mock.patch.object(client_app.xgboost_adapter,
+                                "prepare_xgboost_training",
+                                return_value=object()),
+              mock.patch.object(client_app.xgboost_adapter,
+                                "train_xgboost_native",
+                                return_value=_native_artifact())):
+            train_reply = client_app.train(train_message, self.context)
+            member = train_reply.content["arrays"].to_numpy_ndarrays()[
+                0].tobytes()
+            public_manifest = native_tree_request.public_backend_manifest(
+                self.request)
+            ensemble, digest = native_tree_engine.build_ensemble(
+                public_manifest, [member])
+            evaluate = server_app._evaluation_messages(
+                (1,), self.request, self.request_b64, self.request_sha256,
+                holdout_profile, ensemble, digest)[0]
+
+            def deterministic_release(y, predictions, layout, **kwargs):
+                return (validation.validation_sufficient_vector(
+                    y, predictions, layout,
+                    target_bounds=kwargs.get("target_bounds"),
+                    unit_ids=kwargs.get("unit_ids")), 0.0)
+
+            with mock.patch.object(
+                    validation, "private_validation_vector",
+                    side_effect=deterministic_release) as release:
+                first = client_app.train(evaluate, self.context)
+                replay = client_app.train(evaluate, self.context)
+                changed, changed_digest = native_tree_engine.build_ensemble(
+                    public_manifest, [_native_artifact(0.2)])
+                changed_message = server_app._evaluation_messages(
+                    (1,), self.request, self.request_b64,
+                    self.request_sha256, holdout_profile, changed,
+                    changed_digest)[0]
+                rejected = client_app.train(changed_message, self.context)
+                bad_nodes = server_app._evaluation_messages(
+                    (1,), self.request, self.request_b64,
+                    self.request_sha256, holdout_profile, ensemble, digest)[0]
+                bad_nodes.content["config"]["native-tree-n-nodes"] = 2
+                rejected_nodes = client_app.train(bad_nodes, self.context)
+                bad_bins = server_app._evaluation_messages(
+                    (1,), self.request, self.request_b64,
+                    self.request_sha256, dict(holdout, bins=5),
+                    ensemble, digest)[0]
+                rejected_bins = client_app.train(bad_bins, self.context)
+
+        self.assertEqual(release.call_count, 1)
+        self.assertEqual(load.call_count, 2)
+        self.assertEqual(dict(first.content["metrics"])["available"], 1)
+        self.assertEqual(
+            first.content["arrays"].to_numpy_ndarrays()[0].tobytes(),
+            replay.content["arrays"].to_numpy_ndarrays()[0].tobytes())
+        self.assertEqual(dict(rejected.content["metrics"]), {
+            "available": 0, "num-examples": 1})
+        self.assertEqual(dict(rejected_nodes.content["metrics"]), {
+            "available": 0, "num-examples": 1})
+        self.assertEqual(dict(rejected_bins.content["metrics"]), {
+            "available": 0, "num-examples": 1})
+
+    def test_empty_holdout_is_one_fixed_noise_only_vector(self):
+        holdout = resampling.holdout_contract(500_000, "patient")
+        manifest = _node_manifest(
+            self.request_b64, self.request_sha256, holdout=holdout)
+        manifest["dp-unit"] = "patient"
+        with open(os.path.join(self.root.name, "manifest.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        self.context.run_config = _run_config(
+            self.request_b64, self.request_sha256, nodes=1,
+            holdout=holdout)
+        member = _native_artifact()
+        client_app._mark_training_complete(
+            self.context, self.request, manifest, member)
+        public_manifest = native_tree_request.public_backend_manifest(
+            self.request)
+        ensemble, digest = native_tree_engine.build_ensemble(
+            public_manifest, [member])
+        evaluate = server_app._evaluation_messages(
+            (1,), self.request, self.request_b64, self.request_sha256,
+            dict(holdout, bins=4), ensemble, digest)[0]
+        layout = validation.validation_layout(
+            "classification", n_classes=2, bins=4)
+        expected = np.arange(layout["size"], dtype=np.float64)
+        with (mock.patch.object(
+                  task, "load_native_tree_data", return_value=(
+                      np.asarray([[20.0, -0.5], [60.0, 0.5]]),
+                      np.asarray([0, 1]), np.asarray(["p0", "p1"]))),
+              mock.patch.object(
+                  resampling, "holdout_mask_from_context",
+                  return_value=np.array([False, False])),
+              mock.patch.object(
+                  validation, "private_sufficient_vector",
+                  return_value=(expected, 1.0)) as noise_only,
+              mock.patch.object(
+                  validation, "private_validation_vector",
+                  side_effect=AssertionError("non-empty path used"))):
+            reply = client_app.train(evaluate, self.context)
+        self.assertEqual(dict(reply.content["metrics"]), {
+            "available": 1, "num-examples": 1})
+        np.testing.assert_array_equal(
+            reply.content["arrays"].to_numpy_ndarrays()[0], expected)
+        noise_only.assert_called_once()
+        np.testing.assert_array_equal(
+            noise_only.call_args.args[0], np.zeros(layout["size"]))
+        self.assertAlmostEqual(noise_only.call_args.kwargs["epsilon"], 0.2)
+        self.assertAlmostEqual(noise_only.call_args.kwargs["delta"], 2.0e-7)
+        self.assertIs(
+            noise_only.call_args.kwargs["include_zero_neighbor"], True)
 
 
 class _EndToEndGrid:
@@ -329,7 +504,67 @@ class _EndToEndGrid:
         return [client_app.train(message, self.context) for message in messages]
 
 
+class _HoldoutGrid:
+    def __init__(self, contexts):
+        self.contexts = contexts
+        self.send_calls = 0
+
+    @staticmethod
+    def get_node_ids():
+        return [11, 22]
+
+    def send_and_receive(self, messages, timeout):
+        self.send_calls += 1
+        return [client_app.train(
+            message, self.contexts[message.metadata.dst_node_id])
+            for message in messages]
+
+
 class NativeTreeServerTests(unittest.TestCase):
+    def test_holdout_vector_wire_is_exact_float64_and_finite(self):
+        _request, request_b64, request_sha256 = _request_wire()
+        message = _request_message(1, request_b64, request_sha256)
+        layout = validation.validation_layout(
+            "classification", n_classes=2, bins=4)
+
+        def reply(value):
+            return Message(content=RecordDict({
+                "arrays": ArrayRecord(numpy_ndarrays=[value]),
+                "metrics": MetricRecord({
+                    "available": 1, "num-examples": 1,
+                }),
+            }), reply_to=message)
+
+        vector = np.arange(layout["size"], dtype=np.float64)
+        np.testing.assert_array_equal(
+            server_app._vector_from_reply(reply(vector), layout), vector)
+        with self.assertRaisesRegex(RuntimeError, "invalid geometry"):
+            server_app._vector_from_reply(
+                reply(vector.astype(np.float32)), layout)
+        invalid = vector.copy()
+        invalid[0] = np.nan
+        with self.assertRaisesRegex(RuntimeError, "invalid geometry"):
+            server_app._vector_from_reply(reply(invalid), layout)
+
+    def test_regression_holdout_requires_exact_public_target_bounds(self):
+        request, request_b64, request_sha256 = _regression_request_wire()
+        holdout = resampling.holdout_contract(500_000, "row")
+        config = _run_config(
+            request_b64, request_sha256, "/tmp/results", nodes=2,
+            holdout=holdout)
+        config.update({
+            "holdout-target-lower": -10.0,
+            "holdout-target-upper": 10.0,
+        })
+        parsed = server_app._run_contract(config)
+        self.assertEqual(parsed[0], request)
+        self.assertEqual(parsed[4]["sha256"], holdout["sha256"])
+        self.assertEqual(
+            server_app._holdout_layout(request, 4)["task"], "regression")
+        changed = dict(config, **{"holdout-target-lower": -9.0})
+        with self.assertRaisesRegex(ValueError, "bounds differ"):
+            server_app._run_contract(changed)
+
     def test_exact_roster_rejects_extra_and_duplicate_replies(self):
         class ExtraGrid:
             @staticmethod
@@ -490,6 +725,133 @@ class NativeTreeServerTests(unittest.TestCase):
                 artifact, public_manifest)
             self.assertEqual(predictor.num_models, 2)
             self.assertEqual(len(predictor.predict([[20.0, 0.0]])), 1)
+
+    def test_atomic_holdout_trains_only_complement_then_releases_test(self):
+        request, request_b64, request_sha256 = _request_wire()
+        holdout = resampling.holdout_contract(500_000, "row")
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as results_dir:
+            pd.DataFrame({
+                "age": [10.0, 20.0, 60.0, 70.0],
+                "marker": [-1.0, -0.5, 0.5, 1.0],
+                "outcome": [0, 1, 0, 1],
+            }).to_csv(os.path.join(root, "train.csv"), index=False)
+            manifest = _node_manifest(
+                request_b64, request_sha256, holdout=holdout)
+            manifest["n_units"] = 4
+            with open(os.path.join(root, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            cfg = _run_config(
+                request_b64, request_sha256, results_dir, nodes=2,
+                holdout=holdout)
+            contexts = {
+                node_id: SimpleNamespace(
+                    node_config={"manifest-dir": root},
+                    run_config=cfg, state=RecordDict())
+                for node_id in (11, 22)
+            }
+            grid = _HoldoutGrid(contexts)
+            original_load = task.load_native_tree_data
+
+            def deterministic_release(y, predictions, layout, **kwargs):
+                raw = validation.validation_sufficient_vector(
+                    y, predictions, layout,
+                    target_bounds=kwargs.get("target_bounds"),
+                    unit_ids=kwargs.get("unit_ids"))
+                return raw, 0.0
+
+            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+                  mock.patch.object(client_app.xgboost_bundle,
+                                    "is_verified_bundle", return_value=True),
+                  mock.patch.object(
+                      resampling, "holdout_mask_from_context",
+                      return_value=np.array([False, False, True, True])),
+                  mock.patch.object(task, "load_native_tree_data",
+                                    wraps=original_load) as load,
+                  mock.patch.object(client_app.xgboost_adapter,
+                                    "prepare_xgboost_training",
+                                    return_value=object()) as prepare,
+                  mock.patch.object(client_app.xgboost_adapter,
+                                    "train_xgboost_native",
+                                    return_value=_native_artifact()),
+                  mock.patch.object(
+                      validation, "private_validation_vector",
+                      side_effect=deterministic_release) as release):
+                server_app.main(grid, SimpleNamespace(run_config=cfg))
+
+            self.assertEqual(grid.send_calls, 2)
+            self.assertEqual(load.call_count, 4)
+            self.assertEqual(prepare.call_count, 2)
+            for call in prepare.call_args_list:
+                self.assertEqual(call.args[1].shape, (2, 2))
+                self.assertEqual(call.args[2].shape, (2,))
+            self.assertEqual(release.call_count, 2)
+            for call in release.call_args_list:
+                self.assertEqual(call.args[0].shape, (2,))
+                self.assertAlmostEqual(call.kwargs["epsilon"], 0.2)
+                self.assertAlmostEqual(call.kwargs["delta"], 2.0e-7)
+
+            spec = native_tree_engine.release_spec("xgboost")
+            model_path = os.path.join(results_dir, spec["model_file"])
+            with open(model_path, "rb") as handle:
+                ensemble = handle.read()
+            with open(os.path.join(results_dir, "holdout.json"),
+                      encoding="ascii") as handle:
+                released = json.load(handle)
+            with open(os.path.join(results_dir, server_app.HISTORY_FILE),
+                      encoding="ascii") as handle:
+                history = json.load(handle)
+            self.assertEqual(history, [{"available": True, "round": 1}])
+            self.assertEqual(released["method"], "holdout")
+            self.assertEqual(released["n_nodes"], 2)
+            self.assertTrue(released["pooled_only"])
+            self.assertEqual(set(released["provenance"]), {
+                "artifact_sha256", "native_tree_request_sha256",
+                "public_schema_sha256", "resampling_contract_sha256",
+            })
+            self.assertEqual(
+                released["provenance"]["artifact_sha256"],
+                hashlib.sha256(ensemble).hexdigest())
+            self.assertEqual(
+                released["provenance"]["resampling_contract_sha256"],
+                holdout["sha256"])
+
+    def test_holdout_phase_failure_publishes_no_partial_model(self):
+        request, request_b64, request_sha256 = _request_wire()
+        holdout = resampling.holdout_contract(500_000, "row")
+        with tempfile.TemporaryDirectory() as results_dir:
+            cfg = _run_config(
+                request_b64, request_sha256, results_dir, nodes=2,
+                holdout=holdout)
+
+            class Grid:
+                calls = 0
+
+                @staticmethod
+                def get_node_ids():
+                    return [1, 2]
+
+                @classmethod
+                def send_and_receive(cls, messages, timeout):
+                    cls.calls += 1
+                    if cls.calls == 1:
+                        return [
+                            _release_reply(messages[0], _native_artifact()),
+                            _release_reply(messages[1], _native_artifact(0.2)),
+                        ]
+                    return [_release_reply(messages[0], b"invalid-vector")]
+
+            server_app.main(Grid(), SimpleNamespace(run_config=cfg))
+            spec = native_tree_engine.release_spec("xgboost")
+            for name in (spec["model_file"], spec["profile_file"],
+                         "holdout.json"):
+                self.assertFalse(os.path.exists(os.path.join(
+                    results_dir, name)))
+            with open(os.path.join(results_dir, server_app.HISTORY_FILE),
+                      encoding="ascii") as handle:
+                self.assertEqual(json.load(handle), [{
+                    "available": False, "round": 1}])
 
 
 if __name__ == "__main__":

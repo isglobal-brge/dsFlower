@@ -166,6 +166,7 @@ jobs:
             inst/python/tests/test_holdout.py \
             inst/python/tests/test_epi_association.py \
             inst/python/tests/test_association_flower_app.py \
+            inst.python.tests.test_validation_dp.ValidationSensitivityTests \
             inst.python.tests.test_validation_dp.ValidationReleaseTests \
             inst.python.tests.test_validation_dp.ValidationInferenceTests \
             inst/python/tests/test_sitecustomize.py \

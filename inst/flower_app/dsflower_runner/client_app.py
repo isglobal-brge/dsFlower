@@ -928,9 +928,13 @@ def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim):
     predictions = validation.neural_predictions(model, X, pins["loss_name"])
     bounds = (validation.holdout_target_bounds_from_config(cfg)
               if layout["task"] in ("regression", "count") else None)
+    privacy_unit = cfg.get("resampling-privacy-unit")
+    if privacy_unit not in ("row", "patient"):
+        raise RuntimeError("holdout privacy unit is not pinned")
     released, _sigma = validation.private_validation_vector(
         y, predictions, layout, epsilon=pcfg["epsilon"], delta=pcfg["delta"],
-        target_bounds=bounds, num_releases=1, unit_ids=unit_ids)
+        target_bounds=bounds, num_releases=1, unit_ids=unit_ids,
+        include_zero_neighbor=privacy_unit == "patient")
     return [released.astype(np.float64)]
 
 

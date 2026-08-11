@@ -70,6 +70,37 @@ class ValidationSensitivityTests(unittest.TestCase):
             observed = max(np.linalg.norm(a - b) for a in records for b in records)
             self.assertLessEqual(observed, layout["sensitivity"] + 1e-12)
 
+    def test_patient_holdout_sensitivity_also_bounds_an_absent_unit(self):
+        binary = validation.validation_layout("classification", bins=4)
+        self.assertEqual(
+            validation._validation_release_sensitivity(
+                binary, include_zero_neighbor=True),
+            binary["sensitivity"])
+        expected = {"regression": math.sqrt(5.0), "count": math.sqrt(6.0)}
+        for task, bound in expected.items():
+            with self.subTest(task=task):
+                layout = validation.validation_layout(task)
+                record = validation.validation_contributions(
+                    np.asarray([10.0]), np.asarray([0.0]), layout,
+                    target_bounds=(0.0, 10.0))[0]
+                self.assertGreater(np.linalg.norm(record), layout["sensitivity"])
+                self.assertEqual(
+                    validation._validation_release_sensitivity(
+                        layout, include_zero_neighbor=True),
+                    bound)
+                self.assertLessEqual(np.linalg.norm(record), bound)
+
+    def test_patient_holdout_release_calibrates_to_the_absent_unit_bound(self):
+        layout = validation.validation_layout("regression")
+        with (mock.patch.object(
+                  dp_harness, "compute_output_sigma", return_value=1.0) as sigma,
+              mock.patch.object(
+                  validation, "_validation_noise_key", return_value=b"\x00" * 32)):
+            validation.private_sufficient_vector(
+                np.zeros(layout["size"]), layout, epsilon=1.0, delta=1e-6,
+                include_zero_neighbor=True)
+        self.assertEqual(sigma.call_args.args[2], math.sqrt(5.0))
+
     def test_layout_caps_dimension(self):
         thirty_three = validation.validation_layout(
             "classification", n_classes=33, bins=512)
@@ -343,6 +374,20 @@ class ValidationReleaseTests(unittest.TestCase):
         self.assertEqual(metrics["accuracy"], 1.0)
         self.assertEqual(metrics["roc_auc"], 1.0)
         self.assertLess(metrics["brier"], 0.05)
+
+    def test_noise_only_primary_metrics_are_finite_when_count_projects_to_zero(self):
+        binary = validation.validation_layout("classification", bins=4)
+        binary_metrics = validation.validation_metrics(
+            -np.ones(binary["size"], dtype=np.float64), binary)
+        self.assertTrue(math.isfinite(binary_metrics["accuracy"]))
+
+        regression = validation.validation_layout("regression")
+        regression_metrics = validation.validation_metrics(
+            -np.ones(regression["size"], dtype=np.float64), regression,
+            target_bounds=(0.0, 1.0))
+        for name in ("mae", "mse", "rmse"):
+            with self.subTest(name=name):
+                self.assertTrue(math.isfinite(regression_metrics[name]))
 
     def test_regression_metrics_rescale_to_public_target_domain(self):
         layout = validation.validation_layout("regression")

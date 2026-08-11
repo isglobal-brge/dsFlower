@@ -183,7 +183,9 @@ class NeuralHoldoutTests(unittest.TestCase):
         mask = np.asarray([False, True, False, True, False, True])
         pins = {"loss_name": "bce_logits", "n_classes": 2}
         cfg = {"loss-name": "bce_logits", "task-type": "classification",
-               "num-classes": 2, "holdout-validation-bins": 8}
+               "num-classes": 2, "holdout-validation-bins": 8,
+               "resampling-privacy-unit": "patient"}
+        patient_ids = np.asarray(["a", "b", "c", "d", "e", "f"])
 
         with mock.patch.object(
                 client_app.resampling, "holdout_mask_from_context",
@@ -203,7 +205,7 @@ class NeuralHoldoutTests(unittest.TestCase):
         captured = {}
         with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
               mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=None),
+                                return_value=patient_ids),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
               mock.patch.object(client_app, "_apply_feature_bounds",
                                 side_effect=lambda values, ignored: values),
@@ -217,7 +219,9 @@ class NeuralHoldoutTests(unittest.TestCase):
               mock.patch.object(
                   validation, "private_validation_vector",
                   side_effect=lambda yy, predictions, layout, **kwargs:
-                  (captured.update(y=yy.copy(), predictions=predictions.copy())
+                  (captured.update(y=yy.copy(), predictions=predictions.copy(),
+                                   include_zero_neighbor=kwargs.get(
+                                       "include_zero_neighbor"))
                    or (np.ones(layout["size"]), 1.0)))):
             released = client_app._holdout_neural_release(
                 None, cfg, {"epsilon": 0.4, "delta": 2e-6}, pins,
@@ -225,6 +229,7 @@ class NeuralHoldoutTests(unittest.TestCase):
 
         np.testing.assert_array_equal(captured["y"], y[mask])
         self.assertEqual(len(captured["predictions"]), int(mask.sum()))
+        self.assertIs(captured["include_zero_neighbor"], True)
         self.assertEqual(len(released), 1)
 
     def test_empty_train_and_test_sides_fail_with_one_uniform_outcome(self):
