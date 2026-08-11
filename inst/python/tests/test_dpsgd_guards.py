@@ -136,6 +136,11 @@ class ManifestPrivacyContractTests(unittest.TestCase):
         self.assertEqual(captured["env"]["DSF_RLIMIT_FSIZE"], str(256 * 1024 * 1024))
         self.assertEqual(captured["env"]["DSF_RLIMIT_NPROC"], "16")
         self.assertEqual(captured["env"]["DSF_RLIMIT_CPU"], "7")
+        for name in (
+                "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS",
+                "BLIS_NUM_THREADS"):
+            self.assertEqual(captured["env"][name], "1")
         self.assertEqual(captured["env"]["DSF_DETERMINISTIC_SEED"],
                          (b"c" * 32).hex())
         self.assertEqual(captured["env"]["PYTHONHASHSEED"],

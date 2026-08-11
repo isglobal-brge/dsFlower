@@ -165,7 +165,7 @@ class _Grid:
                 for message in messages]
 
 
-def _exercise_task(work, task, client_app, server_app,
+def _exercise_task(work, task, client_app, server_app, native_tree_engine,
                    native_tree_request, xgboost_predictor):
     request, request_b64, request_sha256 = _request_wire(task)
     if task == "binary":
@@ -215,8 +215,9 @@ def _exercise_task(work, task, client_app, server_app,
         request_b64, request_sha256, results_dir=results, nodes=2)
     grid = _Grid({11: context_one, 22: context_two}, client_app)
     server_app.main(grid, SimpleNamespace(run_config=config))
-    model_path = results / server_app.MODEL_FILE
-    profile_path = results / server_app.PROFILE_FILE
+    spec = native_tree_engine.release_spec(request["engine"])
+    model_path = results / spec["model_file"]
+    profile_path = results / spec["profile_file"]
     history_path = results / server_app.HISTORY_FILE
     artifact = model_path.read_bytes()
     ensemble = json.loads(artifact.decode("ascii"))
@@ -255,6 +256,7 @@ def _child(bundle_root, secret_file, work):
     sys.path.insert(0, str(project_root / "inst" / "flower_app"))
 
     from dsflower_runner import native_tree_client_app as client_app
+    from dsflower_runner import native_tree_engine
     from dsflower_runner import native_tree_request
     from dsflower_runner import native_tree_server_app as server_app
     from dsflower_runner import xgboost_bundle, xgboost_predictor
@@ -266,10 +268,10 @@ def _child(bundle_root, secret_file, work):
             probe.error_code)
     _exercise_task(
         work, "binary", client_app, server_app,
-        native_tree_request, xgboost_predictor)
+        native_tree_engine, native_tree_request, xgboost_predictor)
     _exercise_task(
         work, "regression", client_app, server_app,
-        native_tree_request, xgboost_predictor)
+        native_tree_engine, native_tree_request, xgboost_predictor)
 
 
 def _harden_windows(path):
