@@ -290,6 +290,20 @@ class XGBoostPredictorKnownAnswerTests(unittest.TestCase):
         self.assertAlmostEqual(
             predictions[1], (_sigmoid(0.4) + _sigmoid(-0.1)) / 2.0)
 
+    def test_external_data_only_ensemble_contract_uses_the_same_sanitizer(self):
+        manifest = _manifest()
+        value = json.loads(_ensemble(manifest, [_member()]))
+        value["contract"] = predictor.EXTERNAL_ENSEMBLE_CONTRACT
+        artifact = json.dumps(
+            value, sort_keys=True, separators=(",", ":")).encode("ascii")
+        parsed = predictor.parse_xgboost_ensemble(artifact, manifest)
+        self.assertEqual(parsed.num_models, 1)
+        value["contract"] = "unsupported-external-ensemble"
+        malformed = json.dumps(
+            value, sort_keys=True, separators=(",", ":")).encode("ascii")
+        with self.assertRaisesRegex(ValueError, "ensemble contract"):
+            predictor.parse_xgboost_ensemble(malformed, manifest)
+
     def test_regression_adds_public_base_score_and_uses_default_right(self):
         manifest = _manifest("regression")
         manifest["engine_params"]["num_boost_round"]["value"] = 2
