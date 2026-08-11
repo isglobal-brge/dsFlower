@@ -117,7 +117,8 @@ def backend_manifest(request, *, epsilon, delta, unit,
     """Enrich a public request with trusted, non-public node state."""
     request = _exact(request, _REQUEST_FIELDS, "native-tree request")
     if request["contract"] != REQUEST_CONTRACT or \
-            request["engine"] not in ("xgboost", "extra_trees") or \
+            request["engine"] not in (
+                "xgboost", "extra_trees", "lightgbm", "catboost") or \
             request["mode"] != "native-tight" or \
             request["task"] not in ("binary", "regression"):
         raise ValueError("native-tree request is unsupported")
@@ -136,8 +137,9 @@ def backend_manifest(request, *, epsilon, delta, unit,
         raise ValueError("native-tree public target is invalid")
     task = ("binary_classification" if request["task"] == "binary"
             else "regression")
+    engine = request["engine"]
     if task == "binary_classification":
-        base_score = 0.5
+        base_score = 0.5 if engine == "xgboost" else 0.0
     else:
         lower = target.get("lower")
         upper = target.get("upper")
@@ -145,13 +147,18 @@ def backend_manifest(request, *, epsilon, delta, unit,
                 lower, (int, float)) or not isinstance(upper, (int, float)):
             raise ValueError("native-tree target bounds are invalid")
         base_score = float(lower) + (float(upper) - float(lower)) / 2.0
-    engine = request["engine"]
-    if engine == "xgboost":
+    if engine in ("xgboost", "lightgbm", "catboost"):
         parameters["base_score"] = {
             "type": "float", "value": float(base_score)}
-        parameters["max_bin"] = {
-            "type": "int", "value": max(len(feature) + 1 for feature in cuts),
-        }
+        if engine == "catboost":
+            parameters["border_count"] = {
+                "type": "int", "value": max(len(feature) for feature in cuts),
+            }
+        else:
+            parameters["max_bin"] = {
+                "type": "int",
+                "value": max(len(feature) + 1 for feature in cuts),
+            }
         mechanism = "dp-histogram-v1"
         mechanism_params = {
             "gradient_clip": {

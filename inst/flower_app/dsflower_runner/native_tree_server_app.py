@@ -11,7 +11,7 @@ from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 from flwr.serverapp import Grid, ServerApp
 
-from . import native_tree_request, xgboost_adapter
+from . import native_tree_engine, native_tree_request, xgboost_adapter
 
 
 app = ServerApp()
@@ -41,7 +41,7 @@ def _run_contract(cfg):
     request = native_tree_request.parse_request_wire(
         request_b64, request_sha256)
     manifest = native_tree_request.public_backend_manifest(request)
-    xgboost_adapter.canonical_xgboost_profile(manifest)
+    native_tree_engine.canonical_profile(manifest)
     timeout = cfg.get(
         "round-timeout", request["resources"]["timeout_seconds"])
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or \
@@ -146,19 +146,8 @@ def _canonical_json(value):
 
 def _prediction_profile(request, request_b64, request_sha256,
                         artifact, artifact_sha256):
-    return _canonical_json({
-        "artifact": {
-            "format": xgboost_adapter.ENSEMBLE_FORMAT,
-            "sha256": artifact_sha256,
-            "size_bytes": len(artifact),
-        },
-        "contract": PREDICTION_PROFILE,
-        "native_tree_request_b64": request_b64,
-        "native_tree_request_sha256": request_sha256,
-        "public_schema_sha256": request["public_schema"]["sha256"],
-        "task": request["task"],
-        "version": 1,
-    })
+    return native_tree_engine.build_prediction_profile(
+        request, request_b64, request_sha256, artifact, artifact_sha256)
 
 
 def _atomic_write(path, payload):
@@ -182,10 +171,11 @@ def _save_unavailable(results_dir):
     )
 
 
-def _save_release(results_dir, artifact, profile):
+def _save_release(results_dir, artifact, profile, *, model_file=MODEL_FILE,
+                  profile_file=PROFILE_FILE):
     os.makedirs(results_dir, exist_ok=True)
     paths = [os.path.join(results_dir, name) for name in (
-        MODEL_FILE, PROFILE_FILE, HISTORY_FILE)]
+        model_file, profile_file, HISTORY_FILE)]
     if any(os.path.exists(path) for path in paths):
         raise RuntimeError("native-tree output already exists")
     payloads = [
@@ -214,13 +204,16 @@ def _run_native_tree(grid, cfg):
     artifacts = _collect_artifacts(
         grid, node_ids, request_b64, request_sha256, timeout,
         manifest["resources"]["max_artifact_bytes"])
-    ensemble, artifact_sha256 = xgboost_adapter.build_xgboost_ensemble(
+    ensemble, artifact_sha256 = native_tree_engine.build_ensemble(
         manifest, artifacts)
     if not hashlib.sha256(ensemble).hexdigest() == artifact_sha256:
         raise RuntimeError("native-tree ensemble digest is inconsistent")
     profile = _prediction_profile(
         request, request_b64, request_sha256, ensemble, artifact_sha256)
-    _save_release(results_dir, ensemble, profile)
+    spec = native_tree_engine.release_spec(request["engine"])
+    _save_release(
+        results_dir, ensemble, profile, model_file=spec["model_file"],
+        profile_file=spec["profile_file"])
 
 
 @app.main()

@@ -33,7 +33,8 @@ from flwr.clientapp import ClientApp
 from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 
-from . import native_tree_request, task, xgboost_adapter, xgboost_bundle
+from . import (native_tree_engine, native_tree_request, task, xgboost_adapter,
+               xgboost_bundle)
 
 
 app = ClientApp()
@@ -178,7 +179,7 @@ def _pinned_request(msg, context):
         **{key: privacy[key] for key in (
             "epsilon", "delta", "unit", "unit_canonicalization",
             "gradient_clip")})
-    xgboost_adapter.canonical_xgboost_profile(preflight)
+    native_tree_engine.canonical_profile(preflight)
     return request, manifest, privacy
 
 
@@ -186,7 +187,9 @@ def _pinned_request(msg, context):
 def train(msg: Message, context: Context) -> Message:
     try:
         request, node_manifest, privacy = _pinned_request(msg, context)
-        if not xgboost_bundle.is_verified_bundle(_NATIVE_BUNDLE):
+        engine = request["engine"]
+        if native_tree_engine.requires_xgboost_bundle(engine) and not \
+                xgboost_bundle.is_verified_bundle(_NATIVE_BUNDLE):
             return _unavailable_reply(msg)
         features, target, unit_ids = task.load_native_tree_data(
             context, manifest=node_manifest)
@@ -200,12 +203,17 @@ def train(msg: Message, context: Context) -> Message:
             **{key: privacy[key] for key in (
                 "epsilon", "delta", "unit", "unit_canonicalization",
                 "gradient_clip")})
-        prepared = xgboost_adapter.prepare_xgboost_training(
-            manifest, features, target, native_bundle=_NATIVE_BUNDLE,
-            unit_ids=unit_ids)
-        native_artifact = xgboost_adapter.train_xgboost_native(prepared)
-        artifact, _digest = xgboost_adapter.sanitize_xgboost_artifact(
-            manifest, native_artifact)
+        if engine == "xgboost":
+            # Preserve the verified native-bundle path byte-for-byte in scope.
+            prepared = xgboost_adapter.prepare_xgboost_training(
+                manifest, features, target, native_bundle=_NATIVE_BUNDLE,
+                unit_ids=unit_ids)
+            native_artifact = xgboost_adapter.train_xgboost_native(prepared)
+            artifact, _digest = xgboost_adapter.sanitize_xgboost_artifact(
+                manifest, native_artifact)
+        else:
+            artifact = native_tree_engine.train_model(
+                manifest, features, target, unit_ids=unit_ids)
         return _reply(msg, artifact, True)
     except Exception:
         # Never expose paths, native diagnostics, private counts or exceptions.
