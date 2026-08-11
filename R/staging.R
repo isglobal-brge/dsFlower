@@ -506,8 +506,8 @@
     if (isTRUE(create_roots)) {
       dir.create(root, recursive = TRUE, showWarnings = FALSE)
     }
-    if (.path_is_symlink(root)) {
-      stop("The dsFlower staging root must not be a symbolic link.",
+    if (.privacy_path_is_link(root)) {
+      stop("The dsFlower staging root must not be a link or reparse point.",
            call. = FALSE)
     }
     if (dir.exists(root)) {
@@ -527,8 +527,8 @@
       is.na(staging_dir) || !.path_is_absolute(staging_dir)) {
     stop("Invalid dsFlower staging directory.", call. = FALSE)
   }
-  if (.path_is_symlink(staging_dir)) {
-    stop("The dsFlower staging directory must not be a symbolic link.",
+  if (.privacy_path_is_link(staging_dir)) {
+    stop("The dsFlower staging directory must not be a link or reparse point.",
          call. = FALSE)
   }
   exists <- dir.exists(staging_dir)
@@ -559,7 +559,11 @@
   }
   dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
   staging_dir <- .validateStagingDir(staging_dir, run_token, must_exist = TRUE)
-  Sys.chmod(staging_dir, "0700")
+  if (.Platform$OS.type == "windows") {
+    .windows_set_private_acl(staging_dir, is_directory = TRUE)
+  } else {
+    Sys.chmod(staging_dir, "0700")
+  }
   staging_dir
 }
 

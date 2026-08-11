@@ -38,6 +38,17 @@ test_that("OS entropy is exact and the Windows CSPRNG parser fails closed", {
   )
 })
 
+test_that("PowerShell encoded commands are a single exact argument", {
+  script <- paste(rep("[Console]::Out.Write('OK');", 8L), collapse = "")
+  encoded <- dsFlower:::.encode_windows_powershell_command(script)
+
+  expect_false(grepl("[\r\n]", encoded, perl = TRUE))
+  expect_identical(
+    jsonlite::base64_dec(encoded),
+    iconv(script, from = "UTF-8", to = "UTF-16LE", toRaw = TRUE)[[1L]]
+  )
+})
+
 test_that("Windows path and ACL command boundaries are strict and injectable", {
   root <- tempfile("dsflower-O'Brien-")
   dir.create(root)

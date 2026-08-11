@@ -14,6 +14,26 @@
 # SuperNode singleton registry -- keyed by SuperLink address
 .supernode_registry <- new.env(parent = emptyenv())
 
+.encode_windows_powershell_command <- function(script) {
+  if (!is.character(script) || length(script) != 1L || is.na(script) ||
+      !nzchar(script)) {
+    stop("The Windows privacy bootstrap command is invalid.", call. = FALSE)
+  }
+  utf16 <- iconv(script, from = "UTF-8", to = "UTF-16LE", toRaw = TRUE)[[1L]]
+  if (is.null(utf16)) {
+    stop("Could not encode the Windows privacy bootstrap command.",
+         call. = FALSE)
+  }
+  # jsonlite wraps base64 output at 76 columns. PowerShell's -EncodedCommand
+  # requires one argument, so line breaks must not reach system2().
+  encoded <- gsub("[\r\n]", "", jsonlite::base64_enc(utf16), perl = TRUE)
+  if (!grepl("^[A-Za-z0-9+/]+={0,2}$", encoded, perl = TRUE)) {
+    stop("Could not encode the Windows privacy bootstrap command.",
+         call. = FALSE)
+  }
+  encoded
+}
+
 .run_windows_powershell <- function(script) {
   system_root <- Sys.getenv("SystemRoot", unset = "")
   program_files <- Sys.getenv("ProgramFiles", unset = "")
@@ -29,12 +49,7 @@
          call. = FALSE)
   }
   script <- paste0("$ErrorActionPreference='Stop';", script)
-  utf16 <- iconv(script, from = "UTF-8", to = "UTF-16LE", toRaw = TRUE)[[1L]]
-  if (is.null(utf16)) {
-    stop("Could not encode the Windows privacy bootstrap command.",
-         call. = FALSE)
-  }
-  encoded <- jsonlite::base64_enc(utf16)
+  encoded <- .encode_windows_powershell_command(script)
   output <- suppressWarnings(system2(
     candidates[[1L]],
     c("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded),
