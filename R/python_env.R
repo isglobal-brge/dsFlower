@@ -144,7 +144,8 @@
 #' Get the venv root directory
 #' @keywords internal
 .venv_root <- function() {
-  .dsf_option("venv_root", .default_venv_root())
+  root <- Sys.getenv("DSFLOWER_VENV_ROOT", "")
+  if (nzchar(root)) root else .dsf_option("venv_root", .default_venv_root())
 }
 
 #' TRUE when a usable NVIDIA GPU is visible to this process.
