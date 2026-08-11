@@ -10,6 +10,7 @@ from .xgboost_sanitizer import sanitize_xgboost_json
 
 
 ENSEMBLE_CONTRACT = "dsflower-xgboost-ensemble-v1"
+EXTERNAL_ENSEMBLE_CONTRACT = "dsflower-external-xgboost-ensemble-v1"
 _ENSEMBLE_FIELDS = frozenset((
     "aggregation", "contract", "engine", "models",
     "public_schema_sha256", "task", "version",
@@ -294,7 +295,8 @@ def parse_xgboost_ensemble(artifact, manifest):
     canonical, arguments, task, base_score, bounds = _prediction_profile(manifest)
     container = _parse_artifact(
         artifact, canonical["resources"]["max_artifact_bytes"])
-    if container["contract"] != ENSEMBLE_CONTRACT or \
+    if container["contract"] not in (
+            ENSEMBLE_CONTRACT, EXTERNAL_ENSEMBLE_CONTRACT) or \
             container["version"] != 1 or container["engine"] != "xgboost" or \
             container["aggregation"] != "mean_prediction":
         raise ValueError("unsupported XGBoost ensemble contract")
@@ -328,6 +330,7 @@ def predict_xgboost_ensemble(artifact, manifest, rows):
 
 __all__ = [
     "ENSEMBLE_CONTRACT",
+    "EXTERNAL_ENSEMBLE_CONTRACT",
     "XGBoostEnsemble",
     "parse_xgboost_ensemble",
     "predict_xgboost_ensemble",
