@@ -297,6 +297,11 @@
     is.list(manifest) &&
     identical(as.character(
       manifest[["validation-model-track"]] %||% ""), "native_tree")
+  vision_validation <- identical(track, "validation") &&
+    is.list(manifest) &&
+    identical(as.character(
+      manifest[["validation-model-track"]] %||% ""), "neural") &&
+    identical(as.character(manifest[["data_type"]] %||% ""), "image")
   native_execution <- identical(track, "native_tree") || native_validation
   association_execution <- identical(track, "association")
   native_engine <- if (native_execution) {
@@ -325,6 +330,8 @@
     if (identical(track, "native_tree") || native_validation ||
         association_execution) {
       "native_tree"
+    } else if (vision_validation) {
+      "pytorch_vision"
     } else {
       "pytorch"
     })

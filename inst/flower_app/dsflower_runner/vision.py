@@ -35,6 +35,18 @@ _BACKBONES = {
     "resnet18_3d": (512, True),
     "densenet121_3d": (1024, True),
 }
+_EXTRACTOR_PROFILES = {
+    "resnet18": "dsflower-resnet18-imagenet1k-v1-extractor-v1",
+    "densenet121": "dsflower-densenet121-imagenet1k-v1-extractor-v1",
+    "resnet18_3d": "dsflower-resnet18-monai-seed0-extractor-v1",
+    "densenet121_3d": "dsflower-densenet121-monai-seed0-extractor-v1",
+}
+_MIN_BACKBONE_IMAGE_SIZE = {
+    "resnet18": 1,
+    "densenet121": 29,
+    "resnet18_3d": 1,
+    "densenet121_3d": 128,
+}
 DEFAULT_BACKBONE = "resnet18"
 
 _VOLUME_EXTS = (".nii.gz", ".nii", ".nrrd", ".mha", ".mhd", ".dcm")
@@ -87,6 +99,41 @@ def feature_dim_for(backbone):
 
 def is_3d_backbone(backbone):
     return _BACKBONES[normalize_backbone(backbone)][1]
+
+
+def extractor_profile_for(backbone):
+    """Return the versioned frozen-extractor ABI for one canonical backbone."""
+    name = normalize_backbone(backbone)
+    return _EXTRACTOR_PROFILES[name]
+
+
+def require_extractor_profile(backbone, profile):
+    """Bind a saved head to this versioned frozen-extractor ABI."""
+    name = normalize_backbone(backbone)
+    if (type(backbone) is not str or backbone != name
+            or type(profile) is not str
+            or profile != extractor_profile_for(name)):
+        raise ValueError("vision extractor profile does not match its backbone")
+    return name
+
+
+def require_extractor_geometry(backbone, profile, num_features):
+    """Return the canonical backbone and width bound to its extractor ABI."""
+    name = require_extractor_profile(backbone, profile)
+    feature_dim = int(feature_dim_for(name))
+    if type(num_features) is not int or num_features != feature_dim:
+        raise ValueError("vision feature count does not match its backbone")
+    return name, feature_dim
+
+
+def require_extractor_config(backbone, profile, num_features, image_size):
+    """Validate the complete public geometry of one frozen extractor."""
+    name, feature_dim = require_extractor_geometry(
+        backbone, profile, num_features)
+    size = _validate_image_size(image_size)
+    if size < _MIN_BACKBONE_IMAGE_SIZE[name]:
+        raise ValueError("image-size is too small for the vision backbone")
+    return name, size, feature_dim
 
 
 # --------------------------------------------------------------------------- #
@@ -352,7 +399,7 @@ def build_backbone(backbone):
         base = name.split("_3d")[0]
         if "densenet" in base:
             net = nets.DenseNet121(spatial_dims=3, in_channels=1, out_channels=feat_dim)
-            net.class_layers = nn.Identity()
+            net.class_layers.out = nn.Identity()
         else:
             net = nets.resnet18(spatial_dims=3, n_input_channels=1, num_classes=feat_dim)
             net.fc = nn.Identity()
@@ -402,6 +449,30 @@ def pick_device():
     GPU when one exists. The backbone conv pass is the part that benefits most."""
     import torch
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def prepare_backbone(backbone, profile, num_features, image_size):
+    """Build and prove one public extractor before any private image read."""
+    import torch
+
+    name, size, feature_dim = require_extractor_config(
+        backbone, profile, num_features, image_size)
+    encoder, actual_dim = build_backbone(name)
+    if type(actual_dim) is not int or actual_dim != feature_dim:
+        raise RuntimeError("vision backbone width changed")
+    is_3d = is_3d_backbone(name)
+    shape = _image_record_shape(size, is_3d)
+    device = pick_device()
+    encoder = encoder.to(device)
+    with torch.no_grad():
+        probe = encoder(torch.zeros(
+            (1, *shape), dtype=torch.float32, device=device))
+        probe = probe.reshape(probe.shape[0], -1)
+    if (tuple(probe.shape) != (1, feature_dim)
+            or not bool(torch.all(torch.isfinite(probe)).item())):
+        raise RuntimeError("vision backbone geometry is invalid")
+    del probe
+    return encoder, size, is_3d, device
 
 
 def _image_record_shape(image_size, is_3d):

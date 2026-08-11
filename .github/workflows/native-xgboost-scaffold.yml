@@ -19,6 +19,7 @@ on:
       - "inst/flower_app/dsflower_runner/release_guard.py"
       - "inst/flower_app/dsflower_runner/resampling.py"
       - "inst/flower_app/dsflower_runner/validation.py"
+      - "inst/flower_app/dsflower_runner/vision.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
       - "inst/python/sitecustomize.py"
@@ -62,6 +63,7 @@ on:
       - "inst/flower_app/dsflower_runner/release_guard.py"
       - "inst/flower_app/dsflower_runner/resampling.py"
       - "inst/flower_app/dsflower_runner/validation.py"
+      - "inst/flower_app/dsflower_runner/vision.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
       - "inst/python/sitecustomize.py"
@@ -139,6 +141,7 @@ jobs:
             pyarrow==23.0.1 \
             cryptography==46.0.7 \
             'torch>=2.0.0,<3.0.0' \
+            monai==1.3.0 \
             'opacus>=1.4.0,<2.0.0'
           "$contract_python" -m unittest -v \
             inst/python/tests/test_native_tree_contract.py \
@@ -156,6 +159,7 @@ jobs:
             inst/python/tests/test_epi_association.py \
             inst/python/tests/test_association_flower_app.py \
             inst.python.tests.test_validation_dp.ValidationReleaseTests \
+            inst.python.tests.test_validation_dp.ValidationInferenceTests \
             inst/python/tests/test_sitecustomize.py \
             inst/python/tests/test_xgboost_accounting.py \
             inst/python/tests/test_xgboost_adapter.py \

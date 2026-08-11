@@ -247,9 +247,11 @@ def _neural_input_dim(context, cfg, manifest_image):
     """Resolve @in from public server-pinned metadata, without opening data."""
     if manifest_image:
         from . import vision
-        backbone = vision.normalize_backbone(
-            cfg.get("backbone", cfg.get("model", "resnet18")))
-        return int(vision.feature_dim_for(backbone))
+        _backbone, _image_size, feature_dim = vision.require_extractor_config(
+            cfg.get("backbone", cfg.get("model", "resnet18")),
+            cfg.get("vision-extractor-profile"), cfg.get("num-features"),
+            cfg.get("image-size"))
+        return feature_dim
 
     manifest = task_module._load_manifest(context)
     feature_columns = manifest.get("feature_columns")
@@ -651,7 +653,7 @@ def _apply_feature_bounds(X, cfg):
 
 
 def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
-                  cv_fold=None):
+                  cv_fold=None, on_private_start=None):
     n_classes = int(pins["n_classes"])
     has_holdout = cfg.get("resampling-contract-sha256") is not None
     has_cv = cfg.get("cv-contract-sha256") is not None
@@ -674,15 +676,16 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
 
     if manifest_image:
         from . import vision
-        backbone = vision.normalize_backbone(cfg.get("backbone", cfg.get("model", "resnet18")))
-        image_size = vision._validate_image_size(cfg.get("image-size", 224))
+        encoder, image_size, is_3d, device = vision.prepare_backbone(
+            cfg.get("backbone", cfg.get("model", "resnet18")),
+            cfg.get("vision-extractor-profile"), cfg.get("num-features"),
+            cfg.get("image-size"))
+        if on_private_start is not None:
+            on_private_start()
         paths, y, groups = load_image_collection(context)
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
-        encoder, feat_dim = vision.build_backbone(backbone)
-        if int(feat_dim) != int(input_dim):
-            raise RuntimeError("backbone feature width changed after model validation")
         X = vision.extract_features_from_paths(
-            encoder, paths, image_size, vision.is_3d_backbone(backbone))
+            encoder, paths, image_size, is_3d, device=device)
     else:
         X, y = load_data(context)
         if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
@@ -1157,11 +1160,14 @@ def train(msg: Message, context: Context) -> Message:
                 pins["operation"] = "cv-train"
             model, input_dim, manifest_image = _prepare_neural_model(
                 msg, context, cfg, pcfg, pins)
-            mark_private_started()
+            if not manifest_image:
+                mark_private_started()
             new_arrays, _n = _train_neural(
                 context, cfg, pcfg, pins, model, input_dim, manifest_image,
                 cv_fold=(int(claim["fold"])
-                         if operation == "cv-train" else None))
+                         if operation == "cv-train" else None),
+                on_private_start=(mark_private_started
+                                  if manifest_image else None))
 
         hook_status = True if track == "egress" else None
         if _reply_cache_allowed(claim):

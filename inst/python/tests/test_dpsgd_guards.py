@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -289,6 +289,25 @@ class ManifestPrivacyContractTests(unittest.TestCase):
 
 
 class NeuralSemanticConfigTests(unittest.TestCase):
+    def test_frozen_extractor_profiles_are_exact_and_versioned(self):
+        expected = {
+            "resnet18": "dsflower-resnet18-imagenet1k-v1-extractor-v1",
+            "densenet121": "dsflower-densenet121-imagenet1k-v1-extractor-v1",
+            "resnet18_3d": "dsflower-resnet18-monai-seed0-extractor-v1",
+            "densenet121_3d": "dsflower-densenet121-monai-seed0-extractor-v1",
+        }
+        for backbone, profile in expected.items():
+            with self.subTest(backbone=backbone):
+                self.assertEqual(vision.extractor_profile_for(backbone), profile)
+                self.assertEqual(
+                    vision.require_extractor_profile(backbone, profile), backbone)
+                self.assertEqual(
+                    vision.require_extractor_geometry(
+                        backbone, profile, vision.feature_dim_for(backbone)),
+                    (backbone, vision.feature_dim_for(backbone)))
+                with self.assertRaises(ValueError):
+                    vision.require_extractor_profile(backbone, profile + "-changed")
+
     def test_transport_aliases_canonicalize_to_effective_bounds(self):
         bounds = {"lower": [0.0], "upper": [1.0]}
         encoded = base64.b64encode(json.dumps(
@@ -319,6 +338,138 @@ class NeuralSemanticConfigTests(unittest.TestCase):
             {"backbone": "resnet18", "model": "ignored-two"},
             pins, privacy)
         self.assertEqual(first, second)
+
+    def test_vision_extractor_profile_is_not_a_nominal_seed_axis(self):
+        pins = {"optimizer": "sgd"}
+        privacy = {"policy_hash": "1" * 64}
+        first = client_app._neural_seed_contract({
+            "backbone": "resnet18",
+            "vision-extractor-profile": "extractor-v1",
+        }, pins, privacy)
+        second = client_app._neural_seed_contract({
+            "backbone": "resnet18",
+            "vision-extractor-profile": "extractor-v2",
+        }, pins, privacy)
+        self.assertEqual(first, second)
+
+    def test_training_vision_width_must_match_the_canonical_backbone(self):
+        cfg = {
+            "data-kind": "image", "backbone": "resnet18",
+            "vision-extractor-profile":
+                vision.extractor_profile_for("resnet18"),
+            "num-features": 1024, "image-size": 16,
+        }
+        with self.assertRaisesRegex(ValueError, "feature count"):
+            client_app._neural_input_dim(None, cfg, True)
+        with self.assertRaisesRegex(ValueError, "feature count"):
+            server_app._build_initial_model(cfg)
+
+    def test_backbone_minimum_image_sizes_are_exact(self):
+        expected = {
+            "resnet18": 1, "resnet18_3d": 1,
+            "densenet121": 29, "densenet121_3d": 128,
+        }
+        self.assertEqual(vision._MIN_BACKBONE_IMAGE_SIZE, expected)
+        for backbone, minimum in expected.items():
+            profile = vision.extractor_profile_for(backbone)
+            feature_dim = vision.feature_dim_for(backbone)
+            with self.subTest(backbone=backbone):
+                self.assertEqual(vision.require_extractor_config(
+                    backbone, profile, feature_dim, minimum),
+                    (backbone, minimum, feature_dim))
+                with self.assertRaisesRegex(ValueError, "image-size"):
+                    vision.require_extractor_config(
+                        backbone, profile, feature_dim, minimum - 1)
+
+    def test_3d_backbone_heads_keep_canonical_pooling_geometry(self):
+        built = {}
+
+        class FakeDenseNet(torch.nn.Module):
+            def __init__(self, **_kwargs):
+                super().__init__()
+                self.class_layers = torch.nn.Sequential()
+                self.class_layers.add_module("relu", torch.nn.ReLU())
+                self.class_layers.add_module(
+                    "pool", torch.nn.AdaptiveAvgPool3d(1))
+                self.class_layers.add_module("flatten", torch.nn.Flatten(1))
+                self.class_layers.add_module(
+                    "out", torch.nn.Linear(1024, 1024))
+
+            def forward(self, batch):
+                features = torch.ones(
+                    (batch.shape[0], 1024, 1, 4, 4), device=batch.device)
+                return self.class_layers(features)
+
+        class FakeResNet(torch.nn.Module):
+            def __init__(self, **_kwargs):
+                super().__init__()
+                self.avgpool = torch.nn.AdaptiveAvgPool3d(1)
+                self.fc = torch.nn.Linear(512, 512)
+
+            def forward(self, batch):
+                features = torch.ones(
+                    (batch.shape[0], 512, 1, 4, 4), device=batch.device)
+                features = self.avgpool(features).reshape(batch.shape[0], -1)
+                return self.fc(features)
+
+        nets = ModuleType("monai.networks.nets")
+
+        def dense(**kwargs):
+            built["densenet121_3d"] = FakeDenseNet(**kwargs)
+            return built["densenet121_3d"]
+
+        def resnet(**kwargs):
+            built["resnet18_3d"] = FakeResNet(**kwargs)
+            return built["resnet18_3d"]
+
+        nets.DenseNet121 = dense
+        nets.resnet18 = resnet
+        networks = ModuleType("monai.networks")
+        networks.nets = nets
+        monai = ModuleType("monai")
+        monai.networks = networks
+        modules = {
+            "monai": monai, "monai.networks": networks,
+            "monai.networks.nets": nets,
+        }
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+                vision, "pick_device", return_value=torch.device("cpu")):
+            for backbone in ("resnet18_3d", "densenet121_3d"):
+                feature_dim = vision.feature_dim_for(backbone)
+                size = vision._MIN_BACKBONE_IMAGE_SIZE[backbone]
+                with self.subTest(backbone=backbone):
+                    encoder, got_size, is_3d, device = vision.prepare_backbone(
+                        backbone, vision.extractor_profile_for(backbone),
+                        feature_dim, size)
+                    shape = vision._image_record_shape(size, True)
+                    with torch.no_grad():
+                        output = encoder(torch.zeros((2, *shape)))
+                    self.assertEqual(tuple(output.shape), (2, feature_dim))
+                    self.assertEqual(got_size, size)
+                    self.assertTrue(is_3d)
+                    self.assertEqual(device, torch.device("cpu"))
+
+        dense_layers = built["densenet121_3d"].class_layers
+        self.assertEqual(
+            list(dense_layers._modules), ["relu", "pool", "flatten", "out"])
+        self.assertIsInstance(dense_layers.out, torch.nn.Identity)
+        self.assertIsInstance(built["resnet18_3d"].fc, torch.nn.Identity)
+
+    def test_real_monai_densenet3d_has_canonical_output_geometry(self):
+        try:
+            import monai  # noqa: F401
+        except ImportError:
+            self.skipTest("MONAI is unavailable outside the vision CI profile")
+        backbone = "densenet121_3d"
+        encoder, feature_dim = vision.build_backbone(backbone)
+        self.assertEqual(feature_dim, 1024)
+        self.assertEqual(
+            list(encoder.class_layers._modules),
+            ["relu", "pool", "flatten", "out"])
+        self.assertIsInstance(encoder.class_layers.out, torch.nn.Identity)
+        with torch.no_grad():
+            output = encoder(torch.zeros((1, 1, 32, 32, 32)))
+        self.assertEqual(tuple(output.shape), (1, 1024))
 
     def test_resampling_geometry_is_a_sticky_seed_axis_only_when_present(self):
         cfg = {"model-spec-b64": "e30=", "loss-name": "bce_logits"}
@@ -872,6 +1023,68 @@ class StrictNeuralInitializationTests(unittest.TestCase):
             self.assertEqual(
                 client_app._neural_input_dim(context, {}, False), 2)
 
+    def test_image_training_preflights_extractor_before_private_start(self):
+        class FixedEncoder(torch.nn.Module):
+            def __init__(self, width, *, nonfinite=False):
+                super().__init__()
+                self.width = width
+                self.nonfinite = nonfinite
+
+            def forward(self, batch):
+                fill = float("nan") if self.nonfinite else 0.0
+                return torch.full(
+                    (batch.shape[0], self.width), fill, device=batch.device)
+
+        cfg = {
+            "data-kind": "image", "backbone": "resnet18",
+            "vision-extractor-profile":
+                vision.extractor_profile_for("resnet18"),
+            "num-features": 512, "image-size": 16,
+        }
+        cases = (
+            RuntimeError("dependency unavailable"),
+            (FixedEncoder(512), 1024),
+            (FixedEncoder(511), 512),
+            (FixedEncoder(512, nonfinite=True), 512),
+        )
+        for build_result in cases:
+            callback = mock.Mock()
+            build = (mock.Mock(side_effect=build_result)
+                     if isinstance(build_result, Exception)
+                     else mock.Mock(return_value=build_result))
+            with self.subTest(build_result=build_result), \
+                    mock.patch.object(vision, "build_backbone", build), \
+                    mock.patch.object(
+                        vision, "pick_device", return_value=torch.device("cpu")), \
+                    mock.patch.object(
+                        client_app, "load_image_collection",
+                        side_effect=AssertionError("private read")) as private:
+                with self.assertRaises(RuntimeError):
+                    client_app._train_neural(
+                        None, cfg, {}, {"n_classes": 2}, object(), 512, True,
+                        on_private_start=callback)
+            callback.assert_not_called()
+            private.assert_not_called()
+
+        callback = mock.Mock()
+
+        def private_after_callback(_context):
+            callback.assert_called_once_with()
+            raise RuntimeError("private read sentinel")
+
+        with mock.patch.object(
+                vision, "build_backbone",
+                return_value=(FixedEncoder(512), 512)), mock.patch.object(
+                vision, "pick_device", return_value=torch.device("cpu")), \
+                mock.patch.object(
+                    client_app, "load_image_collection",
+                    side_effect=private_after_callback) as private:
+            with self.assertRaisesRegex(RuntimeError, "private read sentinel"):
+                client_app._train_neural(
+                    None, cfg, {}, {"n_classes": 2}, object(), 512, True,
+                    on_private_start=callback)
+        private.assert_called_once_with(None)
+
     def test_prepare_neural_model_uses_the_original_public_seed_contract(self):
         model = torch.nn.Linear(2, 1)
         msg = SimpleNamespace(content=RecordDict({
@@ -1102,17 +1315,71 @@ class RunPinBoundsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "binary only"):
                 task.load_run_pins(context)
 
-    def test_image_config_is_frozen_from_the_node_manifest(self):
+    def test_image_config_must_match_the_node_manifest_exactly(self):
+        profile = vision.extractor_profile_for("resnet18")
+        manifest = {
+            "dp-track": "neural", "data_type": "image",
+            "image-size": 224, "backbone": "resnet18",
+            "vision-extractor-profile": profile,
+            "num-features": 512,
+        }
+        config = {
+            "data-kind": "image", "image-size": 224,
+            "backbone": "resnet18", "vision-extractor-profile": profile,
+            "num-features": 512,
+        }
         with tempfile.TemporaryDirectory() as manifest_dir:
             with open(os.path.join(manifest_dir, "manifest.json"), "w",
                       encoding="utf-8") as handle:
-                json.dump({"image-size": 224, "backbone": "resnet18"}, handle)
+                json.dump(manifest, handle)
             context = SimpleNamespace(
                 node_config={"manifest-dir": manifest_dir},
-                run_config={"image-size": 10**9, "backbone": "other"})
+                run_config=dict(config))
             cfg = task.load_pinned_run_config(context)
             self.assertEqual(cfg["image-size"], 224)
             self.assertEqual(cfg["backbone"], "resnet18")
+            self.assertEqual(cfg["vision-extractor-profile"], profile)
+            for key, value in {
+                    "data-kind": "tabular", "image-size": 16,
+                    "backbone": "densenet121",
+                    "vision-extractor-profile": "wrong-profile",
+                    "num-features": 1024}.items():
+                with self.subTest(key=key):
+                    context.run_config = {**config, key: value}
+                    with self.assertRaisesRegex(ValueError, "manifest pin"):
+                        task.load_pinned_run_config(context)
+
+    def test_tabular_training_accepts_exact_kind_and_rejects_image_fields(self):
+        manifest = {"dp-track": "neural", "data_type": "tabular"}
+        fields = {
+            "backbone": "resnet18", "image-size": 224,
+            "vision-extractor-profile":
+                vision.extractor_profile_for("resnet18"),
+            "validation-artifact-format": "pytorch-state-dict-v1",
+            "validation-artifact-sha256": "0" * 64,
+            "validation-artifact-size-bytes": 1,
+        }
+        with tempfile.TemporaryDirectory() as manifest_dir:
+            with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": manifest_dir},
+                run_config={"data-kind": "tabular"})
+            self.assertEqual(
+                task.load_pinned_run_config(context)["data-kind"], "tabular")
+            for value in ("image", True):
+                with self.subTest(data_kind=value):
+                    context.run_config = {"data-kind": value}
+                    with self.assertRaisesRegex(ValueError, "data-kind"):
+                        task.load_pinned_run_config(context)
+            for key, value in fields.items():
+                with self.subTest(key=key):
+                    context = SimpleNamespace(
+                        node_config={"manifest-dir": manifest_dir},
+                        run_config={key: value})
+                    with self.assertRaisesRegex(ValueError, "image-only"):
+                        task.load_pinned_run_config(context)
 
     def test_optimizer_and_scheduler_are_manifest_pinned_and_applied(self):
         manifest = {

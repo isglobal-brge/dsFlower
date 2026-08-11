@@ -10,6 +10,8 @@ import hashlib
 import json
 import math
 import os
+import re
+import stat
 
 import numpy as np
 
@@ -23,6 +25,7 @@ _MAX_PUBLIC_BYTES = 64 * 1024 * 1024
 _INFERENCE_BATCH_ROWS = 1024
 _VALIDATION_MECHANISM = "validation-gaussian/v2"
 _VALIDATION_FINGERPRINT = "validation-sufficient-v2"
+_VISION_ARTIFACT_FORMAT = "pytorch-state-dict-v1"
 
 
 def _integer(value, name, lower, upper):
@@ -340,12 +343,74 @@ def _public_model_path(cfg):
     if not path or "\x00" in path or not os.path.isabs(path):
         raise ValueError("validation model path must be absolute")
     try:
-        info = os.stat(path)
+        info = os.lstat(path)
     except OSError as exc:
         raise ValueError("validation model artifact is unavailable") from exc
-    if not os.path.isfile(path) or info.st_size <= 0 or info.st_size > (1 << 30):
+    if (not stat.S_ISREG(info.st_mode) or info.st_size <= 0
+            or info.st_size > (1 << 30)):
         raise ValueError("validation model artifact is not a bounded regular file")
     return path
+
+
+def _vision_geometry_from_config(cfg):
+    """Return the exact saved vision geometry without inspecting private data."""
+    from . import vision
+
+    if type(cfg.get("data-kind")) is not str or cfg["data-kind"] != "image":
+        raise ValueError("vision validation data-kind must be image")
+    backbone, image_size, feature_dim = vision.require_extractor_config(
+        cfg.get("backbone"), cfg.get("vision-extractor-profile"),
+        cfg.get("num-features"), cfg.get("image-size"))
+    n_classes = cfg.get("num-classes")
+    if (type(n_classes) is not int or not 2 <= n_classes <= _MAX_CLASSES):
+        raise ValueError("vision validation class count is invalid")
+    expected_task = "binary" if n_classes == 2 else "multiclass"
+    if (cfg.get("loss-name") != "cross_entropy"
+            or cfg.get("validation-task") != expected_task):
+        raise ValueError("vision validation loss/task contract is invalid")
+    return backbone, image_size, feature_dim
+
+
+def _vision_artifact_pins(cfg):
+    """Validate the public checkpoint identity carried to every node."""
+    if (type(cfg.get("validation-artifact-format")) is not str
+            or cfg["validation-artifact-format"] != _VISION_ARTIFACT_FORMAT):
+        raise ValueError("vision validation artifact format is invalid")
+    expected_size = cfg.get("validation-artifact-size-bytes")
+    if type(expected_size) is not int or not 1 <= expected_size <= (1 << 30):
+        raise ValueError("vision validation artifact size pin is invalid")
+    expected_sha256 = cfg.get("validation-artifact-sha256")
+    if (type(expected_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None):
+        raise ValueError("vision validation artifact SHA-256 pin is invalid")
+    return expected_size, expected_sha256
+
+
+def _load_public_state(path, cfg, *, image):
+    """Verify the public vision checkpoint bytes before invoking torch.load."""
+    import torch
+
+    if not image:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    expected_size, expected_sha256 = _vision_artifact_pins(cfg)
+
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode)
+                    or info.st_size != expected_size):
+                raise ValueError(
+                    "vision validation artifact differs from its size pin")
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            if digest.hexdigest() != expected_sha256:
+                raise ValueError(
+                    "vision validation artifact differs from its SHA-256 pin")
+            handle.seek(0)
+            return torch.load(handle, map_location="cpu", weights_only=True)
+    except OSError as exc:
+        raise ValueError("validation model artifact is unavailable") from exc
 
 
 def _bounded_public_arrays(arrays, *, max_elements=None):
@@ -377,12 +442,22 @@ def public_model_arrays(cfg):
     """Load the researcher-side public model which the ServerApp will send."""
     _model_track(cfg)
     path = _public_model_path(cfg)
-    import torch
     from . import model_spec
     from .params import get_torch_params
 
-    input_dim = _integer(
-        cfg.get("num-features"), "validation feature count", 1, 65536)
+    image = cfg.get("data-kind") == "image"
+    if image:
+        _backbone, _image_size, input_dim = _vision_geometry_from_config(cfg)
+    else:
+        if any(key in cfg for key in (
+                "data-kind", "backbone", "image-size",
+                "vision-extractor-profile",
+                "validation-artifact-format",
+                "validation-artifact-sha256",
+                "validation-artifact-size-bytes")):
+            raise ValueError("tabular neural validation has image-only fields")
+        input_dim = _integer(
+            cfg.get("num-features"), "validation feature count", 1, 65536)
     loss = str(cfg.get("loss-name", "")).lower()
     spec = model_spec.read_spec(cfg)
     output_dim = model_spec.output_width(loss, cfg)
@@ -390,7 +465,7 @@ def public_model_arrays(cfg):
     model = model_spec.build_from_spec(
         spec, in_dim=input_dim, out_dim=output_dim, num_labels=labels,
         output_limit=model_spec.output_limit_for_loss(loss))
-    state = torch.load(path, map_location="cpu", weights_only=True)
+    state = _load_public_state(path, cfg, image=image)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     model.load_state_dict(state, strict=True)
@@ -398,11 +473,50 @@ def public_model_arrays(cfg):
     return _bounded_public_arrays(arrays)
 
 
-def _node_input_dim(context):
+def _validate_image_target_levels(manifest, n_classes):
+    levels = manifest.get("target-levels")
+    if (not isinstance(levels, dict) or set(levels) != {"type", "values"}
+            or levels.get("type") not in ("character", "logical", "numeric")
+            or not isinstance(levels.get("values"), list)
+            or len(levels["values"]) != n_classes):
+        raise ValueError(
+            "vision validation target levels do not match its class count")
+    values = levels["values"]
+    level_type = levels["type"]
+    if level_type == "character":
+        valid = all(type(value) is str and value for value in values)
+    elif level_type == "logical":
+        valid = all(type(value) is bool for value in values)
+    else:
+        valid = all(type(value) in (int, float) and not isinstance(value, bool)
+                    and math.isfinite(value) for value in values)
+    comparable = ([float(value) for value in values]
+                  if valid and level_type == "numeric" else values)
+    unique = valid and len(set(comparable)) == len(values)
+    if not valid or not unique:
+        raise ValueError("vision validation target levels are invalid")
+
+
+def _node_input_dim(context, cfg=None):
     from . import task as task_module
     manifest = task_module._load_manifest(context)
     if manifest.get("data_type") == "image":
-        raise ValueError("standalone private validation currently requires tabular data")
+        if cfg is None:
+            raise ValueError("vision validation configuration is missing")
+        _vision_artifact_pins(cfg)
+        _backbone, _image_size, feature_dim = _vision_geometry_from_config(cfg)
+        if (type(manifest.get("data_type")) is not str
+                or cfg.get("data-kind") != manifest["data_type"]):
+            raise ValueError(
+                "vision validation data-kind does not match manifest pin")
+        _validate_image_target_levels(manifest, cfg["num-classes"])
+        return feature_dim
+    if cfg is not None and any(key in cfg for key in (
+            "data-kind", "backbone", "image-size",
+            "vision-extractor-profile",
+            "validation-artifact-format", "validation-artifact-sha256",
+            "validation-artifact-size-bytes")):
+        raise ValueError("tabular neural validation has image-only fields")
     columns = manifest.get("feature_columns")
     if not isinstance(columns, list) or not columns:
         raise ValueError("validation manifest must pin non-empty feature columns")
@@ -412,6 +526,16 @@ def _node_input_dim(context):
             or any(not isinstance(column, str) or not column for column in columns)):
         raise ValueError("validation feature contract is invalid")
     return len(columns)
+
+
+def _totalize_vision_features(value, n_rows, feature_dim):
+    features = np.asarray(value, dtype=np.float32)
+    if features.shape != (n_rows, feature_dim):
+        raise RuntimeError("vision validation feature geometry changed")
+    return np.clip(np.nan_to_num(
+        features, nan=0.0, posinf=_MAX_MODEL_ABS,
+        neginf=-_MAX_MODEL_ABS), -_MAX_MODEL_ABS,
+        _MAX_MODEL_ABS).astype(np.float32, copy=False)
 
 
 def _apply_feature_bounds(X, cfg):
@@ -453,7 +577,7 @@ def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
 
     layout = layout_from_config(cfg)
     _model_track(cfg)
-    input_dim = _node_input_dim(context)
+    input_dim = _node_input_dim(context, cfg)
     if not isinstance(public_arrays, (list, tuple)) or not public_arrays:
         raise ValueError("validation needs public model arrays")
 
@@ -463,15 +587,33 @@ def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
     model = load_user_model(cfg, input_dim, loss)
     set_torch_params(model, list(public_arrays))
 
-    empty_public_shape = np.empty((0, input_dim), dtype=np.float64)
-    _apply_feature_bounds(empty_public_shape, cfg)
+    image = cfg.get("data-kind") == "image"
+    if image:
+        from . import vision
+        encoder, image_size, is_3d, device = vision.prepare_backbone(
+            cfg.get("backbone"), cfg.get("vision-extractor-profile"),
+            cfg.get("num-features"), cfg.get("image-size"))
+    else:
+        empty_public_shape = np.empty((0, input_dim), dtype=np.float64)
+        _apply_feature_bounds(empty_public_shape, cfg)
 
     if on_private_start is not None:
         on_private_start()
-    X, y = task_module.load_data(context)
-    unit_ids = task_module.load_tabular_patient_ids(context)
-    task_module.assert_pinned_unit_count(context, len(y), unit_ids)
-    X_model = _apply_feature_bounds(X, cfg)
+    if image:
+        paths, y, unit_ids = task_module.load_image_collection(
+            context, allow_empty=True)
+        task_module.assert_pinned_unit_count(context, len(y), unit_ids)
+        if paths:
+            features = vision.extract_features_from_paths(
+                encoder, paths, image_size, is_3d, device=device)
+        else:
+            features = np.empty((0, input_dim), dtype=np.float32)
+        X_model = _totalize_vision_features(features, len(y), input_dim)
+    else:
+        X, y = task_module.load_data(context)
+        unit_ids = task_module.load_tabular_patient_ids(context)
+        task_module.assert_pinned_unit_count(context, len(y), unit_ids)
+        X_model = _apply_feature_bounds(X, cfg)
     predictions = neural_predictions(model, X_model, cfg.get("loss-name"))
     target_bounds = (target_bounds_from_config(cfg)
                      if layout["task"] in ("regression", "count") else None)

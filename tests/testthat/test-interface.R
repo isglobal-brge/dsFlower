@@ -14,6 +14,24 @@ local_interface_privacy_state <- function(.local_envir = parent.frame()) {
   invisible(state_dir)
 }
 
+vision_validation_config <- function(n_classes = 3L) {
+  list(
+    "dp-track" = "validation", "validation-model-track" = "neural",
+    "validation-task" = if (n_classes == 2L) "binary" else "multiclass",
+    "validation-bins" = 24L, "task-type" = "classification",
+    "loss-name" = "cross_entropy", "model-spec-b64" = "e30=",
+    "num-server-rounds" = 1L, "num-features" = 1024L,
+    "num-classes" = as.integer(n_classes), "num-labels" = 2L,
+    "target-levels" = paste0("class-", seq_len(n_classes)),
+    "data_type" = "image", "backbone" = "densenet121_3d",
+    "image-size" = 128L,
+    "vision-extractor-profile" =
+      "dsflower-densenet121-monai-seed0-extractor-v1",
+    "validation-artifact-format" = "pytorch-state-dict-v1",
+    "validation-artifact-sha256" = strrep("a", 64L),
+    "validation-artifact-size-bytes" = 4096L)
+}
+
 test_that("flowerPingDS returns correct structure", {
   result <- flowerPingDS()
   expect_type(result, "list")
@@ -392,6 +410,106 @@ test_that("validation config is pinned to one well-typed release", {
     "binary target levels")
 })
 
+test_that("vision validation accepts only its exact public pin set", {
+  config <- dsFlower:::.addDpConfigToRunConfig(vision_validation_config())
+  expect_identical(config[["data_type"]], "image")
+  expect_identical(config[["backbone"]], "densenet121_3d")
+  expect_identical(config[["image-size"]], 128L)
+  expect_identical(
+    config[["vision-extractor-profile"]],
+    "dsflower-densenet121-monai-seed0-extractor-v1")
+  expect_identical(config[["num-features"]], 1024L)
+  expect_identical(
+    config[["validation-artifact-format"]], "pytorch-state-dict-v1")
+
+  missing <- vision_validation_config()
+  missing[["validation-artifact-sha256"]] <- NULL
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(missing), "exact backbone.*pin set")
+
+  unsupported <- vision_validation_config()
+  unsupported[["backbone"]] <- "resnet50"
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(unsupported), "not canonical")
+
+  wrong_dim <- vision_validation_config()
+  wrong_dim[["num-features"]] <- 512L
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(wrong_dim), "image geometry")
+
+  dense_3d_too_small <- vision_validation_config()
+  dense_3d_too_small[["image-size"]] <- 127L
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(dense_3d_too_small),
+    "image geometry")
+
+  dense_2d <- vision_validation_config()
+  dense_2d[["backbone"]] <- "densenet121"
+  dense_2d[["vision-extractor-profile"]] <-
+    "dsflower-densenet121-imagenet1k-v1-extractor-v1"
+  dense_2d[["image-size"]] <- 28L
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(dense_2d), "image geometry")
+  dense_2d[["image-size"]] <- 29L
+  expect_identical(
+    dsFlower:::.addDpConfigToRunConfig(dense_2d)[["image-size"]], 29L)
+
+  wrong_profile <- vision_validation_config()
+  wrong_profile[["vision-extractor-profile"]] <-
+    "dsflower-densenet121-imagenet1k-v1-extractor-v1"
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(wrong_profile),
+    "profile does not match")
+
+  no_levels <- vision_validation_config()
+  no_levels[["target-levels"]] <- NULL
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(no_levels),
+    "one public target level per class")
+
+  tabular <- vision_validation_config()
+  tabular[["data_type"]] <- "tabular"
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(tabular),
+    "Vision-only validation pins")
+})
+
+test_that("vision training requires its canonical extractor profile", {
+  config <- list(
+    "dp-track" = "neural", "data_type" = "image",
+    "num-server-rounds" = 1L, "num-features" = 512L,
+    "backbone" = "resnet18",
+    "image-size" = 224L,
+    "vision-extractor-profile" =
+      "dsflower-resnet18-imagenet1k-v1-extractor-v1")
+  normalized <- dsFlower:::.addDpConfigToRunConfig(config)
+  expect_identical(
+    normalized[["vision-extractor-profile"]],
+    "dsflower-resnet18-imagenet1k-v1-extractor-v1")
+
+  missing <- config
+  missing[["vision-extractor-profile"]] <- NULL
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(missing),
+    "exact backbone.*profile pin set")
+
+  wrong <- config
+  wrong[["vision-extractor-profile"]] <-
+    "dsflower-resnet18-monai-seed0-extractor-v1"
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(wrong), "profile does not match")
+
+  wrong_dim <- config
+  wrong_dim[["num-features"]] <- 1024L
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(wrong_dim), "image geometry")
+
+  missing_dim <- config
+  missing_dim[["num-features"]] <- NULL
+  expect_error(
+    dsFlower:::.addDpConfigToRunConfig(missing_dim), "image geometry")
+})
+
 test_that("validation preparation persists the public contract before execution", {
   local_interface_privacy_state()
   name <- "test_validation_prepare"
@@ -466,6 +584,75 @@ test_that("validation contract SHA-256 has a cross-package canonical wire", {
     dsFlower:::.validationContractSha256(
       config, c("age", "marker"), "outcome", "patient"),
     "ecf31e300ff0087e26799f6a4fbe1894e8f8357e0fd35667936653318b040e3f")
+})
+
+test_that("vision validation contract has a cross-package schema-2 wire", {
+  config <- dsFlower:::.addDpConfigToRunConfig(vision_validation_config())
+  hash <- dsFlower:::.validationContractSha256(
+    config, NULL, "diagnosis", "patient")
+  expect_identical(
+    hash,
+    "95b536d6b8e0902691170a463177bfa64fd3b8dde4c5d002e2e098da94a37959")
+
+  changed <- config
+  changed[["validation-artifact-sha256"]] <- strrep("b", 64L)
+  expect_false(identical(
+    hash,
+    dsFlower:::.validationContractSha256(
+      changed, NULL, "diagnosis", "patient")))
+
+  changed_profile <- config
+  changed_profile[["vision-extractor-profile"]] <-
+    "dsflower-densenet121-imagenet1k-v1-extractor-v1"
+  expect_false(identical(
+    hash,
+    dsFlower:::.validationContractSha256(
+      changed_profile, NULL, "diagnosis", "patient")))
+})
+
+test_that("vision validation preflights pins before empty private staging", {
+  local_interface_privacy_state()
+  image_root <- withr::local_tempdir()
+  withr::local_options(list(dsflower.image_data_root = image_root))
+  name <- "test_empty_vision_validation"
+  dsFlower:::.setHandle(name, mock_handle(table_data = data.frame(
+    relative_path = character(), diagnosis = character())))
+  withr::defer(dsFlower:::.removeHandle(name))
+
+  config <- vision_validation_config()
+  normalized <- dsFlower:::.addDpConfigToRunConfig(config)
+  config[["validation-contract-sha256"]] <-
+    dsFlower:::.validationContractSha256(
+      normalized, NULL, "diagnosis", dsFlower:::.dpUnitPolicy()$dp_unit)
+
+  tampered <- config
+  tampered[["image-size"]] <- 129L
+  expect_error(
+    flowerPrepareRunDS(name, "diagnosis", NULL, tampered),
+    "contract SHA-256 does not match")
+  expect_null(dsFlower:::.getHandle(name)$run_token)
+
+  expect_error(
+    flowerPrepareRunDS(name, "diagnosis", "relative_path", config),
+    "does not accept tabular feature columns")
+  expect_null(dsFlower:::.getHandle(name)$run_token)
+
+  expect_no_error(flowerPrepareRunDS(name, "diagnosis", NULL, config))
+  handle <- dsFlower:::.getHandle(name)
+  manifest <- jsonlite::fromJSON(
+    file.path(handle$staging_dir, "manifest.json"), simplifyVector = FALSE)
+  expect_identical(manifest$data_type, "image")
+  expect_identical(manifest$n_samples, 0L)
+  expect_identical(manifest$backbone, "densenet121_3d")
+  expect_identical(manifest[["image-size"]], 128L)
+  expect_identical(
+    manifest[["vision-extractor-profile"]],
+    "dsflower-densenet121-monai-seed0-extractor-v1")
+  expect_identical(manifest[["num-features"]], 1024L)
+  expect_identical(
+    manifest[["validation-artifact-sha256"]], strrep("a", 64L))
+  expect_false("feature_columns" %in% names(manifest))
+  expect_false("feature-bounds" %in% names(manifest))
 })
 
 test_that("flowerPrepareRunDS stages data correctly", {
