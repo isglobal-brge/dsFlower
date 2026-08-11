@@ -69,6 +69,16 @@ test_that("server preserves one-feature arrays in the canonical wire", {
     "2d7a1f025f798f69165fdbbdd5fa2b19c6e95b5cf5b8ab78d434356a496ab234")
 })
 
+test_that("server canonical JSON preserves valid closing-tag text", {
+  expect_identical(
+    rawToChar(dsFlower:::.native_tree_json(list(value = "</control>"))),
+    '{"value":"</control>"}')
+  literal <- "<\\/control>"
+  encoded <- rawToChar(dsFlower:::.native_tree_json(list(value = literal)))
+  expect_identical(
+    jsonlite::fromJSON(encoded, simplifyVector = FALSE)$value, literal)
+})
+
 test_that("server pins the exact data-independent ExtraTrees profile", {
   manifest <- .native_tree_manifest_fixture()
   manifest$engine <- "extra_trees"
