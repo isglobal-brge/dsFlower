@@ -94,8 +94,10 @@ def _build_initial_model(cfg):
         from . import model_spec
     if str(cfg.get("data-kind", "")).lower() == "image":
         from . import vision
-        backbone = vision.normalize_backbone(cfg.get("backbone", cfg.get("model", "resnet18")))
-        in_dim = int(vision.feature_dim_for(backbone))
+        _backbone, _image_size, in_dim = vision.require_extractor_config(
+            cfg.get("backbone", cfg.get("model", "resnet18")),
+            cfg.get("vision-extractor-profile"), cfg.get("num-features"),
+            cfg.get("image-size"))
     else:
         in_dim = int(cfg.get("num-features", 0))
         if in_dim <= 0:

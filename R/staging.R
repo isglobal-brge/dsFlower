@@ -771,6 +771,7 @@
     "num-server-rounds", "num-features", "num-classes", "num-labels",
     "feature-bounds", "target-bounds", "target-levels",
     "model-spec-b64", "loss-name", "local-epochs", "batch-size",
+    "backbone", "image-size", "vision-extractor-profile",
     "learning-rate", "weight-decay", "l1-penalty",
     "nb-dispersion", "gamma-shape", "huber-delta", "quantile-level",
     "optimizer-name", "optimizer-momentum", "optimizer-nesterov",

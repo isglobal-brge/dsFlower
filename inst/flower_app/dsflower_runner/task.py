@@ -400,7 +400,7 @@ def _resolve_image_path(images_root, value):
     return candidate
 
 
-def load_image_collection(context=None):
+def load_image_collection(context=None, *, allow_empty=False):
     """Resolve a staged dsImaging collection to (image_paths, y, patient_ids).
 
     The R side (.stageFromDescriptor_image) already resolved the dsImaging dataset
@@ -435,7 +435,7 @@ def load_image_collection(context=None):
     target_col = manifest["target_column"]
     if not isinstance(target_col, str) or target_col not in df.columns:
         raise ValueError("manifest must pin one available target column")
-    if not len(df):
+    if not len(df) and not allow_empty:
         raise ValueError("staged image collection has an invalid target column")
 
     paths = []
@@ -818,6 +818,40 @@ def load_pinned_run_config(context=None):
         for key in neural_public_keys:
             if key in cfg and (key not in manifest or cfg[key] != manifest[key]):
                 raise ValueError("Flower neural config does not match manifest pin")
+        if manifest.get("data_type") == "image":
+            for key in (
+                    "backbone", "image-size", "vision-extractor-profile",
+                    "num-features"):
+                if (key not in cfg or key not in manifest
+                        or type(cfg[key]) is not type(manifest[key])
+                        or cfg[key] != manifest[key]):
+                    raise ValueError(
+                        "Flower vision config does not match manifest pin")
+            if (type(cfg.get("data-kind")) is not str
+                    or cfg["data-kind"] != "image"):
+                raise ValueError(
+                    "Flower vision data-kind does not match manifest pin")
+            if any(key in cfg or key in manifest for key in (
+                    "validation-artifact-format",
+                    "validation-artifact-sha256",
+                    "validation-artifact-size-bytes")):
+                raise ValueError(
+                    "Flower vision training config has validation-only fields")
+        elif any(key in cfg or key in manifest for key in (
+                "backbone", "image-size", "vision-extractor-profile",
+                "validation-artifact-format", "validation-artifact-sha256",
+                "validation-artifact-size-bytes")):
+            raise ValueError(
+                "Flower tabular neural config has image-only fields")
+        else:
+            for source in (cfg, manifest):
+                if ("data-kind" in source
+                        and (type(source["data-kind"]) is not str
+                             or source["data-kind"]
+                             != manifest.get("data_type"))):
+                    raise ValueError(
+                        "Flower tabular neural data-kind does not match "
+                        "manifest pin")
     resampling_fields = (
         "resampling-version", "resampling-method", "resampling-assignment",
         "resampling-test-numerator", "resampling-test-denominator",
@@ -923,9 +957,33 @@ def load_pinned_run_config(context=None):
             "num-server-rounds", "num-features", "num-classes",
             "num-labels", "loss-name",
         ]
-        if str(manifest.get("validation-model-track", "")) == "neural":
+        model_track = str(manifest.get("validation-model-track", ""))
+        if model_track == "neural":
             required.append("model-spec-b64")
-        elif str(manifest.get("validation-model-track", "")) == "native_tree":
+            image_fields = (
+                "backbone", "image-size", "vision-extractor-profile",
+                "validation-artifact-format",
+                "validation-artifact-sha256",
+                "validation-artifact-size-bytes",
+            )
+            data_type = manifest.get("data_type")
+            if data_type == "image":
+                required.extend(image_fields)
+                if ("data-kind" not in cfg
+                        or type(cfg["data-kind"]) is not str
+                        or type(data_type) is not str
+                        or cfg["data-kind"] != data_type):
+                    raise ValueError(
+                        "Flower vision validation data-kind does not match "
+                        "manifest pin")
+            elif data_type == "tabular":
+                inactive = set(image_fields) | {"data-kind"}
+                if any(key in cfg or key in manifest for key in inactive):
+                    raise ValueError(
+                        "Flower tabular validation has image-only fields")
+            else:
+                raise ValueError("manifest has an invalid validation data type")
+        elif model_track == "native_tree":
             required.extend([
                 "validation-native-tree-request-b64",
                 "validation-native-tree-request-sha256",
@@ -937,7 +995,10 @@ def load_pinned_run_config(context=None):
         for key in required:
             if key not in manifest:
                 raise ValueError("manifest is missing validation pin '%s'" % key)
-            if cfg.get(key) != manifest[key]:
+            if (cfg.get(key) != manifest[key]
+                    or (model_track == "neural"
+                        and manifest.get("data_type") == "image"
+                        and type(cfg.get(key)) is not type(manifest[key]))):
                 raise ValueError("Flower validation config does not match manifest pin")
     if str(manifest.get("dp-track", "")).lower() == "association":
         required = (
@@ -966,9 +1027,11 @@ def load_pinned_run_config(context=None):
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",
         "feature-bounds", "backbone", "image-size", "user-module",
+        "vision-extractor-profile",
         "task-type", "app-params-b64", "app-params-sha256",
         "target-bounds", "target-levels", "validation-model-track",
         "validation-task", "validation-bins", "validation-contract-sha256",
+        "data-kind",
         "validation-native-tree-request-b64",
         "validation-native-tree-request-sha256",
         "validation-artifact-format", "validation-artifact-sha256",

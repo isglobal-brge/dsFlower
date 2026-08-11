@@ -1,6 +1,7 @@
 """Formal regressions for the trusted DP validation sufficient statistics."""
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -17,7 +18,7 @@ if RUNNER_ROOT not in sys.path:
     sys.path.insert(0, RUNNER_ROOT)
 
 from dsflower_runner import (client_app, dp_harness, params, server_app, task,
-                             validation)  # noqa: E402
+                             validation, vision)  # noqa: E402
 from flwr.common import (ArrayRecord, ConfigRecord, Message, MetricRecord,
                          RecordDict)  # noqa: E402
 
@@ -425,6 +426,28 @@ class ValidationReleaseTests(unittest.TestCase):
 
 
 class ValidationInferenceTests(unittest.TestCase):
+    @staticmethod
+    def _vision_config(backbone, n_classes=2):
+        feature_dim = vision.feature_dim_for(backbone)
+        spec = {"kind": "sequential", "layers": [
+            {"op": "linear", "out": "@out"}]}
+        return {
+            "validation-model-track": "neural",
+            "validation-task": "binary" if n_classes == 2 else "multiclass",
+            "validation-bins": 8,
+            "validation-contract-sha256": "a" * 64,
+            "data-kind": "image", "backbone": backbone,
+            "image-size": vision._MIN_BACKBONE_IMAGE_SIZE[backbone],
+            "vision-extractor-profile": vision.extractor_profile_for(backbone),
+            "num-features": feature_dim, "num-classes": n_classes,
+            "num-labels": 2, "loss-name": "cross_entropy",
+            "model-spec-b64": base64.b64encode(
+                json.dumps(spec).encode("utf-8")).decode("ascii"),
+            "validation-artifact-format": "pytorch-state-dict-v1",
+            "validation-artifact-sha256": "0" * 64,
+            "validation-artifact-size-bytes": 1,
+        }
+
     def test_neural_inference_is_batched_and_accepts_empty_cohorts(self):
         import torch
 
@@ -478,6 +501,54 @@ class ValidationInferenceTests(unittest.TestCase):
         self.assertEqual(len(actual), len(expected))
         for got, want in zip(actual, expected):
             np.testing.assert_array_equal(got, want)
+
+    def test_server_loads_canonical_2d_and_3d_vision_heads(self):
+        import torch
+
+        for backbone in (
+                "resnet18", "resnet18_3d",
+                "densenet121", "densenet121_3d"):
+            with self.subTest(backbone=backbone), \
+                    tempfile.TemporaryDirectory() as directory:
+                cfg = self._vision_config(
+                    backbone, n_classes=3 if "dense" in backbone else 2)
+                model = params.load_user_model(
+                    cfg, cfg["num-features"], "cross_entropy")
+                expected = params.get_torch_params(model)
+                path = os.path.join(directory, "model.pt")
+                torch.save(model.state_dict(), path)
+                with open(path, "rb") as handle:
+                    digest = hashlib.sha256(handle.read()).hexdigest()
+                cfg.update({
+                    "validation-model-path-b64": base64.b64encode(
+                        path.encode("utf-8")).decode("ascii"),
+                    "validation-artifact-sha256": digest,
+                    "validation-artifact-size-bytes": os.path.getsize(path),
+                })
+                actual = validation.public_model_arrays(cfg)
+                self.assertEqual(len(actual), len(expected))
+                for got, want in zip(actual, expected):
+                    np.testing.assert_array_equal(got, want)
+
+    def test_vision_artifact_tamper_fails_before_torch_decoder(self):
+        import torch
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "model.pt")
+            with open(path, "wb") as handle:
+                handle.write(b"public but tampered checkpoint")
+            cfg = self._vision_config("resnet18")
+            cfg.update({
+                "validation-model-path-b64": base64.b64encode(
+                    path.encode("utf-8")).decode("ascii"),
+                "validation-artifact-size-bytes": os.path.getsize(path),
+            })
+            with mock.patch.object(
+                    torch, "load",
+                    side_effect=AssertionError("decoder must not run")) as load:
+                with self.assertRaisesRegex(ValueError, "SHA-256 pin"):
+                    validation.public_model_arrays(cfg)
+            load.assert_not_called()
 
     def test_server_rejects_removed_tree_validation_track(self):
         with self.assertRaisesRegex(ValueError, "must be neural"):
@@ -629,6 +700,256 @@ class ValidationInferenceTests(unittest.TestCase):
                                       dtype=np.float32), "bce_logits"),
                 validation.validation_layout("classification", bins=8)).sum(axis=0)
             self.assertFalse(np.array_equal(released[0], raw))
+
+    def test_node_vision_validation_preflights_then_releases_2d_and_3d(self):
+        import torch
+
+        class FixedEncoder(torch.nn.Module):
+            def __init__(self, width):
+                super().__init__()
+                self.width = width
+
+            def forward(self, batch):
+                axes = tuple(range(1, batch.ndim))
+                return batch.mean(dim=axes)[:, None].expand(-1, self.width)
+
+        cases = (
+            ("resnet18", 2, "row"),
+            ("densenet121_3d", 3, "patient"),
+        )
+        for backbone, n_classes, privacy_unit in cases:
+            with self.subTest(backbone=backbone, unit=privacy_unit), \
+                    tempfile.TemporaryDirectory() as directory:
+                corrupt = os.path.join(directory, "corrupt.png")
+                with open(corrupt, "wb") as handle:
+                    handle.write(b"not an image")
+                patient_header = ",patient" if privacy_unit == "patient" else ""
+                patient_values = ", p1" if privacy_unit == "patient" else ""
+                with open(os.path.join(directory, "samples.csv"), "w",
+                          encoding="utf-8") as handle:
+                    handle.write("relative_path,label%s\n" % patient_header)
+                    handle.write("corrupt.png,0%s\n" % patient_values)
+                    handle.write("corrupt.png,1%s\n" % patient_values)
+
+                cfg = self._vision_config(backbone, n_classes=n_classes)
+                manifest = {
+                    **{key: value for key, value in cfg.items()
+                       if key != "data-kind"},
+                    "dp-track": "validation", "data_type": "image",
+                    "samples_file": "samples.csv", "target_column": "label",
+                    "assets": {"images": {
+                        "type": "image_root", "root": directory,
+                        "path_col": "relative_path"}},
+                    "dp-unit": privacy_unit,
+                    "patient_column": (
+                        "patient" if privacy_unit == "patient" else None),
+                    "patient-id-canonicalization": "trim-utf8-v2",
+                    "n_units": 1 if privacy_unit == "patient" else 2,
+                    "task-type": "classification",
+                    "target-levels": {"type": "character", "values": [
+                        "class-%d" % value for value in range(n_classes)]},
+                }
+                with open(os.path.join(directory, "manifest.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump(manifest, handle)
+                secret = os.path.join(directory, "node-secret")
+                with open(secret, "w", encoding="ascii") as handle:
+                    handle.write("72" * 32)
+                os.chmod(secret, 0o600)
+                context = type("Context", (), {
+                    "node_config": {"manifest-dir": directory}})()
+                model = params.load_user_model(
+                    cfg, cfg["num-features"], "cross_entropy")
+                private_started = [False]
+
+                def build(name):
+                    self.assertFalse(private_started[0])
+                    self.assertEqual(name, backbone)
+                    return FixedEncoder(cfg["num-features"]), cfg["num-features"]
+
+                original_load = task.load_image_collection
+
+                def load(*args, **kwargs):
+                    self.assertTrue(private_started[0])
+                    self.assertTrue(kwargs.get("allow_empty"))
+                    return original_load(*args, **kwargs)
+
+                with (mock.patch.dict(os.environ, {
+                        "DSFLOWER_NODE_SECRET_FILE": secret}),
+                      mock.patch.object(vision, "build_backbone", side_effect=build),
+                      mock.patch.object(vision, "pick_device",
+                                        return_value=torch.device("cpu")),
+                      mock.patch.object(task, "load_image_collection",
+                                        side_effect=load),
+                      mock.patch.object(
+                          validation, "private_validation_vector",
+                          wraps=validation.private_validation_vector) as release):
+                    result = validation.private_model_validation(
+                        context, cfg, {"epsilon": 1.0, "delta": 1e-5}, 1,
+                        params.get_torch_params(model),
+                        on_private_start=lambda: private_started.__setitem__(0, True))
+                self.assertTrue(private_started[0])
+                self.assertEqual(release.call_count, 1)
+                unit_ids = release.call_args.kwargs["unit_ids"]
+                if privacy_unit == "patient":
+                    np.testing.assert_array_equal(unit_ids, np.asarray(["p1", "p1"]))
+                else:
+                    self.assertIsNone(unit_ids)
+                self.assertEqual(result[0].shape, (
+                    validation.validation_layout(
+                        "classification", n_classes=n_classes, bins=8)["size"],))
+                self.assertTrue(bool(np.all(np.isfinite(result[0]))))
+
+    def test_empty_vision_cohort_emits_one_noise_only_release(self):
+        import torch
+
+        class FixedEncoder(torch.nn.Module):
+            def forward(self, batch):
+                return torch.zeros((batch.shape[0], 512), device=batch.device)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "samples.csv"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("relative_path,label\n")
+            cfg = self._vision_config("resnet18")
+            manifest = {
+                **{key: value for key, value in cfg.items()
+                   if key != "data-kind"},
+                "dp-track": "validation", "data_type": "image",
+                "samples_file": "samples.csv", "target_column": "label",
+                "assets": {"images": {
+                    "type": "image_root", "root": directory,
+                    "path_col": "relative_path"}},
+                "dp-unit": "row", "patient_column": None, "n_units": 0,
+                "task-type": "classification",
+                "target-levels": {
+                    "type": "character", "values": ["no", "yes"]},
+            }
+            with open(os.path.join(directory, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            secret = os.path.join(directory, "node-secret")
+            with open(secret, "w", encoding="ascii") as handle:
+                handle.write("73" * 32)
+            os.chmod(secret, 0o600)
+            context = type("Context", (), {
+                "node_config": {"manifest-dir": directory}})()
+            model = params.load_user_model(cfg, 512, "cross_entropy")
+            with (mock.patch.dict(os.environ, {
+                    "DSFLOWER_NODE_SECRET_FILE": secret}),
+                  mock.patch.object(
+                      vision, "build_backbone",
+                      return_value=(FixedEncoder(), 512)),
+                  mock.patch.object(vision, "pick_device",
+                                    return_value=torch.device("cpu")),
+                  mock.patch.object(
+                      vision, "extract_features_from_paths",
+                      side_effect=AssertionError("empty cohort has no images")) as extract,
+                  mock.patch.object(
+                      validation, "private_validation_vector",
+                      wraps=validation.private_validation_vector) as release):
+                result = validation.private_model_validation(
+                    context, cfg, {"epsilon": 1.0, "delta": 1e-5}, 1,
+                    params.get_torch_params(model))
+            extract.assert_not_called()
+            self.assertEqual(release.call_count, 1)
+            self.assertEqual(release.call_args.args[0].size, 0)
+            self.assertTrue(bool(np.all(np.isfinite(result[0]))))
+            self.assertFalse(bool(np.all(result[0] == 0.0)))
+
+    def test_invalid_vision_target_levels_fail_before_private_read(self):
+        cfg = self._vision_config("resnet18")
+        invalid_levels = (
+            {"type": "character", "values": ["only-one"]},
+            {"type": "numeric", "values": [1, 1.0]},
+            {"type": "logical", "values": [True, 1]},
+        )
+        for levels in invalid_levels:
+            with self.subTest(levels=levels), \
+                    tempfile.TemporaryDirectory() as directory:
+                with open(os.path.join(directory, "manifest.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump({
+                        "data_type": "image", "target-levels": levels,
+                    }, handle)
+                context = type("Context", (), {
+                    "node_config": {"manifest-dir": directory}})()
+                with mock.patch.object(
+                        task, "load_image_collection",
+                        side_effect=AssertionError("private read")) as private:
+                    with self.assertRaisesRegex(ValueError, "target levels"):
+                        validation.private_model_validation(
+                            context, cfg,
+                            {"epsilon": 1.0, "delta": 1e-5}, 1,
+                            [np.zeros(1, dtype=np.float32)])
+                private.assert_not_called()
+
+    def test_invalid_vision_artifact_pins_fail_before_private_read(self):
+        base = self._vision_config("resnet18")
+        cases = (
+            ("validation-artifact-format", "other"),
+            ("validation-artifact-sha256", "A" * 64),
+            ("validation-artifact-size-bytes", True),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({
+                    "data_type": "image",
+                    "target-levels": {
+                        "type": "character", "values": ["no", "yes"]},
+                }, handle)
+            context = type("Context", (), {
+                "node_config": {"manifest-dir": directory}})()
+            for key, value in cases:
+                callback = mock.Mock()
+                with self.subTest(key=key), mock.patch.object(
+                        task, "load_image_collection",
+                        side_effect=AssertionError("private read")) as private:
+                    with self.assertRaisesRegex(ValueError, "artifact"):
+                        validation.private_model_validation(
+                            context, {**base, key: value},
+                            {"epsilon": 1.0, "delta": 1e-5}, 1,
+                            [np.zeros(1, dtype=np.float32)],
+                            on_private_start=callback)
+                callback.assert_not_called()
+                private.assert_not_called()
+
+    def test_vision_model_and_backbone_tamper_fail_before_private_read(self):
+        cfg = self._vision_config("resnet18")
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({
+                    "data_type": "image",
+                    "target-levels": {
+                        "type": "character", "values": ["no", "yes"]},
+                }, handle)
+            context = type("Context", (), {
+                "node_config": {"manifest-dir": directory}})()
+            model = params.load_user_model(cfg, 512, "cross_entropy")
+            arrays = params.get_torch_params(model)
+            cases = (
+                ("arrays", [np.zeros(1, dtype=np.float32)], None),
+                ("geometry", arrays, (object(), 1024)),
+                ("dependency", arrays, RuntimeError("missing backbone")),
+            )
+            for label, supplied, build_result in cases:
+                callback = mock.Mock()
+                build = (mock.Mock(side_effect=build_result)
+                         if isinstance(build_result, Exception)
+                         else mock.Mock(return_value=build_result))
+                with self.subTest(label=label), \
+                        mock.patch.object(vision, "build_backbone", build), \
+                        mock.patch.object(
+                            task, "load_image_collection",
+                            side_effect=AssertionError("private read")) as private:
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        validation.private_model_validation(
+                            context, cfg, {"epsilon": 1.0, "delta": 1e-5}, 1,
+                            supplied, on_private_start=callback)
+                callback.assert_not_called()
+                private.assert_not_called()
 
     def test_node_rejects_removed_tree_validation_before_private_read(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -946,7 +1267,7 @@ class ValidationInferenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "manifest.json"), "w",
                       encoding="utf-8") as handle:
-                json.dump(cfg, handle)
+                json.dump({**cfg, "data_type": "tabular"}, handle)
             context = type("Context", (), {
                 "node_config": {"manifest-dir": directory},
                 "run_config": dict(cfg),
@@ -956,6 +1277,76 @@ class ValidationInferenceTests(unittest.TestCase):
             context.run_config["validation-bins"] = 9
             with self.assertRaises(ValueError):
                 task.load_pinned_run_config(context)
+
+    def test_image_validation_pins_are_exact_before_private_read(self):
+        cfg = self._vision_config("resnet18")
+        cfg["dp-track"] = "validation"
+        cfg["num-server-rounds"] = 1
+        manifest = {
+            **{key: value for key, value in cfg.items()
+               if key != "data-kind"},
+            "data_type": "image",
+        }
+        mutations = {
+            "data-kind": "tabular",
+            "backbone": "densenet121",
+            "image-size": 17,
+            "vision-extractor-profile": "wrong-profile",
+            "validation-artifact-format": "other",
+            "validation-artifact-sha256": "1" * 64,
+            "validation-artifact-size-bytes": 2,
+            "num-features": 512.0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            context = type("Context", (), {
+                "node_config": {"manifest-dir": directory},
+                "run_config": dict(cfg),
+            })()
+            pinned = task.load_pinned_run_config(context)
+            self.assertEqual(pinned["data-kind"], "image")
+            for key, value in mutations.items():
+                with self.subTest(key=key), mock.patch.object(
+                        task, "load_image_collection",
+                        side_effect=AssertionError("private read")) as private:
+                    context.run_config = {**cfg, key: value}
+                    with self.assertRaises(ValueError):
+                        task.load_pinned_run_config(context)
+                    private.assert_not_called()
+
+    def test_tabular_neural_validation_rejects_image_only_fields(self):
+        base = {
+            "dp-track": "validation", "validation-model-track": "neural",
+            "validation-task": "binary", "validation-bins": 8,
+            "validation-contract-sha256": "a" * 64,
+            "num-server-rounds": 1, "num-features": 2,
+            "num-classes": 2, "num-labels": 2,
+            "loss-name": "bce_logits", "model-spec-b64": "e30=",
+        }
+        fields = {
+            "data-kind": "tabular", "backbone": "resnet18",
+            "image-size": 16,
+            "vision-extractor-profile":
+                "dsflower-resnet18-imagenet1k-v1-extractor-v1",
+            "validation-artifact-format": "pytorch-state-dict-v1",
+            "validation-artifact-sha256": "0" * 64,
+            "validation-artifact-size-bytes": 1,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump({**base, "data_type": "tabular"}, handle)
+            context = type("Context", (), {
+                "node_config": {"manifest-dir": directory},
+                "run_config": dict(base),
+            })()
+            for key, value in fields.items():
+                with self.subTest(key=key):
+                    context.run_config = {**base, key: value}
+                    with self.assertRaisesRegex(ValueError, "image-only"):
+                        task.load_pinned_run_config(context)
 
 
 if __name__ == "__main__":

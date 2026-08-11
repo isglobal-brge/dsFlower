@@ -1,6 +1,22 @@
 # Module: DataSHIELD Exposed Methods
 # All DataSHIELD assign/aggregate methods for Flower federated learning.
 
+.VISION_VALIDATION_ARTIFACT_FORMAT <- "pytorch-state-dict-v1"
+.VISION_VALIDATION_ARTIFACT_MAX_BYTES <- 1024^3
+.VISION_EXTRACTOR_FEATURE_DIMS <- c(
+  resnet18 = 512L, resnet18_3d = 512L,
+  densenet121 = 1024L, densenet121_3d = 1024L)
+.VISION_EXTRACTOR_MIN_IMAGE_SIZES <- c(
+  resnet18 = 1L, resnet18_3d = 1L,
+  densenet121 = 29L, densenet121_3d = 128L)
+.VISION_EXTRACTOR_PROFILES <- c(
+  resnet18 = "dsflower-resnet18-imagenet1k-v1-extractor-v1",
+  resnet18_3d = "dsflower-resnet18-monai-seed0-extractor-v1",
+  densenet121 = "dsflower-densenet121-imagenet1k-v1-extractor-v1",
+  densenet121_3d = "dsflower-densenet121-monai-seed0-extractor-v1")
+.VISION_EXTRACTOR_FIELDS <-
+  c("backbone", "image-size", "vision-extractor-profile")
+
 # --- Handle management ---
 
 #' Generate an opaque Flower-handle capability
@@ -370,12 +386,69 @@ flowerInitDS <- function(data_symbol) {
   list(run_config = run_config, data_type = requested)
 }
 
+.normalizeVisionExtractorPins <- function(run_config, num_features = NULL) {
+  backbone <- as.character(unlist(
+    run_config[["backbone"]], use.names = FALSE))
+  image_size <- suppressWarnings(as.numeric(unlist(
+    run_config[["image-size"]], use.names = FALSE)))
+  profile <- as.character(unlist(
+    run_config[["vision-extractor-profile"]], use.names = FALSE))
+  if (length(backbone) != 1L || is.na(backbone) ||
+      !backbone %in% names(.VISION_EXTRACTOR_PROFILES)) {
+    stop("Vision backbone is not canonical.", call. = FALSE)
+  }
+  if (length(profile) != 1L || is.na(profile) ||
+      !identical(profile, unname(.VISION_EXTRACTOR_PROFILES[[backbone]]))) {
+    stop("Vision extractor profile does not match its canonical backbone.",
+         call. = FALSE)
+  }
+  expected_dim <- unname(.VISION_EXTRACTOR_FEATURE_DIMS[[backbone]])
+  minimum_image_size <- unname(
+    .VISION_EXTRACTOR_MIN_IMAGE_SIZES[[backbone]])
+  if (length(image_size) != 1L || !is.finite(image_size) ||
+      image_size != floor(image_size) || image_size < minimum_image_size ||
+      image_size > 512L ||
+      (!is.null(num_features) &&
+       (!is.numeric(num_features) || is.logical(num_features) ||
+        length(num_features) != 1L || is.na(num_features) ||
+        !is.finite(num_features) || num_features != floor(num_features) ||
+        num_features != expected_dim))) {
+    stop("Vision image geometry is outside its public contract.",
+         call. = FALSE)
+  }
+  run_config[["backbone"]] <- backbone
+  run_config[["image-size"]] <- as.integer(image_size)
+  run_config[["vision-extractor-profile"]] <- profile
+  if (!is.null(num_features)) {
+    run_config[["num-features"]] <- as.integer(expected_dim)
+  }
+  run_config
+}
+
 .normalizeValidationConfig <- function(run_config, track) {
   fields <- names(run_config)[startsWith(tolower(names(run_config)),
                                           "validation-")]
   if (!identical(track, "validation")) {
+    present_vision <- intersect(.VISION_EXTRACTOR_FIELDS, names(run_config))
     if (length(fields)) {
       stop("validation-* fields require dp-track='validation'.",
+           call. = FALSE)
+    }
+    data_type <- tolower(as.character(unlist(
+      run_config[["data_type"]] %||% "tabular", use.names = FALSE)))
+    if (identical(track, "neural") && identical(data_type, "image")) {
+      if (!identical(sort(present_vision),
+                     sort(.VISION_EXTRACTOR_FIELDS))) {
+        stop("Image neural training requires the exact backbone, image-size ",
+             "and vision-extractor-profile pin set.", call. = FALSE)
+      }
+      return(.normalizeVisionExtractorPins(
+        run_config,
+        num_features = unlist(
+          run_config[["num-features"]] %||% NA_real_, use.names = FALSE)))
+    }
+    if (length(present_vision)) {
+      stop("Vision extractor fields require neural image training or validation.",
            call. = FALSE)
     }
     return(run_config)
@@ -386,6 +459,8 @@ flowerInitDS <- function(data_symbol) {
   }
   model_track <- tolower(as.character(unlist(
     run_config[["validation-model-track"]] %||% "", use.names = FALSE)))
+  data_type <- tolower(as.character(unlist(
+    run_config[["data_type"]] %||% "tabular", use.names = FALSE)))
   task <- tolower(as.character(unlist(
     run_config[["validation-task"]] %||% "", use.names = FALSE)))
   bins <- suppressWarnings(as.numeric(unlist(
@@ -393,6 +468,11 @@ flowerInitDS <- function(data_symbol) {
   if (length(model_track) != 1L || is.na(model_track) ||
       !model_track %in% c("neural", "native_tree")) {
     stop("validation-model-track must be neural or native_tree.",
+         call. = FALSE)
+  }
+  if (length(data_type) != 1L || is.na(data_type) ||
+      !data_type %in% c("tabular", "image")) {
+    stop("Validation data_type must be exactly tabular or image.",
          call. = FALSE)
   }
   if (length(task) != 1L || is.na(task) ||
@@ -455,20 +535,80 @@ flowerInitDS <- function(data_symbol) {
     stop("validation-task disagrees with the pinned model loss.",
          call. = FALSE)
   }
-  native_fields <- c(
+  artifact_fields <- c(
+    "validation-artifact-format", "validation-artifact-sha256",
+    "validation-artifact-size-bytes")
+  native_only_fields <- c(
     "validation-native-tree-request-b64",
     "validation-native-tree-request-sha256",
-    "validation-artifact-format", "validation-artifact-sha256",
-    "validation-artifact-size-bytes",
     "validation-profile-sha256", "validation-profile-size-bytes",
     "validation-public-schema-sha256")
-  present_native <- intersect(native_fields, names(run_config))
+  present_artifact <- intersect(artifact_fields, names(run_config))
+  present_native_only <- intersect(native_only_fields, names(run_config))
+  vision_fields <- .VISION_EXTRACTOR_FIELDS
+  present_vision <- intersect(vision_fields, names(run_config))
   if (identical(model_track, "neural")) {
-    if (length(present_native)) {
+    if (length(present_native_only)) {
       stop("Native-tree validation pins require validation-model-track=",
            "'native_tree'.", call. = FALSE)
     }
+    if (identical(data_type, "image")) {
+      if (!identical(task, if (n_classes == 2L) "binary" else "multiclass") ||
+          !identical(loss, "cross_entropy") || n_labels != 2L) {
+        stop("Vision validation supports cross_entropy binary/multiclass ",
+             "classification only.", call. = FALSE)
+      }
+      if (!identical(sort(present_vision), sort(vision_fields)) ||
+          !identical(sort(present_artifact), sort(artifact_fields))) {
+        stop("Vision validation requires the exact backbone, image-size, ",
+             "extractor-profile and artifact pin set.", call. = FALSE)
+      }
+      if (!is.null(run_config[["feature-bounds"]]) ||
+          !is.null(run_config[["target-bounds"]])) {
+        stop("Vision validation does not accept tabular feature or target bounds.",
+             call. = FALSE)
+      }
+      levels <- unlist(run_config[["target-levels"]] %||% NULL,
+                       use.names = FALSE)
+      if (length(levels) != n_classes || anyNA(levels) ||
+          anyDuplicated(levels)) {
+        stop("Vision validation requires exactly one public target level per class.",
+             call. = FALSE)
+      }
+      run_config <- .normalizeVisionExtractorPins(
+        run_config, num_features = n_features)
+      artifact_hash <- run_config[["validation-artifact-sha256"]]
+      artifact_size <- suppressWarnings(as.numeric(unlist(
+        run_config[["validation-artifact-size-bytes"]], use.names = FALSE)))
+      if (!identical(run_config[["validation-artifact-format"]],
+                     .VISION_VALIDATION_ARTIFACT_FORMAT) ||
+          !is.character(artifact_hash) || length(artifact_hash) != 1L ||
+          is.na(artifact_hash) || !grepl("^[0-9a-f]{64}$", artifact_hash) ||
+          length(artifact_size) != 1L || !is.finite(artifact_size) ||
+          artifact_size != floor(artifact_size) || artifact_size < 1 ||
+          artifact_size > .VISION_VALIDATION_ARTIFACT_MAX_BYTES) {
+        stop("Vision validation artifact pins are outside their public contract.",
+             call. = FALSE)
+      }
+      spec_b64 <- run_config[["model-spec-b64"]]
+      if (!is.character(spec_b64) || length(spec_b64) != 1L ||
+          is.na(spec_b64) || !nzchar(spec_b64)) {
+        stop("Vision validation requires one declarative model spec.",
+             call. = FALSE)
+      }
+      run_config[["validation-artifact-size-bytes"]] <-
+        as.integer(artifact_size)
+    } else if (length(present_vision) || length(present_artifact)) {
+      stop("Vision-only validation pins require data_type='image'.",
+           call. = FALSE)
+    }
   } else {
+    if (!identical(data_type, "tabular") || length(present_vision)) {
+      stop("Native-tree validation accepts tabular data only.",
+           call. = FALSE)
+    }
+    present_native <- c(present_artifact, present_native_only)
+    native_fields <- c(artifact_fields, native_only_fields)
     if (!identical(task, if (identical(loss, "bce_logits")) "binary" else
                    if (identical(loss, "mse")) "regression" else "") ||
         !identical(sort(present_native), sort(native_fields))) {
@@ -633,7 +773,8 @@ flowerInitDS <- function(data_symbol) {
 }
 
 .validationContractSha256 <- function(run_config, feature_columns,
-                                      target_column, privacy_unit) {
+                                      target_column, privacy_unit,
+                                      data_kind = NULL) {
   bounds <- run_config[["feature-bounds"]] %||% NULL
   target_bounds <- run_config[["target-bounds"]] %||% NULL
   levels <- run_config[["target-levels"]] %||% NULL
@@ -648,29 +789,62 @@ flowerInitDS <- function(data_symbol) {
     level_type <- if (is.character(level_values)) "character" else
       if (is.logical(level_values)) "logical" else "numeric"
   }
-  payload <- list(
-    schema = 1L,
-    privacy_unit = as.character(privacy_unit),
-    patient_id_canonicalization = if (identical(privacy_unit, "patient"))
-      "trim-utf8-v2" else NULL,
-    features = as.character(feature_columns),
-    targets = as.character(target_column),
-    feature_lower = if (is.null(bounds)) NULL else as.numeric(bounds$lower),
-    feature_upper = if (is.null(bounds)) NULL else as.numeric(bounds$upper),
-    target_level_type = level_type,
-    target_levels = level_values,
-    target_lower = if (is.null(target_bounds)) NULL else
-      as.numeric(target_bounds$lower),
-    target_upper = if (is.null(target_bounds)) NULL else
-      as.numeric(target_bounds$upper),
-    model_track = run_config[["validation-model-track"]],
-    task = run_config[["validation-task"]],
-    bins = as.integer(run_config[["validation-bins"]]),
-    loss = run_config[["loss-name"]],
-    num_features = as.integer(run_config[["num-features"]]),
-    num_classes = as.integer(run_config[["num-classes"]]),
-    num_labels = as.integer(run_config[["num-labels"]]),
-    model_spec_b64 = run_config[["model-spec-b64"]] %||% NULL)
+  data_kind <- as.character(data_kind %||%
+    run_config[["data_type"]] %||% "tabular")
+  if (identical(data_kind, "image")) {
+    backbone <- as.character(run_config[["backbone"]])
+    feature_dim <- as.integer(run_config[["num-features"]])
+    payload <- list(
+      schema = 2L,
+      privacy_unit = as.character(privacy_unit),
+      patient_id_canonicalization = if (identical(privacy_unit, "patient"))
+        "trim-utf8-v2" else NULL,
+      data_kind = "image",
+      targets = as.character(target_column),
+      target_level_type = level_type,
+      target_levels = level_values,
+      model_track = run_config[["validation-model-track"]],
+      task = run_config[["validation-task"]],
+      bins = as.integer(run_config[["validation-bins"]]),
+      loss = run_config[["loss-name"]],
+      num_features = feature_dim,
+      num_classes = as.integer(run_config[["num-classes"]]),
+      num_labels = as.integer(run_config[["num-labels"]]),
+      model_spec_b64 = run_config[["model-spec-b64"]] %||% NULL,
+      backbone = backbone,
+      image_size = as.integer(run_config[["image-size"]]),
+      volumetric = endsWith(backbone, "_3d"),
+      feature_dim = feature_dim,
+      vision_extractor_profile = run_config[["vision-extractor-profile"]],
+      artifact_format = run_config[["validation-artifact-format"]],
+      artifact_sha256 = run_config[["validation-artifact-sha256"]],
+      artifact_size_bytes = as.integer(
+        run_config[["validation-artifact-size-bytes"]]))
+  } else {
+    payload <- list(
+      schema = 1L,
+      privacy_unit = as.character(privacy_unit),
+      patient_id_canonicalization = if (identical(privacy_unit, "patient"))
+        "trim-utf8-v2" else NULL,
+      features = as.character(feature_columns),
+      targets = as.character(target_column),
+      feature_lower = if (is.null(bounds)) NULL else as.numeric(bounds$lower),
+      feature_upper = if (is.null(bounds)) NULL else as.numeric(bounds$upper),
+      target_level_type = level_type,
+      target_levels = level_values,
+      target_lower = if (is.null(target_bounds)) NULL else
+        as.numeric(target_bounds$lower),
+      target_upper = if (is.null(target_bounds)) NULL else
+        as.numeric(target_bounds$upper),
+      model_track = run_config[["validation-model-track"]],
+      task = run_config[["validation-task"]],
+      bins = as.integer(run_config[["validation-bins"]]),
+      loss = run_config[["loss-name"]],
+      num_features = as.integer(run_config[["num-features"]]),
+      num_classes = as.integer(run_config[["num-classes"]]),
+      num_labels = as.integer(run_config[["num-labels"]]),
+      model_spec_b64 = run_config[["model-spec-b64"]] %||% NULL)
+  }
   if (identical(run_config[["validation-model-track"]], "native_tree")) {
     payload$native_tree_request_b64 <-
       run_config[["validation-native-tree-request-b64"]]
@@ -1185,12 +1359,19 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
   }
   if (identical(run_config[["dp-track"]], "validation")) {
-    if (!is.character(feature_columns) || !length(feature_columns) ||
-        anyNA(feature_columns) || any(!nzchar(feature_columns)) ||
-        anyDuplicated(feature_columns) ||
-        length(feature_columns) != run_config[["num-features"]]) {
-      stop("Validation requires the explicit ordered public feature contract.",
-           call. = FALSE)
+    if (identical(data_type, "image")) {
+      if (!is.null(feature_columns)) {
+        stop("Vision validation does not accept tabular feature columns.",
+             call. = FALSE)
+      }
+    } else {
+      if (!is.character(feature_columns) || !length(feature_columns) ||
+          anyNA(feature_columns) || any(!nzchar(feature_columns)) ||
+          anyDuplicated(feature_columns) ||
+          length(feature_columns) != run_config[["num-features"]]) {
+        stop("Validation requires the explicit ordered public feature contract.",
+             call. = FALSE)
+      }
     }
     unit_policy <- .dpUnitPolicy()
     if (identical(unit_policy$dp_unit, "patient") &&
@@ -1208,7 +1389,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
            call. = FALSE)
     }
     actual_contract <- .validationContractSha256(
-      run_config, feature_columns, target_column, unit_policy$dp_unit)
+      run_config, feature_columns, target_column, unit_policy$dp_unit,
+      data_kind = data_type)
     if (!identical(supplied_contract, actual_contract)) {
       stop("Validation contract SHA-256 does not match the prepared public contract.",
            call. = FALSE)
