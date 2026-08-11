@@ -146,6 +146,11 @@ jobs:
             'torch>=2.0.0,<3.0.0' \
             monai==1.3.0 \
             'opacus>=1.4.0,<2.0.0'
+          # setup-python exports loader paths on some runners, while the
+          # custodial bundle contract requires the production-clean environment.
+          for loader_var in $(compgen -e); do
+            case "$loader_var" in LD_*|DYLD_*) unset "$loader_var" ;; esac
+          done
           "$contract_python" -m unittest -v \
             inst/python/tests/test_native_tree_contract.py \
             inst/python/tests/test_native_tree_engine.py \
@@ -173,6 +178,9 @@ jobs:
       - name: Verify fail-closed build and curated DP bundle
         shell: bash
         run: |
+          for loader_var in $(compgen -e); do
+            case "$loader_var" in LD_*|DYLD_*) unset "$loader_var" ;; esac
+          done
           if [ "$RUNNER_OS" = "Windows" ]; then
             e2e_python="$RUNNER_TEMP/xgb-contract-venv/Scripts/python.exe"
           else
