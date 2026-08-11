@@ -578,6 +578,13 @@ test_that("image path failures are record-local and preserve row order", {
       image_root = root
     )
     expect_equal(linked_out$relative_path, "__dsflower_invalid_image__")
+    if (.Platform$OS.type == "windows") {
+      dsFlower:::.run_windows_powershell(paste0(
+        "Remove-Item -LiteralPath ",
+        dsFlower:::.powershell_literal(linked),
+        " -Force"
+      ))
+    }
   }
 })
 

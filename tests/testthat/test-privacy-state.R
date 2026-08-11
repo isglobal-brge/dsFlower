@@ -49,6 +49,16 @@ test_that("PowerShell encoded commands are a single exact argument", {
   )
 })
 
+test_that("Windows PowerShell output is captured as one complete line", {
+  skip_on_os("linux")
+  skip_on_os("mac")
+
+  expect_identical(
+    dsFlower:::.run_windows_powershell("Write-Output 'OK'"),
+    "OK"
+  )
+})
+
 test_that("Windows path and ACL command boundaries are strict and injectable", {
   root <- tempfile("dsflower-O'Brien-")
   dir.create(root)
