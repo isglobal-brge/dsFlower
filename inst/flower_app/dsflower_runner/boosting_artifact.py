@@ -31,6 +31,7 @@ _CATBOOST_SPLIT_FIELDS = frozenset((
 _MAX_ENSEMBLE_MODELS = 4096
 _MAX_TOTAL_NODES = 1_000_000
 _CONSTRUCTION_TOKEN = object()
+_PREDICTION_BATCH_ROWS = 4096
 
 
 def _float32(value):
@@ -289,6 +290,120 @@ def _extract_catboost(model):
     ) for tree in model["trees"])
 
 
+def _numeric_numpy_matrix(rows, features):
+    """Return NumPy only for the production numeric matrix fast path."""
+    row_type = type(rows)
+    if row_type.__module__ != "numpy" or row_type.__name__ != "ndarray":
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if row_type is not np.ndarray or rows.ndim != 2 or \
+            rows.dtype.kind not in "iuf" or rows.dtype.itemsize > 8 or \
+            (rows.shape[0] and rows.shape[1] != features):
+        return None
+    return np
+
+
+def _compiled_numpy_models(model, np):
+    compiled = []
+    for base_score, trees in model._models:
+        if model._engine == "lightgbm":
+            converted = []
+            for (left, right, default_left, features, cut_indices,
+                 leaves) in trees:
+                thresholds = tuple(
+                    model._cuts[int(feature)][int(cut)]
+                    for feature, cut in zip(features, cut_indices))
+                converted.append((
+                    np.asarray(left, dtype=np.intp),
+                    np.asarray(right, dtype=np.intp),
+                    np.asarray(default_left, dtype=np.bool_),
+                    np.asarray(features, dtype=np.intp),
+                    np.asarray(thresholds, dtype=np.float64),
+                    np.asarray(leaves, dtype=np.float64),
+                ))
+            converted = tuple(converted)
+        else:
+            converted = []
+            for splits, leaves in trees:
+                converted.append((
+                    np.asarray([value[0] for value in splits], dtype=np.intp),
+                    np.asarray([
+                        model._cuts[int(value[0])][int(value[1])]
+                        for value in splits
+                    ], dtype=np.float64),
+                    np.asarray([value[2] for value in splits], dtype=np.bool_),
+                    np.asarray(leaves, dtype=np.float64),
+                ))
+            converted = tuple(converted)
+        compiled.append((float(base_score), converted))
+    return tuple(compiled)
+
+
+def _lightgbm_leaf_indices(values, tree, np):
+    left, right, default_left, features, thresholds, _leaves = tree
+    node = np.zeros(values.shape[0], dtype=np.intp)
+    active = left[node] != -1
+    while bool(np.any(active)):
+        rows = np.flatnonzero(active)
+        current = node[rows]
+        feature = features[current]
+        observed = values[rows, feature]
+        go_left = np.where(
+            np.isnan(observed), default_left[current],
+            observed <= thresholds[current])
+        node[rows] = np.where(go_left, left[current], right[current])
+        active[rows] = left[node[rows]] != -1
+    return node
+
+
+def _predict_numpy_block(model, block, compiled, np):
+    lower = np.asarray([value[0] for value in model._bounds],
+                       dtype=np.float64)
+    upper = np.asarray([value[1] for value in model._bounds],
+                       dtype=np.float64)
+    values = np.clip(block.astype(np.float64, copy=False), lower, upper)
+    if model._engine == "catboost":
+        values = values.astype(np.float32).astype(np.float64)
+
+    totals = [0.0] * values.shape[0]
+    for base_score, trees in compiled:
+        margins = np.full(values.shape[0], base_score, dtype=np.float64)
+        if model._engine == "lightgbm":
+            for tree in trees:
+                margins += tree[5][_lightgbm_leaf_indices(
+                    values, tree, np)]
+        else:
+            for features, thresholds, default_left, leaves in trees:
+                leaf = np.zeros(values.shape[0], dtype=np.intp)
+                for level in range(features.size):
+                    observed = values[:, features[level]]
+                    right = np.where(
+                        np.isnan(observed), not bool(default_left[level]),
+                        observed > thresholds[level])
+                    leaf |= right.astype(np.intp) << level
+                margins += leaves[leaf]
+
+        for index, margin in enumerate(margins.tolist()):
+            if not math.isfinite(margin):
+                raise ValueError("boosting prediction is non-finite")
+            if model._task == "binary":
+                if margin >= 0.0:
+                    prediction = 1.0 / (1.0 + math.exp(-margin))
+                else:
+                    exp_margin = math.exp(margin)
+                    prediction = exp_margin / (1.0 + exp_margin)
+            else:
+                prediction = margin
+            totals[index] += prediction
+    results = [value / len(compiled) for value in totals]
+    if any(not math.isfinite(value) for value in results):
+        raise ValueError("boosting prediction is non-finite")
+    return results
+
+
 class BoostingEnsemble:
     """Opaque predictor constructed only from re-sanitized projections."""
 
@@ -397,6 +512,15 @@ class BoostingEnsemble:
     def predict(self, rows):
         if isinstance(rows, (str, bytes, bytearray, memoryview)):
             raise ValueError("prediction rows must be a rank-two iterable")
+        np = _numeric_numpy_matrix(rows, len(self._bounds))
+        if np is not None:
+            compiled = _compiled_numpy_models(self, np)
+            predictions = []
+            for start in range(0, rows.shape[0], _PREDICTION_BATCH_ROWS):
+                predictions.extend(_predict_numpy_block(
+                    self, rows[start:start + _PREDICTION_BATCH_ROWS],
+                    compiled, np))
+            return predictions
         try:
             return [self.predict_one(row) for row in rows]
         except TypeError as exc:

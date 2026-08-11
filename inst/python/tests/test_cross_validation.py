@@ -290,9 +290,8 @@ class CvClientTests(unittest.TestCase):
                             geometry_n_units=geometry_n_units)
             return [np.asarray([1.0])], len(target)
 
-        with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
-              mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=None),
+        with (mock.patch.object(
+                  client_app, "load_data", return_value=(X, y, None)),
               mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": 9}),
               mock.patch.object(client_app.task_module,
@@ -342,7 +341,6 @@ class CvClientTests(unittest.TestCase):
 
         with (mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": 4}),
-              mock.patch.object(client_app, "load_data", return_value=(X, y)),
               mock.patch.object(client_app, "_apply_feature_bounds",
                                 side_effect=lambda values, ignored: values),
               mock.patch.object(
@@ -357,8 +355,7 @@ class CvClientTests(unittest.TestCase):
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
             for roster in rosters:
                 with mock.patch.object(
-                        client_app, "load_tabular_patient_ids",
-                        return_value=roster):
+                        client_app, "load_data", return_value=(X, y, roster)):
                     client_app._train_neural(
                         None, {"cv-contract-sha256": "a" * 64}, {},
                         {"loss_name": "bce_logits", "n_classes": 2,
@@ -377,9 +374,8 @@ class CvClientTests(unittest.TestCase):
         cfg = {"loss-name": "bce_logits", "task-type": "classification",
                "num-classes": 2, "cv-validation-bins": 4}
         with (mock.patch.object(client_app, "is_image_run", return_value=False),
-              mock.patch.object(client_app, "load_data", return_value=(X, y)),
-              mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=None),
+              mock.patch.object(
+                  client_app, "load_data", return_value=(X, y, None)),
               mock.patch.object(client_app.task_module,
                                 "assert_pinned_unit_count"),
               mock.patch.object(
@@ -671,6 +667,31 @@ class CvServerTests(unittest.TestCase):
             self.assertTrue(np.isfinite(payload["metrics"]["accuracy"]))
             self.assertGreaterEqual(payload["metrics"]["accuracy"], 0.0)
             self.assertLessEqual(payload["metrics"]["accuracy"], 1.0)
+
+    def test_noise_only_nullable_primary_is_persisted_for_valid_tasks(self):
+        cases = (
+            ("cross_entropy", "classification", 3, "accuracy"),
+            ("ordinal", "ordinal", 3, "accuracy"),
+            ("multilabel_bce", "multilabel", 2, "macro_f1"),
+        )
+        for loss, task, width, primary in cases:
+            with self.subTest(task=task), tempfile.TemporaryDirectory() as root:
+                cfg = self._cfg(root)
+                cfg.update({
+                    "loss-name": loss, "task-type": task,
+                    "num-classes": width, "num-labels": width,
+                })
+                layout = validation.cross_validation_layout_from_config(cfg)
+                metrics = validation.validation_metrics(
+                    np.zeros(layout["size"], dtype=np.float64), layout)
+                self.assertIsNone(metrics[primary])
+
+                server_app._save_cross_validation(
+                    cfg, layout, metrics, folds=3)
+                with open(os.path.join(root, "cv.json"),
+                          encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                self.assertIsNone(payload["metrics"][primary])
 
     def test_output_rejects_nonplausible_primary_or_fold_transcript(self):
         layout = validation.cross_validation_layout_from_config(self._cfg())

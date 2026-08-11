@@ -26,6 +26,7 @@ _RANDOM_FOREST_MECHANISM = {
     "leaf_release": "string", "partition": "string", "transcript": "string",
 }
 _CONSTRUCTION_TOKEN = object()
+_PREDICTION_BATCH_ROWS = 4096
 
 
 def _object_without_duplicates(pairs):
@@ -198,6 +199,64 @@ def _extract_model(model):
     ) for tree in model["trees"])
 
 
+def _numeric_numpy_matrix(rows, features):
+    """Return NumPy only for the production numeric matrix fast path."""
+    row_type = type(rows)
+    if row_type.__module__ != "numpy" or row_type.__name__ != "ndarray":
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if row_type is not np.ndarray or rows.ndim != 2 or \
+            rows.dtype.kind not in "iuf" or rows.dtype.itemsize > 8 or \
+            (rows.shape[0] and rows.shape[1] != features):
+        return None
+    return np
+
+
+def _compiled_numpy_models(model, np):
+    return tuple(tuple((
+        np.asarray(features, dtype=np.intp),
+        np.asarray(cut_indices, dtype=np.int64),
+        np.asarray(defaults, dtype=np.bool_),
+        np.asarray(leaves, dtype=np.float64),
+    ) for features, cut_indices, defaults, leaves in forest)
+                 for forest in model._models)
+
+
+def _predict_numpy_block(model, block, compiled, np):
+    lower = np.asarray([value[0] for value in model._bounds],
+                       dtype=np.float64)
+    upper = np.asarray([value[1] for value in model._bounds],
+                       dtype=np.float64)
+    values = np.clip(
+        block.astype(np.float64, copy=False), lower, upper
+    ).astype(np.float32).astype(np.float64)
+    missing = np.isnan(values)
+    binned = np.empty(values.shape, dtype=np.int64)
+    for column, cuts in enumerate(model._cuts):
+        binned[:, column] = np.searchsorted(
+            np.asarray(cuts, dtype=np.float64), values[:, column], side="left")
+    binned[missing] = -1
+
+    rows = np.arange(values.shape[0], dtype=np.intp)
+    model_total = np.zeros(values.shape[0], dtype=np.float64)
+    internal = (1 << model._depth) - 1
+    for forest in compiled:
+        tree_total = np.zeros(values.shape[0], dtype=np.float64)
+        for features, cut_indices, defaults, leaves in forest:
+            node = np.zeros(values.shape[0], dtype=np.intp)
+            for _level in range(model._depth):
+                value = binned[rows, features[node]]
+                go_left = np.where(
+                    value < 0, defaults[node], value <= cut_indices[node])
+                node = 2 * node + 1 + np.logical_not(go_left)
+            tree_total += leaves[node - internal]
+        model_total += tree_total / len(forest)
+    return (model_total / len(compiled)).tolist()
+
+
 class ForestEnsemble:
     """Parsed prediction-only forest; construct with parse_forest_ensemble."""
 
@@ -249,6 +308,15 @@ class ForestEnsemble:
     def predict(self, rows):
         if isinstance(rows, (str, bytes, bytearray, memoryview)):
             raise ValueError("prediction rows must be a rank-two iterable")
+        np = _numeric_numpy_matrix(rows, self._features)
+        if np is not None:
+            compiled = _compiled_numpy_models(self, np)
+            predictions = []
+            for start in range(0, rows.shape[0], _PREDICTION_BATCH_ROWS):
+                predictions.extend(_predict_numpy_block(
+                    self, rows[start:start + _PREDICTION_BATCH_ROWS],
+                    compiled, np))
+            return predictions
         try:
             return [self.predict_one(row) for row in rows]
         except TypeError as exc:

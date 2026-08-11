@@ -29,6 +29,7 @@ _ENGINE_PARAMETERS = {
 }
 _MAX_NATIVE_DEPTH = 30
 _CONSTRUCTION_TOKEN = object()
+_PREDICTION_BATCH_ROWS = 4096
 
 
 def _object_without_duplicates(pairs):
@@ -201,6 +202,78 @@ def _extract_model(model):
     return tuple(extracted)
 
 
+def _numeric_numpy_matrix(rows, features):
+    """Return NumPy only for the production numeric matrix fast path."""
+    row_type = type(rows)
+    if row_type.__module__ != "numpy" or row_type.__name__ != "ndarray":
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if row_type is not np.ndarray or rows.ndim != 2 or \
+            rows.dtype.kind not in "iuf" or rows.dtype.itemsize > 8 or \
+            (rows.shape[0] and rows.shape[1] != features):
+        return None
+    return np
+
+
+def _compiled_numpy_models(model, np):
+    return tuple(tuple((
+        np.asarray(left, dtype=np.intp),
+        np.asarray(right, dtype=np.intp),
+        np.asarray(default_left, dtype=np.bool_),
+        np.asarray(split_indices, dtype=np.intp),
+        np.asarray(conditions, dtype=np.float64),
+    ) for left, right, default_left, split_indices, conditions in trees)
+                 for trees in model._models)
+
+
+def _xgboost_leaf_indices(values, tree, np):
+    left, right, default_left, split_indices, conditions = tree
+    node = np.zeros(values.shape[0], dtype=np.intp)
+    active = left[node] != -1
+    while bool(np.any(active)):
+        rows = np.flatnonzero(active)
+        current = node[rows]
+        observed = values[rows, split_indices[current]]
+        go_left = np.where(
+            np.isnan(observed), default_left[current],
+            observed < conditions[current])
+        node[rows] = np.where(go_left, left[current], right[current])
+        active[rows] = left[node[rows]] != -1
+    return node
+
+
+def _predict_numpy_block(model, block, compiled, np):
+    lower = np.asarray([value[0] for value in model._bounds],
+                       dtype=np.float64)
+    upper = np.asarray([value[1] for value in model._bounds],
+                       dtype=np.float64)
+    values = np.clip(
+        block.astype(np.float64, copy=False), lower, upper
+    ).astype(np.float32).astype(np.float64)
+    base_margin = (math.log(model._base_score / (1.0 - model._base_score))
+                   if model._task == "binary" else model._base_score)
+    totals = [0.0] * values.shape[0]
+    for trees in compiled:
+        margins = np.full(values.shape[0], base_margin, dtype=np.float64)
+        for tree in trees:
+            leaves = tree[4]
+            margins += leaves[_xgboost_leaf_indices(values, tree, np)]
+        for index, margin in enumerate(margins.tolist()):
+            if model._task == "binary":
+                if margin >= 0.0:
+                    prediction = 1.0 / (1.0 + math.exp(-margin))
+                else:
+                    exp_margin = math.exp(margin)
+                    prediction = exp_margin / (1.0 + exp_margin)
+            else:
+                prediction = margin
+            totals[index] += prediction
+    return [value / len(compiled) for value in totals]
+
+
 class XGBoostEnsemble:
     """Opaque, already re-sanitized prediction-only ensemble."""
 
@@ -258,6 +331,15 @@ class XGBoostEnsemble:
     def predict(self, rows):
         if isinstance(rows, (str, bytes, bytearray, memoryview)):
             raise ValueError("prediction rows must be a rank-two iterable")
+        np = _numeric_numpy_matrix(rows, self._features)
+        if np is not None:
+            compiled = _compiled_numpy_models(self, np)
+            predictions = []
+            for start in range(0, rows.shape[0], _PREDICTION_BATCH_ROWS):
+                predictions.extend(_predict_numpy_block(
+                    self, rows[start:start + _PREDICTION_BATCH_ROWS],
+                    compiled, np))
+            return predictions
         try:
             return [self.predict_one(row) for row in rows]
         except TypeError as exc:

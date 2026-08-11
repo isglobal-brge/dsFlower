@@ -190,8 +190,8 @@ def _read_staged_frame(path, manifest):
     )
 
 
-def load_data(context=None):
-    """Load (X, y) for standard supervised training from the staged manifest."""
+def load_data(context=None, *, include_unit_ids=False):
+    """Load supervised tensors and, when requested, units from one frame."""
     manifest = _load_manifest(context)
     manifest_dir = _get_manifest_dir(context)
     data_file = os.path.join(manifest_dir, manifest["data_file"])
@@ -231,6 +231,8 @@ def load_data(context=None):
         ]).astype(np.float32)
     else:
         y = _load_target(df[target_col], manifest)
+    if include_unit_ids:
+        return X, y, _load_patient_ids(df, manifest)
     return X, y
 
 
@@ -1063,14 +1065,3 @@ def load_pinned_run_config(context=None):
         if key in manifest:
             cfg[key] = manifest[key]
     return cfg
-
-
-def load_tabular_patient_ids(context=None):
-    """Patient/subject ids so tabular neural training uses patient-level DP."""
-    manifest = _load_manifest(context)
-    if manifest.get("data_type") == "image":
-        return None
-    manifest_dir = _get_manifest_dir(context)
-    data_file = os.path.join(manifest_dir, manifest["data_file"])
-    df = _read_staged_frame(data_file, manifest)
-    return _load_patient_ids(df, manifest)

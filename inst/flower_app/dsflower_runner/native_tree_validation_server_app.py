@@ -300,7 +300,7 @@ def _save_validation(results_dir, task_name, metrics, n_nodes, available):
         payload["metrics"] = metrics
     _atomic_write(history_path, history)
     try:
-        _atomic_write(result_path, _canonical_json(payload))
+        _atomic_write(result_path, validation.private_metric_result_wire(payload))
     except Exception:
         try:
             os.unlink(history_path)

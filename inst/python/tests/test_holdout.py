@@ -203,9 +203,8 @@ class NeuralHoldoutTests(unittest.TestCase):
 
         model = object()
         captured = {}
-        with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
-              mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=patient_ids),
+        with (mock.patch.object(
+                  client_app, "load_data", return_value=(X, y, patient_ids)),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
               mock.patch.object(client_app, "_apply_feature_bounds",
                                 side_effect=lambda values, ignored: values),
@@ -270,9 +269,8 @@ class NeuralHoldoutTests(unittest.TestCase):
                 master=master, geometry_n_units=geometry_n_units)
             return [np.asarray([1.0])], len(target)
 
-        with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
-              mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=None),
+        with (mock.patch.object(
+                  client_app, "load_data", return_value=(X, y, None)),
               mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": 6}),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
@@ -337,7 +335,6 @@ class NeuralHoldoutTests(unittest.TestCase):
 
         with (mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": 4}),
-              mock.patch.object(client_app, "load_data", return_value=(X, y)),
               mock.patch.object(client_app, "_apply_feature_bounds",
                                 side_effect=lambda values, ignored: values),
               mock.patch.object(
@@ -357,8 +354,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                 model._dsflower_release_keys = tuple(
                     name for name, _ in torch.nn.Module.named_parameters(model))
                 with mock.patch.object(
-                        client_app, "load_tabular_patient_ids",
-                        return_value=roster):
+                        client_app, "load_data", return_value=(X, y, roster)):
                     client_app._train_neural(
                         None, cfg, pcfg, pins, model, input_dim=2,
                         manifest_image=False)

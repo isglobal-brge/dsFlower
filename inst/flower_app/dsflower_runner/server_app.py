@@ -193,6 +193,19 @@ def _run_validation(grid, cfg):
     return metrics, expected, True
 
 
+def _atomic_private_metric_result(final, payload):
+    from . import validation
+    wire = validation.private_metric_result_wire(payload)
+    temporary = final + ".tmp"
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(wire)
+        os.replace(temporary, final)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def _pool_private_vectors(vectors, size):
     if not vectors:
         raise RuntimeError("no private validation vectors are available")
@@ -295,15 +308,7 @@ def _save_validation(cfg, metrics, n_nodes, available):
     if available:
         payload["metrics"] = metrics
     final = os.path.join(results_dir, "validation.json")
-    temporary = final + ".tmp"
-    try:
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, allow_nan=False,
-                      separators=(",", ":"))
-        os.replace(temporary, final)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    _atomic_private_metric_result(final, payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -677,10 +682,12 @@ def _save_cross_validation(cfg, layout, metrics, folds):
     primary_is_number = (isinstance(primary, (int, float, np.number))
                          and not isinstance(primary, (bool, np.bool_)))
     primary_is_plausible = (
-        primary_is_number and math.isfinite(float(primary))
-        and float(primary) >= 0.0
-        and (layout["task"] in ("regression", "count")
-             or float(primary) <= 1.0))
+        (primary is None and layout["task"] in (
+            "multiclass", "ordinal", "multilabel"))
+        or (primary_is_number and math.isfinite(float(primary))
+            and float(primary) >= 0.0
+            and (layout["task"] in ("regression", "count")
+                 or float(primary) <= 1.0)))
     if (not isinstance(metrics, dict) or required_metric not in metrics
             or not primary_is_plausible
             or _contains_forbidden_cv_key(metrics)):
@@ -709,14 +716,7 @@ def _save_cross_validation(cfg, layout, metrics, folds):
         "metrics": metrics,
     }
     final = os.path.join(results_dir, "cv.json")
-    temporary = final + ".tmp"
-    try:
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, allow_nan=False, separators=(",", ":"))
-        os.replace(temporary, final)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    _atomic_private_metric_result(final, payload)
 
 
 def _run_cross_validation(grid, cfg, track):
@@ -871,14 +871,7 @@ def _save_holdout(cfg, metrics):
         "metrics": metrics,
     }
     final = os.path.join(results_dir, "holdout.json")
-    temporary = final + ".tmp"
-    try:
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, allow_nan=False, separators=(",", ":"))
-        os.replace(temporary, final)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    _atomic_private_metric_result(final, payload)
 
 
 # --------------------------------------------------------------------------- #

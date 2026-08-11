@@ -1206,9 +1206,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
             "num_rounds": 1, "n_classes": 2, "learning_rate": 0.01,
         }
         model = torch.nn.Linear(1, 1)
-        with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
-              mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=None),
+        with (mock.patch.object(
+                  client_app, "load_data", return_value=(X, y, None)),
               mock.patch.object(client_app.task_module,
                                 "assert_pinned_unit_count"),
               mock.patch.object(
@@ -1698,9 +1697,7 @@ class HookAppPublicConfigTests(unittest.TestCase):
                                 return_value={"sandbox": True}),
               mock.patch.object(client_app, "load_data", return_value=(
                   np.zeros((2, 3), dtype=np.float32),
-                  np.zeros(2, dtype=np.float32))),
-              mock.patch.object(client_app, "load_tabular_patient_ids",
-                                return_value=None),
+                  np.zeros(2, dtype=np.float32), None)),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
               mock.patch.object(tier2_lib, "hook_master_seed",
                                 return_value=b"m" * 32),
@@ -1995,12 +1992,17 @@ class PatientIdGateTests(unittest.TestCase):
                       encoding="utf-8") as handle:
                 json.dump({
                     "data_type": "tabular", "data_file": "data.csv",
-                    "data_format": "csv", "patient_column": "patient_id",
+                    "data_format": "csv", "target_column": "y",
+                    "feature_columns": ["x"],
+                    "task-type": "classification", "num-classes": 2,
+                    "patient_column": "patient_id",
                     "dp-unit": "patient",
                     "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
+            _, _, groups = task.load_data(
+                context, include_unit_ids=True)
             self.assertEqual(
-                task.load_tabular_patient_ids(context).tolist(),
+                groups.tolist(),
                 ["p1", task._MISSING_PATIENT_UNIT],
             )
 
@@ -2046,7 +2048,7 @@ class PatientIdGateTests(unittest.TestCase):
                 }, handle)
             context = SimpleNamespace(
                 node_config={"manifest-dir": manifest_dir})
-            ids = task.load_tabular_patient_ids(context)
+            _, _, ids = task.load_data(context, include_unit_ids=True)
             self.assertEqual(ids.tolist(), ["001", "1", "N/A"])
             task.assert_pinned_unit_count(context, 3, ids)
 
@@ -2419,6 +2421,50 @@ class PublicTargetTests(unittest.TestCase):
             X, y = task.load_data(context)
             np.testing.assert_array_equal(X, np.asarray([[1], [2]], np.float32))
             np.testing.assert_array_equal(y, np.asarray([0, 1], np.float32))
+
+    def test_combined_tabular_loader_reads_once_and_preserves_units(self):
+        frame = pd.DataFrame({
+            "patient_id": ["001", "p2"],
+            "x": [1.0, 2.0],
+            "y": [0, 1],
+        })
+        for data_format in ("csv", "parquet"):
+            for privacy_unit in ("row", "patient"):
+                with self.subTest(
+                        data_format=data_format, privacy_unit=privacy_unit), \
+                        tempfile.TemporaryDirectory() as manifest_dir:
+                    patient_column = (
+                        "patient_id" if privacy_unit == "patient" else None)
+                    with open(os.path.join(manifest_dir, "manifest.json"), "w",
+                              encoding="utf-8") as handle:
+                        json.dump({
+                            "data_file": "data." + data_format,
+                            "data_format": data_format,
+                            "target_column": "y",
+                            "feature_columns": ["x"],
+                            "task-type": "classification",
+                            "num-classes": 2,
+                            "dp-unit": privacy_unit,
+                            "patient_column": patient_column,
+                            "patient-id-canonicalization": "trim-utf8-v2",
+                        }, handle)
+                    context = SimpleNamespace(
+                        node_config={"manifest-dir": manifest_dir})
+                    with mock.patch.object(
+                            task, "_read_staged_frame",
+                            return_value=frame.copy()) as read_frame:
+                        X, y, unit_ids = task.load_data(
+                            context, include_unit_ids=True)
+
+                    read_frame.assert_called_once()
+                    np.testing.assert_array_equal(
+                        X, np.asarray([[1], [2]], np.float32))
+                    np.testing.assert_array_equal(
+                        y, np.asarray([0, 1], np.float32))
+                    if privacy_unit == "row":
+                        self.assertIsNone(unit_ids)
+                    else:
+                        self.assertEqual(unit_ids.tolist(), ["001", "p2"])
 
 
 class PatientPartitionTests(unittest.TestCase):
