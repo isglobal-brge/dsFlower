@@ -59,10 +59,8 @@ _NEURAL_SEED_CONFIG_KEYS = frozenset({
     "target-bounds", "nb-dispersion", "gamma-shape", "huber-delta",
     "quantile-level",
 })
-_NEURAL_SEED_PRIVACY_KEYS = frozenset({
-    "policy_hash", "epsilon", "delta", "clipping_norm", "adjacency",
-    "n_samples",
-})
+_NEURAL_PUBLIC_INIT_POLICY_HASH = hashlib.sha256(
+    b"dsflower/neural-public-init-policy/v1").hexdigest()
 
 # Flower 1.31 carries Context.state between isolated ClientApp tasks through its
 # in-memory NodeState. These two namespaced records are the only CV accumulator;
@@ -76,7 +74,7 @@ def _reply_cache_allowed(claim):
     return not str(claim.get("operation", "train")).startswith("cv-")
 
 
-def _neural_seed_contract(cfg, pins, pcfg, geometry_n_units=None):
+def _neural_seed_contract(cfg, pins, _pcfg, geometry_n_units=None):
     """Exact public inputs which can affect trusted neural execution."""
     run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
     bounds = _effective_feature_bounds(cfg)
@@ -91,7 +89,7 @@ def _neural_seed_contract(cfg, pins, pcfg, geometry_n_units=None):
     }
     if geometry_n_units is not None:
         config["resampling-geometry-n-units"] = int(geometry_n_units)
-    return (config, seeding.select_config(pcfg, _NEURAL_SEED_PRIVACY_KEYS))
+    return config, {}
 
 
 def _reply(msg, arrays, hook_executed=None,
@@ -301,9 +299,10 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
             + ("an image collection" if manifest_image else "tabular")
             + ". Use a vision model for imaging collections, a tabular model otherwise.")
     input_dim = _neural_input_dim(context, cfg, manifest_image)
-    seed_config, seed_privacy = _neural_seed_contract(cfg, pins, pcfg)
+    seed_config, _ = _neural_seed_contract(cfg, pins, {})
     public_master = seeding.master_seed(
-        "neural-public-init/v1", seed_config, seed_privacy,
+        "neural-public-init/v1", seed_config,
+        {"policy_hash": _NEURAL_PUBLIC_INIT_POLICY_HASH},
         int(pins["round_index"]))
     seeding.seed_torch(seeding.sub_seed(public_master, "init"))
     model = load_user_model(cfg, input_dim, pins["loss_name"])
@@ -425,7 +424,7 @@ def _scheduled_learning_rate(pins, global_epoch):
     return float(value)
 
 
-def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master,
+def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master, noise_multiplier,
             geometry_n_units=None):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
@@ -465,6 +464,7 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master,
         model, optimizer, trainloader,
         clipping_norm=pcfg["clipping_norm"], epsilon=pcfg["epsilon"],
         delta=pcfg["delta"], local_epochs=local_epochs, num_rounds=num_rounds,
+        noise_multiplier=noise_multiplier,
         n_samples=(len(dataset) if geometry_n_units is None
                    else int(geometry_n_units)), batch_size=batch_size,
         secure_noise_rng=seeding.np_rng(seeding.sub_seed(master, "noise")),
@@ -716,16 +716,27 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         seed_target = np.asarray(y, dtype=np.int64)
     else:
         seed_target = np.asarray(y, dtype=np.float32)
-    seed_config, seed_privacy = _neural_seed_contract(
+    seed_config, _ = _neural_seed_contract(
         cfg, pins, pcfg, geometry_n_units=geometry_n_units)
+    accounting_population = (len(y) if geometry_n_units is None
+                             else int(geometry_n_units))
+    effective_privacy = dp_harness.effective_dpsgd_mechanism(
+        epsilon=pcfg["epsilon"], delta=pcfg["delta"],
+        clipping_norm=pcfg["clipping_norm"],
+        n_samples=accounting_population, batch_size=int(pins["batch_size"]),
+        local_epochs=int(pins["local_epochs"]),
+        num_rounds=int(pins["num_rounds"]))
+    effective_privacy["privacy_unit"] = (
+        "patient" if groups is not None else "row")
     master = seeding.master_seed(
-        "neural-dpsgd/v1", seed_config, seed_privacy,
+        "neural-dpsgd/v1", seed_config, effective_privacy,
         int(pins["round_index"]),
         public_arrays=get_torch_params(model),
         private_arrays=(np.asarray(X, dtype=np.float32), seed_target))
 
     return _dp_fit(
         model, X, y, pcfg, pins, n_staged, cfg, master=master,
+        noise_multiplier=effective_privacy["noise_multiplier"],
         geometry_n_units=geometry_n_units)
 
 

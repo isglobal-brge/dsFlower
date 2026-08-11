@@ -278,15 +278,21 @@ class CvClientTests(unittest.TestCase):
         X = np.arange(18, dtype=np.float32).reshape(9, 2)
         y = np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0], dtype=np.float32)
         assigned = np.asarray([1, 2, 3, 1, 2, 3, 1, 2, 3])
-        pins = {"loss_name": "bce_logits", "n_classes": 2,
-                "num_rounds": 2, "round_index": 1, "fold_index": 2}
+        pins = {
+            "loss_name": "bce_logits", "n_classes": 2,
+            "num_rounds": 2, "round_index": 1, "fold_index": 2,
+            "batch_size": 2, "local_epochs": 1,
+        }
+        pcfg = {
+            "epsilon": 0.2, "delta": 1e-6, "clipping_norm": 1.0,
+        }
         captured = {}
 
         def fake_fit(_model, values, target, pcfg, inner_pins, n_staged,
-                     _cfg, master, geometry_n_units=None):
+                     _cfg, master, noise_multiplier, geometry_n_units=None):
             captured.update(X=values.copy(), y=target.copy(), pcfg=dict(pcfg),
                             pins=dict(inner_pins), n_staged=n_staged,
-                            master=master,
+                            master=master, noise_multiplier=noise_multiplier,
                             geometry_n_units=geometry_n_units)
             return [np.asarray([1.0])], len(target)
 
@@ -303,12 +309,15 @@ class CvClientTests(unittest.TestCase):
                   return_value=assigned),
               mock.patch.object(client_app, "_neural_seed_contract",
                                 return_value=({}, {})) as seed_contract,
+              mock.patch.object(client_app.dp_harness,
+                                "effective_dpsgd_mechanism",
+                                return_value={"noise_multiplier": 1.0}),
               mock.patch.object(client_app.seeding, "master_seed",
                                 return_value=b"fold-master"),
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
             client_app._train_neural(
                 None, {"cv-contract-sha256": "a" * 64},
-                {"epsilon": 0.2, "delta": 1e-6}, pins,
+                pcfg, pins,
                 torch.nn.Linear(2, 1), input_dim=2, manifest_image=False,
                 cv_fold=2)
 
@@ -320,7 +329,7 @@ class CvClientTests(unittest.TestCase):
         self.assertEqual(captured["geometry_n_units"], len(y))
         seed_contract.assert_called_once_with(
             {"cv-contract-sha256": "a" * 64},
-            pins, {"epsilon": 0.2, "delta": 1e-6}, geometry_n_units=len(y))
+            pins, pcfg, geometry_n_units=len(y))
 
     def test_patient_replacement_changes_fold_size_not_training_geometry(self):
         import torch
@@ -334,9 +343,10 @@ class CvClientTests(unittest.TestCase):
         captured = []
 
         def fake_fit(_model, values, target, _pcfg, _pins, _n_staged,
-                     _cfg, master, geometry_n_units=None):
+                     _cfg, master, noise_multiplier, geometry_n_units=None):
             captured.append((
-                len(np.unique(target)), len(target), geometry_n_units, master))
+                len(np.unique(target)), len(target), geometry_n_units, master,
+                noise_multiplier))
             return [np.asarray([1.0])], len(target)
 
         with (mock.patch.object(client_app.task_module, "_load_manifest",
@@ -350,6 +360,9 @@ class CvClientTests(unittest.TestCase):
                   np.where(np.isin(unit_ids, ["c", "e"]), 2, 1)),
               mock.patch.object(client_app, "_neural_seed_contract",
                                 return_value=({}, {})),
+              mock.patch.object(client_app.dp_harness,
+                                "effective_dpsgd_mechanism",
+                                return_value={"noise_multiplier": 1.0}),
               mock.patch.object(client_app.seeding, "master_seed",
                                 return_value=b"\x41" * 32),
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
@@ -357,9 +370,12 @@ class CvClientTests(unittest.TestCase):
                 with mock.patch.object(
                         client_app, "load_data", return_value=(X, y, roster)):
                     client_app._train_neural(
-                        None, {"cv-contract-sha256": "a" * 64}, {},
+                        None, {"cv-contract-sha256": "a" * 64},
+                        {"epsilon": 1.0, "delta": 1e-5,
+                         "clipping_norm": 1.0},
                         {"loss_name": "bce_logits", "n_classes": 2,
-                         "round_index": 1},
+                         "round_index": 1, "batch_size": 2,
+                         "local_epochs": 1, "num_rounds": 1},
                         torch.nn.Linear(2, 1), input_dim=2,
                         manifest_image=False, cv_fold=2)
 

@@ -482,10 +482,10 @@ class NeuralSemanticConfigTests(unittest.TestCase):
         self.assertNotIn("resampling-geometry-n-units", plain)
 
         def derive(geometry):
-            config, effective_privacy = client_app._neural_seed_contract(
+            config, _ = client_app._neural_seed_contract(
                 cfg, pins, privacy, geometry_n_units=geometry)
             return seeding.master_seed(
-                "neural-dpsgd/v1", config, effective_privacy, 1,
+                "neural-dpsgd/v1", config, {"policy_hash": "1" * 64}, 1,
                 public_arrays=public, private_arrays=private,
                 execution_fingerprint={"runtime": "fixed-test"})
 
@@ -500,6 +500,101 @@ class NeuralSemanticConfigTests(unittest.TestCase):
 
 
 class DpSgdAccountingTests(unittest.TestCase):
+    def test_master_seed_tracks_effective_not_raw_dpsgd_policy(self):
+        config = {"run": {"loss-name": "mse"}, "pins": {"round_index": 1}}
+        public = (np.asarray([0.25, -0.5], dtype=np.float32),)
+        private = (np.asarray([[1.0, 2.0]], dtype=np.float32),)
+
+        def derive(raw_policy, noise, **geometry):
+            values = {
+                "clipping_norm": 2.0, "n_samples": 12, "batch_size": 5,
+                "local_epochs": 2, "num_rounds": 3, **geometry,
+            }
+            with mock.patch.object(
+                    dp_harness, "_cached_noise_multiplier",
+                    return_value=noise):
+                mechanism = dp_harness.effective_dpsgd_mechanism(
+                    epsilon=raw_policy["epsilon"], delta=raw_policy["delta"],
+                    **values)
+            mechanism["privacy_unit"] = "row"
+            return seeding.master_seed(
+                "neural-dpsgd/v1", config, mechanism, 1,
+                public_arrays=public, private_arrays=private,
+                execution_fingerprint={"runtime": "fixed-test"})
+
+        first_policy = {
+            "epsilon": 1.0, "delta": 1e-5, "policy_hash": "1" * 64,
+        }
+        other_raw_policy = {
+            "epsilon": 2.0, "delta": 1e-6, "policy_hash": "2" * 64,
+        }
+        with mock.patch.object(
+                seeding, "_node_secret", return_value=b"\x57" * 32):
+            first = derive(first_policy, 1.25)
+            same_effective = derive(other_raw_policy, 1.25)
+            changed_sigma = derive(first_policy, 1.5)
+            changed_clip = derive(first_policy, 1.25, clipping_norm=3.0)
+            changed_geometry = derive(first_policy, 1.25, n_samples=16)
+
+        self.assertEqual(first, same_effective)
+        self.assertNotEqual(first, changed_sigma)
+        self.assertNotEqual(first, changed_clip)
+        self.assertNotEqual(first, changed_geometry)
+
+    def test_effective_mechanism_ignores_raw_budget_when_calibration_matches(self):
+        common = {
+            "clipping_norm": 2.0,
+            "n_samples": 12,
+            "batch_size": 5,
+            "local_epochs": 2,
+            "num_rounds": 3,
+        }
+        with mock.patch.object(
+                dp_harness, "_cached_noise_multiplier",
+                return_value=1.25):
+            first = dp_harness.effective_dpsgd_mechanism(
+                epsilon=1.0, delta=1e-5, **common)
+            same = dp_harness.effective_dpsgd_mechanism(
+                epsilon=2.0, delta=1e-6, **common)
+
+        self.assertEqual(first, same)
+        policy_hash = first.pop("policy_hash")
+        self.assertRegex(policy_hash, r"^[0-9a-f]{64}$")
+        self.assertEqual(first, {
+            "adjacency": "replace_one",
+            "noise_multiplier": 1.25,
+            "clipping_norm": 2.0,
+            "accounting_population": 12,
+            "steps_per_epoch": 3,
+            "sample_rate": 1.0 / 3.0,
+            "expected_batch_size": 4,
+            "total_epochs": 6,
+            "total_steps": 18,
+        })
+
+    def test_effective_mechanism_changes_with_sigma_clip_or_geometry(self):
+        common = {
+            "epsilon": 1.0,
+            "delta": 1e-5,
+            "clipping_norm": 2.0,
+            "n_samples": 12,
+            "batch_size": 5,
+            "local_epochs": 2,
+            "num_rounds": 3,
+        }
+
+        def mechanism(noise, **changes):
+            values = {**common, **changes}
+            with mock.patch.object(
+                    dp_harness, "_cached_noise_multiplier",
+                    return_value=noise):
+                return dp_harness.effective_dpsgd_mechanism(**values)
+
+        baseline = mechanism(1.25)
+        self.assertNotEqual(baseline, mechanism(1.5))
+        self.assertNotEqual(baseline, mechanism(1.25, clipping_norm=3.0))
+        self.assertNotEqual(baseline, mechanism(1.25, n_samples=16))
+
     def test_calibration_cache_reuses_only_the_exact_public_horizon(self):
         cached = dp_harness._cached_noise_multiplier
         cached.cache_clear()
@@ -1085,7 +1180,7 @@ class StrictNeuralInitializationTests(unittest.TestCase):
                     on_private_start=callback)
         private.assert_called_once_with(None)
 
-    def test_prepare_neural_model_uses_the_original_public_seed_contract(self):
+    def test_prepare_neural_model_seed_is_independent_of_raw_privacy(self):
         model = torch.nn.Linear(2, 1)
         msg = SimpleNamespace(content=RecordDict({
             "arrays": ArrayRecord(numpy_ndarrays=self._model_arrays(model)),
@@ -1100,7 +1195,7 @@ class StrictNeuralInitializationTests(unittest.TestCase):
               mock.patch.object(client_app, "_neural_seed_contract",
                                 wraps=original_contract) as seed_contract,
               mock.patch.object(client_app.seeding, "master_seed",
-                                return_value=b"\x61" * 32),
+                                return_value=b"\x61" * 32) as master_seed,
               mock.patch.object(client_app.seeding, "seed_torch"),
               mock.patch.object(client_app, "load_user_model",
                                 return_value=model)):
@@ -1110,7 +1205,10 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         self.assertIs(prepared, model)
         self.assertEqual(input_dim, 2)
         self.assertFalse(manifest_image)
-        seed_contract.assert_called_once_with(cfg, pins, pcfg)
+        seed_contract.assert_called_once_with(cfg, pins, {})
+        self.assertEqual(master_seed.call_args.args[2], {
+            "policy_hash": client_app._NEURAL_PUBLIC_INIT_POLICY_HASH,
+        })
 
     def test_invalid_neural_initial_model_is_rejected_before_private_read(self):
         # Shapes and dtype match a Linear(2,1), but magnitude is hostile.
@@ -1201,11 +1299,23 @@ class StrictNeuralInitializationTests(unittest.TestCase):
     def test_private_values_are_never_used_by_architecture_probe(self):
         X = np.zeros((2, 1), dtype=np.float32)
         y = np.asarray([1.0, 1.0e6], dtype=np.float32)
+        pcfg = {
+            "epsilon": 1.0, "delta": 1e-5, "clipping_norm": 1.0,
+            "policy_hash": "1" * 64, "n_samples": 2,
+        }
         pins = {
             "loss_name": "mse", "batch_size": 2, "local_epochs": 1,
             "num_rounds": 1, "n_classes": 2, "learning_rate": 0.01,
         }
         model = torch.nn.Linear(1, 1)
+        effective = {
+            "policy_hash": "3" * 64,
+            "adjacency": "replace_one", "noise_multiplier": 1.75,
+            "clipping_norm": 1.0, "accounting_population": 2,
+            "steps_per_epoch": 1, "sample_rate": 1.0,
+            "expected_batch_size": 2, "total_epochs": 1,
+            "total_steps": 1,
+        }
         with (mock.patch.object(
                   client_app, "load_data", return_value=(X, y, None)),
               mock.patch.object(client_app.task_module,
@@ -1213,23 +1323,32 @@ class StrictNeuralInitializationTests(unittest.TestCase):
               mock.patch.object(
                   client_app.dp_harness, "per_sample_independence_probe",
                   side_effect=AssertionError("private architecture probe")) as probe,
+              mock.patch.object(
+                  client_app.dp_harness, "effective_dpsgd_mechanism",
+                  return_value=effective.copy()) as mechanism,
               mock.patch.object(client_app.seeding, "master_seed",
                                 return_value=b"m" * 32) as master_seed,
               mock.patch.object(client_app, "_dp_fit",
                                 return_value=([np.zeros(1)], 2)) as fit):
             result = client_app._train_neural(
-                SimpleNamespace(), {}, {
-                    "clipping_norm": 1.0, "policy_hash": "1" * 64,
-                }, {**pins, "round_index": 1}, model,
+                SimpleNamespace(), {}, pcfg,
+                {**pins, "round_index": 1}, model,
                 input_dim=1, manifest_image=False)
 
         probe.assert_not_called()
         fit.assert_called_once()
         self.assertEqual(result[1], 2)
+        mechanism.assert_called_once_with(
+            epsilon=1.0, delta=1e-5, clipping_norm=1.0,
+            n_samples=2, batch_size=2, local_epochs=1, num_rounds=1)
         self.assertEqual(master_seed.call_args.args[0], "neural-dpsgd/v1")
+        self.assertEqual(master_seed.call_args.args[2], {
+            **effective, "privacy_unit": "row",
+        })
         private_arrays = master_seed.call_args.kwargs["private_arrays"]
         np.testing.assert_array_equal(private_arrays[0], X)
         np.testing.assert_array_equal(private_arrays[1], y.astype(np.float32))
+        self.assertEqual(fit.call_args.kwargs["noise_multiplier"], 1.75)
 
 
 class RunPinBoundsTests(unittest.TestCase):

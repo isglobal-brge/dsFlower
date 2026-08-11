@@ -25,6 +25,8 @@ All privacy parameters MUST come from the server-written, tamper-proof
 manifest.json — never from client-controlled pyproject config.
 """
 
+import hashlib
+import json
 import math
 from functools import lru_cache
 
@@ -240,6 +242,55 @@ def _cached_noise_multiplier(epsilon, delta, sample_rate, total_epochs,
         total_epochs=total_epochs, total_steps=total_steps)
 
 
+def effective_dpsgd_mechanism(epsilon, delta, clipping_norm, n_samples,
+                              batch_size, local_epochs, num_rounds):
+    """Calibrate and describe only the DP-SGD mechanism that will execute."""
+    from opacus import __version__ as opacus_version
+
+    if (not isinstance(n_samples, (int, np.integer))
+            or isinstance(n_samples, (bool, np.bool_)) or int(n_samples) < 1
+            or not isinstance(batch_size, (int, np.integer))
+            or isinstance(batch_size, (bool, np.bool_)) or int(batch_size) < 1):
+        raise ValueError("DP-SGD needs positive integer population and batch pins")
+    try:
+        clipping_norm = float(clipping_norm)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("DP-SGD clipping norm must be finite and positive") from exc
+    if not math.isfinite(clipping_norm) or clipping_norm <= 0.0:
+        raise ValueError("DP-SGD clipping norm must be finite and positive")
+
+    accounting_population = int(n_samples)
+    batch_size = int(batch_size)
+    steps_per_epoch = int(math.ceil(accounting_population / float(batch_size)))
+    expected_batch_size = max(
+        1, int(accounting_population / float(steps_per_epoch)))
+    total_epochs = max(1, int(num_rounds)) * max(1, int(local_epochs))
+    total_steps = steps_per_epoch * total_epochs
+    sample_rate = 1.0 / float(steps_per_epoch)
+    noise_multiplier = float(_cached_noise_multiplier(
+        float(epsilon), float(delta), sample_rate, total_epochs, total_steps,
+        str(opacus_version)))
+    if not math.isfinite(noise_multiplier) or noise_multiplier <= 0.0:
+        raise RuntimeError("DP-SGD calibration returned an invalid noise multiplier")
+    mechanism = {
+        "adjacency": "replace_one",
+        "noise_multiplier": noise_multiplier,
+        "clipping_norm": clipping_norm,
+        "accounting_population": accounting_population,
+        "steps_per_epoch": steps_per_epoch,
+        "sample_rate": sample_rate,
+        "expected_batch_size": expected_batch_size,
+        "total_epochs": total_epochs,
+        "total_steps": total_steps,
+    }
+    canonical = json.dumps(
+        mechanism, allow_nan=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    mechanism["policy_hash"] = hashlib.sha256(
+        b"dsflower/effective-dpsgd-policy/v1\x00" + canonical).hexdigest()
+    return mechanism
+
+
 def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
                        epsilon, delta, local_epochs, num_rounds=1,
                        noise_multiplier=None, n_samples=None, batch_size=None,
@@ -257,7 +308,7 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
     per-sample-gradient sensitivity bound). We assert validity here as a
     backstop and do NOT silently fix() the architecture.
     """
-    from opacus import PrivacyEngine, __version__ as opacus_version
+    from opacus import PrivacyEngine
     from opacus.validators import ModuleValidator
 
     if not ModuleValidator.is_valid(model):
@@ -310,12 +361,11 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
         # The secure sampler includes every row independently with rate exactly
         # 1/steps_per_epoch.  Calibrate against that rate and the exact number of
         # steps; using epochs with batch_size/n can under-count at ceil boundaries.
-        total_epochs = max(1, int(num_rounds)) * max(1, int(local_epochs))
-        sample_rate = 1.0 / float(steps_per_epoch)
-        noise_multiplier = _cached_noise_multiplier(
-            float(epsilon), float(delta), float(sample_rate),
-            int(total_epochs), int(steps_per_epoch * total_epochs),
-            str(opacus_version))
+        noise_multiplier = effective_dpsgd_mechanism(
+            epsilon=epsilon, delta=delta, clipping_norm=clipping_norm,
+            n_samples=accounting_population, batch_size=int(batch_size),
+            local_epochs=local_epochs, num_rounds=num_rounds,
+        )["noise_multiplier"]
 
     privacy_engine = PrivacyEngine()
     # DP noise is replaced below by a ChaCha20 stream derived from the node secret
