@@ -267,6 +267,46 @@ def load_native_tree_data(context=None, *, manifest=None):
     return features, target, unit_ids
 
 
+def _load_association_codes(series):
+    """Totalize one staged association axis to the fixed 0/1/2 domain."""
+    numeric = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+    valid = (np.isfinite(numeric) & (numeric == np.floor(numeric))
+             & (numeric >= 0.0) & (numeric <= 2.0))
+    return np.where(valid, numeric, 2.0).astype(np.uint8)
+
+
+def load_association_data(context=None, *, manifest=None):
+    """Load the two pre-encoded axes for one private association release."""
+    if manifest is None:
+        manifest = _load_manifest(context)
+    if manifest.get("data_type") != "tabular":
+        raise ValueError("association requires staged tabular data")
+
+    target_column = manifest.get("target_column")
+    feature_columns = manifest.get("feature_columns")
+    patient_column = manifest.get("patient_column")
+    if not isinstance(target_column, str) or not target_column or \
+            not isinstance(feature_columns, list) or len(feature_columns) != 1 or \
+            not isinstance(feature_columns[0], str) or not feature_columns[0] or \
+            feature_columns[0] == target_column or \
+            patient_column in (target_column, feature_columns[0]):
+        raise ValueError("association manifest columns are invalid")
+
+    manifest_dir = _get_manifest_dir(context)
+    data_file = os.path.join(manifest_dir, manifest["data_file"])
+    frame = _read_staged_frame(data_file, manifest)
+    exposure_column = feature_columns[0]
+    if target_column not in frame.columns or exposure_column not in frame.columns:
+        raise ValueError("association staged columns are unavailable")
+
+    outcome = _load_association_codes(frame[target_column])
+    exposure = _load_association_codes(frame[exposure_column])
+    unit_ids = _load_patient_ids(frame, manifest)
+    assert_pinned_unit_count(
+        context, int(outcome.size), patient_ids=unit_ids, manifest=manifest)
+    return outcome, exposure, unit_ids
+
+
 def is_image_run(context=None):
     """True if the staged manifest is an image collection (data_type=='image')."""
     return _load_manifest(context).get("data_type") == "image"
@@ -524,7 +564,7 @@ def load_dp_track(context=None):
     if "dp-track" not in manifest:
         raise ValueError("manifest is missing the pinned dp-track")
     track = str(manifest["dp-track"]).lower()
-    if track not in ("neural", "egress", "validation"):
+    if track not in ("neural", "egress", "validation", "association"):
         raise ValueError("invalid dp-track '%s'" % track)
     return track
 
@@ -899,6 +939,25 @@ def load_pinned_run_config(context=None):
                 raise ValueError("manifest is missing validation pin '%s'" % key)
             if cfg.get(key) != manifest[key]:
                 raise ValueError("Flower validation config does not match manifest pin")
+    if str(manifest.get("dp-track", "")).lower() == "association":
+        required = (
+            "dp-track", "num-server-rounds", "association-contract",
+            "association-contract-sha256", "association-job-sha256",
+            "association-n-nodes", "association-privacy-unit",
+            "association-unit-semantics",
+        )
+        supplied = {
+            key for key in cfg
+            if str(key).lower().startswith(("association-", "association_"))}
+        if supplied != set(required) - {"dp-track", "num-server-rounds"}:
+            raise ValueError(
+                "Flower association config has an unexpected public field")
+        for key in required:
+            if key not in manifest:
+                raise ValueError("manifest is missing association pin '%s'" % key)
+            if key not in cfg or type(cfg[key]) is not type(manifest[key]) or \
+                    cfg[key] != manifest[key]:
+                raise ValueError("Flower association config does not match manifest pin")
     # The analyst-facing Flower config may name a module for the researcher-side
     # ServerApp, but node execution accepts only the package name derived and
     # written by flowerTier2PinDS after installation/hash verification.
@@ -916,6 +975,9 @@ def load_pinned_run_config(context=None):
         "validation-artifact-size-bytes",
         "validation-profile-sha256", "validation-profile-size-bytes",
         "validation-public-schema-sha256",
+        "association-contract", "association-contract-sha256",
+        "association-job-sha256", "association-n-nodes",
+        "association-privacy-unit", "association-unit-semantics",
         "learning-rate", "weight-decay", "l1-penalty",
         "optimizer-name", "optimizer-momentum", "optimizer-nesterov",
         "optimizer-beta1", "optimizer-beta2", "optimizer-eps",

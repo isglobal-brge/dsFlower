@@ -182,6 +182,8 @@ class ParentImportBoundaryTests(unittest.TestCase):
                  "dsflower_runner.client_app:app"),
                 ("native_validation",
                  "dsflower_runner.native_tree_validation_client_app:app",
+                 "dsflower_runner.client_app:app"),
+                ("association", "dsflower_runner.association_client_app:app",
                  "dsflower_runner.client_app:app")):
             with self.subTest(track=track), tempfile.TemporaryDirectory() as root:
                 with open(os.path.join(root, "manifest.json"), "w",
