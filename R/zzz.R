@@ -196,6 +196,7 @@
   # REPLACEFILE_WRITE_THROUGH flag. Call ReplaceFileW with only its documented
   # ignore-merge flag so the built-in shell remains usable.
   script <- paste0(
+    "$stage='PATH';",
     "$s=[IO.Path]::GetFullPath(", .powershell_literal(replacement), ");",
     "$d=[IO.Path]::GetFullPath(", .powershell_literal(destination), ");",
     "$comparison=[StringComparison]::OrdinalIgnoreCase;",
@@ -209,7 +210,9 @@
     "[return:MarshalAs(UnmanagedType.Bool)]public static extern bool ReplaceFileW(",
     "string replaced,string replacement,string backup,uint flags,",
     "IntPtr exclude,IntPtr reserved);}}';",
+    "$stage='ADD_TYPE';",
     "Add-Type -TypeDefinition $interop -ErrorAction Stop;",
+    "$stage='NATIVE';",
     "$ok=[DsFlower.NativeFile]::ReplaceFileW($d,$s,$null,[uint32]2,",
     "[IntPtr]::Zero,[IntPtr]::Zero);",
     "if(-not $ok){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();",
