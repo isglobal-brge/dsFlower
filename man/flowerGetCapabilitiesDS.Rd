@@ -4,12 +4,19 @@
 \alias{flowerGetCapabilitiesDS}
 \title{Get Server Capabilities}
 \usage{
-flowerGetCapabilitiesDS(native_tree_probe = "none")
+flowerGetCapabilitiesDS(
+  native_tree_probe = "none",
+  association_probe = "none"
+)
 }
 \arguments{
 \item{native_tree_probe}{Exactly \code{"none"} (the default), \code{"all"},
 or one implemented native-tree engine name. This controls an operational
 readiness check only; it is not a privacy permission or operation catalog.}
+
+\item{association_probe}{Exactly \code{"none"} (the default) or
+\code{"runtime"}. This requests only the dependency-light association
+runtime probe and never provisions or imports the neural runtime.}
 }
 \value{
 Named list of capabilities.
@@ -19,5 +26,6 @@ DataSHIELD AGGREGATE method. Returns information about the server's
 Flower capabilities including Python version, the hash-pinned declarative
 runner vocabulary, and disclosure settings. The response is independent of
 cohort contents, handle state, and other sessions, and does not disclose
-filesystem paths. Native-tree availability is probed only when requested.
+filesystem paths. Native-tree and association availability are probed only
+when explicitly requested.
 }

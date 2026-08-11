@@ -288,7 +288,8 @@
     ""
   }
   if (length(track) != 1L ||
-      !track %in% c("neural", "egress", "native_tree", "validation")) {
+      !track %in% c(
+        "neural", "egress", "native_tree", "validation", "association")) {
     stop("Prepared manifest has no supported trusted execution track.",
          call. = FALSE)
   }
@@ -297,6 +298,7 @@
     identical(as.character(
       manifest[["validation-model-track"]] %||% ""), "native_tree")
   native_execution <- identical(track, "native_tree") || native_validation
+  association_execution <- identical(track, "association")
   native_engine <- if (native_execution) {
     .native_tree_engine_from_config(manifest)
   } else {
@@ -313,10 +315,15 @@
     stop("The trusted native-tree runtime for '", native_engine,
          "' is unavailable on this node.", call. = FALSE)
   }
+  if (association_execution && !isTRUE(.association_runtime_probe())) {
+    stop("The trusted association runtime is unavailable on this node.",
+         call. = FALSE)
+  }
   # The release runner is node-resident and hash-pinned. Resolve its framework
   # from the server-validated manifest, never from an analyst executable path.
   runtime_desc <- .resolve_framework_runtime(
-    if (identical(track, "native_tree") || native_validation) {
+    if (identical(track, "native_tree") || native_validation ||
+        association_execution) {
       "native_tree"
     } else {
       "pytorch"

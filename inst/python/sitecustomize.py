@@ -68,6 +68,7 @@ _UNIFIED_CLIENTAPP_REF = "dsflower_runner.client_app:app"
 _NATIVE_TREE_CLIENTAPP_REF = "dsflower_runner.native_tree_client_app:app"
 _NATIVE_TREE_VALIDATION_CLIENTAPP_REF = (
     "dsflower_runner.native_tree_validation_client_app:app")
+_ASSOCIATION_CLIENTAPP_REF = "dsflower_runner.association_client_app:app"
 
 
 def _load_canonical_clientapp_ref():
@@ -86,6 +87,8 @@ def _load_canonical_clientapp_ref():
         return _NATIVE_TREE_CLIENTAPP_REF
     if track == "validation" and validation_track == "native_tree":
         return _NATIVE_TREE_VALIDATION_CLIENTAPP_REF
+    if track == "association":
+        return _ASSOCIATION_CLIENTAPP_REF
     if track in ("neural", "egress", "validation"):
         return _UNIFIED_CLIENTAPP_REF
     return ""

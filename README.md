@@ -403,6 +403,22 @@ streams for known semantic identities. Production nodes should keep it in a
 KMS/HSM-backed secret lifecycle. Preserving the same root preserves deterministic
 recomputation; rotating it intentionally starts a new randomness domain.
 
+## Binary association runner
+
+The `association` track stages exactly one outcome and one exposure as a
+row-preserving 3x3 table (`reference`, `positive`, `unknown`). It performs one
+sticky joint-Gaussian release per node and allows only an all-or-nothing pooled
+result. Public typed levels and the row/patient estimand are bound by the
+association contract SHA-256; a second job SHA-256 binds that request to runner
+ABI 3, the exact runner hash and the public node roster. Neither hash contains a
+data path, run token, cohort size or privacy policy value.
+
+The track uses the dependency-light Flower/NumPy runtime and has dedicated app
+entrypoints; it never falls back to the neural, HookApp, native-tree or
+validation runners. Association privacy remains the existing stateless
+per-job/node policy: there is no database, counter, catalogue, historical budget
+or rate limiter.
+
 ## Server-side lifecycle
 
 | Stage | Exported DataSHIELD methods |

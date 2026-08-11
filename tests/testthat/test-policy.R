@@ -63,3 +63,22 @@ test_that("DP unit is server-owned, explicit, and has no auto fallback", {
       dsFlower:::.dpUnitPolicy()),
     "patient_column")
 })
+
+test_that("patient ID canonicalization matches the runner UTF-8 byte cap", {
+  missing_unit <- "__dsflower_missing_patient_unit__"
+  at_limit <- paste(rep("\u00e9", 2048L), collapse = "")
+  over_limit_x <- paste0(at_limit, "x")
+  over_limit_y <- paste0(at_limit, "y")
+
+  expect_identical(nchar(enc2utf8(at_limit), type = "bytes"), 4096L)
+  expect_identical(nchar(enc2utf8(over_limit_x), type = "bytes"), 4097L)
+  expect_identical(
+    dsFlower:::.canonicalPatientIdText(
+      c(at_limit, over_limit_x, over_limit_y)),
+    c(at_limit, missing_unit, missing_unit)
+  )
+  expect_identical(
+    dsFlower:::.canonicalPatientIds(c(at_limit, over_limit_x, over_limit_y)),
+    c(at_limit, missing_unit, missing_unit)
+  )
+})

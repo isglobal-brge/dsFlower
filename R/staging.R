@@ -591,7 +591,7 @@
     "n_input_samples", "dropped_missing", "target", "target_column",
     "feature_columns", "staged_at", "data_root", "dp-unit", "patient_column",
     "patient-id-canonicalization",
-    "target-preencoded",
+    "target-preencoded", "association-preencoded",
     "group_column", "dataset_id", "source_kind", "assets", "data_type",
     "drop_missing"
   )
@@ -757,7 +757,9 @@
     "privacy-sa_blocks", "privacy-egress_time_pad",
     "privacy-egress_timeout", "privacy-egress_memory_mb",
     "privacy-egress_file_mb", "privacy-egress_processes",
-    "privacy-hook_enabled", "user-module", "app-params-sha256"
+    "privacy-hook_enabled", "user-module", "app-params-sha256",
+    "association-contract", "association-privacy-unit",
+    "association-unit-semantics"
   )
 }
 
@@ -793,6 +795,9 @@
     "cv-version", "cv-method", "cv-assignment", "cv-folds",
     "cv-privacy-unit", "cv-unit-canonicalization", "cv-contract-sha256",
     "cv-validation-bins", "cv-n-nodes", "cv-job-sha256",
+    "association-outcome-levels", "association-exposure-levels",
+    "association-contract-sha256", "association-n-nodes",
+    "association-job-sha256",
     "app-params-b64"
   )
 }
@@ -944,6 +949,10 @@
 .stageData <- function(data, run_token, target_column,
                        feature_columns = NULL, extra_config = list()) {
   extra_config <- .validate_manifest_extra_config(extra_config)
+  if (identical(extra_config[["dp-track"]], "association")) {
+    return(.stageAssociationData(
+      data, run_token, target_column, feature_columns, extra_config))
+  }
   data <- .transformPublicTarget(data, target_column, extra_config)
   unit <- .prepareDpUnitFrame(data)
   data <- unit$data
@@ -1155,6 +1164,12 @@
   extra_config <- .validate_manifest_extra_config(extra_config)
   kind <- desc$source_kind
 
+  if (identical(extra_config[["dp-track"]], "association") &&
+      identical(kind, "image_bundle")) {
+    stop("The association track accepts tabular descriptors only.",
+         call. = FALSE)
+  }
+
   if (identical(kind, "in_memory_df")) {
     return(.stageFromDescriptor_df(desc, run_token, target_column,
                                     feature_columns, extra_config))
@@ -1237,6 +1252,10 @@
 .stageFromDescriptor_parquet <- function(desc, run_token, target_column,
                                           feature_columns, extra_config) {
   extra_config <- .validate_manifest_extra_config(extra_config)
+  if (identical(extra_config[["dp-track"]], "association")) {
+    return(.stageAssociationDescriptorParquet(
+      desc, run_token, target_column, feature_columns, extra_config))
+  }
   if (!requireNamespace("arrow", quietly = TRUE)) {
     stop("Package 'arrow' is required for staged_parquet descriptors.",
          call. = FALSE)

@@ -12,6 +12,7 @@ on:
       - "inst/flower_app/dsflower_runner/random_forest_adapter.py"
       - "inst/flower_app/dsflower_runner/tree_release.py"
       - "inst/flower_app/dsflower_runner/epi_association.py"
+      - "inst/flower_app/dsflower_runner/association_*.py"
       - "inst/flower_app/dsflower_runner/client_app.py"
       - "inst/flower_app/dsflower_runner/dp_harness.py"
       - "inst/flower_app/dsflower_runner/server_app.py"
@@ -20,6 +21,7 @@ on:
       - "inst/flower_app/dsflower_runner/validation.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
+      - "inst/python/sitecustomize.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
       - "inst/python/tests/test_native_tree_*.py"
       - "inst/python/tests/test_boosting_*.py"
@@ -30,6 +32,7 @@ on:
       - "inst/python/tests/test_dpsgd_guards.py"
       - "inst/python/tests/test_holdout.py"
       - "inst/python/tests/test_epi_association.py"
+      - "inst/python/tests/test_association_flower_app.py"
       - "inst/python/tests/test_validation_dp.py"
       - "inst/python/tests/test_sitecustomize.py"
       - "inst/python/tests/test_xgboost_*.py"
@@ -52,6 +55,7 @@ on:
       - "inst/flower_app/dsflower_runner/random_forest_adapter.py"
       - "inst/flower_app/dsflower_runner/tree_release.py"
       - "inst/flower_app/dsflower_runner/epi_association.py"
+      - "inst/flower_app/dsflower_runner/association_*.py"
       - "inst/flower_app/dsflower_runner/client_app.py"
       - "inst/flower_app/dsflower_runner/dp_harness.py"
       - "inst/flower_app/dsflower_runner/server_app.py"
@@ -60,6 +64,7 @@ on:
       - "inst/flower_app/dsflower_runner/validation.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
+      - "inst/python/sitecustomize.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
       - "inst/python/tests/test_native_tree_*.py"
       - "inst/python/tests/test_boosting_*.py"
@@ -70,6 +75,7 @@ on:
       - "inst/python/tests/test_dpsgd_guards.py"
       - "inst/python/tests/test_holdout.py"
       - "inst/python/tests/test_epi_association.py"
+      - "inst/python/tests/test_association_flower_app.py"
       - "inst/python/tests/test_validation_dp.py"
       - "inst/python/tests/test_sitecustomize.py"
       - "inst/python/tests/test_xgboost_*.py"
@@ -148,6 +154,7 @@ jobs:
             inst/python/tests/test_dpsgd_guards.py \
             inst/python/tests/test_holdout.py \
             inst/python/tests/test_epi_association.py \
+            inst/python/tests/test_association_flower_app.py \
             inst.python.tests.test_validation_dp.ValidationReleaseTests \
             inst/python/tests/test_sitecustomize.py \
             inst/python/tests/test_xgboost_accounting.py \

@@ -749,6 +749,8 @@ flowerInitDS <- function(data_symbol) {
     } else {
       "classification"
     }
+  } else if (identical(track, "association")) {
+    inferred <- "classification"
   } else {
     if (!requested %in% c("classification", "regression", "count")) {
       stop("HookApp task-type must be classification, regression, or count.",
@@ -998,12 +1000,14 @@ flowerInitDS <- function(data_symbol) {
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
   if (length(track) != 1L || is.na(track) ||
-      !tolower(track) %in% c("neural", "egress", "native_tree", "validation")) {
-    stop("dp-track must be one of neural, egress, native_tree, or validation.",
+      !tolower(track) %in% c(
+        "neural", "egress", "native_tree", "validation", "association")) {
+    stop("dp-track must be one of neural, egress, native_tree, validation, or association.",
          call. = FALSE)
   }
   track <- tolower(track)
   run_config[["dp-track"]] <- track
+  run_config <- .normalizeAssociationConfig(run_config, track)
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
   run_config <- .normalizeResamplingConfig(run_config, track)
@@ -1144,9 +1148,12 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   native_tabular <- identical(run_config[["dp-track"]], "native_tree") ||
     (identical(run_config[["dp-track"]], "validation") &&
      identical(run_config[["validation-model-track"]], "native_tree"))
-  if (native_tabular &&
+  association_tabular <- identical(run_config[["dp-track"]], "association")
+  if ((native_tabular || association_tabular) &&
       !identical(data_type, "tabular")) {
-    label <- if (identical(run_config[["dp-track"]], "native_tree")) {
+    label <- if (association_tabular) {
+      "The association track"
+    } else if (identical(run_config[["dp-track"]], "native_tree")) {
       "The native_tree track"
     } else {
       "Native-tree validation"
@@ -1157,8 +1164,14 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     target_column, feature_columns, run_config)
   target_column <- columns$target_column
   feature_columns <- columns$feature_columns
+  run_config <- .verifyAssociationContract(
+    run_config, feature_columns, target_column)
   .validatePreparedNativeTreeContract(
     run_config, feature_columns, target_column)
+  if (association_tabular && !isTRUE(.association_runtime_probe())) {
+    stop("The trusted association runtime is unavailable on this node.",
+         call. = FALSE)
+  }
   if (native_tabular) {
     engine <- .native_tree_engine_from_config(run_config)
     available <- if (identical(run_config[["dp-track"]], "native_tree")) {
@@ -1580,15 +1593,21 @@ flowerPingDS <- function() {
 #' Flower capabilities including Python version, the hash-pinned declarative
 #' runner vocabulary, and disclosure settings. The response is independent of
 #' cohort contents, handle state, and other sessions, and does not disclose
-#' filesystem paths. Native-tree availability is probed only when requested.
+#' filesystem paths. Native-tree and association availability are probed only
+#' when explicitly requested.
 #'
 #' @param native_tree_probe Exactly \code{"none"} (the default), \code{"all"},
 #'   or one implemented native-tree engine name. This controls an operational
 #'   readiness check only; it is not a privacy permission or operation catalog.
+#' @param association_probe Exactly \code{"none"} (the default) or
+#'   \code{"runtime"}. This requests only the dependency-light association
+#'   runtime probe and never provisions or imports the neural runtime.
 #' @return Named list of capabilities.
 #' @export
-flowerGetCapabilitiesDS <- function(native_tree_probe = "none") {
+flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
+                                    association_probe = "none") {
   native_tree_probe <- .validate_native_tree_probe(native_tree_probe)
+  association_probe <- .validate_association_probe(association_probe)
   runtime <- .python_runtime_capabilities()
 
   # Disclosure settings
@@ -1597,6 +1616,7 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none") {
   privacy_policy <- .privacy_policy()
   runner_caps <- .RUNNER_PUBLIC_CAPABILITIES
   native_tree <- .native_tree_contract_capabilities(native_tree_probe)
+  association <- .association_contract_capabilities(association_probe)
   hook_enabled <- isTRUE(as.logical(.dsf_option("hook_enabled", FALSE)))
   hook_sandbox <- isTRUE(as.logical(
     .dsf_option("hook_sandbox_attested", FALSE)))
@@ -1627,6 +1647,7 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none") {
     aggregation_strategies = runner_caps$aggregation_strategies,
     resampling          = runner_caps$resampling,
     native_tree         = native_tree,
+    association         = association,
     max_rounds          = settings$max_rounds,
     min_samples         = 0L,
     min_clients_per_round = 1L,
