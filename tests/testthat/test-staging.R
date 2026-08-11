@@ -40,10 +40,10 @@ test_that("run tokens and staging paths fail closed before recursive deletion", 
   withr::defer(dsFlower:::.cleanupStaging(token))
   link <- tempfile("staging-link-")
   if (isTRUE(file.symlink(staging, link))) {
-    withr::defer(unlink(link))
+    withr::defer(suppressWarnings(unlink(link)))
     expect_error(
       dsFlower:::.validateStagingDir(link, token),
-      "symbolic link"
+      "link or reparse point"
     )
   }
 })
@@ -130,10 +130,13 @@ test_that(".stageData creates directory, data file, and manifest", {
   expect_true(manifest$data_format %in% c("csv", "parquet"))
   expect_true(file.exists(file.path(staging_dir, manifest$data_file)))
 
-  # Verify directory permissions are strict (0700)
-  dir_info <- file.info(staging_dir)
-  dir_mode <- as.character(dir_info$mode)
-  expect_true(dir_mode %in% c("700", "0700"))
+  if (.Platform$OS.type == "windows") {
+    expect_no_error(dsFlower:::.windows_validate_private_acl(staging_dir))
+  } else {
+    dir_info <- file.info(staging_dir)
+    dir_mode <- as.character(dir_info$mode)
+    expect_true(dir_mode %in% c("700", "0700"))
+  }
 })
 
 test_that(".stageData writes privacy settings from extra_config", {
