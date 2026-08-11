@@ -375,6 +375,62 @@ class ValidationReleaseTests(unittest.TestCase):
         self.assertEqual(metrics["roc_auc"], 1.0)
         self.assertLess(metrics["brier"], 0.05)
 
+    def test_bounded_metrics_project_floating_roundoff_to_public_ranges(self):
+        layout = validation.validation_layout("classification", bins=4)
+        released = np.asarray([
+            576430.9962633034, 1982734873.9893143,
+            7.129883681671839e-08, 0.04397737062615345,
+            1.453639899011989e-06, 702741.6623881243,
+            5.373852546762856e-05, 9.582066344889491e-09,
+        ])
+        metrics = validation.validation_metrics(released, layout)
+        bounded_scalars = (
+            "accuracy", "sensitivity", "specificity", "precision",
+            "negative_predictive_value", "f1", "balanced_accuracy",
+            "roc_auc", "pr_auc", "brier", "expected_calibration_error",
+        )
+        for name in bounded_scalars:
+            with self.subTest(name=name):
+                value = metrics[name]
+                self.assertTrue(value is None or 0.0 <= value <= 1.0)
+        for values in (
+                metrics["roc"]["fpr"], metrics["roc"]["tpr"],
+                metrics["precision_recall"]["recall"],
+                metrics["precision_recall"]["precision"],
+                metrics["calibration"]["predicted"],
+                metrics["calibration"]["observed"]):
+            self.assertTrue(all(0.0 <= value <= 1.0 for value in values))
+
+    def test_extreme_finite_classification_release_has_finite_required_fields(self):
+        layout = validation.validation_layout(
+            "classification", n_classes=3, bins=4)
+        released = np.full(
+            layout["size"], np.finfo(np.float64).max, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            metrics = validation.validation_metrics(released, layout)
+        self.assertTrue(math.isfinite(metrics["n"]))
+        self.assertTrue(all(
+            math.isfinite(value)
+            for row in metrics["confusion_matrix"] for value in row))
+        for name in (
+                "accuracy", "balanced_accuracy", "macro_precision",
+                "macro_recall", "macro_f1", "macro_roc_auc"):
+            with self.subTest(name=name):
+                value = metrics[name]
+                self.assertTrue(value is None or 0.0 <= value <= 1.0)
+        json.dumps(metrics, allow_nan=False)
+
+    def test_private_metric_result_wire_enforces_the_public_envelope(self):
+        payload = {"metrics": {"accuracy": 1.0}, "pooled_only": True}
+        wire = validation.private_metric_result_wire(payload)
+        self.assertEqual(json.loads(wire), payload)
+        self.assertGreaterEqual(
+            validation._MAX_PRIVATE_RESULT_BYTES, 145_017_239)
+        with mock.patch.object(
+                validation, "_MAX_PRIVATE_RESULT_BYTES", len(wire) - 1):
+            with self.assertRaises(ValueError):
+                validation.private_metric_result_wire(payload)
+
     def test_noise_only_primary_metrics_are_finite_when_count_projects_to_zero(self):
         binary = validation.validation_layout("classification", bins=4)
         binary_metrics = validation.validation_metrics(
@@ -1223,6 +1279,22 @@ class ValidationInferenceTests(unittest.TestCase):
                 payload = json.load(handle)
         self.assertFalse(payload["available"])
         self.assertNotIn("metrics", payload)
+
+    def test_server_never_publishes_an_oversized_metric_result(self):
+        cfg = {
+            "validation-task": "binary", "min-train-nodes": 1,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                    validation, "_MAX_PRIVATE_RESULT_BYTES", 1):
+                with self.assertRaises(ValueError):
+                    server_app._save_validation(
+                        {**cfg, "results-dir": directory},
+                        {"accuracy": 1.0}, 1, True)
+            self.assertFalse(os.path.exists(
+                os.path.join(directory, "validation.json")))
+            self.assertFalse(os.path.exists(
+                os.path.join(directory, "validation.json.tmp")))
 
     def test_server_pooling_totalizes_extreme_finite_node_releases(self):
         layout = validation.validation_layout("classification", bins=8)

@@ -155,6 +155,7 @@ jobs:
             inst/python/tests/test_native_tree_contract.py \
             inst/python/tests/test_native_tree_engine.py \
             inst/python/tests/test_native_tree_flower_app.py \
+            inst/python/tests/test_native_tree_predictor_batch.py \
             inst/python/tests/test_native_tree_validation_app.py \
             inst/python/tests/test_boosting_adapter.py \
             inst/python/tests/test_boosting_artifacts.py \

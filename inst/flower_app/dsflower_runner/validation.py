@@ -19,9 +19,11 @@ _MAX_BINS = 512
 _MAX_CLASSES = 1024
 _MAX_VECTOR = 1 << 22
 _MAX_MODEL_ABS = 1.0e6
+_MAX_POSTPROCESS_CELL = np.finfo(np.float64).max / (2.0 * _MAX_VECTOR)
 _MAX_PUBLIC_ARRAYS = 256
 _MAX_PUBLIC_ELEMENTS = 8_000_000
 _MAX_PUBLIC_BYTES = 64 * 1024 * 1024
+_MAX_PRIVATE_RESULT_BYTES = 160 * 1024 * 1024
 _INFERENCE_BATCH_ROWS = 1024
 _VALIDATION_MECHANISM = "validation-gaussian/v2"
 _VALIDATION_FINGERPRINT = "validation-sufficient-v2"
@@ -630,8 +632,8 @@ def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
             features = np.empty((0, input_dim), dtype=np.float32)
         X_model = _totalize_vision_features(features, len(y), input_dim)
     else:
-        X, y = task_module.load_data(context)
-        unit_ids = task_module.load_tabular_patient_ids(context)
+        X, y, unit_ids = task_module.load_data(
+            context, include_unit_ids=True)
         task_module.assert_pinned_unit_count(context, len(y), unit_ids)
         X_model = _apply_feature_bounds(X, cfg)
     predictions = neural_predictions(model, X_model, cfg.get("loss-name"))
@@ -1030,6 +1032,24 @@ def _safe_ratio(a, b):
     return value if math.isfinite(value) else None
 
 
+def _closed_interval(value, lower, upper):
+    if value is None:
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return number
+    return min(float(upper), max(float(lower), number))
+
+
+def _unit_interval(value):
+    return _closed_interval(value, 0.0, 1.0)
+
+
+def _nonnegative_metric_cells(value):
+    return np.clip(
+        np.asarray(value, dtype=np.float64), 0.0, _MAX_POSTPROCESS_CELL)
+
+
 def _finite_metric_tree(value):
     """Map overflowed post-processing values to JSON-safe missing metrics."""
     if isinstance(value, dict):
@@ -1042,6 +1062,17 @@ def _finite_metric_tree(value):
     return value
 
 
+def private_metric_result_wire(value):
+    """Encode one bounded pooled-result envelope before publication."""
+    wire = json.dumps(
+        value, ensure_ascii=True, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    if not 1 <= len(wire) <= _MAX_PRIVATE_RESULT_BYTES:
+        raise ValueError("private metric result exceeds its public byte cap")
+    return wire
+
+
 def _area(y, x):
     integrate = getattr(np, "trapezoid", None)
     if integrate is None:  # NumPy < 2.0, still supported by the package.
@@ -1050,7 +1081,7 @@ def _area(y, x):
 
 
 def _binary_metrics(hist):
-    hist = np.maximum(np.asarray(hist, dtype=np.float64), 0.0)
+    hist = _nonnegative_metric_cells(hist)
     neg, pos = hist[0], hist[1]
     bins = neg.size
     centers = (np.arange(bins, dtype=np.float64) + 0.5) / bins
@@ -1058,33 +1089,40 @@ def _binary_metrics(hist):
     tn, fp = neg[~cut].sum(), neg[cut].sum()
     fn, tp = pos[~cut].sum(), pos[cut].sum()
     total = tn + fp + fn + tp
-    recall = _safe_ratio(tp, tp + fn)
-    specificity = _safe_ratio(tn, tn + fp)
-    precision = _safe_ratio(tp, tp + fp)
-    npv = _safe_ratio(tn, tn + fn)
+    recall = _unit_interval(_safe_ratio(tp, tp + fn))
+    specificity = _unit_interval(_safe_ratio(tn, tn + fp))
+    precision = _unit_interval(_safe_ratio(tp, tp + fp))
+    npv = _unit_interval(_safe_ratio(tn, tn + fn))
     f1 = (None if precision is None or recall is None or precision + recall <= 0
-          else 2.0 * precision * recall / (precision + recall))
+          else _unit_interval(
+              2.0 * precision * recall / (precision + recall)))
     tpr = np.cumsum(pos[::-1])
     fpr = np.cumsum(neg[::-1])
     if pos.sum() > 0:
-        tpr = tpr / pos.sum()
+        tpr = np.clip(tpr / pos.sum(), 0.0, 1.0)
     if neg.sum() > 0:
-        fpr = fpr / neg.sum()
-    auc = (_area(np.r_[0.0, tpr, 1.0], np.r_[0.0, fpr, 1.0])
+        fpr = np.clip(fpr / neg.sum(), 0.0, 1.0)
+    auc = (_unit_interval(
+        _area(np.r_[0.0, tpr, 1.0], np.r_[0.0, fpr, 1.0]))
            if pos.sum() > 0 and neg.sum() > 0 else None)
-    brier = _safe_ratio(
-        np.sum(pos * (1.0 - centers) ** 2 + neg * centers ** 2), total)
+    brier = _unit_interval(_safe_ratio(
+        np.sum(pos * (1.0 - centers) ** 2 + neg * centers ** 2), total))
     bin_total = pos + neg
-    observed = np.divide(pos, bin_total, out=np.zeros_like(pos),
-                         where=bin_total > 0)
-    ece = _safe_ratio(np.sum(bin_total * np.abs(observed - centers)), total)
+    observed = np.clip(np.divide(
+        pos, bin_total, out=np.zeros_like(pos), where=bin_total > 0),
+        0.0, 1.0)
+    ece = _unit_interval(_safe_ratio(
+        np.sum(bin_total * np.abs(observed - centers)), total))
     tp_curve = np.cumsum(pos[::-1])
     fp_curve = np.cumsum(neg[::-1])
     pr_precision = np.divide(
         tp_curve, tp_curve + fp_curve, out=np.ones_like(tp_curve),
         where=(tp_curve + fp_curve) > 0)
     pr_recall = tp_curve / pos.sum() if pos.sum() > 0 else np.zeros_like(tp_curve)
-    pr_auc = (_area(np.r_[1.0, pr_precision], np.r_[0.0, pr_recall])
+    pr_precision = np.clip(pr_precision, 0.0, 1.0)
+    pr_recall = np.clip(pr_recall, 0.0, 1.0)
+    pr_auc = (_unit_interval(
+        _area(np.r_[1.0, pr_precision], np.r_[0.0, pr_recall]))
               if pos.sum() > 0 else None)
     threshold = centers
     threshold_odds = threshold / (1.0 - threshold)
@@ -1097,12 +1135,13 @@ def _binary_metrics(hist):
                  if prevalence is not None else np.zeros_like(threshold))
     return {
         "n": float(total), "accuracy": (
-            0.0 if total <= 0.0 else _safe_ratio(tp + tn, total)),
+            0.0 if total <= 0.0 else _unit_interval(
+                _safe_ratio(tp + tn, total))),
         "sensitivity": recall, "specificity": specificity,
         "precision": precision, "negative_predictive_value": npv,
         "f1": f1, "balanced_accuracy": (
             None if recall is None or specificity is None
-            else 0.5 * (recall + specificity)),
+            else _unit_interval(0.5 * (recall + specificity))),
         "roc_auc": auc, "pr_auc": pr_auc, "brier": brier,
         "expected_calibration_error": ece,
         "roc": {"fpr": np.r_[0.0, fpr, 1.0].tolist(),
@@ -1133,7 +1172,8 @@ def validation_metrics(released, layout, *, target_bounds=None):
     if task in ("multiclass", "ordinal"):
         classes, bins = layout["classes"], layout["bins"]
         cm_size = classes * classes
-        cm = np.maximum(value[:cm_size].reshape(classes, classes), 0.0)
+        cm = _nonnegative_metric_cells(
+            value[:cm_size].reshape(classes, classes))
         total = cm.sum()
         recall = np.divide(np.diag(cm), cm.sum(axis=1),
                            out=np.zeros(classes), where=cm.sum(axis=1) > 0)
@@ -1141,22 +1181,28 @@ def validation_metrics(released, layout, *, target_bounds=None):
                               out=np.zeros(classes), where=cm.sum(axis=0) > 0)
         f1 = np.divide(2 * precision * recall, precision + recall,
                        out=np.zeros(classes), where=(precision + recall) > 0)
+        recall = np.clip(recall, 0.0, 1.0)
+        precision = np.clip(precision, 0.0, 1.0)
+        f1 = np.clip(f1, 0.0, 1.0)
         hists = value[cm_size:].reshape(classes, 2, bins)
         aucs = [_binary_metrics(hists[i])["roc_auc"] for i in range(classes)]
         out = {
-            "n": float(total), "accuracy": _safe_ratio(np.trace(cm), total),
-            "balanced_accuracy": float(np.mean(recall)),
-            "macro_precision": float(np.mean(precision)),
-            "macro_recall": float(np.mean(recall)),
-            "macro_f1": float(np.mean(f1)),
-            "macro_roc_auc": (float(np.mean([x for x in aucs if x is not None]))
+            "n": float(total), "accuracy": _unit_interval(
+                _safe_ratio(np.trace(cm), total)),
+            "balanced_accuracy": _unit_interval(np.mean(recall)),
+            "macro_precision": _unit_interval(np.mean(precision)),
+            "macro_recall": _unit_interval(np.mean(recall)),
+            "macro_f1": _unit_interval(np.mean(f1)),
+            "macro_roc_auc": (_unit_interval(
+                np.mean([x for x in aucs if x is not None]))
                               if any(x is not None for x in aucs) else None),
             "confusion_matrix": cm.tolist(),
         }
         if task == "ordinal":
             distance = np.abs(np.arange(classes)[:, None]
                               - np.arange(classes)[None, :])
-            out["ordinal_mae"] = _safe_ratio(np.sum(cm * distance), total)
+            out["ordinal_mae"] = _closed_interval(
+                _safe_ratio(np.sum(cm * distance), total), 0.0, classes - 1)
         return _finite_metric_tree(out)
     if task == "multilabel":
         hists = value.reshape(layout["labels"], 2, layout["bins"])
@@ -1165,8 +1211,10 @@ def validation_metrics(released, layout, *, target_bounds=None):
         valid_f1 = [m["f1"] for m in per_label if m["f1"] is not None]
         return _finite_metric_tree({
             "labels": per_label,
-            "macro_roc_auc": float(np.mean(valid_auc)) if valid_auc else None,
-            "macro_f1": float(np.mean(valid_f1)) if valid_f1 else None})
+            "macro_roc_auc": (_unit_interval(np.mean(valid_auc))
+                              if valid_auc else None),
+            "macro_f1": (_unit_interval(np.mean(valid_f1))
+                         if valid_f1 else None)})
     n = max(float(value[0]), 0.0)
     # Each remaining numeric coordinate is the sum of per-unit contributions
     # already bounded to [0, 1]. Project noisy pooled coordinates back onto that
@@ -1190,9 +1238,10 @@ def validation_metrics(released, layout, *, target_bounds=None):
                 else float(mse_normalized * scale * scale)),
         "rmse": (0.0 if mse_normalized is None
                  else float(math.sqrt(max(0.0, mse_normalized)) * scale)),
-        "r_squared": (None if denominator <= 0
-                      else float(1.0 - squared_error / denominator)),
+        "r_squared": (None if denominator <= 0 else min(
+            1.0, float(1.0 - squared_error / denominator))),
     }
     if task == "count":
-        out["mean_poisson_deviance_normalized"] = _safe_ratio(stats[4], n)
+        out["mean_poisson_deviance_normalized"] = _unit_interval(
+            _safe_ratio(stats[4], n))
     return _finite_metric_tree(out)

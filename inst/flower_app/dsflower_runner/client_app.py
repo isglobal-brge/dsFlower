@@ -34,7 +34,7 @@ from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
 
 from .task import (load_data, load_image_collection, is_image_run,
                    load_privacy_config, load_dp_track, load_run_pins,
-                   load_tabular_patient_ids, load_pinned_run_config)
+                   load_pinned_run_config)
 from .params import get_torch_params, set_torch_params, load_user_model
 
 # RELATIVE imports only: resolve within this trusted package, so an uploaded module on
@@ -687,11 +687,10 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         X = vision.extract_features_from_paths(
             encoder, paths, image_size, is_3d, device=device)
     else:
-        X, y = load_data(context)
+        X, y, groups = load_data(context, include_unit_ids=True)
         if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
             raise RuntimeError("staged feature width changed after model validation")
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
-        groups = load_tabular_patient_ids(context)
 
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=groups, manifest=resampling_manifest)
@@ -878,10 +877,9 @@ def _cross_validation_neural_accumulate(context, cfg, pins, model,
     """Evaluate one held-out fold and retain only its raw vector in node RAM."""
     if is_image_run(context):
         raise RuntimeError("cross-validation supports tabular neural data only")
-    X, y = load_data(context)
+    X, y, unit_ids = load_data(context, include_unit_ids=True)
     if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
         raise RuntimeError("staged feature width changed before CV evaluation")
-    unit_ids = load_tabular_patient_ids(context)
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=unit_ids)
     X, y, unit_ids = _cross_validation_partition(
@@ -915,10 +913,9 @@ def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim):
     if is_image_run(context):
         raise RuntimeError(
             "atomic holdout currently supports tabular neural data only")
-    X, y = load_data(context)
+    X, y, unit_ids = load_data(context, include_unit_ids=True)
     if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
         raise RuntimeError("staged feature width changed before holdout evaluation")
-    unit_ids = load_tabular_patient_ids(context)
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=unit_ids)
     X, y, unit_ids = _holdout_partition(
@@ -1133,8 +1130,8 @@ def train(msg: Message, context: Context) -> Message:
             hook_started = time.monotonic()
             try:
                 mark_private_started()
-                X, y = load_data(context)
-                unit_ids = load_tabular_patient_ids(context)
+                X, y, unit_ids = load_data(
+                    context, include_unit_ids=True)
                 task_module.assert_pinned_unit_count(context, len(y), unit_ids)
                 master = tier2_lib.hook_master_seed(
                     module_name, old, X, y, public_hook_cfg, pcfg_round,

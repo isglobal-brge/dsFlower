@@ -321,7 +321,7 @@ def _save_release(results_dir, artifact, profile, *, model_file,
     payloads = [artifact, profile]
     if holdout is not None:
         names.append("holdout.json")
-        payloads.append(_canonical_json(holdout))
+        payloads.append(validation.private_metric_result_wire(holdout))
     names.append(HISTORY_FILE)
     payloads.append(_canonical_json([{"available": True, "round": 1}]))
     paths = [os.path.join(results_dir, name) for name in names]
