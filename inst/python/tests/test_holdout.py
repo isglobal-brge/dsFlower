@@ -258,15 +258,19 @@ class NeuralHoldoutTests(unittest.TestCase):
         mask = np.asarray([False, True, False, True, False, True])
         model = torch.nn.Linear(2, 1)
         cfg = {"resampling-contract-sha256": "a" * 64}
-        pins = {"loss_name": "bce_logits", "n_classes": 2,
-                "round_index": 1}
+        pins = {
+            "loss_name": "bce_logits", "n_classes": 2, "round_index": 1,
+            "batch_size": 2, "local_epochs": 1, "num_rounds": 1,
+        }
+        pcfg = {"epsilon": 1.0, "delta": 1e-5, "clipping_norm": 1.0}
         captured = {}
 
         def fake_fit(_model, values, target, _pcfg, _pins, n_staged,
-                     _cfg, master, geometry_n_units=None):
+                     _cfg, master, noise_multiplier, geometry_n_units=None):
             captured.update(
                 X=values.copy(), y=target.copy(), n_staged=n_staged,
-                master=master, geometry_n_units=geometry_n_units)
+                master=master, noise_multiplier=noise_multiplier,
+                geometry_n_units=geometry_n_units)
             return [np.asarray([1.0])], len(target)
 
         with (mock.patch.object(
@@ -281,11 +285,14 @@ class NeuralHoldoutTests(unittest.TestCase):
                                 return_value=mask),
               mock.patch.object(client_app, "_neural_seed_contract",
                                 return_value=({}, {})) as seed_contract,
+              mock.patch.object(client_app.dp_harness,
+                                "effective_dpsgd_mechanism",
+                                return_value={"noise_multiplier": 1.0}),
               mock.patch.object(client_app.seeding, "master_seed",
                                 return_value=b"semantic-master"),
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
             client_app._train_neural(
-                None, cfg, {}, pins, model, input_dim=2,
+                None, cfg, pcfg, pins, model, input_dim=2,
                 manifest_image=False)
 
         np.testing.assert_array_equal(captured["X"], X[~mask])
@@ -293,7 +300,7 @@ class NeuralHoldoutTests(unittest.TestCase):
         self.assertEqual(captured["n_staged"], len(y))
         self.assertEqual(captured["geometry_n_units"], len(y))
         seed_contract.assert_called_once_with(
-            cfg, pins, {}, geometry_n_units=len(y))
+            cfg, pins, pcfg, geometry_n_units=len(y))
 
     def test_patient_replacement_keeps_fixed_dp_sampling_geometry(self):
         import torch
@@ -421,7 +428,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                   client_app.dp_harness, "assert_releasable")):
             client_app._dp_fit(
                 model, X, y, pcfg, pins, n_staged=6, cfg={},
-                master=b"\x01" * 32)
+                master=b"\x01" * 32, noise_multiplier=1.0)
 
         self.assertEqual(captured["n_samples"], len(X))
         self.assertNotEqual(captured["n_samples"], pcfg["n_samples"])
@@ -434,7 +441,7 @@ class NeuralHoldoutTests(unittest.TestCase):
               self.assertRaisesRegex(RuntimeError, "staged sample count")):
             client_app._dp_fit(
                 fresh, X, y, pcfg, pins, n_staged=5, cfg={},
-                master=b"\x01" * 32)
+                master=b"\x01" * 32, noise_multiplier=1.0)
         make_private.assert_not_called()
 
 
