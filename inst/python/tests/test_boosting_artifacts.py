@@ -121,6 +121,39 @@ def _manifest(engine="lightgbm", task="binary_classification"):
     }
 
 
+def _public_request(engine="lightgbm", task="binary_classification"):
+    manifest = _manifest(engine, task)
+    omitted = ({"base_score", "max_bin"} if engine == "lightgbm"
+               else {"base_score", "border_count"})
+    type_map = {"float": "number", "int": "integer"}
+    parameters = [{
+        "name": name,
+        "type": type_map[record["type"]],
+        "value": record["value"],
+    } for name, record in sorted(manifest["engine_params"].items())
+        if name not in omitted]
+    resources = manifest["resources"]
+    return {
+        "contract": native_tree_contract.REQUEST_CONTRACT
+        if hasattr(native_tree_contract, "REQUEST_CONTRACT") else
+        "dsflower-native-tree-request-v1",
+        "engine": engine,
+        "mode": "native-tight",
+        "parameters": parameters,
+        "public_schema": manifest["public_schema"],
+        "resources": {
+            "max_features": resources["max_features"],
+            "max_trees": resources["max_trees"],
+            "max_depth": resources["max_depth"],
+            "max_bins": resources["max_bins"],
+            "max_threads": resources["threads"],
+            "memory_mb": resources["memory_mib"],
+            "timeout_seconds": resources["wall_seconds"],
+        },
+        "task": "binary" if task == "binary_classification" else "regression",
+    }
+
+
 def _lightgbm_model(task="binary_classification"):
     return {
         "base_score": 0.0 if task == "binary_classification" else 1.0,
@@ -166,6 +199,24 @@ def _json(value, canonical=False):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_public_requests_enrich_exact_boosting_profiles(self):
+        from dsflower_runner import native_tree_request
+        for engine, profile in (
+                ("lightgbm", boosting_profile.lightgbm_profile),
+                ("catboost", boosting_profile.catboost_profile)):
+            manifest = native_tree_request.backend_manifest(
+                _public_request(engine), epsilon=2.0, delta=1.0e-6,
+                unit="row", unit_canonicalization="trim-utf8-v2",
+                gradient_clip=1.0, snapshot_hash="a" * 64,
+                cohort_hash="b" * 64)
+            with self.subTest(engine=engine):
+                self.assertEqual(manifest["engine"], engine)
+                self.assertEqual(manifest["privacy"]["mechanism"],
+                                 "dp-histogram-v1")
+                self.assertEqual(manifest["engine_params"]["base_score"]["value"],
+                                 0.0)
+                self.assertEqual(profile(manifest)["engine"], engine)
+
     def test_exact_lightgbm_and_catboost_profiles(self):
         lightgbm = boosting_profile.lightgbm_profile(_manifest("lightgbm"))
         self.assertEqual(lightgbm["trees"], 1)
