@@ -40,7 +40,19 @@ test_that("run tokens and staging paths fail closed before recursive deletion", 
   withr::defer(dsFlower:::.cleanupStaging(token))
   link <- tempfile("staging-link-")
   if (isTRUE(file.symlink(marker, link))) {
-    withr::defer(unlink(link))
+    withr::defer(expect_no_warning({
+      if (.Platform$OS.type == "windows") {
+        expect_identical(dsFlower:::.run_windows_powershell(paste0(
+          "[IO.File]::Delete(",
+          dsFlower:::.powershell_literal(link),
+          ");Write-Output 'OK'"
+        )), "OK")
+      } else {
+        unlink(link)
+      }
+      expect_false(file.exists(link) || dir.exists(link))
+      expect_true(file.exists(marker))
+    }))
     expect_error(
       dsFlower:::.validateStagingDir(link, token),
       "link or reparse point"

@@ -131,7 +131,19 @@ test_that("the trusted Python environment does not inherit injection variables",
   writeLines("target", unsafe_target)
   unsafe_home <- file.path(unsafe_staging, ".flwr")
   expect_true(file.symlink(unsafe_target, unsafe_home))
-  withr::defer(unlink(unsafe_home))
+  withr::defer(expect_no_warning({
+    if (.Platform$OS.type == "windows") {
+      expect_identical(dsFlower:::.run_windows_powershell(paste0(
+        "[IO.File]::Delete(",
+        dsFlower:::.powershell_literal(unsafe_home),
+        ");Write-Output 'OK'"
+      )), "OK")
+    } else {
+      unlink(unsafe_home)
+    }
+    expect_false(file.exists(unsafe_home) || dir.exists(unsafe_home))
+    expect_true(file.exists(unsafe_target))
+  }))
   expect_error(
     dsFlower:::.build_clean_python_env(tempfile("venv-"), unsafe_staging),
     "Flower home is unsafe"
