@@ -16,6 +16,7 @@ a bounded portable weight record and history (neural/egress), or pooled DP
 metrics only (validation).
 """
 
+import hashlib
 import json
 import math
 import os
@@ -331,10 +332,16 @@ class _RequireCompleteTrain:
     """Reject a round unless the configured federation replies successfully."""
 
     def __init__(self, *, expected_train_nodes,
-                 require_hook_executed=False, stable_roster=False, **kwargs):
+                 require_hook_executed=False, stable_roster=False,
+                 required_roster=None, operation=None, fold=0, **kwargs):
         self.expected_train_nodes = int(expected_train_nodes)
         self.require_hook_executed = bool(require_hook_executed)
         self.stable_roster = bool(stable_roster)
+        self.required_roster = (None if required_roster is None else
+                                frozenset(int(value)
+                                          for value in required_roster))
+        self.operation = operation
+        self.fold = int(fold)
         self.training_roster = None
         self.available_rounds = set()
         self.unavailable_rounds = set()
@@ -349,6 +356,10 @@ class _RequireCompleteTrain:
         # public coordinate and independently checks it against its local manifest.
         round_config = ConfigRecord(dict(config))
         round_config["server-round"] = int(server_round)
+        if self.operation is not None:
+            round_config["dsflower-operation"] = str(self.operation)
+        if self.fold:
+            round_config["dsflower-fold"] = self.fold
         messages = list(super().configure_train(
             server_round, arrays, round_config, grid))
         for message in messages:
@@ -366,12 +377,16 @@ class _RequireCompleteTrain:
                 "refusing an unexpected federation roster."
                 % (len(connected), server_round, self.expected_train_nodes))
         connected_roster = frozenset(int(value) for value in connected)
+        if (self.required_roster is not None
+                and connected_roster != self.required_roster):
+            raise RuntimeError(
+                "federation roster changed during the resampling job")
         if self.stable_roster:
             if self.training_roster is None:
                 self.training_roster = connected_roster
             elif connected_roster != self.training_roster:
                 raise RuntimeError(
-                    "atomic holdout federation roster changed between rounds")
+                    "federation roster changed between resampling rounds")
         self._round_input_arrays[int(server_round)] = arrays
         self._round_expected_nodes[int(server_round)] = set(destinations)
         return messages
@@ -464,7 +479,8 @@ _STRATEGIES = {
 }
 
 
-def _build_strategy(cfg, min_nodes, track=None, stable_roster=False):
+def _build_strategy(cfg, min_nodes, track=None, stable_roster=False,
+                    required_roster=None, operation=None, fold=0):
     name = str(cfg.get("strategy", "fedavg")).lower()
     if name not in _STRATEGIES:
         raise ValueError(f"Unsupported aggregation strategy: {name}")
@@ -504,13 +520,244 @@ def _build_strategy(cfg, min_nodes, track=None, stable_roster=False):
     return _STRATEGIES[name](
         expected_train_nodes=min_nodes,
         require_hook_executed=(track == "egress"),
-        stable_roster=stable_roster, **common, **specific)
+        stable_roster=stable_roster, required_roster=required_roster,
+        operation=operation, fold=fold, **common, **specific)
+
+
+def _cross_validation_initial_arrays(cfg, fold):
+    """Build one clean deterministic public initialization for a CV fold."""
+    material = {
+        "contract": str(cfg.get("cv-contract-sha256", "")),
+        "fold": int(fold),
+        "loss": str(cfg.get("loss-name", "")),
+        "model_spec": str(cfg.get("model-spec-b64", "")),
+        "num_classes": int(cfg.get("num-classes", 2)),
+        "num_features": int(cfg.get("num-features", 0)),
+        "num_labels": int(cfg.get("num-labels", 2)),
+    }
+    wire = json.dumps(
+        material, allow_nan=False, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    seed = int.from_bytes(hashlib.sha256(
+        b"dsflower/cv-public-init/v1\x00" + wire).digest()[:8], "big")
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        model = _build_initial_model(cfg)
+    return model, ArrayRecord(numpy_ndarrays=get_torch_params(model))
+
+
+def _cross_validation_roster(grid, expected):
+    node_ids = list(grid.get_node_ids())
+    try:
+        roster = frozenset(int(value) for value in node_ids)
+    except Exception as exc:
+        raise RuntimeError("cross-validation federation roster is invalid") from exc
+    if len(node_ids) != expected or len(roster) != expected:
+        raise RuntimeError(
+            "cross-validation requires the exact configured federation roster")
+    return roster
+
+
+def _cross_validation_messages(grid, cfg, roster, operation, fold, arrays,
+                               *, strict=True):
+    """Run one non-training CV control exchange against the pinned roster."""
+    import time
+
+    expected = int(cfg.get("min-train-nodes", 2))
+    current = _cross_validation_roster(grid, expected)
+    if current != frozenset(roster):
+        raise RuntimeError("cross-validation federation roster changed")
+    content = RecordDict({
+        "arrays": arrays,
+        "config": ConfigRecord({
+            "server-round": int(cfg.get("num-server-rounds", 1)),
+            "dsflower-operation": str(operation),
+            "dsflower-fold": int(fold),
+        }),
+    })
+    messages = [Message(
+        content=content, message_type="train", dst_node_id=node_id,
+        group_id="dsflower-cv-%s-f%d-v1" % (operation, int(fold)))
+        for node_id in sorted(roster)]
+    timeout = float(cfg.get("round-timeout", 3600))
+    started = time.monotonic()
+    replies = list(grid.send_and_receive(messages, timeout=timeout))
+    if not strict:
+        return replies
+    if time.monotonic() - started > timeout + 1.0:
+        raise RuntimeError("cross-validation control exchange exceeded its timeout")
+    try:
+        sources = [int(reply.metadata.src_node_id) for reply in replies]
+    except Exception as exc:
+        raise RuntimeError(
+            "cross-validation replies have no verifiable identity") from exc
+    if (len(replies) != expected or len(set(sources)) != expected
+            or set(sources) != set(roster)):
+        raise RuntimeError(
+            "cross-validation replies do not match the pinned roster")
+    ordered = [reply for _, reply in sorted(
+        zip(sources, replies), key=lambda item: item[0])]
+    for reply in ordered:
+        if reply.has_error():
+            raise RuntimeError("one or more cross-validation replies are unavailable")
+        metrics = reply.content.get("metrics")
+        if (not isinstance(metrics, MetricRecord)
+                or int(metrics.get("public-preflight-unavailable", 0)) == 1
+                or int(metrics.get("execution-unavailable", 0)) == 1):
+            raise RuntimeError("one or more cross-validation replies are unavailable")
+    return ordered
+
+
+def _cross_validation_accumulate(grid, cfg, roster, fold, arrays):
+    replies = _cross_validation_messages(
+        grid, cfg, roster, "cv-accumulate", fold, arrays)
+    for reply in replies:
+        values = reply.content["arrays"].to_numpy_ndarrays()
+        if (len(values) != 1 or np.asarray(values[0]).shape != (1,)
+                or float(np.asarray(values[0])[0]) != 0.0):
+            raise RuntimeError(
+                "cross-validation accumulation emitted a private transcript")
+
+
+def _cross_validation_release(grid, cfg, roster, folds):
+    from . import validation
+
+    replies = _cross_validation_messages(
+        grid, cfg, roster, "cv-release", folds + 1,
+        ArrayRecord(numpy_ndarrays=[np.zeros(1, dtype=np.float64)]))
+    layout = validation.cross_validation_layout_from_config(dict(cfg))
+    vectors = []
+    for reply in replies:
+        values = reply.content["arrays"].to_numpy_ndarrays()
+        if len(values) != 1:
+            raise RuntimeError("cross-validation release has invalid geometry")
+        vectors.append(values[0])
+    pooled = _pool_private_vectors(vectors, layout["size"])
+    bounds = (validation.cross_validation_target_bounds_from_config(dict(cfg))
+              if layout["task"] in ("regression", "count") else None)
+    return layout, validation.validation_metrics(
+        pooled, layout, target_bounds=bounds)
+
+
+def _abort_cross_validation(grid, cfg, roster, folds):
+    try:
+        _cross_validation_messages(
+            grid, cfg, roster, "cv-abort", folds + 1,
+            ArrayRecord(numpy_ndarrays=[np.zeros(1, dtype=np.float64)]),
+            strict=False)
+    except Exception:
+        pass
+
+
+def _contains_forbidden_cv_key(value):
+    if isinstance(value, dict):
+        if any(str(key) in {
+                "per_node", "per_site", "predictions", "oof_predictions",
+                "fold", "per_fold", "fold_metrics", "models"
+        } for key in value):
+            return True
+        return any(_contains_forbidden_cv_key(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_forbidden_cv_key(item) for item in value)
+    return False
+
+
+def _save_cross_validation(cfg, layout, metrics, folds):
+    results_dir = cfg.get("results-dir")
+    if not results_dir:
+        raise RuntimeError("cross-validation results directory is missing")
+    required_metric = {
+        "binary": "accuracy", "multiclass": "accuracy",
+        "ordinal": "accuracy", "multilabel": "macro_f1",
+        "regression": "mae", "count": "mae",
+    }[layout["task"]]
+    primary = metrics.get(required_metric) if isinstance(metrics, dict) else None
+    primary_is_number = (isinstance(primary, (int, float, np.number))
+                         and not isinstance(primary, (bool, np.bool_)))
+    primary_is_plausible = (
+        primary_is_number and math.isfinite(float(primary))
+        and float(primary) >= 0.0
+        and (layout["task"] in ("regression", "count")
+             or float(primary) <= 1.0))
+    if (not isinstance(metrics, dict) or required_metric not in metrics
+            or not primary_is_plausible
+            or _contains_forbidden_cv_key(metrics)):
+        raise RuntimeError(
+            "cross-validation metrics violate the pooled-only contract")
+    contract_hash = str(cfg.get("cv-contract-sha256", ""))
+    if (len(contract_hash) != 64
+            or any(value not in "0123456789abcdef" for value in contract_hash)):
+        raise RuntimeError("cross-validation contract hash is invalid")
+    job_hash = str(cfg.get("cv-job-sha256", ""))
+    if (len(job_hash) != 64
+            or any(value not in "0123456789abcdef" for value in job_hash)):
+        raise RuntimeError("cross-validation job hash is invalid")
+    os.makedirs(results_dir, exist_ok=True)
+    if os.listdir(results_dir):
+        raise RuntimeError("cross-validation results directory is not empty")
+    payload = {
+        "pooled_only": True,
+        "privacy": "node-dp-pooled-postprocessing",
+        "method": "cross_validation",
+        "task": layout["task"],
+        "n_nodes": int(cfg.get("min-train-nodes", 0)),
+        "folds": int(folds),
+        "cv_contract_sha256": contract_hash,
+        "cv_job_sha256": job_hash,
+        "metrics": metrics,
+    }
+    final = os.path.join(results_dir, "cv.json")
+    temporary = final + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, allow_nan=False, separators=(",", ":"))
+        os.replace(temporary, final)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _run_cross_validation(grid, cfg, track):
+    if track != "neural" or str(cfg.get("data-kind", "")).lower() != "tabular":
+        raise RuntimeError(
+            "cross-validation is implemented only for tabular neural runs")
+    folds = int(cfg.get("cv-folds", 0))
+    if not 2 <= folds <= 10:
+        raise RuntimeError("cross-validation folds must be in [2, 10]")
+    num_rounds = int(cfg.get("num-server-rounds", 1))
+    min_nodes = int(cfg.get("min-train-nodes", 2))
+    if min_nodes != int(cfg.get("cv-n-nodes", 0)):
+        raise RuntimeError(
+            "cross-validation node count differs from its public job pin")
+    roster = _cross_validation_roster(grid, min_nodes)
+    completed = False
+    try:
+        for fold in range(1, folds + 1):
+            _model, initial = _cross_validation_initial_arrays(cfg, fold)
+            strategy = _build_strategy(
+                cfg, min_nodes, track=track, stable_roster=True,
+                required_roster=roster, operation="cv-train", fold=fold)
+            result = strategy.start(
+                grid=grid, initial_arrays=initial, num_rounds=num_rounds)
+            if strategy.available_rounds != set(range(1, num_rounds + 1)):
+                raise RuntimeError(
+                    "cross-validation requires every round of every fold")
+            _cross_validation_accumulate(
+                grid, cfg, roster, fold, result.arrays)
+        layout, metrics = _cross_validation_release(grid, cfg, roster, folds)
+        _save_cross_validation(cfg, layout, metrics, folds)
+        completed = True
+    finally:
+        if not completed:
+            _abort_cross_validation(grid, cfg, roster, folds)
 
 
 def _run_fedavg(grid, cfg, track):
     num_rounds = int(cfg.get("num-server-rounds", 1))
     min_nodes = int(cfg.get("min-train-nodes", 2))
     has_holdout = cfg.get("resampling-contract-sha256") is not None
+    if cfg.get("cv-contract-sha256") is not None:
+        raise RuntimeError("cross-validation requires its dedicated orchestration")
     model, initial = _initial_arrays(cfg, track)
     strategy = _build_strategy(
         cfg, min_nodes, track=track, stable_roster=has_holdout)
@@ -643,5 +890,7 @@ def main(grid: Grid, context: Context) -> None:
     if track == "validation":
         metrics, n_nodes, available = _run_validation(grid, cfg)
         _save_validation(cfg, metrics, n_nodes, available)
+    elif cfg.get("cv-contract-sha256") is not None:
+        _run_cross_validation(grid, cfg, track)
     else:  # neural or egress
         _run_fedavg(grid, cfg, track)

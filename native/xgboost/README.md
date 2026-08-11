@@ -1,8 +1,9 @@
 # dsFlower native XGBoost patchset
 
-This directory contains the reproducible, source-pinned start of dsFlower's
-native XGBoost backend.  It does **not** vendor XGBoost and it does **not** yet
-advertise a production differentially private training capability.
+This directory contains dsFlower's reproducible, source-pinned native XGBoost
+backend. It does **not** vendor XGBoost. A public training capability is exposed
+only when a custodian separately builds and configures the curated bundle and
+the installed runtime passes its complete executable release probe.
 
 The first patch adds an opt-in TreeUpdater registration and a C ABI for a
 server-authoritative privacy context.  The second patch upgrades that C ABI to
@@ -62,11 +63,13 @@ The root total is part of the first release and later totals derive only from
 already privatized bins.  Binary logistic and bounded squared-error objectives
 share this path.
 
-The bundle switch is deliberately not connected to dsFlower's public
-capabilities or R interface.  Its exact internal status is
-`bundle-core:fixed-point-discrete-v1:internal-only`; the normal scaffold reports
-`scaffold-only:no-dp-histogram-privatization`.  Public discovery must remain off
-until the trusted loader, adapter and remaining release gates are closed.
+The curated bundle is connected to dsFlower's R request interface through a
+fresh fail-closed capability probe. Its fixed manifest status identifier is
+`bundle-core:fixed-point-discrete-v1:internal-only`; the identifier does not by
+itself enable discovery. The runtime first verifies the bundle, ABI, mechanism
+and symbols, then completes a synthetic public DMatrix training, sanitization,
+ensemble, sidecar and dependency-light prediction. The normal scaffold status
+`scaffold-only:no-dp-histogram-privatization` never passes this gate.
 
 ## Reproduce and verify
 
@@ -129,11 +132,13 @@ with tracked, untracked, and ignored files.  Builds stop before CMake unless the
 trees match exactly.  The `dmlc-core` worktree is checked the same way against
 its pinned commit tree.
 
-## What remains before production DP can be claimed
+## Runtime release gate
 
-The service adapter must still enforce patient contribution bounding, calculate
-the exact integer scales from the per-training accountant, bind every effective
-input into the derived key, exclude private evaluation paths, and sanitize model
-egress.  Interruption behavior, timing isolation, adversarial release tests and
-the end-to-end proof also require review.  Until those conditions are closed,
-the normal build's unconditional training rejection is a security invariant.
+The trusted service adapter enforces row/patient contribution bounding,
+calculates the fixed-point scales from the per-training accountant, binds every
+effective input into the custodial PRF key, excludes private evaluation paths
+and sanitizes model egress. Adversarial and end-to-end tests cover deterministic
+replay, malformed releases, prediction parity and the per-training tree counter.
+The ordinary scaffold remains unconditionally rejected; only the exact curated
+bundle can reach the executable capability probe. The standard R package
+installer does not build or download this platform-specific trust artifact.

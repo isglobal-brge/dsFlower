@@ -18,8 +18,8 @@ FLOWER_APP = os.path.abspath(os.path.join(
 if FLOWER_APP not in sys.path:
     sys.path.insert(0, FLOWER_APP)
 
-from dsflower_runner import (client_app, release_guard, resampling, server_app,
-                             validation)  # noqa: E402
+from dsflower_runner import (client_app, dp_harness, release_guard, resampling,
+                             server_app, validation)  # noqa: E402
 
 
 class PartitionTests(unittest.TestCase):
@@ -259,15 +259,17 @@ class NeuralHoldoutTests(unittest.TestCase):
         captured = {}
 
         def fake_fit(_model, values, target, _pcfg, _pins, n_staged,
-                     _cfg, master):
+                     _cfg, master, geometry_n_units=None):
             captured.update(
                 X=values.copy(), y=target.copy(), n_staged=n_staged,
-                master=master)
+                master=master, geometry_n_units=geometry_n_units)
             return [np.asarray([1.0])], len(target)
 
         with (mock.patch.object(client_app, "load_data", return_value=(X, y)),
               mock.patch.object(client_app, "load_tabular_patient_ids",
                                 return_value=None),
+              mock.patch.object(client_app.task_module, "_load_manifest",
+                                return_value={"n_units": 6}),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
               mock.patch.object(client_app, "_apply_feature_bounds",
                                 side_effect=lambda values, ignored: values),
@@ -275,7 +277,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                                 "holdout_mask_from_context",
                                 return_value=mask),
               mock.patch.object(client_app, "_neural_seed_contract",
-                                return_value=({}, {})),
+                                return_value=({}, {})) as seed_contract,
               mock.patch.object(client_app.seeding, "master_seed",
                                 return_value=b"semantic-master"),
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
@@ -286,6 +288,93 @@ class NeuralHoldoutTests(unittest.TestCase):
         np.testing.assert_array_equal(captured["X"], X[~mask])
         np.testing.assert_array_equal(captured["y"], y[~mask])
         self.assertEqual(captured["n_staged"], len(y))
+        self.assertEqual(captured["geometry_n_units"], len(y))
+        seed_contract.assert_called_once_with(
+            cfg, pins, {}, geometry_n_units=len(y))
+
+    def test_patient_replacement_keeps_fixed_dp_sampling_geometry(self):
+        import torch
+
+        X = np.arange(16, dtype=np.float32).reshape(8, 2)
+        y = np.asarray([0, 0, 1, 1, 0, 0, 1, 1], dtype=np.float32)
+        rosters = (
+            np.asarray(["a", "a", "b", "b", "c", "c", "d", "d"]),
+            np.asarray(["a", "a", "b", "b", "c", "c", "e", "e"]),
+        )
+        pcfg = {
+            "n_samples": 8, "clipping_norm": 1.0,
+            "epsilon": 1.6, "delta": 8e-6,
+        }
+        pins = {
+            "loss_name": "bce_logits", "batch_size": 2,
+            "local_epochs": 1, "num_rounds": 1, "n_classes": 2,
+            "learning_rate": 0.1, "round_index": 1,
+            "optimizer": {
+                "name": "sgd", "weight_decay": 0.0, "momentum": 0.0,
+                "nesterov": False, "l1_penalty": 0.0,
+            },
+            "scheduler": {"name": "none"},
+        }
+        cfg = {"resampling-contract-sha256": "a" * 64}
+        captured = []
+        original = dp_harness.make_private_dpsgd
+
+        def spy_make_private(*args, **kwargs):
+            wrapped, optimizer, loader, engine = original(*args, **kwargs)
+            captured.append({
+                "subset-units": len(loader.dataset),
+                "steps": len(loader),
+                "q": loader.batch_sampler.sample_rate,
+                "noise": optimizer.noise_multiplier,
+                "normalizer": optimizer.expected_batch_size,
+            })
+            return wrapped, optimizer, [], engine
+
+        with (mock.patch.object(client_app.task_module, "_load_manifest",
+                                return_value={"n_units": 4}),
+              mock.patch.object(client_app, "load_data", return_value=(X, y)),
+              mock.patch.object(client_app, "_apply_feature_bounds",
+                                side_effect=lambda values, ignored: values),
+              mock.patch.object(
+                  client_app.resampling, "holdout_mask_from_context",
+                  side_effect=lambda context, n_rows, unit_ids:
+                  np.isin(unit_ids, ["c", "e"])),
+              mock.patch.object(client_app, "_neural_seed_contract",
+                                return_value=({}, {})),
+              mock.patch.object(client_app.seeding, "master_seed",
+                                return_value=b"\x39" * 32),
+              mock.patch.object(dp_harness, "_cached_noise_multiplier",
+                                return_value=1.75),
+              mock.patch.object(dp_harness, "make_private_dpsgd",
+                                side_effect=spy_make_private)):
+            for roster in rosters:
+                model = torch.nn.Linear(2, 1)
+                model._dsflower_release_keys = tuple(
+                    name for name, _ in torch.nn.Module.named_parameters(model))
+                with mock.patch.object(
+                        client_app, "load_tabular_patient_ids",
+                        return_value=roster):
+                    client_app._train_neural(
+                        None, cfg, pcfg, pins, model, input_dim=2,
+                        manifest_image=False)
+
+        self.assertEqual([item["subset-units"] for item in captured], [3, 2])
+        self.assertEqual(
+            [(item["steps"], item["q"], item["noise"], item["normalizer"])
+             for item in captured],
+            [(2, 0.5, 1.75, 2), (2, 0.5, 1.75, 2)],
+        )
+
+    def test_resampling_unit_pin_fails_before_private_read(self):
+        with (mock.patch.object(client_app.task_module, "_load_manifest",
+                                return_value={"n_units": "invalid"}),
+              mock.patch.object(client_app, "load_data") as load,
+              self.assertRaisesRegex(ValueError, "privacy-unit count")):
+            client_app._train_neural(
+                None, {"resampling-contract-sha256": "a" * 64}, {},
+                {"loss_name": "bce_logits", "n_classes": 2}, object(),
+                input_dim=2, manifest_image=False)
+        load.assert_not_called()
 
     def test_image_holdout_fails_before_loading_private_images(self):
         with (mock.patch.object(client_app, "load_image_collection") as load,

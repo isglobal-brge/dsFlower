@@ -4,8 +4,8 @@ All split topology is drawn from the custodial PRF using only the canonical
 public request.  Private data therefore affects one fixed-layout vector only:
 class counts, or count plus normalized-target sum, at every terminal leaf.  A
 single jointly calibrated Gaussian release privatizes that vector before any
-model bytes exist.  Random Forest remains intentionally unsupported because a
-data-dependent best-split mechanism needs a separate exact accountant.
+model bytes exist. Adaptive Random Forest is implemented by the separate
+random_forest_adapter and shares only the sanitized forest artifact contract.
 """
 
 import copy

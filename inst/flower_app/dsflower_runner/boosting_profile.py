@@ -1,9 +1,9 @@
-"""Exact fail-closed profiles for private boosting-style runners.
+"""Exact profiles for dsFlower's private boosting-style runners.
 
 The profiles bind dsFlower's reviewed reference trainers and safe numeric
-prediction projections.  They do not advertise an upstream LightGBM/CatBoost
-runtime or enable a public Flower capability; that requires a separate E2E
-release gate.
+prediction projections. They neither load nor emit upstream LightGBM/CatBoost
+binary formats; operational Flower availability is established by the shared
+fresh executable probe.
 """
 
 import math
@@ -38,7 +38,6 @@ _CATBOOST_PARAMETERS = {
     "learning_rate": "float",
     "max_delta_step": "float",
 }
-_SUPPORTED = frozenset(("lightgbm", "catboost"))
 
 
 def _float32(value, where):
@@ -225,29 +224,7 @@ def catboost_profile(manifest):
                 max_artifact_bytes=resources["max_artifact_bytes"])
 
 
-def training_capability(engine):
-    """Describe the honest node-local gate; this is not a privacy ACL."""
-    if engine not in _SUPPORTED:
-        raise ValueError("unsupported boosting engine")
-    return {
-        "available": False,
-        "engine": engine,
-        "reason": "verified-native-runner-unavailable",
-        "required_profile": "fixed-point-public-cuts-prf-v1",
-    }
-
-
-def reject_unverified_native_artifact(engine, artifact):
-    """Reject native serialization until its pure sanitizer is implemented."""
-    if engine not in _SUPPORTED or not isinstance(
-            artifact, (bytes, bytearray, memoryview)):
-        raise ValueError("verified native boosting sanitizer is unavailable")
-    raise ValueError("verified native boosting sanitizer is unavailable")
-
-
 __all__ = [
     "catboost_profile",
     "lightgbm_profile",
-    "reject_unverified_native_artifact",
-    "training_capability",
 ]

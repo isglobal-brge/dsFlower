@@ -153,7 +153,7 @@ def _train(manifest, X, y, unit_ids=None):
 
 
 class ExtraTreesAccountingTests(unittest.TestCase):
-    def test_public_request_bridge_injects_only_fixed_forest_mechanism(self):
+    def test_public_request_bridge_injects_exact_forest_mechanisms(self):
         request = _public_request()
         manifest = native_tree_request.backend_manifest(
             request, epsilon=2.0, delta=1.0e-6, unit="row",
@@ -169,13 +169,19 @@ class ExtraTreesAccountingTests(unittest.TestCase):
             adapter.canonical_extra_trees_profile(manifest)["n_estimators"],
             16)
 
-        rejected = copy.deepcopy(request)
-        rejected["engine"] = "random_forest"
-        with self.assertRaisesRegex(ValueError, "unsupported"):
-            native_tree_request.backend_manifest(
-                rejected, epsilon=2.0, delta=1.0e-6, unit="row",
-                unit_canonicalization="trim-utf8-v2", gradient_clip=1.0,
-                snapshot_hash="a" * 64, cohort_hash="b" * 64)
+        random_request = copy.deepcopy(request)
+        random_request["engine"] = "random_forest"
+        random_request["parameters"].append(
+            {"name": "max_features", "type": "integer", "value": 1})
+        random_manifest = native_tree_request.backend_manifest(
+            random_request, epsilon=2.0, delta=1.0e-6, unit="row",
+            unit_canonicalization="trim-utf8-v2", gradient_clip=1.0,
+            snapshot_hash="a" * 64, cohort_hash="b" * 64)
+        self.assertEqual(random_manifest["engine"], "random_forest")
+        self.assertEqual(
+            frozenset(random_manifest["privacy"]["mechanism_params"]),
+            frozenset(("candidate_schedule", "histogram_release",
+                       "leaf_release", "partition", "transcript")))
 
     def test_joint_vector_sensitivity_and_sigma_are_pinned(self):
         self.assertEqual(
@@ -191,7 +197,7 @@ class ExtraTreesAccountingTests(unittest.TestCase):
         self.assertEqual(
             profile["release_coordinates"], 2 * 8 * (1 << 3))
 
-    def test_profile_is_exact_and_random_forest_is_fail_closed(self):
+    def test_profile_is_exact_and_adapter_is_engine_specific(self):
         manifest = _manifest()
         profile = adapter.canonical_extra_trees_profile(manifest)
         self.assertEqual(profile["engine"], "extra_trees")

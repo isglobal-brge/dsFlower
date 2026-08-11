@@ -267,13 +267,31 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
             "must be rejected in validation, not silently rewritten."
         )
 
-    # The canonical loader's length pins both the configured Poisson rate and
-    # the number of optimizer/accountant steps.  Sampling itself must not fall
+    # Resampling jobs pass the server-pinned total privacy-unit census here. It
+    # fixes the mechanism geometry even though this loader contains only the
+    # training complement. Non-resampling callers pass the dataset size, which
+    # preserves their existing geometry exactly.
+    if n_samples is None:
+        n_samples = len(trainloader.dataset)
+    if batch_size is None:
+        batch_size = trainloader.batch_size
+    if (not isinstance(n_samples, (int, np.integer))
+            or isinstance(n_samples, (bool, np.bool_)) or int(n_samples) < 1
+            or not isinstance(batch_size, (int, np.integer))
+            or isinstance(batch_size, (bool, np.bool_)) or int(batch_size) < 1):
+        raise ValueError("DP-SGD needs positive integer population and batch pins")
+    accounting_population = int(n_samples)
+    if accounting_population < len(trainloader.dataset):
+        raise ValueError("DP-SGD population pin cannot be smaller than its dataset")
+    steps_per_epoch = int(math.ceil(
+        accounting_population / float(int(batch_size))))
+    expected_batch_size = max(
+        1, int(accounting_population / float(steps_per_epoch)))
+
+    # The pinned geometry fixes both the configured Poisson rate and the number
+    # of optimizer/accountant steps. Sampling itself must not fall
     # back to torch.Generator (MT19937); that would truncate the release key and
     # would not provide the cryptographic threat model used for DP noise.
-    steps_per_epoch = len(trainloader)
-    if steps_per_epoch < 1:
-        raise ValueError("DP-SGD needs a non-empty data loader")
     if secure_sampling_rng is None:
         raise RuntimeError("DP-SGD requires the node ChaCha20 sampling RNG")
     if not isinstance(secure_sampling_rng, SecureNumpyRng):
@@ -314,6 +332,9 @@ def make_private_dpsgd(model, optimizer, trainloader, clipping_norm,
         # attaches its accountant hook with q=1/len(trainloader).
         poisson_sampling=False,
     )
+    # PrivacyEngine derives this mean-loss divisor from the complement dataset.
+    # Override it with the same public fixed geometry used for q and accounting.
+    optimizer.expected_batch_size = expected_batch_size
     if not isinstance(trainloader.batch_sampler, _SecurePoissonBatchSampler):
         raise RuntimeError("Opacus replaced the trusted Poisson sampler")
     # Modern torchcsprng wheels do not exist for current PyTorch/Python.  Keep

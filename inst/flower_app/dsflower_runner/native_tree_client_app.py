@@ -1,4 +1,4 @@
-"""Dedicated trusted ClientApp for one complete native DP-XGBoost training."""
+"""Dedicated trusted ClientApp for one complete native-tree training."""
 
 import os
 import re

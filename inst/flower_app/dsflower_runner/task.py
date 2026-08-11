@@ -26,6 +26,46 @@ _MISSING_PATIENT_UNIT = "__dsflower_missing_patient_unit__"
 _INVALID_IMAGE = "__dsflower_invalid_image__"
 _ASCII_ID_TRIM = " \t\r\n"
 
+_CV_EXECUTION_FIELDS = (
+    "dp-track", "task-type", "model-spec-b64", "loss-name",
+    "num-classes", "num-labels", "num-features", "local-epochs",
+    "batch-size", "num-server-rounds",
+)
+_CV_TRAINING_FIELDS = (
+    "learning-rate", "weight-decay", "l1-penalty",
+    "optimizer-name", "scheduler-name",
+)
+_CV_OPTIMIZER_FIELDS = {
+    "sgd": ("optimizer-momentum", "optimizer-nesterov"),
+    "adam": ("optimizer-beta1", "optimizer-beta2", "optimizer-eps",
+             "optimizer-amsgrad"),
+    "adamw": ("optimizer-beta1", "optimizer-beta2", "optimizer-eps",
+              "optimizer-amsgrad"),
+    "rmsprop": ("optimizer-momentum", "optimizer-eps",
+                "optimizer-rmsprop-alpha"),
+}
+_CV_SCHEDULER_FIELDS = {
+    "none": (),
+    "step": ("scheduler-step-size", "scheduler-gamma"),
+    "exponential": ("scheduler-gamma",),
+    "cosine": ("scheduler-min-lr",),
+}
+_CV_LOSS_FIELDS = {
+    "negbin_nll": ("nb-dispersion",),
+    "gamma_nll": ("gamma-shape",),
+    "huber": ("huber-delta",),
+    "quantile": ("quantile-level",),
+}
+_CV_KNOWN_EXECUTION_FIELDS = frozenset(
+    _CV_EXECUTION_FIELDS + _CV_TRAINING_FIELDS + ("data-kind",)
+    + tuple(field for fields in _CV_OPTIMIZER_FIELDS.values()
+            for field in fields)
+    + tuple(field for fields in _CV_SCHEDULER_FIELDS.values()
+            for field in fields)
+    + tuple(field for fields in _CV_LOSS_FIELDS.values()
+            for field in fields)
+)
+
 
 def _get_manifest_dir(context=None):
     manifest_dir = None
@@ -272,6 +312,18 @@ def assert_pinned_unit_count(context, n_rows, patient_ids=None, *,
         manifest = _load_manifest(context)
     if "n_units" not in manifest:
         return
+    number = pinned_unit_count_from_manifest(manifest)
+    observed = (int(n_rows) if patient_ids is None else int(np.unique(
+        np.asarray([_canonical_patient_id(value) for value in patient_ids],
+                   dtype=str)).size))
+    if observed != number:
+        raise RuntimeError("staged privacy-unit roster changed after manifest pinning")
+
+
+def pinned_unit_count_from_manifest(manifest):
+    """Return the validated server-pinned public privacy-unit census."""
+    if "n_units" not in manifest:
+        raise ValueError("manifest is missing its pinned privacy-unit count")
     raw = manifest["n_units"]
     if isinstance(raw, (bool, np.bool_)):
         raise ValueError("manifest has an invalid pinned privacy-unit count")
@@ -281,11 +333,7 @@ def assert_pinned_unit_count(context, n_rows, patient_ids=None, *,
         raise ValueError("manifest has an invalid pinned privacy-unit count") from exc
     if (not math.isfinite(number) or number != math.floor(number) or number < 0):
         raise ValueError("manifest has an invalid pinned privacy-unit count")
-    observed = (int(n_rows) if patient_ids is None else int(np.unique(
-        np.asarray([_canonical_patient_id(value) for value in patient_ids],
-                   dtype=str)).size))
-    if observed != int(number):
-        raise RuntimeError("staged privacy-unit roster changed after manifest pinning")
+    return int(number)
 
 
 def _resolve_image_path(images_root, value):
@@ -652,10 +700,59 @@ def load_run_pins(context=None):
     }
 
 
+def _cv_execution_contract(manifest):
+    """Return every Flower scalar that can change one pinned CV execution."""
+    optimizer = str(manifest.get("optimizer-name", "")).lower()
+    scheduler = str(manifest.get("scheduler-name", "")).lower()
+    loss = str(manifest.get("loss-name", "")).lower()
+    if (optimizer not in _CV_OPTIMIZER_FIELDS
+            or scheduler not in _CV_SCHEDULER_FIELDS):
+        raise ValueError(
+            "manifest has an invalid cross-validation training pin")
+    fields = (
+        _CV_EXECUTION_FIELDS + _CV_TRAINING_FIELDS
+        + _CV_OPTIMIZER_FIELDS[optimizer]
+        + _CV_SCHEDULER_FIELDS[scheduler]
+        + _CV_LOSS_FIELDS.get(loss, ())
+    )
+    missing = [field for field in fields if field not in manifest]
+    if "data_type" not in manifest:
+        missing.append("data_type")
+    if missing:
+        raise ValueError(
+            "manifest is missing cross-validation execution pin '%s'"
+            % sorted(missing)[0])
+    expected = {field: manifest[field] for field in fields}
+    expected["data-kind"] = manifest["data_type"]
+    return expected
+
+
+def _validate_cv_execution_config(manifest, cfg):
+    """Reject a Flower CV recipe that differs from its server-authored job."""
+    expected = _cv_execution_contract(manifest)
+    present = _CV_KNOWN_EXECUTION_FIELDS & set(cfg)
+    if present != set(expected):
+        raise ValueError(
+            "Flower cross-validation execution config does not match manifest pin")
+    for key, value in expected.items():
+        supplied = cfg[key]
+        if type(supplied) is not type(value) or supplied != value:
+            raise ValueError(
+                "Flower cross-validation execution config does not match "
+                "manifest pin")
+
+
 def load_pinned_run_config(context=None):
     """Overlay every node-pinned declarative field onto Flower run_config."""
     manifest = _load_manifest(context)
+    if (manifest.get("resampling-contract-sha256") is not None
+            or manifest.get("cv-contract-sha256") is not None):
+        if pinned_unit_count_from_manifest(manifest) < 1:
+            raise ValueError(
+                "resampling requires a positive pinned privacy-unit count")
     cfg = _run_config(context)
+    if manifest.get("cv-contract-sha256") is not None:
+        _validate_cv_execution_config(manifest, cfg)
     if str(manifest.get("dp-track", "")).lower() == "egress":
         # The R service canonicalises and hashes the public app payload before
         # staging.  Require the Flower bundle to carry that exact copy before a
@@ -714,6 +811,71 @@ def load_pinned_run_config(context=None):
                 raise ValueError("Flower holdout config does not match manifest pin")
     elif supplied_resampling:
         raise ValueError("Flower config requests holdout without a manifest contract")
+    cv_fields = (
+        "cv-version", "cv-method", "cv-assignment", "cv-folds",
+        "cv-privacy-unit", "cv-unit-canonicalization",
+        "cv-contract-sha256", "cv-validation-bins", "cv-n-nodes",
+        "cv-job-sha256")
+    cv_bound_fields = {"cv-target-lower", "cv-target-upper"}
+    supplied_cv = {
+        key for key in cfg
+        if str(key).lower().startswith(("cv-", "cv_"))}
+    if (manifest.get("resampling-contract-sha256") is not None
+            and manifest.get("cv-contract-sha256") is not None):
+        raise ValueError("manifest cannot combine holdout and cross-validation")
+    if manifest.get("cv-contract-sha256") is not None:
+        try:
+            from . import resampling
+            resampling.cross_validation_contract_from_manifest(manifest)
+        except Exception as exc:
+            raise ValueError(
+                "manifest has no valid cross-validation contract") from exc
+        expected_supplied = set(cv_fields)
+        supplied_bounds = supplied_cv & cv_bound_fields
+        if supplied_bounds and supplied_bounds != cv_bound_fields:
+            raise ValueError("Flower cross-validation target bounds are incomplete")
+        if supplied_bounds:
+            bounds = manifest.get("target-bounds")
+            if (not isinstance(bounds, dict)
+                    or cfg.get("cv-target-lower") != bounds.get("lower")
+                    or cfg.get("cv-target-upper") != bounds.get("upper")):
+                raise ValueError(
+                    "Flower cross-validation target bounds do not match manifest pin")
+            expected_supplied |= cv_bound_fields
+        if supplied_cv != expected_supplied:
+            raise ValueError(
+                "Flower cross-validation config has an unexpected field or seed axis")
+        for key in cv_fields:
+            if key not in manifest or cfg.get(key) != manifest[key]:
+                raise ValueError(
+                    "Flower cross-validation config does not match manifest pin")
+        try:
+            cv_nodes = int(manifest["cv-n-nodes"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "manifest has no valid cross-validation node pin") from exc
+        if (isinstance(manifest["cv-n-nodes"], bool)
+                or cv_nodes != manifest["cv-n-nodes"]
+                or not 1 <= cv_nodes <= 65536
+                or cfg.get("min-train-nodes") != cv_nodes):
+            raise ValueError(
+                "Flower cross-validation node count does not match manifest pin")
+        strategy_fields = {
+            "strategy", "strategy-eta", "strategy-eta-l",
+            "strategy-beta-1", "strategy-beta-2", "strategy-tau",
+            "strategy-server-learning-rate", "strategy-server-momentum",
+        }
+        manifest_strategy = {
+            key for key in strategy_fields if key in manifest}
+        flower_strategy = {key for key in strategy_fields if key in cfg}
+        if (manifest_strategy != flower_strategy
+                or "strategy" not in manifest_strategy
+                or any(cfg[key] != manifest[key] for key in manifest_strategy)):
+            raise ValueError(
+                "Flower cross-validation strategy does not match manifest pin")
+    elif supplied_cv:
+        raise ValueError(
+            "Flower config requests cross-validation without a manifest contract")
     if str(manifest.get("dp-track", "")).lower() == "validation":
         required = [
             "validation-model-track", "validation-task", "validation-bins",
@@ -765,6 +927,12 @@ def load_pinned_run_config(context=None):
         "resampling-test-numerator", "resampling-test-denominator",
         "resampling-privacy-unit", "resampling-unit-canonicalization",
         "resampling-contract-sha256", "holdout-validation-bins",
+        "cv-version", "cv-method", "cv-assignment", "cv-folds",
+        "cv-privacy-unit", "cv-unit-canonicalization",
+        "cv-contract-sha256", "cv-validation-bins", "cv-n-nodes",
+        "cv-job-sha256", "strategy", "strategy-eta", "strategy-eta-l",
+        "strategy-beta-1", "strategy-beta-2", "strategy-tau",
+        "strategy-server-learning-rate", "strategy-server-momentum",
     )
     for key in keys:
         if key in manifest:

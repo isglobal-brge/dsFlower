@@ -296,17 +296,6 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "float32"):
             boosting_profile.catboost_profile(collapsed)
 
-    def test_native_training_gate_is_explicitly_closed(self):
-        for engine, payload in (
-                ("lightgbm", b"tree\nversion=v4\n"),
-                ("catboost", b"CBM1untrusted")):
-            with self.subTest(engine=engine):
-                self.assertFalse(
-                    boosting_profile.training_capability(engine)["available"])
-                with self.assertRaisesRegex(ValueError, "verified native"):
-                    boosting_profile.reject_unverified_native_artifact(
-                        engine, payload)
-
     def test_common_result_contract_rejects_native_prefixes_and_accepts_only_safe_projection(self):
         for engine, module, model, native_prefix in (
                 ("lightgbm", lightgbm_artifact, _lightgbm_model,

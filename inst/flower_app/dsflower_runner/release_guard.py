@@ -80,6 +80,9 @@ def _fixed_manifest(context):
         manifest.get("privacy-delta"), "manifest privacy-delta",
         0.0, 1.0e-3)
     holdout = manifest.get("resampling-contract-sha256") is not None
+    cross_validation = manifest.get("cv-contract-sha256") is not None
+    if holdout and cross_validation:
+        raise RuntimeError("manifest cannot combine holdout and cross-validation")
     budgets = {
         "train": (epsilon, delta),
     }
@@ -113,11 +116,54 @@ def _fixed_manifest(context):
         budgets["holdout-evaluate"] = (
             actual["privacy-holdout-epsilon"],
             actual["privacy-holdout-delta"])
+    cv_folds = 0
+    if cross_validation:
+        try:
+            from . import resampling
+        except ImportError:  # direct module tests
+            import resampling
+        try:
+            contract = resampling.cross_validation_contract_from_manifest(
+                manifest)
+        except Exception as exc:
+            raise RuntimeError(
+                "manifest has no valid cross-validation contract") from exc
+        cv_folds = int(contract["folds"])
+        expected = {
+            "privacy-cv-training-epsilon": epsilon * 0.8,
+            "privacy-cv-training-delta": delta * 0.8,
+            "privacy-cv-fold-epsilon": epsilon * 0.8 / cv_folds,
+            "privacy-cv-fold-delta": delta * 0.8 / cv_folds,
+            "privacy-cv-oof-epsilon": epsilon - epsilon * 0.8,
+            "privacy-cv-oof-delta": delta - delta * 0.8,
+        }
+        actual = {}
+        for key, value in expected.items():
+            actual[key] = _finite_float(
+                manifest.get(key), "manifest %s" % key, 0.0,
+                10.0 if key.endswith("epsilon") else 1.0e-3)
+            if not math.isclose(actual[key], value, rel_tol=1.0e-15,
+                                abs_tol=0.0):
+                raise RuntimeError(
+                    "manifest cross-validation budget differs from its fixed "
+                    "job allocation")
+        budgets = {
+            "cv-train": (
+                actual["privacy-cv-fold-epsilon"],
+                actual["privacy-cv-fold-delta"]),
+            "cv-accumulate": (0.0, 0.0),
+            "cv-release": (
+                actual["privacy-cv-oof-epsilon"],
+                actual["privacy-cv-oof-delta"]),
+            "cv-abort": (0.0, 0.0),
+        }
     return {
         "num_rounds": num_rounds,
         "policy_hash": policy_hash,
         "budgets": budgets,
         "holdout": holdout,
+        "cross_validation": cross_validation,
+        "cv_folds": cv_folds,
     }
 
 
@@ -151,6 +197,34 @@ def _operation(msg, fixed):
     return value
 
 
+def _fold_coordinate(msg, fixed, operation, round_index):
+    config = _message_config(msg)
+    supplied = config.get("dsflower-fold")
+    if not fixed["cross_validation"]:
+        if supplied is not None:
+            raise RuntimeError(
+                "fold coordinate requires a cross-validation contract")
+        return 0
+    folds = int(fixed["cv_folds"])
+    fold = _exact_int(
+        supplied, "cross-validation fold", 1, folds + 1)
+    if operation in ("cv-train", "cv-accumulate") and fold > folds:
+        raise RuntimeError("cross-validation fold is outside the training folds")
+    if operation == "cv-accumulate" and round_index != fixed["num_rounds"]:
+        raise RuntimeError(
+            "cross-validation accumulation requires the final training round")
+    if operation == "cv-release":
+        if fold != folds + 1:
+            raise RuntimeError("cross-validation final release fold is invalid")
+        if round_index != fixed["num_rounds"]:
+            raise RuntimeError(
+                "cross-validation release requires the final training round")
+    if operation == "cv-abort":
+        if fold != folds + 1 or round_index != fixed["num_rounds"]:
+            raise RuntimeError("cross-validation abort coordinate is invalid")
+    return fold
+
+
 def _message_id(msg):
     """Return a bounded cache hint; an absent identifier simply disables it."""
     metadata = getattr(msg, "metadata", None)
@@ -169,7 +243,7 @@ def _frame(digest, value):
     digest.update(raw)
 
 
-def _request_id(msg, operation, round_index):
+def _request_id(msg, operation, fold, round_index):
     """Hash the exact bounded public ArrayRecord and its round coordinate."""
     content = getattr(msg, "content", None)
     try:
@@ -184,6 +258,7 @@ def _request_id(msg, operation, round_index):
 
     digest = hashlib.sha256(b"dsflower/public-request/v1\x00")
     _frame(digest, operation)
+    digest.update(int(fold).to_bytes(8, "big"))
     digest.update(int(round_index).to_bytes(8, "big"))
     total = 0
     for key, item in entries:
@@ -204,7 +279,8 @@ def _request_id(msg, operation, round_index):
     return digest.hexdigest()
 
 
-def _cached_status(context, message_id, operation, round_index, request_id):
+def _cached_status(context, message_id, operation, fold, round_index,
+                   request_id):
     state = getattr(context, "state", None)
     if state is None or not hasattr(state, "get"):
         return "new"
@@ -215,9 +291,11 @@ def _cached_status(context, message_id, operation, round_index, request_id):
     cached_message = str(meta.get("message-id", "") or "")
     cached_request = str(meta.get("request-id", "") or "")
     cached_operation = str(meta.get("operation", "train") or "")
+    cached_fold = int(meta.get("fold", 0) or 0)
     cached_round = meta.get("release-index")
     exact = (cached_request == request_id
              and cached_operation == operation
+             and cached_fold == fold
              and cached_round == round_index)
     if exact and state.get(_CACHE_ARRAYS_KEY) is not None:
         return "replay"
@@ -227,6 +305,7 @@ def _cached_status(context, message_id, operation, round_index, request_id):
     # identity; they only make these accidental/malicious cache collisions visible.
     if ((message_id and cached_message == message_id)
             or (cached_request and cached_operation == operation
+                and cached_fold == fold
                 and cached_round == round_index)):
         if not exact:
             raise RuntimeError("cached round identity does not match request payload")
@@ -240,13 +319,15 @@ def claim_release(context, msg):
     operation = _operation(msg, fixed)
     epsilon, delta = fixed["budgets"][operation]
     round_index = _server_round(msg, num_rounds)
-    request_id = _request_id(msg, operation, round_index)
+    fold = _fold_coordinate(msg, fixed, operation, round_index)
+    request_id = _request_id(msg, operation, fold, round_index)
     message_id = _message_id(msg)
     status = _cached_status(
-        context, message_id, operation, round_index, request_id)
+        context, message_id, operation, fold, round_index, request_id)
     return {
         "status": status,
         "operation": operation,
+        "fold": fold,
         "release_index": round_index,
         "epsilon": epsilon,
         "delta": delta,

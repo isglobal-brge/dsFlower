@@ -361,8 +361,34 @@ class ValidationReleaseTests(unittest.TestCase):
                 np.asarray([1e-320, 1e308, 1e308, 0.0, 1e-320]),
                 layout, target_bounds=(0.0, 1.0))
         json.dumps(metrics, allow_nan=False)
-        self.assertIsNone(metrics["mae"])
-        self.assertIsNone(metrics["mse"])
+        self.assertGreaterEqual(metrics["mae"], 0.0)
+        self.assertLessEqual(metrics["mae"], 1.0)
+        self.assertGreaterEqual(metrics["mse"], 0.0)
+        self.assertLessEqual(metrics["mse"], 1.0)
+
+    def test_numeric_metrics_project_huge_noise_to_public_ranges(self):
+        regression = validation.validation_layout("regression")
+        metrics = validation.validation_metrics(
+            np.asarray([2.0, 1e300, 1e300, 1e300, -1e300]),
+            regression, target_bounds=(10.0, 20.0))
+        self.assertEqual(metrics["n"], 2.0)
+        self.assertGreaterEqual(metrics["mae"], 0.0)
+        self.assertLessEqual(metrics["mae"], 10.0)
+        self.assertGreaterEqual(metrics["mse"], 0.0)
+        self.assertLessEqual(metrics["mse"], 100.0)
+        self.assertGreaterEqual(metrics["rmse"], 0.0)
+        self.assertLessEqual(metrics["rmse"], 10.0)
+        if metrics["r_squared"] is not None:
+            self.assertLessEqual(metrics["r_squared"], 1.0)
+
+        count = validation.validation_layout("count")
+        count_metrics = validation.validation_metrics(
+            np.asarray([3.0, 1e300, 1e300, 1e300, 1e300, 1e300]),
+            count, target_bounds=(0.0, 5.0))
+        self.assertGreaterEqual(
+            count_metrics["mean_poisson_deviance_normalized"], 0.0)
+        self.assertLessEqual(
+            count_metrics["mean_poisson_deviance_normalized"], 1.0)
 
     def test_multiclass_ordinal_multilabel_and_count_metrics(self):
         labels = np.asarray([0, 1, 2])

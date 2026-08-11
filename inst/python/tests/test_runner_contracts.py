@@ -306,7 +306,7 @@ class StrategyRuntimeTests(unittest.TestCase):
         self.assertEqual(strategy.available_rounds, {1})
         self.assertEqual(strategy.unavailable_rounds, {2, 3})
 
-class RemovedBackendTests(unittest.TestCase):
+class UnsupportedTrackTests(unittest.TestCase):
     def test_tree_track_is_rejected_and_runtime_entry_points_are_absent(self):
         with tempfile.TemporaryDirectory() as manifest_dir:
             with open(os.path.join(manifest_dir, "manifest.json"), "w",
@@ -319,8 +319,7 @@ class RemovedBackendTests(unittest.TestCase):
 
         for module, names in (
                 (client_app, ("_train_trees",)),
-                (server_app, ("_collect_trees", "_bag_boosters", "_save_trees")),
-                (task, ("load_gbdt_spec",))):
+                (server_app, ("_collect_trees", "_bag_boosters", "_save_trees"))):
             for name in names:
                 with self.subTest(module=module.__name__, name=name):
                     self.assertFalse(hasattr(module, name))

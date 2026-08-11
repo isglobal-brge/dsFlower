@@ -128,6 +128,23 @@ test_that("bootstrap persists only one custodial noise root", {
   expect_setequal(list.files(root), c("noise_root", "noise_root.lock"))
 })
 
+test_that("the default node-secret path is platform-aware", {
+  local_data <- file.path("C:", "Users", "dsflower-test", "AppData", "Local")
+  withr::local_envvar(c(
+    LOCALAPPDATA = local_data,
+    APPDATA = NA,
+    USERPROFILE = NA
+  ))
+  expect_identical(
+    dsFlower:::.default_node_secret_path("windows"),
+    file.path(local_data, "dsflower", "privacy", "noise_root")
+  )
+  expect_identical(
+    dsFlower:::.default_node_secret_path("unix"),
+    "/var/lib/dsflower/privacy/noise_root"
+  )
+})
+
 test_that("unsafe secret paths fail closed", {
   skip_on_os("windows")
   root <- local_stateless_privacy()

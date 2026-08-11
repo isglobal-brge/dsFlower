@@ -31,6 +31,15 @@ _SPECS = {
         "profile_file": "model.extra-trees-ensemble.profile.json",
         "profile_version": 2,
     },
+    "random_forest": {
+        "engine": "random_forest",
+        "ensemble_contract": "dsflower-forest-ensemble-v1",
+        "ensemble_format": "dsflower-forest-ensemble-json-v1",
+        "model_file": "model.random-forest-ensemble.json",
+        "profile_contract": _PROFILE_V2,
+        "profile_file": "model.random-forest-ensemble.profile.json",
+        "profile_version": 2,
+    },
     "lightgbm": {
         "engine": "lightgbm",
         "ensemble_contract": "dsflower-lightgbm-safe-ensemble-v1",
@@ -94,6 +103,9 @@ def canonical_profile(manifest):
     if engine == "extra_trees":
         from . import forest_adapter
         return forest_adapter.canonical_extra_trees_profile(manifest)
+    if engine == "random_forest":
+        from . import random_forest_adapter
+        return random_forest_adapter.canonical_random_forest_profile(manifest)
     if engine in ("lightgbm", "catboost"):
         from . import boosting_adapter
         return boosting_adapter.canonical_boosting_profile(manifest)
@@ -119,6 +131,13 @@ def train_model(manifest, features, target, *, unit_ids=None,
         artifact = forest_adapter.train_extra_trees(prepared)
         return forest_adapter.sanitize_extra_trees_artifact(
             manifest, artifact)[0]
+    if engine == "random_forest":
+        from . import random_forest_adapter
+        prepared = random_forest_adapter.prepare_random_forest_training(
+            manifest, features, target, unit_ids=unit_ids)
+        artifact = random_forest_adapter.train_random_forest(prepared)
+        return random_forest_adapter.sanitize_random_forest_artifact(
+            manifest, artifact)[0]
     if engine in ("lightgbm", "catboost"):
         from . import boosting_adapter
         prepared = boosting_adapter.prepare_boosting_training(
@@ -137,6 +156,10 @@ def build_ensemble(manifest, artifacts):
     if engine == "extra_trees":
         from . import forest_adapter
         return forest_adapter.build_extra_trees_ensemble(manifest, artifacts)
+    if engine == "random_forest":
+        from . import random_forest_adapter
+        return random_forest_adapter.build_random_forest_ensemble(
+            manifest, artifacts)
     if engine in ("lightgbm", "catboost"):
         from . import boosting_adapter
         return boosting_adapter.build_boosting_ensemble(manifest, artifacts)
@@ -148,7 +171,7 @@ def parse_ensemble(manifest, artifact):
     if engine == "xgboost":
         from . import xgboost_predictor
         return xgboost_predictor.parse_xgboost_ensemble(artifact, manifest)
-    if engine == "extra_trees":
+    if engine in ("extra_trees", "random_forest"):
         from . import forest_predictor
         return forest_predictor.parse_forest_ensemble(artifact, manifest)
     if engine == "lightgbm":

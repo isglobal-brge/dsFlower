@@ -10,13 +10,48 @@
 # by setting DSFLOWER_UV_VERSION and DSFLOWER_UV_SHA256. Mutable curl|sh
 # installers are deliberately not executed.
 
+# Hermetic package checks may explicitly skip all external Python setup. This
+# gate is intentionally before HOME/venv resolution and every host probe.
+case "$(printf '%s' "${DSFLOWER_SKIP_PYTHON_SETUP:-}" | tr 'A-Z' 'a-z')" in
+  1|true|yes)
+    printf '%s\n' "[dsFlower configure] Python setup explicitly skipped."
+    exit 0
+    ;;
+  0|false|no|'') ;;
+  *)
+    printf '%s\n' "[dsFlower configure] WARNING: DSFLOWER_SKIP_PYTHON_SETUP must be true or false; refusing setup." >&2
+    exit 1
+    ;;
+esac
+
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) DSFLOWER_WINDOWS=true ;;
+  *) DSFLOWER_WINDOWS=false ;;
+esac
+
+venv_executable() {
+  _venv="$1"; _name="$2"
+  if [ "${DSFLOWER_WINDOWS}" = true ]; then
+    printf '%s/Scripts/%s.exe\n' "${_venv}" "${_name}"
+  else
+    printf '%s/bin/%s\n' "${_venv}" "${_name}"
+  fi
+}
+
 # Resolve a WRITABLE venv root so install works with ZERO root. Honor an
-# explicit DSFLOWER_VENV_ROOT; otherwise pick the first creatable location,
-# cascading from system paths down to a user-space dir. The user-space path
-# mirrors tools::R_user_dir("dsFlower","data") so .onLoad resolves the same
-# location at runtime.
+# explicit DSFLOWER_VENV_ROOT. Windows defaults to the current user's local
+# application-data directory; a service account can opt into a shared system
+# location explicitly. Unix cascades from system paths to user space.
 if [ -n "${DSFLOWER_VENV_ROOT:-}" ]; then
   VENV_ROOT="${DSFLOWER_VENV_ROOT}"
+elif [ "${DSFLOWER_WINDOWS}" = true ]; then
+  _win_data="${LOCALAPPDATA:-${APPDATA:-}}"
+  if [ -z "${_win_data}" ] && [ -n "${USERPROFILE:-}" ]; then
+    _win_data="${USERPROFILE}/AppData/Local"
+  fi
+  _win_data="${_win_data:-${HOME}}"
+  _win_data="$(printf '%s' "${_win_data}" | sed 's|\\|/|g')"
+  VENV_ROOT="${_win_data}/dsflower/venvs"
 else
   _user_data="${XDG_DATA_HOME:-${HOME}/.local/share}/R/dsFlower/venvs"
   VENV_ROOT=""
@@ -100,7 +135,8 @@ ensure_uv() {
   if [ -n "${UV}" ] && [ -x "${UV}" ]; then return 0; fi
 
   # 2. Common install locations
-  for _p in "${HOME}/.local/bin/uv" "${HOME}/.cargo/bin/uv" "/usr/local/bin/uv"; do
+  if [ "${DSFLOWER_WINDOWS}" = true ]; then _uv_name="uv.exe"; else _uv_name="uv"; fi
+  for _p in "${HOME}/.local/bin/${_uv_name}" "${HOME}/.cargo/bin/${_uv_name}" "/usr/local/bin/${_uv_name}"; do
     if [ -x "${_p}" ]; then UV="${_p}"; return 0; fi
   done
 
@@ -127,6 +163,7 @@ ensure_uv() {
   case "$(uname -s 2>/dev/null)" in
     Darwin) _os="apple-darwin" ;;
     Linux) _os="unknown-linux-gnu" ;;
+    MINGW*|MSYS*|CYGWIN*) _os="pc-windows-msvc" ;;
     *) log_warn "Unsupported OS for uv bootstrap."; return 1 ;;
   esac
   case "$(uname -m 2>/dev/null)" in
@@ -136,9 +173,14 @@ ensure_uv() {
   esac
 
   _triple="${_arch}-${_os}"
-  _url="https://github.com/astral-sh/uv/releases/download/${_version}/uv-${_triple}.tar.gz"
+  if [ "${DSFLOWER_WINDOWS}" = true ]; then
+    _archive_ext="zip"; _member="uv-${_triple}/uv.exe"
+  else
+    _archive_ext="tar.gz"; _member="uv-${_triple}/uv"
+  fi
+  _url="https://github.com/astral-sh/uv/releases/download/${_version}/uv-${_triple}.${_archive_ext}"
   _tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/dsflower-uv.XXXXXX")" || return 1
-  _archive="${_tmp_dir}/uv.tar.gz"
+  _archive="${_tmp_dir}/uv.${_archive_ext}"
   log_info "Downloading pinned uv ${_version} (${_triple})..."
   if ! download_file "${_url}" "${_archive}"; then
     rm -rf "${_tmp_dir}"
@@ -151,14 +193,25 @@ ensure_uv() {
     log_warn "uv archive SHA-256 mismatch; refusing to execute it."
     return 1
   fi
-  _member="uv-${_triple}/uv"
-  if ! tar -xzf "${_archive}" -C "${_tmp_dir}" "${_member}" 2>/dev/null; then
+  if [ "${DSFLOWER_WINDOWS}" = true ]; then
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -qq "${_archive}" "${_member}" -d "${_tmp_dir}" 2>/dev/null
+    else
+      Rscript --vanilla -e 'args <- commandArgs(TRUE); utils::unzip(args[[1]], files=args[[2]], exdir=args[[3]])' \
+        "${_archive}" "${_member}" "${_tmp_dir}" >/dev/null 2>&1
+    fi
+    _extract_status=$?
+  else
+    tar -xzf "${_archive}" -C "${_tmp_dir}" "${_member}" 2>/dev/null
+    _extract_status=$?
+  fi
+  if [ "${_extract_status}" -ne 0 ] || [ ! -f "${_tmp_dir}/${_member}" ]; then
     rm -rf "${_tmp_dir}"
     log_warn "Verified uv archive did not contain ${_member}."
     return 1
   fi
   mkdir -p "${HOME}/.local/bin" || { rm -rf "${_tmp_dir}"; return 1; }
-  UV="${HOME}/.local/bin/uv"
+  UV="${HOME}/.local/bin/${_uv_name}"
   if ! cp "${_tmp_dir}/${_member}" "${UV}.tmp" ||
      ! chmod 0755 "${UV}.tmp" || ! mv "${UV}.tmp" "${UV}"; then
     rm -f "${UV}.tmp"
@@ -203,51 +256,91 @@ ensure_python() {
   return 1
 }
 
-# --- Run bootstrap ---
-
-ensure_uv || {
-  log_warn "uv not available. Cannot proceed."
-  log_warn "Install uv: https://docs.astral.sh/uv/"
-  exit 0
-}
-
-ensure_python || {
-  log_warn "No Python available. Skipping environment setup."
-  exit 0
-}
-
-USE_UV=true
-
 # Optional production lock. uv's --require-hashes rejects unpinned or unhashed
 # transitive dependencies, so this file must describe the complete environment.
 PYTHON_LOCK="${DSFLOWER_PYTHON_LOCK:-}"
+PYTHON_LOCK_HASH=""
 case "$(printf '%s' "${DSFLOWER_REQUIRE_PYTHON_LOCK:-0}" | tr 'A-Z' 'a-z')" in
   1|true|yes)
+    REQUIRE_PYTHON_LOCK=true
     if [ -z "${PYTHON_LOCK}" ]; then
       log_warn "DSFLOWER_REQUIRE_PYTHON_LOCK is enabled but DSFLOWER_PYTHON_LOCK is unset."
-      exit 0
+      exit 1
     fi
     ;;
-  0|false|no|'') ;;
-  *) log_warn "DSFLOWER_REQUIRE_PYTHON_LOCK must be true or false."; exit 0 ;;
+  0|false|no|'') REQUIRE_PYTHON_LOCK=false ;;
+  *) log_warn "DSFLOWER_REQUIRE_PYTHON_LOCK must be true or false."; exit 1 ;;
 esac
 if [ -n "${PYTHON_LOCK}" ]; then
   if [ ! -f "${PYTHON_LOCK}" ] || [ ! -r "${PYTHON_LOCK}" ]; then
     log_warn "DSFLOWER_PYTHON_LOCK is not a readable regular file."
-    exit 0
+    if [ "${REQUIRE_PYTHON_LOCK}" = true ]; then exit 1; else exit 0; fi
   fi
+fi
+
+# The dependency-light tree runtime has a separate lock because its graph is
+# intentionally distinct from the PyTorch/Opacus environment.
+NATIVE_TREE_PYTHON_LOCK="${DSFLOWER_NATIVE_TREE_PYTHON_LOCK:-}"
+NATIVE_TREE_PYTHON_LOCK_HASH=""
+case "$(printf '%s' "${DSFLOWER_NATIVE_TREE_REQUIRE_PYTHON_LOCK:-0}" | tr 'A-Z' 'a-z')" in
+  1|true|yes)
+    REQUIRE_NATIVE_TREE_PYTHON_LOCK=true
+    if [ -z "${NATIVE_TREE_PYTHON_LOCK}" ]; then
+      log_warn "DSFLOWER_NATIVE_TREE_REQUIRE_PYTHON_LOCK is enabled but DSFLOWER_NATIVE_TREE_PYTHON_LOCK is unset."
+      exit 1
+    fi
+    ;;
+  0|false|no|'') REQUIRE_NATIVE_TREE_PYTHON_LOCK=false ;;
+  *) log_warn "DSFLOWER_NATIVE_TREE_REQUIRE_PYTHON_LOCK must be true or false."; exit 1 ;;
+esac
+if [ -n "${NATIVE_TREE_PYTHON_LOCK}" ]; then
+  if [ ! -f "${NATIVE_TREE_PYTHON_LOCK}" ] || [ ! -r "${NATIVE_TREE_PYTHON_LOCK}" ]; then
+    log_warn "DSFLOWER_NATIVE_TREE_PYTHON_LOCK is not a readable regular file."
+    if [ "${REQUIRE_NATIVE_TREE_PYTHON_LOCK}" = true ]; then exit 1; else exit 0; fi
+  fi
+fi
+
+# --- Run bootstrap ---
+
+required_lock_setup() {
+  [ "${REQUIRE_PYTHON_LOCK}" = true ] ||
+    [ "${REQUIRE_NATIVE_TREE_PYTHON_LOCK}" = true ]
+}
+
+ensure_uv || {
+  log_warn "uv not available. Cannot proceed."
+  log_warn "Install uv: https://docs.astral.sh/uv/"
+  if required_lock_setup; then exit 1; else exit 0; fi
+}
+
+ensure_python || {
+  log_warn "No Python available. Skipping environment setup."
+  if required_lock_setup; then exit 1; else exit 0; fi
+}
+
+USE_UV=true
+
+if [ -n "${PYTHON_LOCK}" ]; then
   PYTHON_LOCK_HASH="$(file_hash "${PYTHON_LOCK}" 2>/dev/null || true)"
   if [ -z "${PYTHON_LOCK_HASH}" ]; then
     log_warn "Could not hash DSFLOWER_PYTHON_LOCK."
-    exit 0
+    if [ "${REQUIRE_PYTHON_LOCK}" = true ]; then exit 1; else exit 0; fi
   fi
   log_info "Using hash-locked Python requirements (${PYTHON_LOCK_HASH})."
+fi
+if [ -n "${NATIVE_TREE_PYTHON_LOCK}" ]; then
+  NATIVE_TREE_PYTHON_LOCK_HASH="$(file_hash "${NATIVE_TREE_PYTHON_LOCK}" 2>/dev/null || true)"
+  if [ -z "${NATIVE_TREE_PYTHON_LOCK_HASH}" ]; then
+    log_warn "Could not hash DSFLOWER_NATIVE_TREE_PYTHON_LOCK."
+    if [ "${REQUIRE_NATIVE_TREE_PYTHON_LOCK}" = true ]; then exit 1; else exit 0; fi
+  fi
+  log_info "Using hash-locked native-tree requirements (${NATIVE_TREE_PYTHON_LOCK_HASH})."
 fi
 
 # Check venv root
 mkdir -p "${VENV_ROOT}" 2>/dev/null || {
   log_warn "Cannot create ${VENV_ROOT}. Skipping."
-  exit 0
+  if required_lock_setup; then exit 1; else exit 0; fi
 }
 mkdir -p "${DSFLOWER_HOME}/supernode_pids" 2>/dev/null || true
 if id rock >/dev/null 2>&1; then
@@ -288,9 +381,12 @@ gpu_present() {
 }
 
 install_deps() {
-  local name="$1"; local backend="$2"; shift 2
+  local name="$1"; local backend="$2"; local lock_path="$3"; shift 3
   local venv_path="${VENV_ROOT}/${name}"
-  local venv_python="${venv_path}/bin/python"
+  local venv_python
+  local install_log="${venv_path}/.dsflower_install.log.tmp"
+  local install_status=0
+  venv_python="$(venv_executable "${venv_path}" python)"
   # The torch backend is chosen by the CALLER: "cpu" for the universal `pytorch`
   # venv (CPU wheels -> none of the CUDA build's ~3.5GB nvidia/triton dead weight),
   # "auto" for the `pytorch-gpu` venv (uv installs the matching CUDA build). Both
@@ -301,29 +397,48 @@ install_deps() {
     torch_flag="--torch-backend ${DSFLOWER_TORCH_BACKEND:-${backend}}"
     ;;
   esac
-  if [ -n "${PYTHON_LOCK}" ]; then
+  if [ -n "${lock_path}" ]; then
     log_info "  ${name}: installing administrator hash-locked requirements"
   else
     log_info "  ${name}: installing $*"
   fi
   if [ "${USE_UV}" = true ]; then
-    if [ -n "${PYTHON_LOCK}" ]; then
+    if [ -n "${lock_path}" ]; then
       # shellcheck disable=SC2086
-      "${UV}" pip install --python "${venv_python}" --quiet ${torch_flag} \
-        --require-hashes -r "${PYTHON_LOCK}" 2>&1 | tail -5
+      if "${UV}" pip install --python "${venv_python}" --quiet ${torch_flag} \
+        --require-hashes -r "${lock_path}" > "${install_log}" 2>&1; then
+        install_status=0
+      else
+        install_status=$?
+      fi
     else
       # shellcheck disable=SC2086
-      "${UV}" pip install --python "${venv_python}" --quiet ${torch_flag} "$@" 2>&1 | tail -5
+      if "${UV}" pip install --python "${venv_python}" --quiet ${torch_flag} \
+        "$@" > "${install_log}" 2>&1; then
+        install_status=0
+      else
+        install_status=$?
+      fi
     fi
   else
-    "${venv_path}/bin/pip" install --quiet --no-cache-dir "$@" 2>&1 | tail -5
+    if "$(venv_executable "${venv_path}" pip)" install --quiet \
+      --no-cache-dir "$@" > "${install_log}" 2>&1; then
+      install_status=0
+    else
+      install_status=$?
+    fi
   fi
+  tail -5 "${install_log}" 2>/dev/null || true
+  rm -f "${install_log}"
+  return "${install_status}"
 }
 
 mark_ready() {
   local venv_path="${VENV_ROOT}/$1"
+  local venv_python
+  venv_python="$(venv_executable "${venv_path}" python)"
   local versions_tmp="${venv_path}/.dsflower_versions.txt.tmp"
-  if "${venv_path}/bin/python" - <<'PY' > "${versions_tmp}"
+  if "${venv_python}" - <<'PY' > "${versions_tmp}"
 from importlib import metadata
 
 rows = set()
@@ -335,59 +450,96 @@ for row in sorted(rows, key=str.lower):
     print(row)
 PY
   then
-    mv "${versions_tmp}" "${venv_path}/.dsflower_versions.txt"
+    if ! mv "${versions_tmp}" "${venv_path}/.dsflower_versions.txt"; then
+      rm -f "${versions_tmp}" "${venv_path}/.dsflower_versions.txt"
+      return 1
+    fi
   else
-    rm -f "${versions_tmp}"
+    rm -f "${versions_tmp}" "${venv_path}/.dsflower_versions.txt"
     log_warn "  $1: could not record resolved dependency versions."
+    return 1
   fi
-  printf '%s\n' "$2" > "${venv_path}/.dsflower_ready.tmp"
-  mv "${venv_path}/.dsflower_ready.tmp" "${venv_path}/.dsflower_ready"
+  if ! printf '%s\n' "$2" > "${venv_path}/.dsflower_ready.tmp" ||
+     ! mv "${venv_path}/.dsflower_ready.tmp" "${venv_path}/.dsflower_ready"; then
+    rm -f "${venv_path}/.dsflower_ready.tmp"
+    return 1
+  fi
+  return 0
 }
 
 provision_framework() {
-  local name="$1"; local backend="$2"; local check_modules="$3"; shift 3; local deps="$*"
+  local name="$1"; local backend="$2"; local check_modules="$3"; local require_venv="$4"; shift 4; local deps="$*"
   local venv_path="${VENV_ROOT}/${name}"
-  local base_deps="flwr>=1.31.0,<1.32.0 numpy>=1.21.0 pandas>=1.3.0 pyarrow>=10.0.0 cryptography>=42.0.0"
+  local venv_python
+  venv_python="$(venv_executable "${venv_path}" python)"
+  local lock_path="${PYTHON_LOCK}"
+  local lock_hash="${PYTHON_LOCK_HASH}"
+  local lock_required="${REQUIRE_PYTHON_LOCK}"
+  if [ "${name}" = "native-tree" ]; then
+    lock_path="${NATIVE_TREE_PYTHON_LOCK}"
+    lock_hash="${NATIVE_TREE_PYTHON_LOCK_HASH}"
+    lock_required="${REQUIRE_NATIVE_TREE_PYTHON_LOCK}"
+  fi
   local expected_hash
-  if [ -n "${PYTHON_LOCK}" ]; then
-    expected_hash="python=${PYTHON_VERSION};lock-sha256:${PYTHON_LOCK_HASH}"
+  if [ -n "${lock_path}" ]; then
+    expected_hash="python=${PYTHON_VERSION};lock-sha256:${lock_hash}"
   else
     # shellcheck disable=SC2086
-    expected_hash="$(deps_hash "python=${PYTHON_VERSION}" ${base_deps} ${deps})"
+    expected_hash="$(deps_hash "python=${PYTHON_VERSION}" ${deps})"
   fi
 
   if [ -f "${venv_path}/.dsflower_ready" ]; then
     current_hash="$(cat "${venv_path}/.dsflower_ready" 2>/dev/null || true)"
     # shellcheck disable=SC2086
     if [ "${current_hash}" = "${expected_hash}" ] && \
-       check_imports "${venv_path}/bin/python" ${check_modules}; then
+       check_imports "${venv_python}" ${check_modules}; then
       log_info "  ${name}: OK (cached)"
       return 0
     fi
     log_info "  ${name}: cached but stale/unhealthy, refreshing..."
   fi
 
+  # A cache that did not pass the exact marker + import fast-path is not a
+  # trustworthy base for a locked install: `uv pip install` does not remove
+  # unrelated packages. Recreate every incomplete/stale venv from scratch.
+  if [ -d "${venv_path}" ] && ! rm -rf "${venv_path}"; then
+    log_warn "  ${name}: could not remove stale/unhealthy venv."
+    if [ "${lock_required}" = true ]; then return 1; else return 0; fi
+  fi
+
   # shellcheck disable=SC2086
-  if check_imports "${PYTHON}" ${check_modules}; then
+  if [ -z "${lock_path}" ] && [ "${require_venv}" != "true" ] && \
+     check_imports "${PYTHON}" ${check_modules}; then
     log_info "  ${name}: system Python already has ${check_modules}, skipping venv."
     return 0
   fi
 
-  if [ ! -x "${venv_path}/bin/python" ]; then
-    create_venv "${name}" || { log_warn "  ${name}: venv failed."; return 0; }
+  if [ ! -x "${venv_python}" ]; then
+    create_venv "${name}" || {
+      log_warn "  ${name}: venv failed."
+      if [ "${lock_required}" = true ]; then return 1; else return 0; fi
+    }
   fi
 
   # shellcheck disable=SC2086
-  install_deps "${name}" "${backend}" ${base_deps} ${deps} || {
-    log_warn "  ${name}: install failed."; rm -rf "${venv_path}"; return 0
+  install_deps "${name}" "${backend}" "${lock_path}" ${deps} || {
+    log_warn "  ${name}: install failed."
+    rm -rf "${venv_path}"
+    if [ "${lock_required}" = true ]; then return 1; else return 0; fi
   }
 
   # shellcheck disable=SC2086
-  if check_imports "${venv_path}/bin/python" ${check_modules}; then
-    mark_ready "${name}" "${expected_hash}"
+  if check_imports "${venv_python}" ${check_modules}; then
+    if ! mark_ready "${name}" "${expected_hash}"; then
+      log_warn "  ${name}: could not write readiness marker."
+      rm -rf "${venv_path}"
+      if [ "${lock_required}" = true ]; then return 1; else return 0; fi
+    fi
     log_info "  ${name}: ready."
+    return 0
   else
     log_warn "  ${name}: import check failed."; rm -rf "${venv_path}"
+    if [ "${lock_required}" = true ]; then return 1; else return 0; fi
   fi
 }
 
@@ -401,11 +553,21 @@ echo ""
 # ONE torch venv for BOTH tabular and vision (vision deps are a superset). The cpu
 # and gpu venvs install the SAME packages; only --torch-backend differs.
 PYTORCH_CHECK="flwr numpy pandas pyarrow cryptography torch opacus torchvision PIL nibabel pydicom nrrd SimpleITK monai"
-PYTORCH_DEPS="torch>=2.0.0,<3.0.0 opacus>=1.4.0,<2.0.0 torchvision>=0.15.0,<1.0.0 Pillow>=9.0.0 nibabel>=5.0.0 pydicom>=2.4.0 pynrrd>=1.0.0 SimpleITK>=2.2.0 monai>=1.3.0"
+PYTORCH_DEPS="flwr==1.31.0 numpy>=1.21.0 pandas>=1.3.0 pyarrow>=10.0.0 cryptography>=42.0.0 torch>=2.0.0,<3.0.0 opacus>=1.4.0,<2.0.0 torchvision>=0.15.0,<1.0.0 Pillow>=9.0.0 nibabel>=5.0.0 pydicom>=2.4.0 pynrrd>=1.0.0 SimpleITK>=2.2.0 monai>=1.3.0"
+
+# Dependency-light trusted tree runtime. Upstream XGBoost remains in the
+# separately verified bundle and LightGBM/CatBoost use dsFlower's own engines.
+NATIVE_TREE_CHECK="flwr numpy pandas pyarrow cryptography"
+NATIVE_TREE_DEPS="flwr==1.31.0 numpy==2.4.6 pandas==3.0.3 pyarrow==23.0.1 cryptography==46.0.7"
+
+# A physical native-tree venv is required because runtime selection and fresh
+# capability probes intentionally never fall back to ambient system Python.
+# shellcheck disable=SC2086
+provision_framework "native-tree" "cpu" "${NATIVE_TREE_CHECK}" "true" ${NATIVE_TREE_DEPS} || exit 1
 
 # `pytorch` (cpu): the universal default -- built on every node, no CUDA dead weight.
 # shellcheck disable=SC2086
-provision_framework "pytorch" "cpu" "${PYTORCH_CHECK}" ${PYTORCH_DEPS}
+provision_framework "pytorch" "cpu" "${PYTORCH_CHECK}" "false" ${PYTORCH_DEPS} || exit 1
 
 # `pytorch-gpu` (cuda): built ONLY when a GPU is visible at (re)provision, so the
 # backend is never locked in at first install. The run-time client param selects it;
@@ -413,7 +575,7 @@ provision_framework "pytorch" "cpu" "${PYTORCH_CHECK}" ${PYTORCH_DEPS}
 if gpu_present; then
   log_info "GPU visible -> also building the CUDA torch venv (pytorch-gpu)."
   # shellcheck disable=SC2086
-  provision_framework "pytorch-gpu" "auto" "${PYTORCH_CHECK}" ${PYTORCH_DEPS}
+  provision_framework "pytorch-gpu" "auto" "${PYTORCH_CHECK}" "false" ${PYTORCH_DEPS} || exit 1
 fi
 
 # Fix Python permissions (Rock runs as non-root 'rock' user)
@@ -427,7 +589,7 @@ echo ""
 log_info "Python environment setup complete."
 log_info "Venvs stored in: ${VENV_ROOT}"
 
-for fw in pytorch pytorch-gpu; do
+for fw in native-tree pytorch pytorch-gpu; do
   venv="${VENV_ROOT}/${fw}"
   if [ -f "${venv}/.dsflower_ready" ]; then
     size=$(du -sh "${venv}" 2>/dev/null | cut -f1)

@@ -1,4 +1,4 @@
-"""Dedicated trusted ClientApp for private XGBoost model validation."""
+"""Dedicated trusted ClientApp for private native-tree model validation."""
 
 import hashlib
 import hmac
@@ -37,12 +37,11 @@ from flwr.clientapp import ClientApp
 from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 
-from . import native_tree_request, task, validation, xgboost_predictor
+from . import native_tree_engine, native_tree_request, task, validation
 
 
 app = ClientApp()
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
-_ARTIFACT_FORMAT = "dsflower-xgboost-ensemble-json-v1"
 _NPY_HEADER_ALLOWANCE = 4096
 _MESSAGE_CONFIG_FIELDS = frozenset((
     "server-round",
@@ -200,8 +199,6 @@ def _pinned_public_model(msg, context):
         if key not in manifest or run_config.get(key) != manifest[key] or \
                 message_config[key] != manifest[key]:
             raise ValueError("Flower validation config differs from manifest pin")
-    if manifest.get("validation-artifact-format") != _ARTIFACT_FORMAT:
-        raise ValueError("native validation artifact format is unsupported")
     artifact_size = _positive_integer(
         manifest.get("validation-artifact-size-bytes"),
         "native validation artifact size", 64 * 1024 * 1024)
@@ -219,6 +216,10 @@ def _pinned_public_model(msg, context):
     request = native_tree_request.parse_request_wire(
         manifest["validation-native-tree-request-b64"],
         manifest["validation-native-tree-request-sha256"])
+    release_spec = native_tree_engine.release_spec(request["engine"])
+    if manifest.get("validation-artifact-format") != \
+            release_spec["ensemble_format"]:
+        raise ValueError("native validation artifact format is unsupported")
     expected_task = "binary" if request["task"] == "binary" else "regression"
     if manifest["validation-task"] != expected_task or \
             request["public_schema"]["sha256"] != \
@@ -232,8 +233,7 @@ def _pinned_public_model(msg, context):
         manifest["validation-artifact-sha256"])
     # This parse re-sanitizes every model member and validates the complete public
     # prediction profile. It is deliberately the final step before private I/O.
-    model = xgboost_predictor.parse_xgboost_ensemble(
-        artifact, public_manifest)
+    model = native_tree_engine.parse_ensemble(public_manifest, artifact)
     layout = validation.layout_from_config(run_config)
     if model.task != expected_task or \
             model.num_features != len(request["public_schema"]["features"]):

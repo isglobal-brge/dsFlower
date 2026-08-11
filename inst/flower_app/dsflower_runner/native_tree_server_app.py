@@ -1,4 +1,4 @@
-"""Dedicated coordinator ServerApp for atomic native XGBoost federation."""
+"""Dedicated coordinator ServerApp for one atomic native-tree federation."""
 
 import hashlib
 import json
@@ -11,14 +11,11 @@ from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 from flwr.serverapp import Grid, ServerApp
 
-from . import native_tree_engine, native_tree_request, xgboost_adapter
+from . import native_tree_engine, native_tree_request
 
 
 app = ServerApp()
-MODEL_FILE = "model.xgboost-ensemble.json"
-PROFILE_FILE = "model.xgboost-ensemble.profile.json"
 HISTORY_FILE = "history.json"
-PREDICTION_PROFILE = "dsflower-xgboost-prediction-profile-v1"
 _REPLY_FIELDS = frozenset(("arrays", "metrics"))
 _METRIC_FIELDS = frozenset(("available", "num-examples"))
 _NPY_HEADER_ALLOWANCE = 4096
@@ -171,8 +168,8 @@ def _save_unavailable(results_dir):
     )
 
 
-def _save_release(results_dir, artifact, profile, *, model_file=MODEL_FILE,
-                  profile_file=PROFILE_FILE):
+def _save_release(results_dir, artifact, profile, *, model_file,
+                  profile_file):
     os.makedirs(results_dir, exist_ok=True)
     paths = [os.path.join(results_dir, name) for name in (
         model_file, profile_file, HISTORY_FILE)]
@@ -229,7 +226,4 @@ def main(grid: Grid, context: Context) -> None:
                 pass
 
 
-__all__ = [
-    "HISTORY_FILE", "MODEL_FILE", "PREDICTION_PROFILE", "PROFILE_FILE",
-    "app", "main",
-]
+__all__ = ["HISTORY_FILE", "app", "main"]

@@ -33,9 +33,13 @@ custodian explicitly opts in with `dsflower.allow_untrusted_coordinator = TRUE`.
 remotes::install_github("isglobal-brge/dsFlower")
 ```
 
-The `configure` script prepares the node Python runtime. Runtime environments
-contain Flower, PyTorch, Opacus and the cryptographic dependencies used by the
-canonical runner.
+The `configure` script prepares two node-owned Python runtime families: a
+PyTorch/Opacus environment for neural and vision training, and a small
+`native-tree` environment for trusted tree training, validation and executable
+capability probes. The latter pins Flower 1.31.0, NumPy 2.4.6, pandas 3.0.3,
+PyArrow 23.0.1 and cryptography 46.0.7 exactly. It does not install upstream
+XGBoost, LightGBM or CatBoost: XGBoost remains in its separately verified native
+bundle, while the other two names identify dsFlower-style numeric engines.
 
 ## Computation contracts
 
@@ -76,17 +80,33 @@ The Hook timing envelope is defense in depth, not a formal constant-time
 guarantee: cleanup, process availability and storage behavior remain outside the
 numeric DP proof and require deployment-level quotas/isolation when in scope.
 
-No tree learner is exposed by this runner ABI. Native XGBoost, LightGBM and
-CatBoost learn data-dependent bins, split topology, categories and stopping
-rules, so validating public parameters or perturbing only a serialized model
-would not establish formal DP. They require separately reviewed node-owned
-mechanisms. A HookApp can release a fixed numeric representation under generic
-whole-update DP, but cannot turn an ordinary variable-topology booster into a
-tight private learner.
+The dedicated native-tree ABI implements reviewed node-owned mechanisms for
+XGBoost, ExtraTrees, adaptive Random Forest, dsFlower LightGBM-style boosting
+and dsFlower CatBoost-style boosting. Every request pins public bounds, public
+cuts and a fixed typed parameter profile before private data are opened; the
+node owns privacy calibration and sticky custodial randomness. LightGBM-style
+and CatBoost-style are safe dsFlower numeric engines, not wrappers around the
+upstream binaries or model formats. Capability fields report fresh executable
+probes on each node; the engine list describes request syntax and is not a
+privacy permission catalogue.
 
-Private validation loads an already public declarative model before opening the
-staged validation frame. The current validation track accepts tabular neural
-artifacts; vision validation is not yet implemented and fails explicitly.
+The Random Forest mechanism uses a disjoint node-owned partition: each
+effective privacy unit contributes to exactly one tree. It is not upstream
+bootstrap/bagging Random Forest, and small cohorts can consequently have fewer
+effective units per tree. The public defaults (8 depth-4 binary trees; 4 depth-4
+regression trees) are benchmark-oriented starting points, not private-size
+admission rules.
+
+The four pure dsFlower engines are operational after the standard
+dependency-light runtime is provisioned. Native XGBoost remains fail-closed on
+a clean install: a custodian must separately build, verify and configure the
+platform-specific curated bundle. The installer does not compile or download
+that native trust artifact implicitly.
+
+Private validation loads an already public declarative or sanitized native-tree
+model before opening the staged validation frame. The current validation track
+accepts tabular neural and native-tree artifacts; vision validation is not yet
+implemented and fails explicitly.
 Each row or configured patient contributes one bounded
 histogram/sufficient-statistic vector. The node releases its sum once through the
 Gaussian mechanism; exact predictions, labels, counts and per-node metrics never
@@ -263,7 +283,7 @@ controls remain normal DataSHIELD profile options.
 | `dp_unit` | `row` | Adjacency unit: exactly `row` or `patient`. |
 | `patient_column` | unset | Required explicit stable identifier when `dp_unit="patient"`; never auto-detected. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |
-| `node_secret_path` | `/var/lib/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; `DSFLOWER_NODE_SECRET_FILE` takes precedence when a deployment selects a secret-manager path. |
+| `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; `DSFLOWER_NODE_SECRET_FILE` takes precedence when a deployment selects a service or secret-manager path. |
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |
 | `max_fab_bytes` | `52428800` | Per-FAB compressed upload cap. |
 | `app_spool_max_bytes` | `1073741824` | Global logical-byte cap across all uploaded FABs and unpacked apps. |
@@ -326,7 +346,8 @@ offset, length and content identity. After an ambiguous response, only the
 byte-identical in-flight chunk may be replayed against an idempotent store: its
 geometry is never reduced or extended until that ACK is resolved.
 
-Example:
+Example Unix node policy (Windows services should set an absolute
+`DSFLOWER_NODE_SECRET_FILE` or `default.dsflower.node_secret_path` explicitly):
 
 ```r
 options(
@@ -345,16 +366,22 @@ selection over one released DP model is post-processing; HPO or CV that trains
 new models creates new per-training releases.
 
 The Python privacy runtime is constrained to the audited compatibility families:
-Flower 1.31.x, Torch 2.x, Opacus 1.x and torchvision 0.x. Provisioning writes the
+Flower 1.31.0 exactly, Torch 2.x, Opacus 1.x and torchvision 0.x. The dedicated
+native-tree runtime uses the exact dependency set documented above. Provisioning writes the
 exact resolved distribution set to `.dsflower_versions.txt`; capabilities report
 the Flower/Torch/Opacus versions and the file's SHA-256. That post-install
 manifest is audit evidence, not a reproducible lock. A production administrator
 can set `DSFLOWER_PYTHON_LOCK` (or `dsflower.python_lock`) to a complete
-requirements file with hashes for every transitive artifact; provisioning then
+PyTorch requirements file with hashes for every transitive artifact, and
+`DSFLOWER_NATIVE_TREE_PYTHON_LOCK` (or
+`dsflower.native_tree_python_lock`) to a separate complete native-tree lock;
+provisioning then
 uses `uv pip install --require-hashes` and binds the lock SHA-256 into the venv
-marker. Keep the same root-owned lock available for later health checks and
-re-provisioning. Set `DSFLOWER_REQUIRE_PYTHON_LOCK=true` to make an absent or
-invalid lock a fail-closed provisioning error. Set `DSFLOWER_PYTHON_VERSION` to
+marker. Never reuse either lock for the other dependency graph. Keep the same
+root-owned locks available for later health checks and re-provisioning. Set
+`DSFLOWER_REQUIRE_PYTHON_LOCK=true` and/or
+`DSFLOWER_NATIVE_TREE_REQUIRE_PYTHON_LOCK=true` to make an absent or invalid
+corresponding lock a fail-closed provisioning error. Set `DSFLOWER_PYTHON_VERSION` to
 an exact `major.minor.patch` to prevent interpreter patch drift; the flexible
 default `3.11` intentionally tracks a compatible patch release. Immutable
 container digests remain the deployment identity for byte-for-byte artifacts.

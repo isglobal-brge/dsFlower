@@ -33,9 +33,10 @@ Until the native engine adapters do so, no capability may be advertised.
 
 The exact rejection sampler and arbitrary-precision arithmetic are
 variable-time. Its output-distribution proof does not cover timing or resource
-side channels. Before an analyst-visible capability is enabled, the enclosing
-service must isolate or coarsen completion timing according to a reviewed
-public schedule; raw sampler/training latency must not be an egress channel.
+side channels. The advertised numeric DP guarantee therefore excludes timing,
+availability and resource-observation channels. Process isolation and a
+coarsened public completion schedule remain deployment hardening when those
+channels are in scope; they are not properties supplied by this primitive.
 
 ## Build and test
 

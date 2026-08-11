@@ -389,6 +389,7 @@ test_that("native XGBoost capability is an operational fail-closed probe", {
     runtime, "python")), recursive = TRUE)
   file.create(file.path(runner, "native_tree_server_app.py"))
   file.create(file.path(runner, "native_tree_client_app.py"))
+  file.create(file.path(runner, "native_tree_runtime_probe.py"))
   file.create(dsFlower:::.native_tree_runtime_executable(runtime, "python"))
   file.create(dsFlower:::.native_tree_runtime_executable(
     runtime, "flower-supernode"))
@@ -409,6 +410,7 @@ test_that("native XGBoost capability is an operational fail-closed probe", {
   expect_match(probe_code, "native_tree_client_app", fixed = TRUE)
   expect_match(probe_code, "native_tree_server_app", fixed = TRUE)
   expect_match(probe_code, "is_verified_bundle", fixed = TRUE)
+  expect_match(probe_code, "probe_xgboost_engine", fixed = TRUE)
   expect_identical(
     unname(invocation$env[["DSFLOWER_XGBOOST_BUNDLE_ROOT"]]),
     bundle)
@@ -418,8 +420,133 @@ test_that("native XGBoost capability is an operational fail-closed probe", {
   expect_identical(calls, 1L)
 })
 
-test_that("native-tree contract capability reflects the fresh probe", {
-  capabilities <- dsFlower:::.native_tree_contract_capabilities(FALSE)
+test_that("XGBoost capability fails closed when its real trainer probe fails", {
+  root <- withr::local_tempdir()
+  runner <- file.path(root, "dsflower_runner")
+  runtime <- file.path(root, "runtime")
+  bundle <- file.path(root, "bundle")
+  dir.create(runner)
+  dir.create(bundle)
+  dir.create(dirname(dsFlower:::.native_tree_runtime_executable(
+    runtime, "python")), recursive = TRUE)
+  for (name in c(
+      "native_tree_server_app.py", "native_tree_client_app.py",
+      "native_tree_runtime_probe.py")) {
+    file.create(file.path(runner, name))
+  }
+  file.create(dsFlower:::.native_tree_runtime_executable(runtime, "python"))
+  file.create(dsFlower:::.native_tree_runtime_executable(
+    runtime, "flower-supernode"))
+  hook <- file.path(root, "sitecustomize.py")
+  writeLines("dsflower_runner.native_tree_client_app:app", hook)
+
+  expect_false(dsFlower:::.native_tree_xgboost_probe(
+    runner, hook, runtime, bundle,
+    run_probe = function(...) list(
+      status = 3L, stdout = "", stderr = "trainer rejected")))
+})
+
+test_that("pure native-tree capabilities execute the exact trusted pipeline", {
+  root <- withr::local_tempdir()
+  runner <- file.path(root, "dsflower_runner")
+  runtime <- file.path(root, "runtime")
+  dir.create(runner)
+  dir.create(dirname(dsFlower:::.native_tree_runtime_executable(
+    runtime, "python")), recursive = TRUE)
+  for (name in c(
+      "native_tree_server_app.py", "native_tree_client_app.py",
+      "native_tree_runtime_probe.py")) {
+    file.create(file.path(runner, name))
+  }
+  file.create(dsFlower:::.native_tree_runtime_executable(runtime, "python"))
+  file.create(dsFlower:::.native_tree_runtime_executable(
+    runtime, "flower-supernode"))
+  hook <- file.path(root, "sitecustomize.py")
+  writeLines("dsflower_runner.native_tree_client_app:app", hook)
+  calls <- 0L
+  invocation <- NULL
+  run_probe <- function(...) {
+    calls <<- calls + 1L
+    invocation <<- list(...)
+    list(
+      status = 0L,
+      stdout = paste0(
+        paste0('{"catboost":true,"extra_trees":true,"lightgbm":true,',
+               '"random_forest":true}')),
+      stderr = "")
+  }
+
+  readiness <- dsFlower:::.native_tree_pure_probes(
+    runner_dir = runner, integrity_hook = hook, runtime_root = runtime,
+    run_probe = run_probe)
+  expect_true(all(readiness))
+  expect_identical(calls, 1L)
+  probe_code <- paste(invocation$args, collapse = "\n")
+  expect_match(probe_code, "probe_pure_engines", fixed = TRUE)
+  expect_match(probe_code, "native_tree_client_app", fixed = TRUE)
+  expect_match(probe_code, "native_tree_server_app", fixed = TRUE)
+  expect_identical(
+    unname(invocation$env[["DSFLOWER_XGBOOST_BUNDLE_ROOT"]]), "")
+
+  unlink(file.path(runner, "native_tree_runtime_probe.py"))
+  expect_false(any(dsFlower:::.native_tree_pure_probes(
+    runner_dir = runner, integrity_hook = hook, runtime_root = runtime,
+    run_probe = run_probe)))
+  expect_identical(calls, 1L)
+})
+
+test_that("native-tree validation capability parses and predicts a real release", {
+  root <- withr::local_tempdir()
+  runner <- file.path(root, "dsflower_runner")
+  runtime <- file.path(root, "runtime")
+  dir.create(runner)
+  dir.create(dirname(dsFlower:::.native_tree_runtime_executable(
+    runtime, "python")), recursive = TRUE)
+  for (name in c(
+      "native_tree_validation_server_app.py",
+      "native_tree_validation_client_app.py",
+      "native_tree_runtime_probe.py")) {
+    file.create(file.path(runner, name))
+  }
+  file.create(dsFlower:::.native_tree_runtime_executable(runtime, "python"))
+  file.create(dsFlower:::.native_tree_runtime_executable(
+    runtime, "flower-supernode"))
+  hook <- file.path(root, "sitecustomize.py")
+  writeLines("dsflower_runner.native_tree_validation_client_app:app", hook)
+  invocation <- NULL
+  run_probe <- function(...) {
+    invocation <<- list(...)
+    list(status = 0L, stdout = "available", stderr = "")
+  }
+
+  expect_true(dsFlower:::.native_tree_validation_probe(
+    "random_forest", runner, hook, runtime, run_probe))
+  probe_code <- paste(invocation$args, collapse = "\n")
+  expect_match(probe_code, "probe_validation_engine", fixed = TRUE)
+  expect_match(probe_code, "native_tree_validation_client_app", fixed = TRUE)
+  expect_match(probe_code, "native_tree_validation_server_app", fixed = TRUE)
+
+  unlink(file.path(runner, "native_tree_runtime_probe.py"))
+  expect_false(dsFlower:::.native_tree_validation_probe(
+    "random_forest", runner, hook, runtime, run_probe))
+})
+
+test_that("native-tree capabilities run only their explicitly requested probe", {
+  xgboost_calls <- 0L
+  pure_calls <- list()
+  local_mocked_bindings(
+    .native_tree_xgboost_probe = function(...) {
+      xgboost_calls <<- xgboost_calls + 1L
+      FALSE
+    },
+    .native_tree_pure_probes = function(engines, ...) {
+      pure_calls[[length(pure_calls) + 1L]] <<- engines
+      stats::setNames(engines %in% c(
+        "catboost", "lightgbm", "random_forest"), engines)
+    },
+    .package = "dsFlower")
+
+  capabilities <- dsFlower:::.native_tree_contract_capabilities("none")
   expect_identical(capabilities$contract, "dsflower-native-tree-request-v1")
   expect_identical(capabilities$modes, "native-tight")
   expect_setequal(
@@ -429,18 +556,45 @@ test_that("native-tree contract capability reflects the fresh probe", {
   expect_true(capabilities$native_tight_requires_public_cuts)
   expect_identical(capabilities$max_manifest_bytes, 65536L)
   expect_identical(capabilities$max_total_public_cuts, 16384L)
-  expect_false(capabilities$xgboost_native_tight_available)
-  expect_false(capabilities$extra_trees_native_tight_available)
+  expect_identical(capabilities$probed_engines, character())
+  expect_false(any(grepl("_native_tight_available$", names(capabilities))))
+  expect_identical(xgboost_calls, 0L)
+  expect_length(pure_calls, 0L)
+  expect_identical(capabilities$availability_semantics,
+                   "fresh-executable-node-probe")
   expect_setequal(
     capabilities$extra_trees_required_parameters,
     c("max_depth", "n_estimators"))
+  expect_setequal(
+    capabilities$random_forest_required_parameters,
+    c("max_depth", "max_features", "n_estimators"))
   expect_setequal(
     capabilities$xgboost_required_parameters,
     c("learning_rate", "max_delta_step", "max_depth", "min_child_weight",
       "min_split_loss", "num_boost_round", "reg_alpha", "reg_lambda"))
   expect_length(capabilities$xgboost_optional_parameters, 0L)
-  expect_true(dsFlower:::.native_tree_contract_capabilities(
-    TRUE)$xgboost_native_tight_available)
+
+  random_forest <- dsFlower:::.native_tree_contract_capabilities(
+    "random_forest")
+  expect_identical(random_forest$probed_engines, "random_forest")
+  expect_true(random_forest$random_forest_native_tight_available)
+  expect_false("xgboost_native_tight_available" %in% names(random_forest))
+  expect_identical(xgboost_calls, 0L)
+  expect_identical(pure_calls, list("random_forest"))
+
+  all <- dsFlower:::.native_tree_contract_capabilities("all")
+  expect_identical(all$probed_engines, dsFlower:::.NATIVE_TREE_ENGINES)
+  expect_false(all$xgboost_native_tight_available)
+  expect_false(all$extra_trees_native_tight_available)
+  expect_true(all$lightgbm_native_tight_available)
+  expect_true(all$catboost_native_tight_available)
+  expect_true(all$random_forest_native_tight_available)
+  expect_identical(xgboost_calls, 1L)
+  expect_identical(pure_calls[[2L]], dsFlower:::.NATIVE_TREE_PURE_ENGINES)
+
+  expect_error(
+    dsFlower:::.native_tree_contract_capabilities("Random_Forest"),
+    "native_tree_probe must be exactly")
 })
 
 test_that("native-tree prepare rejects an unavailable runtime before private IO", {
@@ -460,7 +614,7 @@ test_that("native-tree prepare rejects an unavailable runtime before private IO"
   withr::defer(dsFlower:::.removeHandle("native_tree_probe_false"))
   private_io <- FALSE
   testthat::local_mocked_bindings(
-    .native_tree_xgboost_probe = function(...) FALSE,
+    .native_tree_engine_probe = function(...) FALSE,
     .loadTrainingData = function(...) {
       private_io <<- TRUE
       stop("private data was read", call. = FALSE)
@@ -474,7 +628,7 @@ test_that("native-tree prepare rejects an unavailable runtime before private IO"
   expect_error(
     flowerPrepareRunDS(
       "native_tree_probe_false", "outcome", c("age", "marker"), config),
-    "verified native XGBoost runtime is unavailable")
+    "trusted native-tree runtime for 'xgboost' is unavailable")
   image_config <- config
   image_config$data_type <- "image"
   expect_error(

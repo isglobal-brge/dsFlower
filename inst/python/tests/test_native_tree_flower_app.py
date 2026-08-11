@@ -21,6 +21,7 @@ FLOWER_APP = os.path.join(
 sys.path.insert(0, FLOWER_APP)
 
 from dsflower_runner import native_tree_client_app as client_app  # noqa: E402
+from dsflower_runner import native_tree_engine  # noqa: E402
 from dsflower_runner import native_tree_request  # noqa: E402
 from dsflower_runner import native_tree_server_app as server_app  # noqa: E402
 from dsflower_runner import seeding, task, xgboost_predictor  # noqa: E402
@@ -388,10 +389,8 @@ class NativeTreeServerTests(unittest.TestCase):
             Grid(True), (1, 2), request_b64, request_sha256,
             1.0, 1_000_000)
         manifest = native_tree_request.public_backend_manifest(request)
-        first = server_app.xgboost_adapter.build_xgboost_ensemble(
-            manifest, forward)[0]
-        second = server_app.xgboost_adapter.build_xgboost_ensemble(
-            manifest, reverse)[0]
+        first = native_tree_engine.build_ensemble(manifest, forward)[0]
+        second = native_tree_engine.build_ensemble(manifest, reverse)[0]
         self.assertEqual(first, second)
         self.assertNotIn(b"node_id", first.lower())
 
@@ -415,10 +414,11 @@ class NativeTreeServerTests(unittest.TestCase):
                     ]
 
             server_app.main(Grid(), SimpleNamespace(run_config=cfg))
+            spec = native_tree_engine.release_spec("xgboost")
             self.assertFalse(os.path.exists(os.path.join(
-                results_dir, server_app.MODEL_FILE)))
+                results_dir, spec["model_file"])))
             self.assertFalse(os.path.exists(os.path.join(
-                results_dir, server_app.PROFILE_FILE)))
+                results_dir, spec["profile_file"])))
             with open(os.path.join(results_dir, server_app.HISTORY_FILE),
                       encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle), [{
@@ -457,8 +457,9 @@ class NativeTreeServerTests(unittest.TestCase):
             self.assertEqual(load.call_count, 2)
             self.assertEqual(prepare.call_count, 2)
             self.assertEqual(native.call_count, 2)
-            model_path = os.path.join(results_dir, server_app.MODEL_FILE)
-            profile_path = os.path.join(results_dir, server_app.PROFILE_FILE)
+            spec = native_tree_engine.release_spec("xgboost")
+            model_path = os.path.join(results_dir, spec["model_file"])
+            profile_path = os.path.join(results_dir, spec["profile_file"])
             with open(model_path, "rb") as handle:
                 artifact = handle.read()
             with open(profile_path, "rb") as handle:
@@ -468,14 +469,14 @@ class NativeTreeServerTests(unittest.TestCase):
                       encoding="utf-8") as handle:
                 history = json.load(handle)
             self.assertEqual(history, [{"available": True, "round": 1}])
-            self.assertEqual(profile["contract"], server_app.PREDICTION_PROFILE)
+            self.assertEqual(profile["contract"], spec["profile_contract"])
             self.assertEqual(profile_bytes, server_app._canonical_json(profile))
             self.assertEqual(
                 profile["artifact"]["sha256"],
                 hashlib.sha256(artifact).hexdigest())
             self.assertEqual(profile["artifact"]["size_bytes"], len(artifact))
             self.assertEqual(profile["artifact"]["format"],
-                             server_app.xgboost_adapter.ENSEMBLE_FORMAT)
+                             spec["ensemble_format"])
             self.assertEqual(profile["native_tree_request_b64"], request_b64)
             self.assertEqual(profile["native_tree_request_sha256"],
                              request_sha256)
