@@ -570,21 +570,15 @@ test_that("image path failures are record-local and preserve row order", {
   )
 
   outside <- withr::local_tempdir()
-  writeLines("private", file.path(outside, "outside.png"))
-  linked <- file.path(root, "linked")
-  if (isTRUE(suppressWarnings(file.symlink(outside, linked)))) {
+  outside_file <- file.path(outside, "outside.png")
+  writeLines("private", outside_file)
+  linked <- file.path(root, "linked.png")
+  if (isTRUE(suppressWarnings(file.symlink(outside_file, linked)))) {
     linked_out <- dsFlower:::.ensureImagePathColumn(
-      data.frame(relative_path = "linked/outside.png", label = 1L),
+      data.frame(relative_path = "linked.png", label = 1L),
       image_root = root
     )
     expect_equal(linked_out$relative_path, "__dsflower_invalid_image__")
-    if (.Platform$OS.type == "windows") {
-      dsFlower:::.run_windows_powershell(paste0(
-        "Remove-Item -LiteralPath ",
-        dsFlower:::.powershell_literal(linked),
-        " -Force"
-      ))
-    }
   }
 })
 
