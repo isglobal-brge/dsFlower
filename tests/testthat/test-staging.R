@@ -39,8 +39,8 @@ test_that("run tokens and staging paths fail closed before recursive deletion", 
   staging <- dsFlower:::.ensureStagingDir(token)
   withr::defer(dsFlower:::.cleanupStaging(token))
   link <- tempfile("staging-link-")
-  if (isTRUE(file.symlink(staging, link))) {
-    withr::defer(suppressWarnings(unlink(link)))
+  if (isTRUE(file.symlink(marker, link))) {
+    withr::defer(unlink(link))
     expect_error(
       dsFlower:::.validateStagingDir(link, token),
       "link or reparse point"

@@ -44,7 +44,10 @@ test_that("the final Python boundary creates and repairs only the noise root", {
       file.path(getwd(), "venv"), file.path(getwd(), "staging-1"))
     first_secret <- readLines(secret, warn = FALSE)
     expect_match(first_secret, "^[0-9a-f]{64}$")
-    expect_identical(unname(first_env[["DSFLOWER_NODE_SECRET_FILE"]]), secret)
+    expect_identical(
+      unname(first_env[["DSFLOWER_NODE_SECRET_FILE"]]),
+      dsFlower:::.canonical_state_path(secret)
+    )
     expect_setequal(list.files(state_dir), c("noise_root", "noise_root.lock"))
     expect_identical(file.info(paste0(secret, ".lock"))$size[[1L]], 0)
 
@@ -54,7 +57,10 @@ test_that("the final Python boundary creates and repairs only the noise root", {
       file.path(getwd(), "venv"), file.path(getwd(), "staging-2"))
     expect_match(readLines(secret, warn = FALSE), "^[0-9a-f]{64}$")
     expect_false(identical(readLines(secret, warn = FALSE), first_secret))
-    expect_identical(unname(second_env[["DSFLOWER_NODE_SECRET_FILE"]]), secret)
+    expect_identical(
+      unname(second_env[["DSFLOWER_NODE_SECRET_FILE"]]),
+      dsFlower:::.canonical_state_path(secret)
+    )
     expect_setequal(list.files(state_dir), c("noise_root", "noise_root.lock"))
   })
 })
@@ -98,11 +104,15 @@ test_that("the trusted Python environment does not inherit injection variables",
   expect_identical(
     unname(env[["FLWR_HOME"]]), file.path(staging, ".flwr"))
   expect_true(dir.exists(env[["FLWR_HOME"]]))
-  expect_equal(
-    bitwAnd(as.integer(file.info(env[["FLWR_HOME"]])$mode),
-            as.integer(strtoi("77", base = 8))),
-    0L
-  )
+  if (.Platform$OS.type == "windows") {
+    expect_no_error(dsFlower:::.windows_validate_private_acl(env[["FLWR_HOME"]]))
+  } else {
+    expect_equal(
+      bitwAnd(as.integer(file.info(env[["FLWR_HOME"]])$mode),
+              as.integer(strtoi("77", base = 8))),
+      0L
+    )
+  }
   expect_identical(unname(env[["DSF_SAA_SANDBOX_OK"]]), "0")
   expect_identical(
     unname(env[["DSF_HOOK_RESOURCE_ISOLATION_OK"]]), "0")
@@ -117,8 +127,11 @@ test_that("the trusted Python environment does not inherit injection variables",
     unname(attested[["DSF_HOOK_RESOURCE_ISOLATION_OK"]]), "1")
 
   unsafe_staging <- withr::local_tempdir()
-  expect_true(file.symlink(withr::local_tempdir(),
-                           file.path(unsafe_staging, ".flwr")))
+  unsafe_target <- file.path(unsafe_staging, "target")
+  writeLines("target", unsafe_target)
+  unsafe_home <- file.path(unsafe_staging, ".flwr")
+  expect_true(file.symlink(unsafe_target, unsafe_home))
+  withr::defer(unlink(unsafe_home))
   expect_error(
     dsFlower:::.build_clean_python_env(tempfile("venv-"), unsafe_staging),
     "Flower home is unsafe"

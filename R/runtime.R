@@ -135,16 +135,20 @@
   privacy_state <- .privacy_runtime_bootstrap()
   secret_path <- .validate_node_secret(privacy_state$secret_path)
   flwr_home <- file.path(staging_dir, ".flwr")
-  if (.path_is_symlink(flwr_home) ||
+  if (.privacy_path_is_link(flwr_home) ||
       ((file.exists(flwr_home) || dir.exists(flwr_home)) &&
        !dir.exists(flwr_home))) {
     stop("The per-run Flower home is unsafe.", call. = FALSE)
   }
   dir.create(flwr_home, mode = "0700", showWarnings = FALSE)
-  if (!dir.exists(flwr_home) || .path_is_symlink(flwr_home)) {
+  if (!dir.exists(flwr_home) || .privacy_path_is_link(flwr_home)) {
     stop("Could not create the private per-run Flower home.", call. = FALSE)
   }
-  Sys.chmod(flwr_home, "0700")
+  if (.Platform$OS.type == "windows") {
+    .windows_set_private_acl(flwr_home, is_directory = TRUE)
+  } else {
+    Sys.chmod(flwr_home, "0700")
+  }
 
   # Inherit only variables needed for locale, TLS/proxies, accelerators and
   # temporary-file placement. In particular, never inherit PYTHONPATH,
