@@ -53,7 +53,7 @@
   output <- suppressWarnings(system2(
     candidates[[1L]],
     c("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded),
-    stdout = TRUE, stderr = TRUE
+    stdout = TRUE, stderr = FALSE
   ))
   status <- attr(output, "status", exact = TRUE)
   if (!is.null(status) && !identical(as.integer(status), 0L)) {
