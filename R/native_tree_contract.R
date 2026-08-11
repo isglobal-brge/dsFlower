@@ -148,6 +148,10 @@
   json <- as.character(jsonlite::toJSON(
     value, auto_unbox = TRUE, null = "null", na = "null",
     digits = NA, always_decimal = TRUE, pretty = FALSE))
+  # jsonlite protects embedded HTML by escaping a solidus after "<".  The
+  # cross-runtime ABI uses Python's JSON canonical form, where that optional
+  # escape is absent.
+  json <- gsub("<\\\\/", "</", json)
   charToRaw(enc2utf8(json))
 }
 
