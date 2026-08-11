@@ -63,25 +63,6 @@ test_that("Windows private ACL and atomic replacement round-trip", {
   skip_on_os("linux")
   skip_on_os("mac")
 
-  diagnostic_runner <- function(script) {
-    wrapped <- paste0(
-      "$stage='PATH';$code='';try{", script, "}",
-      "catch{$safe='';if(([string]$code) -match '^[0-9]{1,10}$')",
-      "{$safe=[string]$code};$bits='';",
-      "if(([string]$diag) -match '^[01]{9}$'){$bits=[string]$diag};",
-      "Write-Output ('FAIL|'+$stage+'|'+$safe+'|'+$bits)}"
-    )
-    result <- paste(dsFlower:::.run_windows_powershell(wrapped), collapse = "")
-    if (!identical(result, "OK")) {
-      if (!grepl("^FAIL\\|(PATH|ADD_TYPE|NATIVE)\\|[0-9]{0,10}\\|[01]{0,9}$",
-                 result, perl = TRUE)) {
-        result <- "FAIL|OUTPUT||"
-      }
-      stop("Windows replacement diagnostic: ", result, call. = FALSE)
-    }
-    result
-  }
-
   root <- tempfile("dsflower-windows-acl-")
   dir.create(root)
   withr::defer(unlink(root, recursive = TRUE))
@@ -94,8 +75,7 @@ test_that("Windows private ACL and atomic replacement round-trip", {
   writeLines("old", destination)
   dsFlower:::.windows_set_private_acl(replacement, is_directory = FALSE)
   dsFlower:::.windows_set_private_acl(destination, is_directory = FALSE)
-  dsFlower:::.windows_replace_file_atomic(
-    replacement, destination, runner = diagnostic_runner)
+  dsFlower:::.windows_replace_file_atomic(replacement, destination)
 
   expect_identical(readLines(destination, warn = FALSE), "new")
   expect_false(file.exists(replacement))
@@ -130,10 +110,13 @@ test_that("Windows path and ACL command boundaries are strict and injectable", {
   expect_match(replace_command, "SetLastError=true", fixed = TRUE)
   expect_match(replace_command, "GetDirectoryName($s)", fixed = TRUE)
   expect_match(replace_command, "GetDirectoryName($d)", fixed = TRUE)
-  expect_match(replace_command, "$stage='ADD_TYPE'", fixed = TRUE)
-  expect_match(replace_command, "$stage='NATIVE'", fixed = TRUE)
   expect_match(replace_command, "private static extern bool ReplaceFileW(",
                fixed = TRUE)
+  expect_match(
+    replace_command,
+    "ReplaceFileW(replaced,replacement,null,2,IntPtr.Zero,IntPtr.Zero)",
+    fixed = TRUE
+  )
   expect_match(replace_command, "return Marshal.GetLastWin32Error()",
                fixed = TRUE)
   expect_match(replace_command, "$code=[DsFlower.NativeFile]::Replace($d,$s)",

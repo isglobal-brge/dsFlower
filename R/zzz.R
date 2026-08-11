@@ -193,10 +193,11 @@
 .windows_replace_file_atomic <- function(
     replacement, destination, runner = .run_windows_powershell) {
   # Windows PowerShell 5's File.Replace wrapper adds an unsupported
-  # REPLACEFILE_WRITE_THROUGH flag. Call ReplaceFileW with only its documented
-  # ignore-merge flag so the built-in shell remains usable.
+  # REPLACEFILE_WRITE_THROUGH flag, and PowerShell method binding converts
+  # $null to an empty string for a string parameter. Keep the native call in
+  # C# so the backup path is a true null and only the documented ignore-merge
+  # flag is passed.
   script <- paste0(
-    "$stage='PATH';",
     "$s=[IO.Path]::GetFullPath(", .powershell_literal(replacement), ");",
     "$d=[IO.Path]::GetFullPath(", .powershell_literal(destination), ");",
     "$comparison=[StringComparison]::OrdinalIgnoreCase;",
@@ -213,19 +214,7 @@
     "public static int Replace(string replaced,string replacement){",
     "if(ReplaceFileW(replaced,replacement,null,2,IntPtr.Zero,IntPtr.Zero))",
     "{return 0;}return Marshal.GetLastWin32Error();}}}';",
-    "$stage='ADD_TYPE';",
     "Add-Type -TypeDefinition $interop -ErrorAction Stop;",
-    "$stage='NATIVE';",
-    "$diag=([int][IO.File]::Exists($s)).ToString()+",
-    "([int][IO.File]::Exists($d)).ToString()+",
-    "([int][IO.Directory]::Exists([IO.Path]::GetDirectoryName($s))).ToString()+",
-    "([int][IO.Directory]::Exists([IO.Path]::GetDirectoryName($d))).ToString()+",
-    "([int][String]::Equals([IO.Path]::GetPathRoot($s),",
-    "[IO.Path]::GetPathRoot($d),$comparison)).ToString()+",
-    "([int]$s.StartsWith('\\\\?\\')).ToString()+",
-    "([int]$d.StartsWith('\\\\?\\')).ToString()+",
-    "([int]($s.IndexOf('/') -ge 0)).ToString()+",
-    "([int]($d.IndexOf('/') -ge 0)).ToString();",
     "$code=[DsFlower.NativeFile]::Replace($d,$s);",
     "if($code -ne 0){",
     "throw ('ReplaceFileW failed with Win32 error '+$code)};",
