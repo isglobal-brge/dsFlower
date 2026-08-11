@@ -102,7 +102,22 @@ test_that("Windows path and ACL command boundaries are strict and injectable", {
     secret, file.path(root, "destination"), runner))
   expect_true(any(grepl("O''Brien", commands, fixed = TRUE)))
   expect_true(any(grepl("RemoveAccessRuleSpecific", commands, fixed = TRUE)))
-  expect_true(any(grepl(",$null,$true)", commands, fixed = TRUE)))
+  replace_command <- commands[grepl("ReplaceFileW", commands, fixed = TRUE)]
+  expect_length(replace_command, 1L)
+  expect_match(replace_command, "EntryPoint=\"ReplaceFileW\"", fixed = TRUE)
+  expect_match(replace_command, "CharSet=CharSet.Unicode", fixed = TRUE)
+  expect_match(replace_command, "ExactSpelling=true", fixed = TRUE)
+  expect_match(replace_command, "SetLastError=true", fixed = TRUE)
+  expect_match(replace_command, "GetDirectoryName($s)", fixed = TRUE)
+  expect_match(replace_command, "GetDirectoryName($d)", fixed = TRUE)
+  expect_match(
+    replace_command, "ReplaceFileW($d,$s,$null,[uint32]2,", fixed = TRUE)
+  expect_false(grepl("[IO.File]::Replace", replace_command, fixed = TRUE))
+  expect_error(
+    dsFlower:::.windows_replace_file_atomic(
+      secret, file.path(root, "destination"), function(script) "FAILED"),
+    "atomically install"
+  )
 
   expect_error(
     dsFlower:::.windows_validate_private_acl(

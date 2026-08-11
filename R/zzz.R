@@ -192,9 +192,28 @@
 
 .windows_replace_file_atomic <- function(
     replacement, destination, runner = .run_windows_powershell) {
+  # Windows PowerShell 5's File.Replace wrapper adds an unsupported
+  # REPLACEFILE_WRITE_THROUGH flag. Call ReplaceFileW with only its documented
+  # ignore-merge flag so the built-in shell remains usable.
   script <- paste0(
-    "[IO.File]::Replace(", .powershell_literal(replacement), ",",
-    .powershell_literal(destination), ",$null,$true);",
+    "$s=[IO.Path]::GetFullPath(", .powershell_literal(replacement), ");",
+    "$d=[IO.Path]::GetFullPath(", .powershell_literal(destination), ");",
+    "$comparison=[StringComparison]::OrdinalIgnoreCase;",
+    "if(-not [String]::Equals([IO.Path]::GetDirectoryName($s),",
+    "[IO.Path]::GetDirectoryName($d),$comparison))",
+    "{throw 'Atomic replacement requires one directory'};",
+    "$interop='using System;using System.Runtime.InteropServices;",
+    "namespace DsFlower{public static class NativeFile{",
+    "[DllImport(\"kernel32.dll\",EntryPoint=\"ReplaceFileW\",",
+    "CharSet=CharSet.Unicode,ExactSpelling=true,SetLastError=true)]",
+    "[return:MarshalAs(UnmanagedType.Bool)]public static extern bool ReplaceFileW(",
+    "string replaced,string replacement,string backup,uint flags,",
+    "IntPtr exclude,IntPtr reserved);}}';",
+    "Add-Type -TypeDefinition $interop -ErrorAction Stop;",
+    "$ok=[DsFlower.NativeFile]::ReplaceFileW($d,$s,$null,[uint32]2,",
+    "[IntPtr]::Zero,[IntPtr]::Zero);",
+    "if(-not $ok){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();",
+    "throw ('ReplaceFileW failed with Win32 error '+$code)};",
     "Write-Output 'OK'"
   )
   result <- paste(runner(script), collapse = "")
