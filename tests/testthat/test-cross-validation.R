@@ -39,6 +39,61 @@ cv_job_config <- function(contract) {
     "target-levels" = list(type = "character", values = c("no", "yes")))
 }
 
+native_cv_wire <- function() paste0(
+  '{"contract":"dsflower-native-tree-request-v1","engine":"xgboost",',
+  '"mode":"native-tight","task":"binary","public_schema":{',
+  '"version":1,"features":["age","marker"],"lower":[0.0,-5.0],',
+  '"upper":[100.0,5.0],"cuts":[[18.0,40.0,65.0],[-1.0,0.0,1.0]],',
+  '"target":{"name":"outcome","kind":"binary","levels":',
+  '[{"type":"string","value":"control"},{"type":"string","value":"case"}],',
+  '"lower":0.0,"upper":1.0},',
+  '"sha256":"77a6e8d46a174381b8b4da168b833b2ee75f09f8ca8ac55f2c954be642ba9073"},',
+  '"parameters":[{"name":"learning_rate","type":"number","value":0.25},',
+  '{"name":"max_delta_step","type":"number","value":1.0},',
+  '{"name":"max_depth","type":"integer","value":2},',
+  '{"name":"min_child_weight","type":"number","value":1.0},',
+  '{"name":"min_split_loss","type":"number","value":0.0},',
+  '{"name":"num_boost_round","type":"integer","value":8},',
+  '{"name":"reg_alpha","type":"number","value":0.0},',
+  '{"name":"reg_lambda","type":"number","value":1.0}],',
+  '"resources":{"max_features":2,"max_trees":8,"max_depth":2,',
+  '"max_bins":4,"max_threads":32,"memory_mb":32768,',
+  '"timeout_seconds":21600}}')
+
+test_that("native-tree CV job KAT matches the client fixture without neural pins", {
+  request <- dsFlower:::.validate_native_tree_manifest(
+    jsonlite::fromJSON(native_cv_wire(), simplifyVector = FALSE),
+    "193390a92a076bf9d4cdac0686e6542990b5948809cdc8f1dbbc9ccaac787692")
+  contract <- dsFlower:::.crossValidationContract(3L, "row")
+  config <- list(
+    "task-type" = "classification", "dp-track" = "native_tree",
+    "num-server-rounds" = 1L, "num-features" = 2L,
+    "native-tree-request-b64" = request$b64,
+    "native-tree-request-sha256" = request$sha256,
+    "cv-version" = contract$version, "cv-method" = contract$method,
+    "cv-assignment" = contract$assignment, "cv-folds" = contract$folds,
+    "cv-privacy-unit" = contract$privacy_unit,
+    "cv-unit-canonicalization" = contract$unit_canonicalization,
+    "cv-contract-sha256" = contract$sha256,
+    "cv-validation-bins" = 32L, "cv-n-nodes" = 2L,
+    "feature-bounds" = list(lower = c(0, -5), upper = c(100, 5)),
+    "target-levels" = c("control", "case"))
+  hash <- function(value = config) dsFlower:::.cv_job_sha256(
+    value, c("age", "marker"), "outcome", 3L, strrep("a", 64L),
+    strrep("b", 64L), 1)
+  baseline <- hash()
+  expect_identical(
+    baseline,
+    "1f8d5520eb02029caad12b3a8e40e929ab58a142edd494b4cfe751dec826982c")
+
+  irrelevant <- config
+  irrelevant[["model-spec-b64"]] <- "W10="
+  irrelevant[["loss-name"]] <- "mse"
+  irrelevant[["optimizer-name"]] <- "adamw"
+  irrelevant$strategy <- "fedadam"
+  expect_identical(hash(irrelevant), baseline)
+})
+
 test_that("CV job provenance has a mirrored golden and binds every public group", {
   config <- cv_job_config(dsFlower:::.crossValidationContract(3L, "row"))
   config[["target-levels"]] <- c("no", "yes")
@@ -156,10 +211,12 @@ test_that("one server-owned job budget is split 80 percent over K folds", {
     dsFlower:::.addDpConfigToRunConfig(c(
       cv_config(contract), list("cv-seed" = 4L))),
     "unsupported field.*cv-seed")
-  expect_error(
+  native <- cv_config(contract)
+  native[["dp-track"]] <- "native_tree"
+  expect_identical(
     dsFlower:::.normalizeCrossValidationConfig(
-      cv_config(contract), "native_tree"),
-    "neural")
+      native, "native_tree")[["cv-contract-sha256"]],
+    contract$sha256)
 })
 
 test_that("holdout and cross-validation cannot share one job", {

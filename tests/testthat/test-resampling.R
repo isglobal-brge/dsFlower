@@ -70,8 +70,12 @@ test_that("holdout normalization is track-exact and hash pinned", {
                "neural and native_tree")
   image <- base
   image$data_type <- "image"
-  expect_error(dsFlower:::.normalizeResamplingConfig(image, "neural"),
-               "tabular")
+  expect_identical(
+    dsFlower:::.normalizeResamplingConfig(image, "neural")[[
+      "resampling-contract-sha256"]],
+    contract$sha256)
+  expect_error(dsFlower:::.normalizeResamplingConfig(image, "native_tree"),
+               "vision|image", ignore.case = TRUE)
 })
 
 test_that("prepared manifest pins the complete job allocation and contract", {

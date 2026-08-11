@@ -2,7 +2,9 @@
 
 The client exports this protocol as `ds.flower.cross_validate()`. It is a
 dedicated metrics-only job; it does not wrap repeated fit or validation calls.
-The default is three folds, while values from 2 through 10 are supported.
+The default is three folds, while values from 2 through 10 are supported for
+tabular neural models and native-tree binary classification or bounded
+regression.
 
 ## Public job contract
 
@@ -26,19 +28,24 @@ is required; the app must not infer or export such linkage.
 
 ## Required execution
 
-For each fold `f = 1..K`, the ServerApp performs a real, independently
-initialized federated training:
+For each fold `f = 1..K`, the ServerApp performs a real, clean-initialized
+federated training. Neural models run their configured rounds; each native-tree
+engine runs its complete public schedule in one Flower round and the ServerApp
+builds the same canonical exact ensemble used by ordinary native training:
 
 1. Every node trains only on units whose assigned fold is not `f`.
-2. Every configured round must complete on the exact roster.
-3. The final fold aggregate is sent once to those nodes for prediction only on
-   units assigned to `f`.
+2. Every configured neural round, or the single native-tree round, must complete
+   on the exact roster.
+3. The final neural aggregate or exact native-tree ensemble is sent once to
+   those nodes for prediction only on units assigned to `f`.
 4. Each node adds the bounded sufficient statistics to namespaced
    `Context.state` records carried by Flower's in-memory node runtime and
    acknowledges without returning a vector, prediction, metric or model. The
    records are bound to the public CV-job hash, contract, layout and fold
    digests; they never use a file or database.
-5. The fold model is discarded in memory and is never persisted or returned.
+5. The fold model is discarded in memory and is never persisted or published
+   to the user; native sanitized members exist only long enough for the
+   ServerApp to construct that fold's exact ensemble.
 
 After all folds finish, each node makes exactly one DP release of its accumulated
 OOF sufficient-statistic vector. The ServerApp pools one vector per node in
@@ -52,7 +59,7 @@ The custodian-provided epsilon/delta pair is the total CV-job budget. The node
 reserves 80 percent for training and assigns `0.8 / K` of the pair to each fold;
 the remaining 20 percent is used by the single OOF release. This conservative
 allocation remains valid when replace-one adjacency changes a unit's fold.
-Larger `K` therefore gives each DP-SGD training less budget and can reduce
+Larger `K` therefore gives each fold-training mechanism less budget and can reduce
 utility. This accounting exists only inside the active job. There is no
 lifetime/global/resource budget, call counter, rate limit or operation-catalog
 authorization.
@@ -63,9 +70,10 @@ metrics artifact. Intermediate state is RAM-only and is consumed before the
 final reply or by every abort message the node receives. A node unreachable
 during abort can retain only its in-memory record until that runtime exits; it
 cannot persist or return it. Restart means deterministic recomputation of the
-entire job. The implementation must bind fold index and the
-exact train tensors into each training's semantic PRF identity while binding the
-canonical OOF sufficient vector, layout and noise scale into the final release.
+entire job. Each training's semantic PRF identity binds its mechanism and exact
+effective training tensors; the fold affects that identity only through its
+effective partition. The final release binds the canonical OOF sufficient
+vector, layout and noise scale.
 
 ## Verified invariants
 

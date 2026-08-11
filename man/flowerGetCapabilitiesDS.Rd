@@ -4,10 +4,7 @@
 \alias{flowerGetCapabilitiesDS}
 \title{Get Server Capabilities}
 \usage{
-flowerGetCapabilitiesDS(
-  native_tree_probe = "none",
-  association_probe = "none"
-)
+flowerGetCapabilitiesDS(native_tree_probe = "none", association_probe = "none")
 }
 \arguments{
 \item{native_tree_probe}{Exactly \code{"none"} (the default), \code{"all"},
@@ -27,6 +24,7 @@ Flower capabilities including Python version, the hash-pinned declarative
 runner vocabulary, and disclosure settings. The response is independent of
 cohort contents, handle state, and other sessions, and does not disclose
 filesystem paths. Native-tree and association availability are probed only
-when explicitly requested. Resampling advertises atomic tabular holdout for
-exactly the neural and native-tree tracks.
+when explicitly requested. Resampling advertises atomic holdout for tabular
+neural/native-tree runs and native dsFlower neural vision; cross-validation
+remains tabular for the neural and native-tree tracks.
 }

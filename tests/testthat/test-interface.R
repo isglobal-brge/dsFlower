@@ -994,10 +994,12 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   )
   expect_identical(caps$resampling$holdout$tracks,
                    c("neural", "native_tree"))
-  expect_identical(caps$resampling$holdout$data_kinds, "tabular")
+  expect_identical(caps$resampling$holdout$data_kinds,
+                   c("tabular", "image"))
   expect_true(caps$resampling$holdout$pooled_only)
   expect_true(caps$resampling$cross_validation$available)
-  expect_identical(caps$resampling$cross_validation$tracks, "neural")
+  expect_identical(caps$resampling$cross_validation$tracks,
+                   c("neural", "native_tree"))
   expect_identical(caps$resampling$cross_validation$data_kinds, "tabular")
   expect_identical(caps$resampling$cross_validation$folds, c(2L, 10L))
   expect_true(caps$resampling$cross_validation$pooled_only)

@@ -425,12 +425,20 @@ def _scheduled_learning_rate(pins, global_epoch):
 
 
 def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master, noise_multiplier,
-            geometry_n_units=None):
+            geometry_n_units=None, public_zero_gradient=False):
     """Opacus DP-SGD with the harness-owned loss + manifest-pinned sampling/horizon.
     Every input to the noise calibration (clip C, epsilon, delta, batch size, local
     epochs, rounds, sample count) is authoritative from the manifest, never the
     client run config -- so the client cannot stretch the composition horizon
     against the fixed per-training calibration."""
+    if type(public_zero_gradient) is not bool:
+        raise RuntimeError("zero-gradient mode must be a boolean")
+    if public_zero_gradient and (
+            geometry_n_units is None or len(X) != 1
+            or bool(np.any(np.asarray(X) != 0.0))
+            or bool(np.any(np.asarray(y) != 0.0))):
+        raise RuntimeError(
+            "zero-gradient mode requires one public zero dummy and pinned geometry")
     _assert_finite_private_inputs(X, y)
     X = np.clip(X, -dp_harness.MAX_PARAMETER_ABS,
                 dp_harness.MAX_PARAMETER_ABS).astype(np.float32)
@@ -486,7 +494,9 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master, noise_multiplier,
             xb, yb = xb.to(device), yb.to(device)
             clean = [p.detach().clone() for p in model.parameters()]
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            output = model(xb)
+            loss = (output.sum() * 0.0 if public_zero_gradient
+                    else criterion(output, yb))
             loss.backward()
             # Defense-in-depth for the param-stash (A1): undo ANY in-place write the
             # forward made to the leaf params BEFORE the optimizer steps, so weights
@@ -659,9 +669,9 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
     has_cv = cfg.get("cv-contract-sha256") is not None
     if has_holdout and has_cv:
         raise RuntimeError("holdout and cross-validation cannot be combined")
-    if (has_holdout or has_cv) and manifest_image:
+    if has_cv and manifest_image:
         raise RuntimeError(
-            "resampling currently supports tabular neural data only")
+            "cross-validation currently supports tabular neural data only")
     if has_cv != (cv_fold is not None):
         raise RuntimeError("cross-validation fold coordinate is unavailable")
     geometry_n_units = None
@@ -682,30 +692,33 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
             cfg.get("image-size"))
         if on_private_start is not None:
             on_private_start()
-        paths, y, groups = load_image_collection(context)
-        n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
-        X = vision.extract_features_from_paths(
-            encoder, paths, image_size, is_3d, device=device)
+        values, y, groups = load_image_collection(context)
     else:
-        X, y, groups = load_data(context, include_unit_ids=True)
-        if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
+        values, y, groups = load_data(context, include_unit_ids=True)
+        if values.ndim != 2 or int(values.shape[1]) != int(input_dim):
             raise RuntimeError("staged feature width changed after model validation")
-        n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
+    n_staged = len(y)                          # pre-pool staged count (== manifest n_samples)
 
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=groups, manifest=resampling_manifest)
     if has_holdout:
-        X, y, groups = _holdout_partition(
-            context, X, y, groups, subset="train")
+        values, y, groups = _holdout_partition(
+            context, values, y, groups, subset="train")
     elif has_cv:
-        X, y, groups = _cross_validation_partition(
-            context, X, y, groups, fold=int(cv_fold), subset="train")
-    if not manifest_image:
+        values, y, groups = _cross_validation_partition(
+            context, values, y, groups, fold=int(cv_fold), subset="train")
+    empty_training = len(y) == 0
+    if manifest_image:
+        X = (np.empty((0, int(input_dim)), dtype=np.float32)
+             if empty_training else vision.extract_features_from_paths(
+                 encoder, list(values), image_size, is_3d, device=device))
+    else:
+        X = values
         X = _apply_feature_bounds(X, cfg)
     X = _totalize_private_features(X)
-    if pins["loss_name"] in _CLASSIFICATION_LOSSES:
+    if not empty_training and pins["loss_name"] in _CLASSIFICATION_LOSSES:
         _assert_label_range(y, n_classes)
-    if groups is not None:
+    if not empty_training and groups is not None:
         X, y = _pool_by_patient(X, y, groups, pins["loss_name"])
         X = _totalize_private_features(X)
     # Bind every stochastic DP-SGD axis only after preprocessing has produced
@@ -734,10 +747,22 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         public_arrays=get_torch_params(model),
         private_arrays=(np.asarray(X, dtype=np.float32), seed_target))
 
+    fit_X, fit_y = X, y
+    if empty_training:
+        # Keep the exact calibrated q/steps/sigma schedule without creating an
+        # output atom at the public input model. The sole public dummy has a
+        # forced zero per-sample gradient; every optimizer step still receives
+        # the normal DP noise under the pinned total-unit geometry.
+        fit_X = np.zeros((1, int(input_dim)), dtype=np.float32)
+        fit_y = np.zeros(
+            (1, *np.asarray(y).shape[1:]), dtype=np.asarray(y).dtype)
+
+    fit_options = ({"public_zero_gradient": True}
+                   if empty_training else {})
     return _dp_fit(
-        model, X, y, pcfg, pins, n_staged, cfg, master=master,
+        model, fit_X, fit_y, pcfg, pins, n_staged, cfg, master=master,
         noise_multiplier=effective_privacy["noise_multiplier"],
-        geometry_n_units=geometry_n_units)
+        geometry_n_units=geometry_n_units, **fit_options)
 
 
 def _holdout_partition(context, X, y, unit_ids, *, subset):
@@ -751,8 +776,6 @@ def _holdout_partition(context, X, y, unit_ids, *, subset):
     mask = resampling.holdout_mask_from_context(
         context, n_rows=int(target.shape[0]), unit_ids=unit_ids)
     selected = mask if subset == "test" else ~mask
-    if not bool(np.any(selected)):
-        raise RuntimeError("atomic holdout partition is unavailable")
     selected_units = (None if unit_ids is None
                       else np.asarray(unit_ids)[selected])
     return values[selected], target[selected], selected_units
@@ -772,8 +795,6 @@ def _cross_validation_partition(context, X, y, unit_ids, *, fold, subset):
     selected = assigned == fold
     if subset == "train":
         selected = ~selected
-    if not bool(np.any(selected)):
-        raise RuntimeError("cross-validation partition is unavailable")
     selected_units = (None if unit_ids is None
                       else np.asarray(unit_ids)[selected])
     return values[selected], target[selected], selected_units
@@ -919,19 +940,36 @@ def _cross_validation_release(context, cfg, pcfg):
         _forget_cv_sufficient(context)
 
 
-def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim):
+def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim,
+                            on_private_start=None):
     """Evaluate the final public aggregate on test units and release one vector."""
-    if is_image_run(context):
-        raise RuntimeError(
-            "atomic holdout currently supports tabular neural data only")
-    X, y, unit_ids = load_data(context, include_unit_ids=True)
-    if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
-        raise RuntimeError("staged feature width changed before holdout evaluation")
+    manifest_image = is_image_run(context)
+    if manifest_image:
+        from . import vision
+        encoder, image_size, is_3d, device = vision.prepare_backbone(
+            cfg.get("backbone", cfg.get("model", "resnet18")),
+            cfg.get("vision-extractor-profile"), cfg.get("num-features"),
+            cfg.get("image-size"))
+        if on_private_start is not None:
+            on_private_start()
+        values, y, unit_ids = load_image_collection(context)
+    else:
+        if on_private_start is not None:
+            on_private_start()
+        values, y, unit_ids = load_data(context, include_unit_ids=True)
+        if values.ndim != 2 or int(values.shape[1]) != int(input_dim):
+            raise RuntimeError(
+                "staged feature width changed before holdout evaluation")
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=unit_ids)
-    X, y, unit_ids = _holdout_partition(
-        context, X, y, unit_ids, subset="test")
-    X = _apply_feature_bounds(X, cfg)
+    values, y, unit_ids = _holdout_partition(
+        context, values, y, unit_ids, subset="test")
+    if manifest_image:
+        X = (np.empty((0, int(input_dim)), dtype=np.float32)
+             if len(y) == 0 else vision.extract_features_from_paths(
+                 encoder, list(values), image_size, is_3d, device=device))
+    else:
+        X = _apply_feature_bounds(values, cfg)
     layout = validation.holdout_layout_from_config(cfg)
     predictions = validation.neural_predictions(model, X, pins["loss_name"])
     bounds = (validation.holdout_target_bounds_from_config(cfg)
@@ -1096,12 +1134,9 @@ def train(msg: Message, context: Context) -> Message:
             pins["round_index"] = int(pins["num_rounds"])
             model, input_dim, manifest_image = _prepare_neural_model(
                 msg, context, cfg, pcfg, pins)
-            if manifest_image:
-                raise RuntimeError(
-                    "atomic holdout currently supports tabular neural data only")
-            mark_private_started()
             new_arrays = _holdout_neural_release(
-                context, cfg, pcfg, pins, model, input_dim)
+                context, cfg, pcfg, pins, model, input_dim,
+                on_private_start=mark_private_started)
         elif track == "validation":
             if int(claim["num_rounds"]) != 1:
                 raise RuntimeError("validation release horizon must be exactly one")
