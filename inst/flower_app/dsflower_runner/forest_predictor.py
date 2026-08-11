@@ -16,8 +16,15 @@ _ENSEMBLE_FIELDS = frozenset((
     "aggregation", "contract", "engine", "models",
     "public_schema_sha256", "task", "version",
 ))
-_ENGINE_PARAMETERS = {"max_depth": "int", "n_estimators": "int"}
-_MECHANISM_PARAMETERS = {"leaf_release": "string", "topology": "string"}
+_EXTRA_TREES_PARAMETERS = {"max_depth": "int", "n_estimators": "int"}
+_EXTRA_TREES_MECHANISM = {"leaf_release": "string", "topology": "string"}
+_RANDOM_FOREST_PARAMETERS = {
+    "max_depth": "int", "max_features": "int", "n_estimators": "int",
+}
+_RANDOM_FOREST_MECHANISM = {
+    "candidate_schedule": "string", "histogram_release": "string",
+    "leaf_release": "string", "partition": "string", "transcript": "string",
+}
 _CONSTRUCTION_TOKEN = object()
 
 
@@ -51,46 +58,65 @@ def _float32(value, where):
 def _parameter(parameters, name, kind):
     record = _exact(parameters[name], ("type", "value"), name)
     if record["type"] != kind:
-        raise ValueError("ExtraTrees parameter type mismatch")
+        raise ValueError("forest parameter type mismatch")
     value = record["value"]
     if kind == "int":
         if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("ExtraTrees integer parameter is malformed")
+            raise ValueError("forest integer parameter is malformed")
     elif not isinstance(value, str):
-        raise ValueError("ExtraTrees string parameter is malformed")
+        raise ValueError("forest string parameter is malformed")
     return value
 
 
 def _prediction_profile(manifest):
     canonical = tree_contract.canonical_engine_manifest(manifest)
-    if canonical["engine"] != "extra_trees" or \
+    engine = canonical["engine"]
+    if engine not in ("extra_trees", "random_forest") or \
             canonical["mode"] != "native-tight":
-        raise ValueError("predictor requires native-tight ExtraTrees")
+        raise ValueError("predictor requires a native-tight forest")
+    engine_parameters = (_EXTRA_TREES_PARAMETERS
+                         if engine == "extra_trees"
+                         else _RANDOM_FOREST_PARAMETERS)
     parameters = canonical["engine_params"]
-    if frozenset(parameters) != frozenset(_ENGINE_PARAMETERS):
-        raise ValueError("ExtraTrees parameter profile is incomplete")
+    if frozenset(parameters) != frozenset(engine_parameters):
+        raise ValueError("forest parameter profile is incomplete")
     values = {
         name: _parameter(parameters, name, kind)
-        for name, kind in _ENGINE_PARAMETERS.items()
+        for name, kind in engine_parameters.items()
     }
     trees = values["n_estimators"]
     depth = values["max_depth"]
     if not 1 <= trees <= min(512, canonical["resources"]["max_trees"]) or \
             not 1 <= depth <= min(12, canonical["resources"]["max_depth"]):
-        raise ValueError("ExtraTrees prediction geometry is outside its profile")
+        raise ValueError("forest prediction geometry is outside its profile")
     if 2 * trees * (1 << depth) > 8_000_000:
-        raise ValueError("ExtraTrees prediction vector exceeds its profile")
+        raise ValueError("forest prediction vector exceeds its profile")
 
+    mechanism_parameters = (_EXTRA_TREES_MECHANISM
+                            if engine == "extra_trees"
+                            else _RANDOM_FOREST_MECHANISM)
     mechanism = canonical["privacy"]["mechanism_params"]
-    if frozenset(mechanism) != frozenset(_MECHANISM_PARAMETERS):
-        raise ValueError("ExtraTrees mechanism profile is incomplete")
+    if frozenset(mechanism) != frozenset(mechanism_parameters):
+        raise ValueError("forest mechanism profile is incomplete")
     pinned = {
         name: _parameter(mechanism, name, kind)
-        for name, kind in _MECHANISM_PARAMETERS.items()
+        for name, kind in mechanism_parameters.items()
     }
-    if pinned["topology"] != forest_accounting.TOPOLOGY_PROFILE or \
-            pinned["leaf_release"] != forest_accounting.LEAF_RELEASE_PROFILE:
-        raise ValueError("ExtraTrees mechanism profile differs from its pins")
+    if engine == "extra_trees":
+        expected = {
+            "leaf_release": forest_accounting.LEAF_RELEASE_PROFILE,
+            "topology": forest_accounting.TOPOLOGY_PROFILE,
+        }
+    else:
+        expected = {
+            "candidate_schedule": forest_accounting.RANDOM_FOREST_CANDIDATE_PROFILE,
+            "histogram_release": forest_accounting.RANDOM_FOREST_HISTOGRAM_PROFILE,
+            "leaf_release": forest_accounting.RANDOM_FOREST_LEAF_PROFILE,
+            "partition": forest_accounting.RANDOM_FOREST_PARTITION_PROFILE,
+            "transcript": forest_accounting.RANDOM_FOREST_TRANSCRIPT_PROFILE,
+        }
+    if pinned != expected:
+        raise ValueError("forest mechanism profile differs from its pins")
 
     schema = canonical["public_schema"]
     cuts = []
@@ -105,18 +131,26 @@ def _prediction_profile(manifest):
                 right <= left for left, right in zip(
                     feature_cuts, feature_cuts[1:])) or any(
                         not lower < value < upper for value in feature_cuts):
-            raise ValueError("ExtraTrees public bins are outside their profile")
+            raise ValueError("forest public bins are outside their profile")
         bounds.append((lower, upper))
         cuts.append(feature_cuts)
     target = schema["target"]
     target_lower = _float32(target["lower"], "target lower bound")
     target_upper = _float32(target["upper"], "target upper bound")
     if target_lower >= target_upper:
-        raise ValueError("ExtraTrees target bounds are not strict")
+        raise ValueError("forest target bounds are not strict")
+    if engine == "random_forest":
+        max_features = values["max_features"]
+        if not 1 <= max_features <= len(cuts):
+            raise ValueError("Random Forest max_features is outside its profile")
+        bin_slots = max(len(value) + 2 for value in cuts)
+        if (2 * trees * (1 << (depth - 1)) * max_features * bin_slots >
+                8_000_000):
+            raise ValueError("Random Forest transcript exceeds its profile")
     task = ("binary" if canonical["task"] == "binary_classification"
             else "regression")
     arguments = {
-        "expected_engine": "extra_trees",
+        "expected_engine": engine,
         "expected_task": canonical["task"],
         "expected_features": len(schema["features"]),
         "expected_trees": trees,
@@ -255,7 +289,7 @@ def parse_forest_ensemble(artifact, manifest):
     if container["contract"] != ENSEMBLE_CONTRACT or \
             type(container["version"]) is not int or \
             container["version"] != 1 or \
-            container["engine"] != "extra_trees" or \
+            container["engine"] != canonical["engine"] or \
             container["aggregation"] != "mean_prediction" or \
             container["task"] != task or \
             container["public_schema_sha256"] != canonical["public_schema"]["sha256"]:
