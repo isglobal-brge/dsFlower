@@ -132,11 +132,6 @@
 .windows_set_private_acl <- function(
     path, is_directory, runner = .run_windows_powershell) {
   literal <- .powershell_literal(path)
-  acl_type <- if (isTRUE(is_directory)) {
-    "DirectorySecurity"
-  } else {
-    "FileSecurity"
-  }
   inheritance <- if (isTRUE(is_directory)) {
     paste0(
       "([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor ",
@@ -147,19 +142,24 @@
   }
   script <- paste0(
     "$p=", literal, ";$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;",
-    "$acl=New-Object Security.AccessControl.", acl_type, ";",
-    "$acl.SetOwner($sid);$acl.SetAccessRuleProtection($true,$false);",
+    "$acl=Get-Acl -LiteralPath $p -ErrorAction Stop;",
+    "$acl.SetAccessRuleProtection($true,$false);",
+    "$rules=@($acl.GetAccessRules($true,$false,",
+    "[Security.Principal.SecurityIdentifier]));foreach($existing in $rules){",
+    "[void]$acl.RemoveAccessRuleSpecific($existing)};",
+    "$acl.SetOwner($sid);",
     "$rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,",
     "[Security.AccessControl.FileSystemRights]::FullControl,", inheritance, ",",
     "[Security.AccessControl.PropagationFlags]::None,",
     "[Security.AccessControl.AccessControlType]::Allow);",
-    "[void]$acl.AddAccessRule($rule);Set-Acl -LiteralPath $p -AclObject $acl;",
+    "$acl.SetAccessRule($rule);Set-Acl -LiteralPath $p -AclObject $acl;",
     "Write-Output 'OK'"
   )
   result <- paste(runner(script), collapse = "")
   if (!identical(result, "OK")) {
     stop("Could not protect the Windows node-secret path.", call. = FALSE)
   }
+  .windows_validate_private_acl(path, runner = runner)
   invisible(path)
 }
 
@@ -194,13 +194,14 @@
     replacement, destination, runner = .run_windows_powershell) {
   script <- paste0(
     "[IO.File]::Replace(", .powershell_literal(replacement), ",",
-    .powershell_literal(destination), ",$null);",
+    .powershell_literal(destination), ",$null,$true);",
     "Write-Output 'OK'"
   )
   result <- paste(runner(script), collapse = "")
   if (!identical(result, "OK")) {
     stop("Could not atomically install the Windows node secret.", call. = FALSE)
   }
+  .windows_set_private_acl(destination, is_directory = FALSE, runner = runner)
   invisible(destination)
 }
 

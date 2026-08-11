@@ -59,6 +59,29 @@ test_that("Windows PowerShell output is captured as one complete line", {
   )
 })
 
+test_that("Windows private ACL and atomic replacement round-trip", {
+  skip_on_os("linux")
+  skip_on_os("mac")
+
+  root <- tempfile("dsflower-windows-acl-")
+  dir.create(root)
+  withr::defer(unlink(root, recursive = TRUE))
+  dsFlower:::.windows_set_private_acl(root, is_directory = TRUE)
+  expect_no_error(dsFlower:::.windows_validate_private_acl(root))
+
+  replacement <- file.path(root, "replacement")
+  destination <- file.path(root, "destination")
+  writeLines("new", replacement)
+  writeLines("old", destination)
+  dsFlower:::.windows_set_private_acl(replacement, is_directory = FALSE)
+  dsFlower:::.windows_set_private_acl(destination, is_directory = FALSE)
+  dsFlower:::.windows_replace_file_atomic(replacement, destination)
+
+  expect_identical(readLines(destination, warn = FALSE), "new")
+  expect_false(file.exists(replacement))
+  expect_no_error(dsFlower:::.windows_validate_private_acl(destination))
+})
+
 test_that("Windows path and ACL command boundaries are strict and injectable", {
   root <- tempfile("dsflower-O'Brien-")
   dir.create(root)
@@ -78,6 +101,8 @@ test_that("Windows path and ACL command boundaries are strict and injectable", {
   expect_no_error(dsFlower:::.windows_replace_file_atomic(
     secret, file.path(root, "destination"), runner))
   expect_true(any(grepl("O''Brien", commands, fixed = TRUE)))
+  expect_true(any(grepl("RemoveAccessRuleSpecific", commands, fixed = TRUE)))
+  expect_true(any(grepl(",$null,$true)", commands, fixed = TRUE)))
 
   expect_error(
     dsFlower:::.windows_validate_private_acl(
