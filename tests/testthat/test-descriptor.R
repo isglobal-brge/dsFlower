@@ -85,6 +85,9 @@ test_that(".createHandleFromDescriptor produces correct handle", {
 
 test_that("flowerInitDS accepts FlowerDatasetDescriptor", {
   privacy <- withr::local_tempdir()
+  if (.Platform$OS.type == "windows") {
+    dsFlower:::.windows_set_private_acl(privacy, is_directory = TRUE)
+  }
   withr::local_envvar(c(
     DSFLOWER_NODE_SECRET_FILE = file.path(privacy, "noise_root"),
     DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"

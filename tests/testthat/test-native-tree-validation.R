@@ -45,6 +45,9 @@
 .native_validation_privacy_state <- function(.local_envir = parent.frame()) {
   state_dir <- tempfile("dsflower-native-validation-state-")
   dir.create(state_dir, recursive = TRUE)
+  if (.Platform$OS.type == "windows") {
+    dsFlower:::.windows_set_private_acl(state_dir, is_directory = TRUE)
+  }
   withr::defer(unlink(state_dir, recursive = TRUE), envir = .local_envir)
   withr::local_envvar(c(
     DSFLOWER_NODE_SECRET_FILE = file.path(state_dir, "node-secret"),
