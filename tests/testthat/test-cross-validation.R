@@ -258,3 +258,42 @@ test_that("prepared manifest pins only the per-job CV allocation", {
   expect_false(any(grepl(
     "lifetime|remaining|counter|quota", names(manifest), ignore.case = TRUE)))
 })
+
+test_that("staged CV budget survives JSON at the release guard's tolerance", {
+  # The trusted runner recomputes the fixed 80/20-over-K allocation in IEEE
+  # doubles and requires the manifest values within rel_tol = 1e-15
+  # (release_guard._fixed_manifest). A 15-significant-digit manifest decimal
+  # (epsilon 4, folds 3 -> 3.2/3) is 3e-15 off, so every live CV round failed
+  # closed as unavailable at 0.4.1. Assert the written manifest round-trips
+  # each budget field to within one ulp of the exact allocation.
+  withr::local_options(list(
+    dsflower.dp_unit = "row",
+    dsflower.dp_per_training_epsilon = 4,
+    dsflower.dp_per_training_delta = 1e-5
+  ))
+  contract <- dsFlower:::.crossValidationContract(3L, "row")
+  config <- dsFlower:::.addDpConfigToRunConfig(cv_config(contract))
+  token <- "run_00000000000000000000000000000903"
+  withr::defer(dsFlower:::.cleanupStaging(token))
+  staged <- dsFlower:::.stageData(
+    data.frame(x = seq_len(12), y = rep(0:1, 6)), token, "y", "x",
+    extra_config = config)
+  manifest <- jsonlite::fromJSON(
+    file.path(staged, "manifest.json"), simplifyVector = TRUE)
+  epsilon <- as.numeric(manifest[["privacy-epsilon"]])
+  delta <- as.numeric(manifest[["privacy-delta"]])
+  expect_identical(epsilon, 4)
+  expect_identical(delta, 1e-5)
+  exact <- list(
+    "privacy-cv-training-epsilon" = epsilon * 0.8,
+    "privacy-cv-training-delta" = delta * 0.8,
+    "privacy-cv-fold-epsilon" = epsilon * 0.8 / 3L,
+    "privacy-cv-fold-delta" = delta * 0.8 / 3L,
+    "privacy-cv-oof-epsilon" = epsilon - epsilon * 0.8,
+    "privacy-cv-oof-delta" = delta - delta * 0.8)
+  for (field in names(exact)) {
+    relative_error <- abs(manifest[[field]] - exact[[field]]) /
+      abs(exact[[field]])
+    expect_lte(relative_error, 2.3e-16)  # one ulp; guard allows 1e-15
+  }
+})
