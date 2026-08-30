@@ -4,7 +4,7 @@ A ready-to-run **DataSHIELD rock node with dsFlower preinstalled** — server-en
 differential privacy for federated learning, with the PyTorch (CPU) Flower runtime baked
 in so the first federated run is instant.
 
-Source release image: **`davidsarrat/dsflower-rock:0.4.1`**. Deploy and derive
+Source release image: **`davidsarrat/dsflower-rock:0.4.2`**. Deploy and derive
 other images from an immutable digest, not from a mutable tag.
 
 ## What's inside
@@ -25,8 +25,8 @@ mv dsFlower_*.tar.gz docker/dsFlower.tar.gz
 # build (native linux/amd64 for the federation hosts)
 docker build \
   --build-arg ROCK_BASE_IMAGE='datashield/rock-base@sha256:<reviewed-digest>' \
-  -t davidsarrat/dsflower-rock:0.4.1 docker/
-docker push davidsarrat/dsflower-rock:0.4.1
+  -t davidsarrat/dsflower-rock:0.4.2 docker/
+docker push davidsarrat/dsflower-rock:0.4.2
 ```
 
 `ROCK_BASE_IMAGE` should be the digest recorded during base-image review. A tag
