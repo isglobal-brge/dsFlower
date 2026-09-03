@@ -69,11 +69,8 @@ test_that("registered dsFlower outer calls do not initialize nested handles", {
   withr::defer(DSI::dsDisconnect(connection))
   invisible(DSI::dsAssignTable(connection, "D", "T"))
 
-  before <- length(ls(envir = dsFlower:::.handle_registry, all.names = TRUE))
   expression <- call("flowerStatusDS", call("flowerInitDS", "D"))
   expect_error(
     DSI::dsFetch(DSI::dsAggregate(connection, expression, async = FALSE)),
     "literal values or assigned server symbols")
-  after <- length(ls(envir = dsFlower:::.handle_registry, all.names = TRUE))
-  expect_identical(after, before)
 })

@@ -1,3 +1,27 @@
+# dsFlower 0.4.4
+
+### Complete dsImaging feature handoff
+
+* Private Flower handles now live in locked session-owned state, so dropping a
+  DataSHIELD session releases its tables, credentials, and staging metadata even
+  when explicit handle cleanup did not run.
+* `flowerInitDS()` accepts the new opaque dsImaging feature view and stages its
+  full, seal-bound sample roster using patient-level adjacency. The source
+  capability, collection seal, data hash, public label vocabulary, and exact
+  sample-to-patient mapping are checked again before and after staging.
+* A session that exported a raw imaging feature table cannot initialize a
+  generic table or matrix in dsFlower. This conservative session taint blocks
+  full-table, subset, copy, rebinding, and symbol-destruction laundering while
+  preserving ordinary tabular workflows in clean sessions.
+* Imaging target levels must match the operator-declared ordered vocabulary,
+  and sample/patient identifiers cannot become targets or model features.
+* Association contracts now use the server-authored privacy unit bound to the
+  initialized imaging handle, so a global row-level default cannot replace the
+  collection's patient-level adjacency.
+* NIfTI, inline NRRD/MHA, single-file DICOM, PNG/JPEG and TIFF remain supported;
+  detached sidecar containers and unsupported multi-file formats fail before
+  a training manifest is created.
+
 # dsFlower 0.4.3
 
 ### Disclosure admission

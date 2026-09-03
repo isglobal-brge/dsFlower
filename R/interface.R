@@ -61,8 +61,9 @@
     stop("Invalid Flower handle registration.", call. = FALSE)
   }
   capability <- .new_handle_capability()
-  .handle_registry[[capability]] <- list(
-    handle = handle, owner_env = owner_env)
+  state <- .flower_session_state(owner_env, create = TRUE)
+  handles <- state$handles
+  handles[[capability]] <- list(handle = handle)
   .handle_reference(capability)
 }
 
@@ -93,15 +94,16 @@
 .resolveHandle <- function(symbol) {
   found <- .find_handle_reference(symbol)
   capability <- .validate_handle_capability(found$reference$capability)
-  entry <- .handle_registry[[capability]]
-  if (is.null(entry) || !is.list(entry) || !is.list(entry$handle) ||
-      !is.environment(entry$owner_env) ||
-      !identical(entry$owner_env, found$owner_env)) {
+  state <- tryCatch(
+    .flower_session_state(found$owner_env, create = FALSE),
+    error = function(e) NULL)
+  entry <- if (is.null(state)) NULL else state$handles[[capability]]
+  if (is.null(entry) || !is.list(entry) || !is.list(entry$handle)) {
     stop("No Flower handle for symbol '", symbol,
          "' (unknown, stale, or cross-session capability).", call. = FALSE)
   }
   list(capability = capability, reference = found$reference,
-       owner_env = found$owner_env, handle = entry$handle)
+       owner_env = found$owner_env, state = state, handle = entry$handle)
 }
 
 #' Retrieve authoritative state for an opaque Flower handle
@@ -114,8 +116,8 @@
 # ASSIGN expression to place back in the session workspace.
 .storeHandle <- function(symbol, handle) {
   resolved <- .resolveHandle(symbol)
-  .handle_registry[[resolved$capability]] <- list(
-    handle = handle, owner_env = resolved$owner_env)
+  handles <- resolved$state$handles
+  handles[[resolved$capability]] <- list(handle = handle)
   resolved$reference
 }
 
@@ -124,7 +126,13 @@
 .setHandle <- function(symbol, handle, owner_env = parent.frame()) {
   if (exists(symbol, envir = owner_env, inherits = FALSE)) {
     old <- get(symbol, envir = owner_env, inherits = FALSE)
-    if (.is_handle_reference(old)) .handle_registry[[old$capability]] <- NULL
+    if (.is_handle_reference(old)) {
+      state <- .flower_session_state(owner_env, create = FALSE)
+      if (!is.null(state)) {
+        handles <- state$handles
+        handles[[old$capability]] <- NULL
+      }
+    }
   }
   reference <- .registerHandle(handle, owner_env = owner_env)
   assign(symbol, reference, envir = owner_env)
@@ -176,7 +184,8 @@
     if (!is.null(handle$run_token)) .cleanupStaging(handle$run_token)
     .cleanupPendingStaging(handle)
   }
-  .handle_registry[[resolved$capability]] <- NULL
+  handles <- resolved$state$handles
+  handles[[resolved$capability]] <- NULL
   if (exists(symbol, envir = resolved$owner_env, inherits = FALSE)) {
     current <- get(symbol, envir = resolved$owner_env, inherits = FALSE)
     if (.is_handle_reference(current) &&
@@ -261,6 +270,20 @@
 
 # --- ASSIGN methods ---
 
+.dsImagingSafetyHook <- function(name) {
+  if (!requireNamespace("dsImaging", quietly = TRUE)) {
+    stop("Package 'dsImaging' is required for this imaging safety contract.",
+         call. = FALSE)
+  }
+  namespace <- asNamespace("dsImaging")
+  if (!exists(name, envir = namespace, inherits = FALSE) ||
+      !is.function(get(name, envir = namespace, inherits = FALSE))) {
+    stop("The installed dsImaging version does not provide the required ",
+         "dsFlower safety contract.", call. = FALSE)
+  }
+  get(name, envir = namespace, inherits = FALSE)
+}
+
 #' Initialize Flower Handle
 #'
 #' DataSHIELD ASSIGN method. Creates a Flower federation handle from
@@ -288,8 +311,45 @@ flowerInitDS <- function(data_symbol) {
 
   # Existing path: data.frame
   if (is.data.frame(obj)) {
+    if (requireNamespace("dsImaging", quietly = TRUE)) {
+      session_tainted <- .dsImagingSafetyHook(
+        ".imaging_session_exported_feature_table")
+      if (isTRUE(session_tainted(owner_env))) {
+        stop("This session exported a naked imaging feature table, so generic ",
+             "table initialization is blocked. Create a new session and use ",
+             "imagingFeatureViewDS() for dsFlower.", call. = FALSE)
+      }
+    }
     return(.registerHandle(
       .createHandleFromTable(obj, data_symbol = data_symbol), owner_env))
+  }
+
+  # Complete feature assets cross the boundary as an opaque, session-bound
+  # dsImaging view. The patient mapping and table never enter the workspace.
+  is_feature_reference <- is.list(obj) &&
+    identical(names(obj), "capability") &&
+    is.character(obj$capability) && length(obj$capability) == 1L &&
+    !is.na(obj$capability) &&
+    grepl("^imgf_[0-9a-f]{64}$", obj$capability)
+  if (is_feature_reference) {
+    resolver <- .dsImagingSafetyHook(
+      ".resolve_imaging_feature_view_for_consumer")
+    authorized <- resolver(
+      data_symbol, expected_capability = obj$capability,
+      owner_env = owner_env)
+    if (!is.list(authorized) || !is.data.frame(authorized$data) ||
+        !is.list(authorized$manifest) || !is.list(authorized$privacy_roster)) {
+      stop("The dsImaging feature view is unavailable.", call. = FALSE)
+    }
+    desc <- flower_dataset_descriptor(
+      dataset_id = authorized$dataset_id,
+      source_kind = "imaging_feature_view",
+      metadata = authorized$manifest$metadata,
+      assets = list(), manifest = authorized$manifest)
+    handle <- .createHandleFromDescriptor(desc, data_symbol = data_symbol)
+    handle$imaging_feature_view_symbol <- data_symbol
+    handle$imaging_feature_view_capability <- obj$capability
+    return(.registerHandle(handle, owner_env))
   }
 
   # Imaging resources cross the package boundary only as an opaque dsImaging
@@ -330,7 +390,8 @@ flowerInitDS <- function(data_symbol) {
   # A Flower descriptor remains valid for tabular inputs. Imaging descriptors
   # must follow the authorized dsImaging-handle path above.
   if (inherits(obj, "FlowerDatasetDescriptor")) {
-    if (obj$source_kind %in% c("image_bundle", "asset_ref")) {
+    if (obj$source_kind %in% c(
+      "image_bundle", "asset_ref", "imaging_feature_view")) {
       stop("Imaging data must be initialized with imagingInitDS() before ",
            "flowerInitDS().", call. = FALSE)
     }
@@ -373,7 +434,7 @@ flowerInitDS <- function(data_symbol) {
 
   stop("Symbol '", data_symbol, "' is not a data.frame, matrix, ",
        "a tabular FlowerDatasetDescriptor, ResourceClient, or authorized ",
-       "dsImaging handle. ",
+       "dsImaging handle or feature view. ",
        "Assign your data first with datashield.assign.table(), ",
        "imagingInitDS(), or similar.",
        call. = FALSE)
@@ -1208,7 +1269,7 @@ flowerInitDS <- function(data_symbol) {
   }
   track <- tolower(track)
   run_config[["dp-track"]] <- track
-  run_config <- .normalizeAssociationConfig(run_config, track)
+  run_config <- .normalizeAssociationConfig(run_config, track, unit_policy)
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
   run_config <- .normalizeResamplingConfig(run_config, track, unit_policy)
@@ -1345,6 +1406,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     # not need to inspect private descriptor contents.
     if (identical(handle$source_kind, "image_bundle")) "image" else "tabular"
   } else "tabular"
+  imaging_backed <- identical(handle$source, "descriptor") &&
+    handle$source_kind %in% c("image_bundle", "imaging_feature_view")
   if (identical(descriptor_data_type, "image")) {
     capability <- handle$imaging_handle_capability %||% ""
     if (!is.character(handle$imaging_handle_symbol) ||
@@ -1357,12 +1420,27 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
            "with imagingInitDS().", call. = FALSE)
     }
   }
-  imaging_unit_policy <- if (identical(descriptor_data_type, "image")) {
+  if (identical(handle$source_kind, "imaging_feature_view")) {
+    capability <- handle$imaging_feature_view_capability %||% ""
+    if (!is.character(handle$imaging_feature_view_symbol) ||
+        length(handle$imaging_feature_view_symbol) != 1L ||
+        is.na(handle$imaging_feature_view_symbol) ||
+        !nzchar(handle$imaging_feature_view_symbol) ||
+        !is.character(capability) || length(capability) != 1L ||
+        is.na(capability) || !grepl("^imgf_[0-9a-f]{64}$", capability)) {
+      stop("Feature training requires an authorized dsImaging feature view.",
+           call. = FALSE)
+    }
+  }
+  imaging_unit_policy <- if (isTRUE(imaging_backed)) {
     .imagingPrivacyUnitPolicy(handle$descriptor)
   } else {
     NULL
   }
   run_config <- .addDpConfigToRunConfig(run_config, imaging_unit_policy)
+  if (isTRUE(imaging_backed)) {
+    .validateImagingTargetLevels(handle$descriptor, run_config)
+  }
   routed <- .takeRunDataType(run_config, expected = descriptor_data_type)
   run_config <- routed$run_config
   data_type <- routed$data_type
@@ -1390,14 +1468,23 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     if (!is.character(label_column) || length(label_column) != 1L ||
         is.na(label_column) || !nzchar(trimws(label_column)) ||
         !identical(as.character(target_column), trimws(label_column))) {
-      stop("Image training requires the single manifest-declared label_col ",
+      stop("Imaging training requires the single manifest-declared label_col ",
            "as its target.", call. = FALSE)
+    }
+    if (identical(handle$source_kind, "imaging_feature_view")) {
+      id_column <- handle$descriptor$manifest$metadata$id_col %||% ""
+      selected <- as.character(unlist(feature_columns, use.names = FALSE))
+      if (length(intersect(selected, c(
+        id_column, imaging_unit_policy$patient_column)))) {
+        stop("Imaging sample and patient identifiers cannot be model features.",
+             call. = FALSE)
+      }
     }
     feature_columns <- .excludePatientFeature(
       feature_columns, imaging_unit_policy$patient_column)
   }
   run_config <- .verifyAssociationContract(
-    run_config, feature_columns, target_column)
+    run_config, feature_columns, target_column, imaging_unit_policy)
   .validatePreparedNativeTreeContract(
     run_config, feature_columns, target_column)
   if (association_tabular && !isTRUE(.association_runtime_probe())) {
@@ -1499,6 +1586,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       # which handles in_memory_df, staged_parquet, and image_bundle.
       desc <- handle$descriptor
       imaging_authorized <- NULL
+      feature_authorized <- NULL
       if (identical(handle$source_kind, "image_bundle") &&
           !is.null(handle$imaging_handle_symbol)) {
         if (!requireNamespace("dsImaging", quietly = TRUE)) {
@@ -1520,6 +1608,21 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
         desc$backend <- imaging_authorized$backend
         desc$manifest_uri <- imaging_authorized$manifest_uri
         desc$.collection_snapshot <- imaging_authorized$collection_snapshot
+      }
+      if (identical(handle$source_kind, "imaging_feature_view") &&
+          !is.null(handle$imaging_feature_view_symbol)) {
+        feature_resolver <- .dsImagingSafetyHook(
+          ".resolve_imaging_feature_view_for_consumer")
+        feature_authorized <- feature_resolver(
+          handle$imaging_feature_view_symbol,
+          expected_capability = handle$imaging_feature_view_capability,
+          owner_env = owner_env)
+        desc <- flower_dataset_descriptor(
+          dataset_id = feature_authorized$dataset_id,
+          source_kind = "imaging_feature_view",
+          metadata = feature_authorized$manifest$metadata,
+          assets = list(), manifest = feature_authorized$manifest,
+          table_data = feature_authorized$data)
       }
       staging_dir <- .stageFromDescriptor(
         desc, run_token, target_column, feature_columns, run_config)
@@ -1547,6 +1650,25 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
           imaging_authorized$privacy_roster,
           privacy_ids = staged_data[[privacy$privacy_unit_col]],
           context = "staged imaging data")
+      }
+      if (!is.null(feature_authorized)) {
+        # The view and its underlying image handle must still be current after
+        # the feature table has been written. Then verify the exact staged
+        # sample-to-patient mapping, not merely its row or patient count.
+        feature_resolver(
+          handle$imaging_feature_view_symbol,
+          expected_capability = handle$imaging_feature_view_capability,
+          owner_env = owner_env)
+        staged_data <- .readStagedSamples(file.path(
+          staging_dir, staged_manifest$data_file))
+        privacy <- feature_authorized$privacy
+        assert_roster <- utils::getFromNamespace(
+          ".assert_exact_imaging_roster", "dsImaging")
+        assert_roster(
+          staged_data[[privacy$id_col]],
+          feature_authorized$privacy_roster,
+          privacy_ids = staged_data[[privacy$privacy_unit_col]],
+          context = "staged imaging feature data")
       }
 
       data_type <- staged_manifest$data_type %||% "tabular"
@@ -1849,7 +1971,7 @@ flowerCleanupRunDS <- function(handle_symbol) {
 #' DataSHIELD ASSIGN method. Full cleanup: removes staging, stops
 #' the associated SuperNode, and removes the handle. A retry is idempotent only
 #' when the same session still contains the well-formed opaque reference after
-#' its private registry entry has already been removed.
+#' its private payload has already been removed.
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @return NULL.
@@ -1872,16 +1994,18 @@ flowerDestroyDS <- function(handle_symbol) {
     unavailable()
   }
   capability <- .validate_handle_capability(reference$capability)
-  entry <- .handle_registry[[capability]]
-  if (is.null(entry)) {
+  state <- tryCatch(
+    .flower_session_state(owner_env, create = FALSE),
+    error = function(e) NULL)
+  if (is.null(state)) unavailable()
+  entry <- state$handles[[capability]]
+  if (identical(entry, .dsflower_handle_tombstone)) {
     # Idempotent retry after authoritative state was removed but the session
     # symbol could not be cleared (for example, a lost destroy response).
     rm(list = handle_symbol, envir = owner_env)
     return(NULL)
   }
-  if (!is.list(entry) || !is.list(entry$handle) ||
-      !is.environment(entry$owner_env) ||
-      !identical(entry$owner_env, owner_env)) {
+  if (is.null(entry) || !is.list(entry) || !is.list(entry$handle)) {
     unavailable()
   }
   # Accept the same safe partial-cleanup state as flowerCleanupRunDS(): the
@@ -1898,7 +2022,8 @@ flowerDestroyDS <- function(handle_symbol) {
   }
   handle <- .cleanupPendingStaging(handle)
 
-  .handle_registry[[capability]] <- NULL
+  handles <- state$handles
+  handles[[capability]] <- .dsflower_handle_tombstone
   rm(list = handle_symbol, envir = owner_env)
   NULL
 }
@@ -2031,7 +2156,8 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
 #' Get Handle Status
 #'
 #' DataSHIELD AGGREGATE method. Returns the current status of the handle
-#' including whether data is prepared and a SuperNode is ensured.
+#' including whether data is prepared, a SuperNode is ensured, and the
+#' server-authored privacy unit effective for this handle.
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @return Named list with status information.
@@ -2039,6 +2165,14 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
 flowerStatusDS <- function(handle_symbol) {
   .dsflower_require_literal_arguments()
   handle <- .validateHandleStaging(.getHandle(handle_symbol))
+
+  imaging_backed <- identical(handle$source, "descriptor") &&
+    handle$source_kind %in% c("image_bundle", "imaging_feature_view")
+  unit_policy <- if (isTRUE(imaging_backed)) {
+    .imagingPrivacyUnitPolicy(handle$descriptor)
+  } else {
+    .resolvePrivacyUnitPolicy()
+  }
 
   supernode_running <- FALSE
   if (!is.null(handle$staging_dir)) {
@@ -2053,7 +2187,8 @@ flowerStatusDS <- function(handle_symbol) {
     superlink_address  = handle$superlink_address,
     federation_id      = handle$federation_id,
     target_column      = handle$target_column,
-    feature_columns    = handle$feature_columns
+    feature_columns    = handle$feature_columns,
+    privacy_unit       = unit_policy$dp_unit
   )
 }
 

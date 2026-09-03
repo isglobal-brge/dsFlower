@@ -225,7 +225,7 @@
     algo = "sha256", serialize = FALSE)
 }
 
-.normalizeAssociationConfig <- function(run_config, track) {
+.normalizeAssociationConfig <- function(run_config, track, unit_policy = NULL) {
   association_fields <- names(run_config)[startsWith(
     tolower(names(run_config)), "association-")]
   if (!identical(track, "association")) {
@@ -271,7 +271,7 @@
   run_config[["association-job-sha256"]] <- .association_sha256(
     run_config[["association-job-sha256"]], "association-job-sha256")
 
-  policy <- .dpUnitPolicy()
+  policy <- .resolvePrivacyUnitPolicy(unit_policy)
   run_config[["association-contract"]] <- .ASSOCIATION_CONTRACT
   run_config[["association-privacy-unit"]] <- policy$dp_unit
   run_config[["association-unit-semantics"]] <-
@@ -280,7 +280,7 @@
 }
 
 .verifyAssociationContract <- function(
-    run_config, feature_columns, target_column) {
+    run_config, feature_columns, target_column, unit_policy = NULL) {
   if (!identical(run_config[["dp-track"]], "association")) return(run_config)
   target <- as.character(unlist(target_column, use.names = FALSE))
   features <- as.character(unlist(feature_columns, use.names = FALSE))
@@ -290,7 +290,7 @@
     stop("Association requires one distinct outcome and exposure column.",
          call. = FALSE)
   }
-  policy <- .dpUnitPolicy()
+  policy <- .resolvePrivacyUnitPolicy(unit_policy)
   if (identical(policy$dp_unit, "patient") &&
       policy$patient_column %in% c(target, features)) {
     stop("The server patient identifier cannot be the association outcome or exposure.",
@@ -354,7 +354,8 @@
 }
 
 .association_prepared_frame <- function(
-    data, target_column, feature_columns, extra_config) {
+    data, target_column, feature_columns, extra_config,
+    unit_policy = NULL, identity_columns = character()) {
   if (!is.data.frame(data)) data <- as.data.frame(data)
   target <- .association_column(target_column, "outcome column")
   exposure <- as.character(unlist(feature_columns, use.names = FALSE))
@@ -362,8 +363,16 @@
     stop("Association requires exactly one exposure column.", call. = FALSE)
   }
   exposure <- .association_column(exposure, "exposure column")
+  if (length(intersect(c(target, exposure), identity_columns))) {
+    stop("Imaging feature-view identity columns cannot be analysis columns.",
+         call. = FALSE)
+  }
   .validateDataSchema(data, target, exposure)
-  unit <- .prepareDpUnitFrame(data)
+  unit <- if (is.null(unit_policy)) {
+    .prepareDpUnitFrame(data)
+  } else {
+    .prepareImagingPrivacyUnitFrame(data, unit_policy)
+  }
   data <- unit$data
   data[[target]] <- .association_encode_values(
     data[[target]], extra_config[["association-outcome-levels"]])
@@ -373,21 +382,27 @@
     data, target_column = target, feature_columns = exposure,
     drop_missing = FALSE, select_columns = TRUE,
     patient_column = unit$patient_column)
+  output <- prepared$data
+  for (column in setdiff(identity_columns, names(output))) {
+    output[[column]] <- unit$data[[column]]
+  }
   list(
-    data = prepared$data, prepared = prepared, unit = unit,
+    data = output, prepared = prepared, unit = unit,
     target = target, exposure = exposure)
 }
 
 .stageAssociationData <- function(
     data, run_token, target_column, feature_columns, extra_config = list(),
-    source_config = list(), required_bytes = 0) {
+    source_config = list(), required_bytes = 0, unit_policy = NULL,
+    identity_columns = character()) {
   extra_config <- .validate_manifest_extra_config(extra_config)
   if (!identical(extra_config[["dp-track"]], "association")) {
     stop("Association staging requires dp-track='association'.",
          call. = FALSE)
   }
   frame <- .association_prepared_frame(
-    data, target_column, feature_columns, extra_config)
+    data, target_column, feature_columns, extra_config,
+    unit_policy = unit_policy, identity_columns = identity_columns)
   staging_dir <- .ensureStagingDir(run_token, required_bytes = required_bytes)
   use_parquet <- requireNamespace("arrow", quietly = TRUE)
   data_file <- if (use_parquet) "train.parquet" else "train.csv"

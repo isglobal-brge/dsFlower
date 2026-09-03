@@ -9,7 +9,9 @@
   run_token,
   target_column,
   feature_columns = NULL,
-  extra_config = list()
+  extra_config = list(),
+  unit_policy = NULL,
+  identity_columns = character()
 )
 }
 \arguments{

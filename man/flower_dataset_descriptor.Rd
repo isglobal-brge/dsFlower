@@ -17,7 +17,7 @@ flower_dataset_descriptor(
 (e.g. "radiology.chest_xray.v3").}
 
 \item{source_kind}{Character; one of "in_memory_df", "staged_parquet",
-"image_bundle".}
+"image_bundle", "imaging_feature_view".}
 
 \item{metadata}{Named list with file/format/column information for the
 samples metadata table.}

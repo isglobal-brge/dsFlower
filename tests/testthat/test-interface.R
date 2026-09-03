@@ -124,21 +124,29 @@ test_that("flowerDestroyDS retries only owner-local opaque tombstones", {
   assign("flowerDestroyDS", dsFlower::flowerDestroyDS, envir = owner_b)
 
   active <- dsFlower:::.registerHandle(mock_handle(), owner_env = owner_a)
+  other <- dsFlower:::.registerHandle(mock_handle(), owner_env = owner_b)
   assign("active", active, envir = owner_a)
   assign("active", active, envir = owner_b)
+  assign("other", other, envir = owner_b)
   expect_error(evalq(flowerDestroyDS("active"), owner_b), "unavailable")
-  expect_true(exists(active$capability, envir = dsFlower:::.handle_registry,
+  state_a <- dsFlower:::.flower_session_state(owner_a, create = FALSE)
+  expect_true(exists(active$capability, envir = state_a$handles,
                      inherits = FALSE))
 
-  rm(list = active$capability, envir = dsFlower:::.handle_registry)
+  expect_null(evalq(flowerDestroyDS("active"), owner_a))
+  expect_false(exists("active", envir = owner_a, inherits = FALSE))
+  expect_identical(
+    state_a$handles[[active$capability]],
+    dsFlower:::.dsflower_handle_tombstone)
+  assign("active", active, envir = owner_a)
   expect_null(evalq(flowerDestroyDS("active"), owner_a))
   expect_false(exists("active", envir = owner_a, inherits = FALSE))
 
   forged <- structure(list(capability = paste0("hdl_", strrep("f", 32))),
                       class = "dsflower_handle_ref")
   assign("forged", forged, envir = owner_a)
-  expect_null(evalq(flowerDestroyDS("forged"), owner_a))
-  expect_false(exists("forged", envir = owner_a, inherits = FALSE))
+  expect_error(evalq(flowerDestroyDS("forged"), owner_a), "unavailable")
+  expect_true(exists("forged", envir = owner_a, inherits = FALSE))
 
   assign("malformed", list(capability = "not-a-capability"), envir = owner_a)
   expect_error(evalq(flowerDestroyDS("malformed"), owner_a), "unavailable")
@@ -149,7 +157,8 @@ test_that("handle resolution never falls back to a global session", {
   local_interface_privacy_state()
   global_reference <- dsFlower:::.registerHandle(
     mock_handle(), owner_env = .GlobalEnv)
-  registry <- dsFlower:::.handle_registry
+  registry <- dsFlower:::.flower_session_state(
+    .GlobalEnv, create = FALSE)$handles
   assign("global_only_flower_handle", global_reference, envir = .GlobalEnv)
   withr::defer({
     if (exists("global_only_flower_handle", envir = .GlobalEnv,
@@ -173,6 +182,28 @@ test_that("handle resolution never falls back to a global session", {
     "session.csv"
   )
   evalq(dsFlower:::.removeHandle("session_flower_handle"), session)
+})
+
+test_that("private Flower session state is hidden, locked, and collectable", {
+  collected <- tempfile("dsflower-session-collected-")
+  local({
+    owner <- new.env(parent = emptyenv())
+    reference <- dsFlower:::.registerHandle(
+      mock_handle(table_data = data.frame(secret = 1L)), owner_env = owner)
+    state <- dsFlower:::.flower_session_state(owner, create = FALSE)
+    expect_true(bindingIsLocked(
+      dsFlower:::.DSFLOWER_SESSION_STATE_BINDING, owner))
+    expect_true(environmentIsLocked(state))
+    expect_true(exists(
+      reference$capability, envir = state$handles, inherits = FALSE))
+    reg.finalizer(state, function(e) file.create(collected), onexit = FALSE)
+  })
+
+  for (attempt in seq_len(10L)) {
+    gc()
+    if (file.exists(collected)) break
+  }
+  expect_true(file.exists(collected))
 })
 
 test_that("opaque handles preserve the legitimate DSLite assign flow", {
@@ -370,9 +401,9 @@ test_that("flowerInitDS consumes an independent dsImaging handle", {
     withr::defer(DSLite::dsDisconnect(connection_b))
     session_a <- server$getSession(connection_a@sid)
     session_b <- server$getSession(connection_b@sid)
-    imaging_registry <- dsImaging:::.imaging_handle_registry
     dslite_reference <- dsImaging:::.register_imaging_handle(
       imaging, session_a)
+    imaging_registry <- dsImaging:::.imaging_session_state(session_a)$handles
     assign("img", dslite_reference, envir = session_a)
     assign("img", dslite_reference, envir = session_b)
 

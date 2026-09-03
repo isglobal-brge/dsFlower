@@ -311,6 +311,33 @@
   ))
 }
 
+# Require the public training vocabulary to be the manifest-declared ordered
+# vocabulary. This runs before a run token is created or any feature/image
+# table is staged, so a mismatch cannot be totalised into a silent relabelling.
+.validateImagingTargetLevels <- function(desc, run_config) {
+  metadata <- if (is.list(desc$manifest)) desc$manifest$metadata else NULL
+  declared <- if (is.list(metadata)) metadata$label_levels %||% NULL else NULL
+  if (is.null(declared)) return(invisible(TRUE))
+  declared <- enc2utf8(as.character(unlist(declared, use.names = FALSE)))
+  supplied <- if (identical(run_config[["dp-track"]], "association")) {
+    run_config[["association-outcome-levels"]] %||% NULL
+  } else {
+    run_config[["target-levels"]] %||% NULL
+  }
+  if (!length(declared) || anyNA(declared) || anyDuplicated(declared) ||
+      !is.list(supplied) || is.null(supplied$values)) {
+    stop("Imaging training requires the manifest-declared ordered target levels.",
+         call. = FALSE)
+  }
+  supplied <- enc2utf8(as.character(unlist(
+    supplied$values, use.names = FALSE)))
+  if (!identical(supplied, declared)) {
+    stop("Public target levels do not match the imaging manifest label_levels.",
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
 # Apply a validated imaging privacy unit without consulting global options.
 .prepareImagingPrivacyUnitFrame <- function(data, unit_policy) {
   policy <- .resolvePrivacyUnitPolicy(unit_policy)
@@ -370,11 +397,15 @@
 #' Resolve an explicit, identifier-free tabular model feature set
 #' @keywords internal
 .resolveModelFeatures <- function(data, target_column, feature_columns,
-                                  patient_column) {
+                                  patient_column,
+                                  identity_columns = character()) {
   resolved <- if (is.null(feature_columns)) {
-    setdiff(names(data), c(as.character(target_column), patient_column))
+    setdiff(names(data), c(
+      as.character(target_column), patient_column, identity_columns))
   } else {
-    .excludePatientFeature(feature_columns, patient_column)
+    setdiff(
+      .excludePatientFeature(feature_columns, patient_column),
+      identity_columns)
   }
   resolved <- unique(as.character(unlist(resolved, use.names = FALSE)))
   resolved <- resolved[nzchar(resolved)]
@@ -1005,18 +1036,33 @@
 #' @return Character; path to the staging directory.
 #' @keywords internal
 .stageData <- function(data, run_token, target_column,
-                       feature_columns = NULL, extra_config = list()) {
+                       feature_columns = NULL, extra_config = list(),
+                       unit_policy = NULL,
+                       identity_columns = character()) {
   extra_config <- .validate_manifest_extra_config(extra_config)
+  identity_columns <- unique(as.character(unlist(
+    identity_columns, use.names = FALSE)))
+  if (anyNA(identity_columns) || any(!nzchar(identity_columns)) ||
+      any(!identity_columns %in% names(data)) ||
+      length(intersect(identity_columns, as.character(target_column)))) {
+    stop("Imaging feature-view identity columns are invalid.", call. = FALSE)
+  }
   if (identical(extra_config[["dp-track"]], "association")) {
     return(.stageAssociationData(
-      data, run_token, target_column, feature_columns, extra_config))
+      data, run_token, target_column, feature_columns, extra_config,
+      unit_policy = unit_policy, identity_columns = identity_columns))
   }
   data <- .transformPublicTarget(data, target_column, extra_config)
-  unit <- .prepareDpUnitFrame(data)
+  unit <- if (is.null(unit_policy)) {
+    .prepareDpUnitFrame(data)
+  } else {
+    .prepareImagingPrivacyUnitFrame(data, unit_policy)
+  }
   data <- unit$data
   patient_column <- unit$patient_column
   feature_columns <- .resolveModelFeatures(
-    data, target_column, feature_columns, patient_column)
+    data, target_column, feature_columns, patient_column,
+    identity_columns = identity_columns)
   data <- .totalizeModelFeatures(data, feature_columns, extra_config)
   prepared <- .prepareTrainingFrame(
     data,
@@ -1027,6 +1073,9 @@
     patient_column = patient_column
   )
   data <- prepared$data
+  for (column in setdiff(identity_columns, names(data))) {
+    data[[column]] <- unit$data[[column]]
+  }
 
   staging_dir <- .ensureStagingDir(run_token)
 
@@ -1233,7 +1282,7 @@
          call. = FALSE)
   }
 
-  if (identical(kind, "in_memory_df")) {
+  if (kind %in% c("in_memory_df", "imaging_feature_view")) {
     return(.stageFromDescriptor_df(desc, run_token, target_column,
                                     feature_columns, extra_config))
   }
@@ -1298,11 +1347,20 @@
                                      feature_columns, extra_config) {
   df <- desc$table_data
   if (is.null(df) || !is.data.frame(df)) {
-    stop("Descriptor source_kind='in_memory_df' but no table_data found.",
+    stop("Tabular descriptor has no table_data.",
          call. = FALSE)
   }
   .validateDataSchema(df, target_column, feature_columns)
-  .stageData(df, run_token, target_column, feature_columns, extra_config)
+  if (identical(desc$source_kind, "imaging_feature_view")) {
+    unit_policy <- .imagingPrivacyUnitPolicy(desc)
+    identity_columns <- desc$manifest$metadata$id_col %||% character(0)
+  } else {
+    unit_policy <- NULL
+    identity_columns <- character(0)
+  }
+  .stageData(
+    df, run_token, target_column, feature_columns, extra_config,
+    unit_policy = unit_policy, identity_columns = identity_columns)
 }
 
 #' Stage from a staged Parquet descriptor
@@ -1588,6 +1646,107 @@
 .knownImageExtensions <- function() {
   c(".nii.gz", ".nii", ".nrrd", ".mha", ".mhd", ".dcm",
     ".png", ".jpg", ".jpeg", ".tif", ".tiff")
+}
+
+.imagePayloadExtension <- function(path) {
+  lower <- tolower(path)
+  matches <- .knownImageExtensions()[vapply(
+    .knownImageExtensions(), function(ext) endsWith(lower, ext), logical(1))]
+  if (!length(matches)) "" else matches[[1]]
+}
+
+.boundedMedicalHeaderLines <- function(path, stop_at_blank = FALSE,
+                                       stop_pattern = NULL,
+                                       max_bytes = 1024L * 1024L) {
+  con <- file(path, open = "rb")
+  on.exit(close(con), add = TRUE)
+  prefix <- readBin(con, what = "raw", n = max_bytes + 1L)
+  line_ends <- which(prefix == as.raw(0x0a))
+  if (!length(line_ends)) {
+    stop("The medical-image header is invalid or exceeds the safety limit.",
+         call. = FALSE)
+  }
+
+  lines <- character(0)
+  start <- 1L
+  for (line_end in line_ends) {
+    bytes <- if (line_end > start) {
+      prefix[seq.int(start, line_end - 1L)]
+    } else {
+      raw(0)
+    }
+    if (length(bytes) && identical(bytes[[length(bytes)]], as.raw(0x0d))) {
+      bytes <- bytes[-length(bytes)]
+    }
+    if (any(bytes == as.raw(0x00))) {
+      stop("The medical-image header is invalid or exceeds the safety limit.",
+           call. = FALSE)
+    }
+    line <- rawToChar(bytes)
+    lines <- c(lines, line)
+    if (isTRUE(stop_at_blank) && !nzchar(line)) return(lines)
+    if (!is.null(stop_pattern) && grepl(
+      stop_pattern, line, ignore.case = TRUE)) return(lines)
+    start <- line_end + 1L
+  }
+  lines
+}
+
+#' Reject image containers that can resolve undeclared sidecar payloads
+#'
+#' The Python decoder totalizes corrupt record-local images. Container shape,
+#' however, is a collection-level precondition: every accepted sample must be
+#' one self-contained file. Validate that contract while the sealed files are
+#' still in private staging, before a runner can start.
+#' @keywords internal
+.validateImagePayloadContract <- function(paths, image_root) {
+  paths <- unique(as.character(paths))
+  paths <- paths[!is.na(paths) & nzchar(paths) &
+                         paths != .DSFLOWER_INVALID_IMAGE_PATH]
+  if (!length(paths)) return(invisible(TRUE))
+
+  root <- normalizePath(image_root, winslash = "/", mustWork = TRUE)
+  for (relative_path in paths) {
+    extension <- .imagePayloadExtension(relative_path)
+    if (!nzchar(extension)) {
+      stop("Vision training supports only single-file NIfTI, inline NRRD/MHA, ",
+           "single-file DICOM, PNG, JPEG, and TIFF images.", call. = FALSE)
+    }
+    if (identical(extension, ".mhd")) {
+      stop("Detached NRRD/MHD payloads are not supported for vision training. ",
+           "Use inline NRRD/MHA or NIfTI instead.", call. = FALSE)
+    }
+    if (!extension %in% c(".nrrd", ".mha")) next
+
+    path <- file.path(root, relative_path)
+    if (identical(extension, ".nrrd")) {
+      header <- .boundedMedicalHeaderLines(path, stop_at_blank = TRUE)
+      if (!length(header) || nzchar(utils::tail(header, 1L))) {
+        stop("The NRRD header is invalid or exceeds the safety limit.",
+             call. = FALSE)
+      }
+      if (any(grepl(
+        "^[[:space:]]*(data[[:space:]]*file|datafile)[[:space:]]*:",
+        header, ignore.case = TRUE))) {
+        stop("Detached NRRD/MHD payloads are not supported for vision training. ",
+             "Use inline NRRD/MHA or NIfTI instead.", call. = FALSE)
+      }
+    } else {
+      header <- .boundedMedicalHeaderLines(
+        path,
+        stop_pattern = "^[[:space:]]*ElementDataFile[[:space:]]*=")
+      data_line <- grep(
+        "^[[:space:]]*ElementDataFile[[:space:]]*=", header,
+        ignore.case = TRUE, value = TRUE)
+      inline <- length(data_line) == 1L && identical(
+        tolower(trimws(sub("^[^=]*=", "", data_line[[1]]))), "local")
+      if (!isTRUE(inline)) {
+        stop("Detached NRRD/MHD payloads are not supported for vision training. ",
+             "Use inline NRRD/MHA or NIfTI instead.", call. = FALSE)
+      }
+    }
+  }
+  invisible(TRUE)
 }
 
 .stripKnownImageExtension <- function(path) {
@@ -2050,6 +2209,8 @@
       image_uri = image_asset$uri %||% NULL,
       downloaded_rels = downloaded_rels$images %||% character(0)
     )
+    .validateImagePayloadContract(
+      samples_df[[image_path_col]], validated_assets$images$root)
   }
   .writeStagedSamples(samples_df, staged_samples)
   n_samples <- nrow(samples_df)

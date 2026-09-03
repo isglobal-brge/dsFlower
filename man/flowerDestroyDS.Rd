@@ -16,5 +16,5 @@ NULL.
 DataSHIELD ASSIGN method. Full cleanup: removes staging, stops
 the associated SuperNode, and removes the handle. A retry is idempotent only
 when the same session still contains the well-formed opaque reference after
-its private registry entry has already been removed.
+its private payload has already been removed.
 }

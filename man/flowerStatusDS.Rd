@@ -14,5 +14,6 @@ Named list with status information.
 }
 \description{
 DataSHIELD AGGREGATE method. Returns the current status of the handle
-including whether data is prepared and a SuperNode is ensured.
+including whether data is prepared, a SuperNode is ensured, and the
+server-authored privacy unit effective for this handle.
 }

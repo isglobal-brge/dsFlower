@@ -769,6 +769,89 @@ test_that("vision staging rejects multi-file samples before materialization", {
     "Convert DICOM series to one NIfTI")
 })
 
+test_that("vision payload contract accepts only supported self-contained files", {
+  root <- withr::local_tempdir()
+  write_payload <- function(name, bytes) {
+    path <- file.path(root, name)
+    writeBin(bytes, path)
+    path
+  }
+  write_payload("inline.nrrd", c(
+    charToRaw(paste0(
+      "NRRD0005\n", "type: uint8\n", "dimension: 2\n",
+      "sizes: 1 1\n", "encoding: raw\n\n")), as.raw(0)))
+  write_payload("inline.mha", c(
+    charToRaw(paste0(
+      "ObjectType = Image\n", "NDims = 2\n", "DimSize = 1 1\n",
+      "ElementType = MET_UCHAR\n", "ElementDataFile = LOCAL\n")),
+    as.raw(c(0, 10, 0))))
+  for (name in c("scan.nii", "scan.nii.gz", "scan.dcm", "scan.png",
+                 "scan.jpg", "scan.jpeg", "scan.tif", "scan.tiff")) {
+    write_payload(name, charToRaw("placeholder"))
+  }
+
+  expect_invisible(dsFlower:::.validateImagePayloadContract(
+    c("inline.nrrd", "inline.mha", "scan.nii", "scan.nii.gz", "scan.dcm",
+      "scan.png", "scan.jpg", "scan.jpeg", "scan.tif", "scan.tiff"),
+    root))
+
+  write_payload("detached.nrrd", charToRaw(paste0(
+    "NRRD0005\n", "type: uint8\n", "dimension: 2\n", "sizes: 1 1\n",
+    "encoding: raw\n", "data file: private.raw\n\n")))
+  write_payload("detached.mha", charToRaw(paste0(
+    "ObjectType = Image\n", "ElementDataFile = private.raw\n")))
+  write_payload("detached.mhd", charToRaw(paste0(
+    "ObjectType = Image\n", "ElementDataFile = private.raw\n")))
+  write_payload("slide.svs", charToRaw("placeholder"))
+
+  for (name in c("detached.nrrd", "detached.mha", "detached.mhd")) {
+    expect_error(
+      dsFlower:::.validateImagePayloadContract(name, root),
+      "Detached NRRD/MHD payloads are not supported")
+  }
+  expect_error(
+    dsFlower:::.validateImagePayloadContract("slide.svs", root),
+    "supports only single-file")
+})
+
+test_that("detached medical payloads fail staging before a run manifest exists", {
+  image_root <- withr::local_tempdir()
+  staging_root <- withr::local_tempdir()
+  withr::local_options(list(dsflower.staging_root = staging_root))
+  metadata <- .test_imaging_metadata("patient_id")
+
+  stage_detached <- function(name, contents, token_index) {
+    writeBin(charToRaw(contents), file.path(image_root, name))
+    desc <- list(
+      metadata = metadata,
+      table_data = data.frame(
+        sample_id = c("sample-a", "sample-b"),
+        patient_id = c("patient-a", "patient-b"),
+        relative_path = name,
+        label = c(0L, 1L)),
+      assets = list(images = list(
+        type = "image_root", root = image_root,
+        path_col = "relative_path")),
+      manifest = list(metadata = metadata),
+      dataset_id = "detached-payload-test")
+    token <- .test_run_token(token_index)
+    expect_error(
+      dsFlower:::.stageFromDescriptor_image(
+        desc, token, "label", NULL, list()),
+      "Detached NRRD/MHD payloads are not supported")
+    expect_false(file.exists(file.path(staging_root, token, "manifest.json")))
+  }
+
+  stage_detached(
+    "scan.nrrd",
+    paste0("NRRD0005\n", "type: uint8\n", "dimension: 2\n",
+           "sizes: 1 1\n", "data file: private.raw\n\n"),
+    112)
+  stage_detached(
+    "scan.mhd", "ObjectType = Image\nElementDataFile = private.raw\n",
+    113)
+})
+
 test_that("image metadata paths cannot escape their configured root", {
   expect_equal(
     dsFlower:::.safeRelativeAssetPath("nested/scan.png"),

@@ -4,7 +4,13 @@
 \alias{.resolveModelFeatures}
 \title{Resolve an explicit, identifier-free tabular model feature set}
 \usage{
-.resolveModelFeatures(data, target_column, feature_columns, patient_column)
+.resolveModelFeatures(
+  data,
+  target_column,
+  feature_columns,
+  patient_column,
+  identity_columns = character()
+)
 }
 \description{
 Resolve an explicit, identifier-free tabular model feature set

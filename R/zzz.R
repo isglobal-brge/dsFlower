@@ -7,9 +7,40 @@
 # Session-level transport state
 .dsflower_env <- new.env(parent = emptyenv())
 
-# Authoritative Flower-handle state. Session workspaces receive only an opaque
-# capability; sensitive paths, data and lifecycle flags stay in this registry.
-.handle_registry <- new.env(parent = emptyenv())
+# Authoritative Flower-handle state lives with the DataSHIELD session rather
+# than in a package-global registry. The hidden binding is locked against
+# rebinding; releasing the session environment releases its private tables,
+# staging metadata, and lifecycle state without requiring explicit destroy.
+.DSFLOWER_SESSION_STATE_BINDING <- ".dsflower_private_state_v1"
+.dsflower_session_state_marker <- new.env(parent = emptyenv())
+.dsflower_handle_tombstone <- new.env(parent = emptyenv())
+
+.flower_session_state <- function(owner_env, create = FALSE) {
+  if (!is.environment(owner_env)) {
+    stop("Invalid Flower session environment.", call. = FALSE)
+  }
+  binding <- .DSFLOWER_SESSION_STATE_BINDING
+  if (exists(binding, envir = owner_env, inherits = FALSE)) {
+    state <- get(binding, envir = owner_env, inherits = FALSE)
+    valid <- is.environment(state) &&
+      identical(state$marker, .dsflower_session_state_marker) &&
+      is.environment(state$handles) &&
+      bindingIsLocked(binding, owner_env) && environmentIsLocked(state)
+    if (!isTRUE(valid)) {
+      stop("Flower private session state is unavailable.", call. = FALSE)
+    }
+    return(state)
+  }
+  if (!isTRUE(create)) return(NULL)
+
+  state <- new.env(parent = emptyenv())
+  state$marker <- .dsflower_session_state_marker
+  state$handles <- new.env(parent = emptyenv())
+  lockEnvironment(state, bindings = TRUE)
+  assign(binding, state, envir = owner_env)
+  lockBinding(binding, owner_env)
+  state
+}
 
 # SuperNode singleton registry -- keyed by SuperLink address
 .supernode_registry <- new.env(parent = emptyenv())

@@ -40,7 +40,8 @@
   descriptor <- handle$descriptor
   source_kind <- descriptor$source_kind %||% handle$source_kind
   if (!identical(handle$source, "descriptor") || is.null(descriptor) ||
-      !source_kind %in% c("image_bundle", "imaging_resource")) {
+      !source_kind %in% c(
+        "image_bundle", "imaging_resource", "imaging_feature_view")) {
     return(NULL)
   }
   descriptor
