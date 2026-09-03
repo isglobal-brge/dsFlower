@@ -28,6 +28,7 @@ Suggests:
     DSI,
     resourcer,
     dsImaging (>= 0.3.5),
+    R6,
     testthat (>= 3.0.0),
     withr,
     DSLite,
