@@ -12,6 +12,10 @@ sys.path.insert(0, REPO_ROOT)
 from inst.python import supernode_reaper
 
 
+@unittest.skipUnless(
+    all(hasattr(os, name) for name in ("fork", "killpg", "waitpid")),
+    "POSIX process-group primitives are unavailable",
+)
 class SuperNodeReaperTests(unittest.TestCase):
     def test_echild_does_not_hide_a_live_descendant_process_group(self):
         with (mock.patch.object(supernode_reaper, "_set_child_subreaper"),

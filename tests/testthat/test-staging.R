@@ -657,6 +657,7 @@ test_that("image descriptor and root failures remain global preconditions", {
 })
 
 test_that("S3 image descriptors stage metadata and assets without credentials", {
+  skip_if_not_installed("dsImaging")
   root <- withr::local_tempdir()
   withr::local_options(list(dsflower.staging_root = root))
   metadata_uri <- "s3://imaging/site/metadata/samples.csv"
