@@ -503,19 +503,29 @@
 
 #' Stop a SuperNode
 #'
-#' Sends SIGTERM, waits 5 seconds, then SIGKILL if needed.
-#' Removes from registry.
+#' Sends SIGTERM, waits for the configured grace period, then SIGKILL if needed.
+#' Removes from the registry only after termination is verified.
 #'
 #' @param manifest_dir Character; the manifest directory (registry key).
 #' @return Invisible TRUE.
 #' @keywords internal
 .supernode_stop <- function(manifest_dir) {
   stop_pid <- function(pid) {
-    .terminate_supernode_pid(pid)   # SIGTERM + drain (wrapper reaps subtree) + SIGKILL last resort
+    .terminate_supernode_pid(pid)   # SIGTERM + drain; SIGKILL is last resort
+    if (.pid_is_alive(pid)) {
+      stop("SuperNode cleanup did not complete.", call. = FALSE)
+    }
     .remove_supernode_pid(pid)
   }
 
-  entry <- .supernode_lookup(manifest_dir)
+  # Do not use .supernode_lookup(): it discards a registry entry as soon as its
+  # processx object says "dead", before the OS PID and stale peers are verified.
+  entry <- if (exists(manifest_dir, envir = .supernode_registry,
+                      inherits = FALSE)) {
+    get(manifest_dir, envir = .supernode_registry, inherits = FALSE)
+  } else {
+    NULL
+  }
   if (is.null(entry)) {
     # Cleanup can run in a different Rserve process than the one that spawned
     # the SuperNode. In that case the processx object is not in this registry,
@@ -528,24 +538,52 @@
         stop_pid(pid)
       }
     }
+    remaining <- .list_supernode_processes()
+    if (nrow(remaining) > 0L && any(
+        !is.na(remaining$manifest_dir) &
+        remaining$manifest_dir == manifest_dir)) {
+      stop("SuperNode cleanup did not complete.", call. = FALSE)
+    }
     return(invisible(TRUE))
   }
 
   proc <- entry$process
-  pid <- entry$pid
+  pid <- suppressWarnings(as.integer(entry$pid))
+  if (length(pid) != 1L || is.na(pid) || pid <= 0L) {
+    stop("SuperNode cleanup did not complete.", call. = FALSE)
+  }
   tryCatch({
-    if (proc$is_alive()) {
+    if (!is.null(proc) && isTRUE(proc$is_alive())) {
       proc$signal(15L)  # SIGTERM -> wrapper drains its supernode group + reaps the subtree
       proc$wait(timeout = 15000)   # generous: let the wrapper finish reaping before SIGKILL
-      if (proc$is_alive()) {
+      if (isTRUE(proc$is_alive())) {
         proc$kill()
       }
     }
   }, error = function(e) NULL)
 
-  if (.pid_is_alive(pid)) stop_pid(pid)
-
-  # Remove PID file
+  # A bare PID may already belong to an unrelated process after the tracked
+  # child exits. Prefer the processx identity; only fall back to a raw PID when
+  # the live process can still be tied to this exact manifest directory.
+  proc_alive <- if (is.null(proc)) NA else tryCatch(
+    isTRUE(proc$is_alive()), error = function(e) NA)
+  if (isTRUE(proc_alive)) {
+    .terminate_supernode_pid(pid)
+    proc_alive <- tryCatch(
+      isTRUE(proc$is_alive()), error = function(e) NA)
+    if (!identical(proc_alive, FALSE)) {
+      stop("SuperNode cleanup did not complete.", call. = FALSE)
+    }
+  } else if (is.na(proc_alive) && .pid_is_alive(pid)) {
+    discovered <- .list_supernode_processes()
+    same_process <- nrow(discovered) > 0L && any(
+      discovered$pid == pid & !is.na(discovered$manifest_dir) &
+      discovered$manifest_dir == manifest_dir, na.rm = TRUE)
+    if (!same_process) {
+      stop("SuperNode cleanup did not complete.", call. = FALSE)
+    }
+    stop_pid(pid)
+  }
   .remove_supernode_pid(pid)
 
   # A stale SuperNode may be visible by manifest_dir even if the processx
@@ -555,8 +593,15 @@
     matches <- procs[!is.na(procs$manifest_dir) &
                        procs$manifest_dir == manifest_dir, , drop = FALSE]
     for (match_pid in matches$pid) {
-      if (match_pid != pid) stop_pid(match_pid)
+      stop_pid(match_pid)
     }
+  }
+
+  remaining <- .list_supernode_processes()
+  if (nrow(remaining) > 0L && any(
+      !is.na(remaining$manifest_dir) &
+      remaining$manifest_dir == manifest_dir)) {
+    stop("SuperNode cleanup did not complete.", call. = FALSE)
   }
 
   key <- manifest_dir
@@ -643,10 +688,26 @@
 #' Remove a PID file for a SuperNode
 #' @keywords internal
 .remove_supernode_pid <- function(pid) {
-  tryCatch({
+  pid <- suppressWarnings(as.integer(pid))
+  if (length(pid) != 1L || is.na(pid) || pid <= 0L) {
+    stop("SuperNode cleanup did not complete.", call. = FALSE)
+  }
+  removed <- tryCatch({
     pid_file <- file.path(.supernode_pid_dir(), paste0(pid, ".pid"))
-    if (file.exists(pid_file)) unlink(pid_file)
-  }, error = function(e) NULL)
+    ok <- TRUE
+    if (file.exists(pid_file) || dir.exists(pid_file) ||
+        .privacy_path_is_link(pid_file)) {
+      rc <- unlink(pid_file)
+      ok <- length(rc) == 1L && !is.na(rc) && rc == 0L &&
+        !file.exists(pid_file) && !dir.exists(pid_file) &&
+        !.privacy_path_is_link(pid_file)
+    }
+    ok
+  }, error = function(e) FALSE)
+  if (!isTRUE(removed)) {
+    stop("SuperNode cleanup did not complete.", call. = FALSE)
+  }
+  invisible(TRUE)
 }
 
 #' Read tracked SuperNode PIDs from the shared PID directory
@@ -726,15 +787,34 @@
 .terminate_supernode_pid <- function(pid) {
   grace <- suppressWarnings(as.numeric(.dsf_option("supernode_term_grace", 15)))
   if (is.na(grace) || grace < 1) grace <- 15
-  tryCatch({
-    if (!.pid_is_alive(pid)) return(invisible(TRUE))
-    tools::pskill(pid, signal = 15L)
-    waited <- 0
-    while (waited < grace && .pid_is_alive(pid)) {
-      Sys.sleep(0.5); waited <- waited + 0.5
+  stopped <- tryCatch({
+    if (!.pid_is_alive(pid)) {
+      TRUE
+    } else {
+      signalled <- tools::pskill(pid, signal = 15L)
+      signal_ok <- isTRUE(signalled) || !.pid_is_alive(pid)
+      waited <- 0
+      while (signal_ok && waited < grace && .pid_is_alive(pid)) {
+        Sys.sleep(0.5); waited <- waited + 0.5
+      }
+      if (!signal_ok) {
+        FALSE
+      } else if (.pid_is_alive(pid)) {
+        killed <- tools::pskill(pid, signal = 9L)   # last resort
+        kill_ok <- isTRUE(killed) || !.pid_is_alive(pid)
+        waited <- 0
+        while (kill_ok && waited < 5 && .pid_is_alive(pid)) {
+          Sys.sleep(0.1); waited <- waited + 0.1
+        }
+        kill_ok && !.pid_is_alive(pid)
+      } else {
+        TRUE
+      }
     }
-    if (.pid_is_alive(pid)) tools::pskill(pid, signal = 9L)   # last resort
-  }, error = function(e) NULL)
+  }, error = function(e) FALSE)
+  if (!isTRUE(stopped)) {
+    stop("SuperNode cleanup did not complete.", call. = FALSE)
+  }
   invisible(TRUE)
 }
 

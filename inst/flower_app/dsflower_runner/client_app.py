@@ -156,7 +156,7 @@ def _replay_reply(context, claim, msg):
             execution_unavailable=bool(meta.get(
                 "execution-unavailable", 0)))
     # Defensive fallback for inconsistent or externally-mutated Context state.
-    # The stateless guard normally returns ``new`` when reply bytes are absent.
+    # The sticky guard returns ``replay`` only while these exact bytes are cached.
     return _safe_fallback_reply(
         msg, context, claim=claim, execution_unavailable=True)
 
@@ -1090,7 +1090,7 @@ def train(msg: Message, context: Context) -> Message:
         # tighter track, and the neural track only ever runs the hash-verified harness.
         track = dp_harness.resolve_dp_track(cfg, load_dp_track(context))
         pcfg = load_privacy_config(context)
-        # The node-written manifest is authoritative. The stateless guard validates
+        # The node-written manifest is authoritative. The sticky guard validates
         # its fixed policy and returns those exact per-training values.
         pcfg["epsilon"] = float(claim["epsilon"])
         pcfg["delta"] = float(claim["delta"])

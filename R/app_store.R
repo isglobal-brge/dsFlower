@@ -47,7 +47,7 @@
       finally = Sys.umask(old_umask)
     )
     if (!isTRUE(created) && !dir.exists(root)) {
-      stop("Could not create app spool root: ", root, call. = FALSE)
+      stop("App spool storage is unavailable.", call. = FALSE)
     }
   }
   if (.path_is_symlink(root) || !dir.exists(root)) {
@@ -471,6 +471,7 @@
 #' @keywords internal
 #' @export
 flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
+  .dsflower_require_literal_arguments()
   token <- .validate_app_token(.ds_arg(token))
   .with_app_lock(token, {
     cap <- .max_fab_bytes()
@@ -680,6 +681,7 @@ flowerAppPushDS <- function(token, chunk_b64 = "", offset = NULL) {
 #' @keywords internal
 #' @export
 flowerAppInstallDS <- function(token, expected_sha256) {
+  .dsflower_require_literal_arguments()
   token <- .validate_app_token(.ds_arg(token))
   .with_app_lock(token, {
     cap <- .max_fab_bytes()
@@ -732,8 +734,8 @@ flowerAppInstallDS <- function(token, expected_sha256) {
                call. = FALSE)
         }
         unlink(spool, recursive = TRUE)
-        stop("Uploaded app is an unsafe FAB archive (", extracted$first,
-             "); rejected.", call. = FALSE)
+        stop("Uploaded app is an unsafe FAB archive; rejected.",
+             call. = FALSE)
       }
       .assert_app_spool_quota(root, policy)
 
@@ -784,6 +786,7 @@ flowerAppInstallDS <- function(token, expected_sha256) {
 #' @keywords internal
 #' @export
 flowerTier2PinDS <- function(handle_symbol, app_token) {
+  .dsflower_require_literal_arguments()
   handle <- .validateHandleStaging(.getHandle(handle_symbol), required = TRUE)
   app_token <- .validate_app_token(.ds_arg(app_token))
   .with_app_lock(app_token, {
@@ -831,9 +834,10 @@ flowerTier2PinDS <- function(handle_symbol, app_token) {
 
     manifest_path <- file.path(handle$staging_dir, "manifest.json")
     manifest <- tryCatch(
-      jsonlite::fromJSON(manifest_path, simplifyVector = FALSE),
-      error = function(e) stop("Prepared run manifest is unreadable: ",
-                               conditionMessage(e), call. = FALSE))
+      suppressWarnings(jsonlite::fromJSON(
+        manifest_path, simplifyVector = FALSE)),
+      error = function(e) stop("Prepared run manifest is unreadable.",
+                               call. = FALSE))
     manifest[["user-module"]] <- user_module
     .write_manifest_atomic(manifest, manifest_path)
     writeLines(apps_dir, file.path(handle$staging_dir, "tier2_pythonpath.txt"))
@@ -847,6 +851,7 @@ flowerTier2PinDS <- function(handle_symbol, app_token) {
 #' @keywords internal
 #' @export
 flowerAppDeleteDS <- function(token) {
+  .dsflower_require_literal_arguments()
   token <- .validate_app_token(.ds_arg(token))
   .with_app_lock(token, {
     .with_app_store_lock({

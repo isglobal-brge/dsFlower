@@ -282,6 +282,53 @@
   )
 }
 
+# Read the mandatory per-dataset patient unit from an imaging manifest.
+.imagingPrivacyUnitPolicy <- function(desc) {
+  metadata <- if (is.list(desc$manifest)) desc$manifest$metadata else NULL
+  if (!is.list(metadata) ||
+      !is.character(metadata$privacy_unit) ||
+      length(metadata$privacy_unit) != 1L ||
+      is.na(metadata$privacy_unit) ||
+      !identical(metadata$privacy_unit, "patient") ||
+      !is.character(metadata$privacy_unit_col) ||
+      length(metadata$privacy_unit_col) != 1L ||
+      is.na(metadata$privacy_unit_col) ||
+      !nzchar(trimws(metadata$privacy_unit_col)) ||
+      !is.character(metadata$privacy_unit_canonicalization) ||
+      length(metadata$privacy_unit_canonicalization) != 1L ||
+      is.na(metadata$privacy_unit_canonicalization) ||
+      !identical(metadata$privacy_unit_canonicalization, "trim-utf8-v2")) {
+    stop(
+      "Imaging metadata must declare privacy_unit='patient', one non-empty ",
+      "privacy_unit_col, and privacy_unit_canonicalization='trim-utf8-v2'.",
+      call. = FALSE
+    )
+  }
+  .resolvePrivacyUnitPolicy(list(
+    dp_unit = metadata$privacy_unit,
+    patient_column = metadata$privacy_unit_col,
+    canonicalization = metadata$privacy_unit_canonicalization
+  ))
+}
+
+# Apply a validated imaging privacy unit without consulting global options.
+.prepareImagingPrivacyUnitFrame <- function(data, unit_policy) {
+  policy <- .resolvePrivacyUnitPolicy(unit_policy)
+  if (!is.data.frame(data) || !policy$patient_column %in% names(data)) {
+    stop("Imaging metadata is missing its declared privacy-unit column.",
+         call. = FALSE)
+  }
+  ids <- .canonicalPatientIdText(data[[policy$patient_column]])
+  ids[.invalidPatientIds(ids)] <- "__dsflower_missing_patient_unit__"
+  data[[policy$patient_column]] <- ids
+  list(
+    data = data,
+    dp_unit = policy$dp_unit,
+    patient_column = policy$patient_column,
+    canonicalization = policy$canonicalization
+  )
+}
+
 #' Count the privacy units in the exact frame consumed by training
 #'
 #' This is an internal staging invariant, not an analyst-visible statistic.
@@ -767,7 +814,7 @@
 # This is input validation, not an authorization or privacy-permission catalogue.
 .client_run_config_fields <- function() {
   c(
-    "dp-track", "data_type", "task-type", "task_type", "label_set",
+    "dp-track", "data_type", "task-type", "task_type",
     "num-server-rounds", "num-features", "num-classes", "num-labels",
     "feature-bounds", "target-bounds", "target-levels",
     "model-spec-b64", "loss-name", "local-epochs", "batch-size",
@@ -1043,10 +1090,15 @@
   # Check every permitted root. Exact token validation and canonical containment
   # happen before recursive deletion; traversal and symlink aliases fail closed.
   for (staging_dir in .expectedStagingDirs(run_token, create_roots = FALSE)) {
-    if (dir.exists(staging_dir)) {
-      staging_dir <- .validateStagingDir(
-        staging_dir, run_token, must_exist = TRUE)
-      unlink(staging_dir, recursive = TRUE)
+    staging_dir <- .validateStagingDir(
+      staging_dir, run_token, must_exist = FALSE)
+    if (file.exists(staging_dir) || dir.exists(staging_dir)) {
+      removed <- unlink(staging_dir, recursive = TRUE)
+      if (length(removed) != 1L || is.na(removed) || removed != 0L ||
+          file.exists(staging_dir) || dir.exists(staging_dir) ||
+          .privacy_path_is_link(staging_dir)) {
+        stop("Staging cleanup did not complete.", call. = FALSE)
+      }
     }
   }
   invisible(TRUE)
@@ -1562,40 +1614,6 @@
   .readStagedSamples(sm_file)
 }
 
-#' Left-join private image labels without changing the sample roster
-#'
-#' Missing, blank, or duplicate label identifiers are record-local failures:
-#' they produce missing label cells which the public target contract totalizes.
-#' Missing join columns remain a descriptor-schema error.
-#' @keywords internal
-.leftJoinImageLabels <- function(samples_df, labels_df) {
-  if (!is.data.frame(samples_df) || !is.data.frame(labels_df) ||
-      !("sample_id" %in% names(samples_df)) ||
-      !("sample_id" %in% names(labels_df))) {
-    stop("Image sample and label metadata must contain a sample_id column.",
-         call. = FALSE)
-  }
-  label_columns <- setdiff(names(labels_df), "sample_id")
-  if (!length(label_columns)) {
-    stop("Image label metadata must contain at least one label column.",
-         call. = FALSE)
-  }
-
-  sample_ids <- .canonicalPatientIdText(samples_df$sample_id)
-  label_ids <- .canonicalPatientIdText(labels_df$sample_id)
-  sample_invalid <- .invalidPatientIds(sample_ids)
-  label_invalid <- .invalidPatientIds(label_ids)
-  label_duplicate <- duplicated(label_ids) | duplicated(label_ids, fromLast = TRUE)
-  label_ids[label_invalid | label_duplicate] <- NA_character_
-
-  match_index <- match(sample_ids, label_ids)
-  match_index[sample_invalid] <- NA_integer_
-  for (column in label_columns) {
-    samples_df[[column]] <- labels_df[[column]][match_index]
-  }
-  samples_df
-}
-
 .primaryFromFilesJson <- function(files_json) {
   if (is.null(files_json) || length(files_json) != 1L || is.na(files_json) ||
       !is.character(files_json) || !nzchar(files_json)) {
@@ -1759,8 +1777,34 @@
 .stageFromDescriptor_image <- function(desc, run_token, target_column,
                                         feature_columns, extra_config) {
   extra_config <- .validate_manifest_extra_config(extra_config)
+  collection_snapshot <- desc$.collection_snapshot %||% NULL
+  if (!is.null(collection_snapshot)) {
+    records <- collection_snapshot$records %||% list()
+    supported <- length(records) > 0L && all(vapply(records, function(record) {
+      is.list(record) && identical(record$source_kind, "single_file") &&
+        identical(as.integer(record$n_files), 1L)
+    }, logical(1)))
+    if (!isTRUE(supported)) {
+      stop("Multi-file imaging samples are not supported for vision training. ",
+           "Convert DICOM series to one NIfTI file per sample first.",
+           call. = FALSE)
+    }
+  }
+  imaging_unit_policy <- .imagingPrivacyUnitPolicy(desc)
+  if (imaging_unit_policy$patient_column %in%
+      as.character(unlist(target_column, use.names = FALSE))) {
+    stop("The imaging privacy-unit column cannot be a model target.",
+         call. = FALSE)
+  }
+  feature_columns <- .excludePatientFeature(
+    feature_columns, imaging_unit_policy$patient_column)
   meta <- desc$metadata
   assets <- desc$assets
+  if (!is.null(collection_snapshot)) {
+    # The current vision consumer is authorized only for the primary image
+    # pack. Other manifest assets require their own complete snapshot contract.
+    assets <- assets[intersect(names(assets), "images")]
+  }
   if (!is.list(assets) ||
       (length(assets) > 0L &&
        (is.null(names(assets)) || any(!nzchar(names(assets))) ||
@@ -1780,18 +1824,6 @@
   s3_metadata <- !is.null(meta$uri) && grepl("^s3://", meta$uri)
   s3_sample_manifests <- !is.null(desc$manifest$sample_manifests$uri) &&
     grepl("^s3://", desc$manifest$sample_manifests$uri)
-  selected_label <- extra_config[["label_set"]] %||% NULL
-  selected_label_uri <- NULL
-  if (!is.null(selected_label)) {
-    for (label in desc$manifest$labels %||% list()) {
-      if (identical(label$name, selected_label)) {
-        selected_label_uri <- label$uri %||% NULL
-        break
-      }
-    }
-  }
-  s3_labels <- !is.null(selected_label_uri) &&
-    grepl("^s3://", selected_label_uri)
   s3_assets <- any(vapply(names(assets), function(asset_name) {
     asset <- assets[[asset_name]]
     asset_type <- asset$type %||% asset$kind %||% "unknown"
@@ -1800,19 +1832,24 @@
       grepl("^s3://", uri)
   }, logical(1)))
   if (is.null(desc$backend) &&
-      (s3_metadata || s3_sample_manifests || s3_labels || s3_assets)) {
+      (s3_metadata || s3_sample_manifests || s3_assets)) {
     stop("Image bundle descriptor uses S3 objects but has no storage backend. ",
          "Initialize it with dsImaging before passing it to dsFlower.",
          call. = FALSE)
   }
 
   s3_asset_plans <- list()
-  required_bytes <- 0
+  required_bytes <- if (!is.null(collection_snapshot)) {
+    sum(vapply(collection_snapshot$records, function(record) {
+      as.numeric(record$size %||% 0)
+    }, numeric(1)))
+  } else 0
   for (asset_name in names(assets)) {
     asset <- assets[[asset_name]]
     asset_type <- asset$type %||% asset$kind %||% "unknown"
     s3_uri <- asset$uri %||% NULL
-    if (asset_type %in% dir_asset_types &&
+    if (!identical(asset_name, "images") &&
+        asset_type %in% dir_asset_types &&
         .imageAssetNeedsStaging(asset_name, asset_type, extra_config) &&
         !is.null(s3_uri) && grepl("^s3://", s3_uri) &&
         !is.null(desc$backend)) {
@@ -1827,6 +1864,25 @@
   # Stage metadata table (local file, S3 URI, or in-memory table)
   meta_file <- meta$file
   meta_uri <- meta$uri
+
+  if (!is.null(collection_snapshot)) {
+    artifact <- collection_snapshot$artifacts$metadata
+    samples_basename <- paste0("samples.", artifact$format)
+    staged_samples <- file.path(staging_dir, samples_basename)
+    copy_artifact <- utils::getFromNamespace(
+      ".copy_imaging_snapshot_artifact", "dsImaging")
+    copy_artifact(collection_snapshot, desc$backend, "metadata",
+                  staged_samples)
+    meta_file <- staged_samples
+
+    sample_manifest_artifact <- collection_snapshot$artifacts$sample_manifests
+    sample_manifest_file <- file.path(
+      staging_dir,
+      paste0("sample_manifests.", sample_manifest_artifact$format))
+    copy_artifact(collection_snapshot, desc$backend, "sample_manifests",
+                  sample_manifest_file)
+    desc$manifest$sample_manifests$file <- sample_manifest_file
+  }
 
   # If local file doesn't exist but S3 URI is available, download via backend
   if ((is.null(meta_file) || !file.exists(meta_file %||% "")) &&
@@ -1855,33 +1911,10 @@
          call. = FALSE)
   }
 
-  # Join label set if specified
-  label_set_name <- extra_config[["label_set"]] %||% NULL
-  if (!is.null(label_set_name) && !is.null(desc$manifest$labels) &&
-      !is.null(desc$backend)) {
-    get_label_uri <- utils::getFromNamespace(".get_label_uri", "dsImaging")
-    label_uri <- get_label_uri(desc$manifest, label_set_name)
-    if (is.null(label_uri))
-      stop("Label set '", label_set_name, "' not found in manifest.", call. = FALSE)
-
-    label_file <- file.path(staging_dir, "labels.parquet")
-    dsImaging::backend_get_file(desc$backend, label_uri, label_file)
-
-    if (requireNamespace("arrow", quietly = TRUE)) {
-      samples_df <- .readStagedSamples(staged_samples)
-      labels_df <- as.data.frame(arrow::read_parquet(label_file))
-      merged <- .leftJoinImageLabels(samples_df, labels_df)
-      .writeStagedSamples(merged, staged_samples)
-      message("  Joined label set '", label_set_name, "' (",
-              ncol(labels_df) - 1, " label columns)")
-    }
-    unlink(label_file)
-  }
-
   samples_df <- .readStagedSamples(staged_samples)
   samples_df <- .transformPublicTarget(
     samples_df, target_column, extra_config)
-  unit <- .prepareDpUnitFrame(samples_df)
+  unit <- .prepareImagingPrivacyUnitFrame(samples_df, imaging_unit_policy)
   patient_column <- unit$patient_column
   prepared <- .prepareTrainingFrame(
     unit$data,
@@ -1904,6 +1937,26 @@
     if (asset_type %in% dir_asset_types) {
       root <- asset$root %||% NULL
       s3_uri <- asset$uri %||% NULL
+
+      if (identical(asset_name, "images") &&
+          !is.null(collection_snapshot)) {
+        materialize <- utils::getFromNamespace(
+          ".materialize_imaging_snapshot", "dsImaging")
+        materialized <- materialize(
+          collection_snapshot, desc$backend,
+          file.path(staging_dir, asset_name))
+        root <- materialized$root
+        downloaded_rels[[asset_name]] <- materialized$relative_paths
+        s3_uri <- NULL
+      }
+
+      # File-backed dsImaging manifests use the same absolute `uri` field as
+      # S3 manifests. The resource boundary has already confined it to the
+      # collection root; use it directly without copying the image pack.
+      if (is.null(root) && !is.null(s3_uri) &&
+          !grepl("^s3://", s3_uri)) {
+        root <- s3_uri
+      }
 
       # S3 asset: download required objects, preserving paths under the prefix.
       if (.imageAssetNeedsStaging(asset_name, asset_type, extra_config) &&
@@ -1942,7 +1995,7 @@
       validated_assets[[asset_name]] <- va
 
     } else if (asset_type %in% file_asset_types) {
-      feat_file <- asset$file
+      feat_file <- asset$file %||% asset$uri
       if (is.null(feat_file) || !file.exists(feat_file)) {
         stop("A configured feature asset is unavailable.", call. = FALSE)
       }
@@ -1953,7 +2006,7 @@
       )
 
     } else if (identical(asset_type, "multimodal_ref")) {
-      mpath <- asset$manifest
+      mpath <- asset$manifest %||% asset$uri
       if (is.null(mpath) || !file.exists(mpath)) {
         stop("A configured multimodal manifest is unavailable.", call. = FALSE)
       }
@@ -1968,6 +2021,27 @@
   if (!is.null(validated_assets$images)) {
     image_asset <- assets$images %||% list()
     image_path_col <- validated_assets$images$path_col %||% "relative_path"
+    if (!is.null(collection_snapshot)) {
+      id_col <- desc$manifest$metadata$id_col %||% "sample_id"
+      if (!is.character(id_col) || length(id_col) != 1L || is.na(id_col) ||
+          !id_col %in% names(samples_df)) {
+        stop("Staged imaging data is not the complete admitted collection.",
+             call. = FALSE)
+      }
+      sample_ids <- as.character(samples_df[[id_col]])
+      record_ids <- vapply(collection_snapshot$records, `[[`, character(1),
+                           "sample_id")
+      record_paths <- vapply(collection_snapshot$records, `[[`, character(1),
+                             "relative_path")
+      if (anyNA(sample_ids) || anyDuplicated(sample_ids) ||
+          anyDuplicated(record_ids) || !setequal(sample_ids, record_ids)) {
+        stop("Staged imaging data is not the complete admitted collection.",
+             call. = FALSE)
+      }
+      # Metadata is clinical annotation, not routing authority. Bind each row
+      # to the exact object path from the sealed content index.
+      samples_df[[image_path_col]] <- record_paths[match(sample_ids, record_ids)]
+    }
     samples_df <- .ensureImagePathColumn(
       samples_df,
       path_col = image_path_col,
@@ -1980,9 +2054,8 @@
   .writeStagedSamples(samples_df, staged_samples)
   n_samples <- nrow(samples_df)
 
-  # Build manifest. patient_column is the column the disclosure admission grouped
-  # by (.detectPatientColumn); pinning it here makes the harness train per-PATIENT
-  # on the SAME column, so the DP unit matches the admission unit.
+  # Build the run manifest from the exact server-authored imaging unit used to
+  # canonicalize and count this dataset. Cohort admission remains in dsImaging.
   manifest <- list(
     run_token     = run_token,
     data_type     = "image",

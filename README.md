@@ -187,6 +187,15 @@ a runtime fingerprint (runner bytes, dependency versions and selected backend).
 Paths, run tokens, message IDs and timestamps are deliberately excluded. The
 private-input digest never leaves the node.
 
+Within one Flower run, a bounded claim ledger in the private staging directory
+reserves every operation/fold/round coordinate atomically before private work.
+It is mirrored into `NodeState`, survives ClientApp process restarts while that
+run's staging remains, and prevents concurrent processes from claiming the same
+coordinate. A changed payload cannot reuse a claim, and an older exact request
+fails closed once its cached reply has advanced. This per-run replay control is
+distinct from a cross-training privacy-budget ledger; separate authorized
+trainings still compose under the custodian's deployment policy.
+
 The trusted built-in tracks request strict deterministic Torch kernels. HookApps
 receive deterministic Python, NumPy and Torch seeds, and their final noise key is
 also bound to the validated clipped update. Arbitrary native user code cannot be
@@ -249,14 +258,17 @@ prediction helpers.
 
 Run admission never inspects class or event frequencies. Such a check would turn
 prepare success/failure into a label-dependent oracle outside the DP mechanism.
-It also never rejects a run because its staged row/patient count is below a
-threshold. Empty or tiny inputs reach the trusted mechanism without a
-prepare-time size predicate. In
-patient mode unusable identifiers are collapsed into one fixed sentinel privacy
-unit; there is never a silent row-level fallback. This is deliberately
-conservative (it can protect several unidentified subjects together and reduce
-utility). A meaningful per-person interpretation still requires the custodian to
-provide a complete, stable identifier roster across releases.
+It does enforce the server-owned DataSHIELD minimum on the staged privacy-unit
+count: rows in row mode and distinct canonical patients in patient mode,
+including image runs.
+The threshold is at least `nfilter.subset` (default 3) and can be raised with
+`dsflower.min_train_rows`; a refusal returns one generic node error and never the
+exact count or shortfall. In patient mode unusable identifiers are collapsed
+into one fixed sentinel privacy unit; there is never a silent row-level fallback.
+This is deliberately conservative (it can protect several unidentified subjects
+together and reduce utility). A meaningful per-person interpretation still
+requires the custodian to provide a complete, stable identifier roster across
+releases.
 
 `flowerPrepareRunDS()` validates and pins the complete per-training contract
 before it reads private table/file contents. `flowerEnsureSuperNodeDS()` checks

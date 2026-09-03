@@ -49,7 +49,7 @@
   )
 }
 
-.normalizeResamplingConfig <- function(run_config, track) {
+.normalizeResamplingConfig <- function(run_config, track, unit_policy = NULL) {
   names_lower <- tolower(names(run_config) %||% character())
   present <- names(run_config)[
     startsWith(names_lower, "resampling-") |
@@ -97,7 +97,7 @@
     stop("Holdout resampling uses the fixed millionths denominator.",
          call. = FALSE)
   }
-  policy <- .dpUnitPolicy()
+  policy <- .resolvePrivacyUnitPolicy(unit_policy)
   contract <- .holdoutContract(numerator, policy$dp_unit)
   supplied <- list(
     version = run_config[["resampling-version"]],

@@ -72,9 +72,6 @@
     stop("Invalid Flower handle symbol.", call. = FALSE)
   }
   frames <- rev(sys.frames())
-  if (!any(vapply(frames, identical, logical(1), y = .GlobalEnv))) {
-    frames <- c(frames, list(.GlobalEnv))
-  }
   saw_malformed <- FALSE
   for (env in frames) {
     if (exists(symbol, envir = env, inherits = FALSE)) {
@@ -134,7 +131,8 @@
   invisible(reference)
 }
 
-.validateHandleStaging <- function(handle, required = FALSE) {
+.validateHandleStaging <- function(handle, required = FALSE,
+                                   must_exist = TRUE) {
   has_token <- !is.null(handle$run_token)
   has_dir <- !is.null(handle$staging_dir)
   if (!identical(has_token, has_dir)) {
@@ -146,8 +144,25 @@
   if (has_token) {
     handle$run_token <- .validate_run_token(handle$run_token)
     handle$staging_dir <- .validateStagingDir(
-      handle$staging_dir, handle$run_token, must_exist = TRUE)
+      handle$staging_dir, handle$run_token, must_exist = must_exist)
   }
+  pending <- handle$pending_cleanup_tokens %||% character()
+  if (!is.character(pending) || anyNA(pending) || anyDuplicated(pending)) {
+    stop("Flower handle has inconsistent staging state.", call. = FALSE)
+  }
+  if (length(pending)) {
+    handle$pending_cleanup_tokens <- vapply(
+      pending, .validate_run_token, character(1), USE.NAMES = FALSE)
+  } else {
+    handle$pending_cleanup_tokens <- NULL
+  }
+  handle
+}
+
+.cleanupPendingStaging <- function(handle) {
+  pending <- handle$pending_cleanup_tokens %||% character()
+  for (run_token in pending) .cleanupStaging(run_token)
+  handle$pending_cleanup_tokens <- NULL
   handle
 }
 
@@ -156,8 +171,10 @@
 .removeHandle <- function(symbol, cleanup = TRUE) {
   resolved <- .resolveHandle(symbol)
   if (isTRUE(cleanup)) {
-    handle <- .validateHandleStaging(resolved$handle)
+    handle <- .validateHandleStaging(
+      resolved$handle, must_exist = FALSE)
     if (!is.null(handle$run_token)) .cleanupStaging(handle$run_token)
+    .cleanupPendingStaging(handle)
   }
   .handle_registry[[resolved$capability]] <- NULL
   if (exists(symbol, envir = resolved$owner_env, inherits = FALSE)) {
@@ -256,10 +273,11 @@
 #' @return A Flower handle object (assigned server-side).
 #' @export
 flowerInitDS <- function(data_symbol) {
+  .dsflower_require_literal_arguments()
   # Initialize persistent privacy state before the first dsFlower operation
   # inspects a session object. This runs only in a live service/session, never
   # from package installation or namespace loading.
-  .privacy_runtime_bootstrap()
+  .public_privacy_runtime_bootstrap()
 
   # data_symbol is a STRING (e.g. "D"), not the object itself.
   # Pattern matches dsOMOP: get(symbol, parent.frame())
@@ -274,17 +292,56 @@ flowerInitDS <- function(data_symbol) {
       .createHandleFromTable(obj, data_symbol = data_symbol), owner_env))
   }
 
-  # Descriptor path: dsFlower descriptor, independent dsImaging descriptor,
-  # or a resource client supplied by the resourcer ecosystem.
+  # Imaging resources cross the package boundary only as an opaque dsImaging
+  # handle created in this same DataSHIELD session.  This ensures dsImaging has
+  # admitted the complete patient roster before dsFlower can consume it.
+  is_imaging_reference <- is.list(obj) && identical(names(obj), "capability") &&
+    is.character(obj$capability) && length(obj$capability) == 1L &&
+    !is.na(obj$capability) &&
+    grepl("^imgh_[0-9a-f]{64}$", obj$capability)
+  if (is_imaging_reference) {
+    if (!requireNamespace("dsImaging", quietly = TRUE)) {
+      stop("Package 'dsImaging' is required for imaging handles.",
+           call. = FALSE)
+    }
+    resolver <- utils::getFromNamespace(
+      ".resolve_imaging_handle_for_consumer", "dsImaging")
+    authorized <- resolver(
+      data_symbol, expected_capability = obj$capability,
+      owner_env = owner_env)
+    if (!is.list(authorized) ||
+        !inherits(authorized$descriptor, "ImagingDatasetDescriptor") ||
+        !is.list(authorized$collection_snapshot)) {
+      stop("The dsImaging handle is not an authorized imaging dataset.",
+           call. = FALSE)
+    }
+    desc <- as_flower_dataset(authorized$descriptor)
+    desc$backend <- authorized$backend %||% NULL
+    desc$manifest_uri <- authorized$manifest_uri %||% NULL
+    handle <- .createHandleFromDescriptor(desc, data_symbol = data_symbol)
+    handle$imaging_handle_symbol <- data_symbol
+    # Kept only in dsFlower's private registry. It binds later staging to the
+    # exact dsImaging handle admitted here, even if the workspace symbol is
+    # subsequently rebound.
+    handle$imaging_handle_capability <- obj$capability
+    return(.registerHandle(handle, owner_env))
+  }
+
+  # A Flower descriptor remains valid for tabular inputs. Imaging descriptors
+  # must follow the authorized dsImaging-handle path above.
   if (inherits(obj, "FlowerDatasetDescriptor")) {
+    if (obj$source_kind %in% c("image_bundle", "asset_ref")) {
+      stop("Imaging data must be initialized with imagingInitDS() before ",
+           "flowerInitDS().", call. = FALSE)
+    }
     return(.registerHandle(
       .createHandleFromDescriptor(obj, data_symbol = data_symbol), owner_env))
   }
 
-  if (inherits(obj, "ImagingDatasetDescriptor")) {
-    desc <- as_flower_dataset(obj)
-    return(.registerHandle(
-      .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
+  if (inherits(obj, c("ImagingDatasetDescriptor",
+                      "ImagingDatasetResourceClient"))) {
+    stop("Imaging data must be initialized with imagingInitDS() before ",
+         "flowerInitDS().", call. = FALSE)
   }
 
   if (inherits(obj, "ResourceClient")) {
@@ -293,68 +350,30 @@ flowerInitDS <- function(data_symbol) {
       .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
   }
 
-  # Imaging handle path: list with descriptor field (from imagingInitDS)
-  # Note: S3 classes may be lost during Opal serialization, so we check
-  # structurally rather than by class.
+  # Legacy full imaging handles exposed manifests and storage context in the
+  # session workspace and could bypass dsImaging admission. Reject them.
   if (is.list(obj) && !is.null(obj$descriptor)) {
-    desc <- obj$descriptor
-    # Carry backend from imaging handle to descriptor (needed for S3 staging)
-    if (!is.null(obj$backend) && is.null(desc$backend)) {
-      desc$backend <- obj$backend
-    }
-    if (!is.null(obj$manifest_uri) && is.null(desc$manifest_uri)) {
-      desc$manifest_uri <- obj$manifest_uri
-    }
-    if (inherits(desc, "FlowerDatasetDescriptor")) {
-      return(.registerHandle(
-        .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
-    }
-    if (is.list(desc) && !is.null(desc$dataset_id) &&
-        !is.null(desc$source_kind)) {
-      desc <- flower_dataset_descriptor(
-        dataset_id  = desc$dataset_id,
-        source_kind = desc$source_kind,
-        metadata    = desc$metadata,
-        assets      = desc$assets %||% list(),
-        manifest    = desc$manifest,
-        table_data  = desc$table_data
-      )
-      desc$backend <- obj$backend
-      desc$manifest_uri <- obj$manifest_uri %||% NULL
-      return(.registerHandle(
-        .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
-    }
+    stop("Legacy imaging handles are not accepted. Recreate the handle with ",
+         "imagingInitDS().", call. = FALSE)
   }
 
-  # Raw Resource path: list with imaging+dataset:// URL (from datashield.assign.resource)
+  # Raw imaging resources have not yet passed dsImaging admission.
   if (is.list(obj) && !is.null(obj$url) &&
       grepl("^imaging\\+dataset://", obj$url %||% "")) {
-    if (requireNamespace("dsImaging", quietly = TRUE)) {
-      client <- dsImaging::ImagingDatasetResourceClient$new(obj)
-      desc <- as_flower_dataset(client)
-      return(.registerHandle(
-        .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
-    }
+    stop("Imaging resources must be initialized with imagingInitDS() before ",
+         "flowerInitDS().", call. = FALSE)
   }
 
-  # Asset reference path: list with asset_ref (from ds.flower.nodes.init inputs)
+  # Feature assets must likewise be loaded through an authorized dsImaging
+  # handle instead of resolving a shared registry identifier supplied by a user.
   if (is.list(obj) && !is.null(obj$asset_ref)) {
-    if (requireNamespace("dsImaging", quietly = TRUE)) {
-      aref <- obj$asset_ref
-      asset_info <- dsImaging::resolve_feature_table_asset(
-        aref$dataset_id, aref$alias_or_id)
-      desc <- flower_dataset_descriptor(
-        dataset_id = asset_info$dataset_id,
-        source_kind = "asset_ref",
-        asset_info = asset_info)
-      return(.registerHandle(
-        .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
-    }
+    stop("Imaging assets must be loaded with imagingLoadAssetDS() before ",
+         "flowerInitDS().", call. = FALSE)
   }
 
   stop("Symbol '", data_symbol, "' is not a data.frame, matrix, ",
-       "FlowerDatasetDescriptor, ImagingDatasetDescriptor, ResourceClient, ",
-       "or imaging handle. ",
+       "a tabular FlowerDatasetDescriptor, ResourceClient, or authorized ",
+       "dsImaging handle. ",
        "Assign your data first with datashield.assign.table(), ",
        "imagingInitDS(), or similar.",
        call. = FALSE)
@@ -1176,7 +1195,7 @@ flowerInitDS <- function(data_symbol) {
   value
 }
 
-.addDpConfigToRunConfig <- function(run_config) {
+.addDpConfigToRunConfig <- function(run_config, unit_policy = NULL) {
   run_config <- .validate_client_run_config(run_config)
   run_config <- .normalizeRunRounds(run_config)
   track <- as.character(unlist(
@@ -1192,7 +1211,7 @@ flowerInitDS <- function(data_symbol) {
   run_config <- .normalizeAssociationConfig(run_config, track)
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
-  run_config <- .normalizeResamplingConfig(run_config, track)
+  run_config <- .normalizeResamplingConfig(run_config, track, unit_policy)
   run_config <- .normalizeCrossValidationConfig(run_config, track)
   run_config <- .normalizePinnedTaskType(run_config, track)
   run_config <- .normalizeHookAppParams(run_config, track)
@@ -1202,7 +1221,7 @@ flowerInitDS <- function(data_symbol) {
   run_config[["allow_per_node_metrics"]]   <- FALSE
   run_config[["allow_exact_num_examples"]] <- FALSE
   run_config[["fixed_client_sampling"]]    <- TRUE
-  policy <- .privacy_policy()  # validate admin policy before touching private data
+  policy <- .privacy_policy(unit_policy)  # validate server policy before private data
   run_config[["privacy-adjacency"]] <- policy$adjacency
   run_config[["privacy-policy-sha256"]] <- policy$policy_hash
   run_config[["privacy-epsilon"]] <- policy$per_training_epsilon
@@ -1253,20 +1272,22 @@ flowerInitDS <- function(data_symbol) {
 }
 
 # Shared structural + DP enforcement for both prepare paths. DP is
-# unconditional and admission never branches on a private count.
+# unconditional and admission applies the server-owned DataSHIELD minimum to
+# the staged privacy-unit count (rows for row adjacency, patients for patient
+# adjacency).
 .enforceDisclosureAndDp <- function(handle, target_column,
                                     n_samples, target_data, run_config,
                                     data_type = "tabular",
                                     n_units = n_samples) {
-  # Validate the server-authored structural count, but never branch on a minimum
-  # derived from private rows or identifiers. A threshold would expose an exact
-  # success/error predicate; tiny/empty inputs instead reach the trusted
-  # mechanism without a prepare-time size disclosure.
+  # Validate the server-authored structural count before applying the standard
+  # minimum-size gate. The caller wraps threshold failures in one generic node
+  # error, so neither the exact count nor the shortfall leaves the node.
   unit_count <- suppressWarnings(as.numeric(unlist(n_units, use.names = FALSE)))
   if (length(unit_count) != 1L || !is.finite(unit_count) || unit_count < 0 ||
       unit_count != floor(unit_count)) {
     stop("Invalid staged privacy-unit count.", call. = FALSE)
   }
+  .assertMinSamples(unit_count)
   # The stateless per-training policy was validated before private staging. The
   # clipping bound is likewise server-owned and cannot come from the analyst.
   dp_clip <- suppressWarnings(as.numeric(unlist(
@@ -1293,6 +1314,7 @@ flowerInitDS <- function(data_symbol) {
 #' @export
 flowerPrepareRunDS <- function(handle_symbol, target_column,
                                 feature_columns = NULL, run_config = "{}") {
+  .dsflower_require_literal_arguments()
   target_column <- .ds_arg(target_column)   # decode (B64 for multi-col survival targets;
                                             # .ds_arg passes a raw single string through)
   feature_columns <- .ds_arg(feature_columns)
@@ -1306,13 +1328,15 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     feature_columns <- .ds_arg(feature_columns)
   }
 
-  handle <- .getHandle(handle_symbol)
+  resolved_handle <- .resolveHandle(handle_symbol)
+  handle <- resolved_handle$handle
+  owner_env <- resolved_handle$owner_env
   handle <- .validateHandleStaging(handle)
-
-  # Clean up previous staging if any
-  if (!is.null(handle$run_token)) {
-    .cleanupStaging(handle$run_token)
+  if (length(handle$pending_cleanup_tokens %||% character())) {
+    handle <- .cleanupPendingStaging(handle)
+    .storeHandle(handle_symbol, handle)
   }
+  previous_run_token <- handle$run_token %||% NULL
 
   # Validate every analyst/admin-controlled value and the fixed privacy contract
   # before touching private data. There is no historical counter or budget.
@@ -1320,10 +1344,25 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     # source_kind is copied into the handle at initialization, so routing does
     # not need to inspect private descriptor contents.
     if (identical(handle$source_kind, "image_bundle")) "image" else "tabular"
+  } else "tabular"
+  if (identical(descriptor_data_type, "image")) {
+    capability <- handle$imaging_handle_capability %||% ""
+    if (!is.character(handle$imaging_handle_symbol) ||
+        length(handle$imaging_handle_symbol) != 1L ||
+        is.na(handle$imaging_handle_symbol) ||
+        !nzchar(handle$imaging_handle_symbol) ||
+        !is.character(capability) || length(capability) != 1L ||
+        is.na(capability) || !grepl("^imgh_[0-9a-f]{64}$", capability)) {
+      stop("Image training requires an authorized dsImaging handle created ",
+           "with imagingInitDS().", call. = FALSE)
+    }
+  }
+  imaging_unit_policy <- if (identical(descriptor_data_type, "image")) {
+    .imagingPrivacyUnitPolicy(handle$descriptor)
   } else {
     NULL
   }
-  run_config <- .addDpConfigToRunConfig(run_config)
+  run_config <- .addDpConfigToRunConfig(run_config, imaging_unit_policy)
   routed <- .takeRunDataType(run_config, expected = descriptor_data_type)
   run_config <- routed$run_config
   data_type <- routed$data_type
@@ -1346,6 +1385,17 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     target_column, feature_columns, run_config)
   target_column <- columns$target_column
   feature_columns <- columns$feature_columns
+  if (!is.null(imaging_unit_policy)) {
+    label_column <- handle$descriptor$manifest$metadata$label_col %||% NULL
+    if (!is.character(label_column) || length(label_column) != 1L ||
+        is.na(label_column) || !nzchar(trimws(label_column)) ||
+        !identical(as.character(target_column), trimws(label_column))) {
+      stop("Image training requires the single manifest-declared label_col ",
+           "as its target.", call. = FALSE)
+    }
+    feature_columns <- .excludePatientFeature(
+      feature_columns, imaging_unit_policy$patient_column)
+  }
   run_config <- .verifyAssociationContract(
     run_config, feature_columns, target_column)
   .validatePreparedNativeTreeContract(
@@ -1381,7 +1431,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
              call. = FALSE)
       }
     }
-    unit_policy <- .dpUnitPolicy()
+    unit_policy <- .resolvePrivacyUnitPolicy(imaging_unit_policy)
     if (identical(unit_policy$dp_unit, "patient") &&
         unit_policy$patient_column %in%
           c(feature_columns, as.character(target_column))) {
@@ -1410,11 +1460,32 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   run_config <- .verifyCrossValidationJob(
     run_config, feature_columns, target_column)
   run_token <- .generate_run_token()
-  .privacy_runtime_bootstrap()
-  num_rounds <- as.integer(run_config[["num-server-rounds"]])
-  contract <- .privacy_training_contract(run_token, num_rounds)
+  # Record the exact rollback target before any private staging begins. If the
+  # best-effort on.exit deletion itself fails, an explicit cleanup/destroy retry
+  # can still find and remove the partially created directory.
+  handle$pending_cleanup_tokens <- unique(c(
+    handle$pending_cleanup_tokens %||% character(), run_token))
+  .storeHandle(handle_symbol, handle)
   admitted <- FALSE
-  on.exit(if (!admitted) .cleanupStaging(run_token), add = TRUE)
+  on.exit(if (!admitted) {
+    removed <- tryCatch({
+      .cleanupStaging(run_token)
+      TRUE
+    }, error = function(e) FALSE)
+    if (removed) {
+      try({
+        current <- .validateHandleStaging(
+          .getHandle(handle_symbol), must_exist = FALSE)
+        current$pending_cleanup_tokens <- setdiff(
+          current$pending_cleanup_tokens %||% character(), run_token)
+        .storeHandle(handle_symbol, current)
+      }, silent = TRUE)
+    }
+  }, add = TRUE)
+  .public_privacy_runtime_bootstrap()
+  num_rounds <- as.integer(run_config[["num-server-rounds"]])
+  contract <- .privacy_training_contract(
+    run_token, num_rounds, imaging_unit_policy)
 
   # From this point onward errors can be caused by private storage/content or
   # third-party decoders. Keep their text inside the node: the exterior DSI
@@ -1427,6 +1498,29 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       # Descriptor path: delegate staging entirely to .stageFromDescriptor,
       # which handles in_memory_df, staged_parquet, and image_bundle.
       desc <- handle$descriptor
+      imaging_authorized <- NULL
+      if (identical(handle$source_kind, "image_bundle") &&
+          !is.null(handle$imaging_handle_symbol)) {
+        if (!requireNamespace("dsImaging", quietly = TRUE)) {
+          stop("Package 'dsImaging' is required for imaging handles.",
+               call. = FALSE)
+        }
+        resolver <- utils::getFromNamespace(
+          ".resolve_imaging_handle_for_consumer", "dsImaging")
+        # Resolve through dsImaging again immediately before reading private
+        # objects. The expected capability makes a symbol rebind fail closed.
+        imaging_authorized <- resolver(
+          handle$imaging_handle_symbol,
+          expected_capability = handle$imaging_handle_capability,
+          owner_env = owner_env)
+        # Consume the current descriptor returned through dsImaging's pinned
+        # collection boundary. The private snapshot never enters the workspace
+        # object or an Aggregate result.
+        desc <- as_flower_dataset(imaging_authorized$descriptor)
+        desc$backend <- imaging_authorized$backend
+        desc$manifest_uri <- imaging_authorized$manifest_uri
+        desc$.collection_snapshot <- imaging_authorized$collection_snapshot
+      }
       staging_dir <- .stageFromDescriptor(
         desc, run_token, target_column, feature_columns, run_config)
 
@@ -1435,38 +1529,31 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       staged_manifest <- jsonlite::fromJSON(
         manifest_path, simplifyVector = TRUE)
 
+      if (!is.null(imaging_authorized)) {
+        # Close the read-time race: dsImaging checks the publish lock and the
+        # original admitted roster once more, then dsFlower verifies that the
+        # exact sample-to-patient mapping it staged is that same roster.
+        resolver(
+          handle$imaging_handle_symbol,
+          expected_capability = handle$imaging_handle_capability,
+          owner_env = owner_env)
+        staged_data <- .readStagedSamples(file.path(
+          staging_dir, staged_manifest$samples_file))
+        privacy <- imaging_authorized$privacy
+        assert_roster <- utils::getFromNamespace(
+          ".assert_exact_imaging_roster", "dsImaging")
+        assert_roster(
+          staged_data[[privacy$id_col]],
+          imaging_authorized$privacy_roster,
+          privacy_ids = staged_data[[privacy$privacy_unit_col]],
+          context = "staged imaging data")
+      }
+
       data_type <- staged_manifest$data_type %||% "tabular"
       .enforceDisclosureAndDp(
         handle, target_column, staged_manifest$n_samples,
         NULL, run_config, data_type = data_type,
         n_units = staged_manifest$n_units)
-
-      # Inject validated mask paths from dsImaging (segmentation tasks)
-      seg_generation_id <-
-        run_config[["segmentation_generation_id"]] %||% NULL
-      if (!is.null(seg_generation_id) &&
-          requireNamespace("dsImaging", quietly = TRUE)) {
-        mask_paths <-
-          dsImaging::imagingSegmentationGetMaskPaths(seg_generation_id)
-        if (length(mask_paths) > 0) {
-          # Create a mask root directory with symlinks to actual artifacts
-          mask_root <- file.path(staging_dir, "masks")
-          dir.create(mask_root, showWarnings = FALSE)
-          for (sid in names(mask_paths)) {
-            src <- mask_paths[[sid]]
-            dst <- file.path(mask_root, basename(src))
-            if (file.exists(src) && !file.exists(dst)) file.symlink(src, dst)
-          }
-          # Update manifest with masks asset
-          staged_manifest$assets$masks <- list(
-            type = "image_root",
-            root = normalizePath(mask_root),
-            path_col = "mask_path"
-          )
-          staged_manifest$segmentation_generation_id <- seg_generation_id
-          .write_manifest_atomic(staged_manifest, manifest_path)
-        }
-      }
 
       .apply_privacy_contract(staging_dir, contract)
 
@@ -1475,6 +1562,12 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       handle$target_column   <- target_column
       handle$feature_columns <- feature_columns
       handle$prepared        <- TRUE
+      if (!is.null(previous_run_token) &&
+          !identical(previous_run_token, run_token)) {
+        .cleanupStaging(previous_run_token)
+      }
+      handle$pending_cleanup_tokens <- setdiff(
+        handle$pending_cleanup_tokens %||% character(), run_token)
       admitted <- TRUE
       return(.storeHandle(handle_symbol, handle))
     }
@@ -1486,18 +1579,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     }
     .validateDataSchema(data, target_column, feature_columns)
 
-    # Stage the total, row-preserving preprocessing selected by public config.
-    staging_dir <- if (identical(data_type, "image")) {
-      # Image pipeline: the data.frame is sample metadata; pixels stay on disk.
-      if (!("relative_path" %in% names(data))) {
-        stop("Image data requires a 'relative_path' column in the data. ",
-             "The data.frame should contain sample metadata, not pixel data.",
-             call. = FALSE)
-      }
-      .stage_image_manifest(run_token, target_column, data, run_config)
-    } else {
-      .stageData(data, run_token, target_column, feature_columns, run_config)
-    }
+    # Non-descriptor handles are always tabular. Image collections must cross
+    # the dsImaging admission boundary above.
+    staging_dir <- .stageData(
+      data, run_token, target_column, feature_columns, run_config)
 
     staged_manifest <- jsonlite::fromJSON(
       file.path(staging_dir, "manifest.json"), simplifyVector = TRUE)
@@ -1513,6 +1598,12 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     handle$feature_columns <- feature_columns
     handle$prepared        <- TRUE
 
+    if (!is.null(previous_run_token) &&
+        !identical(previous_run_token, run_token)) {
+      .cleanupStaging(previous_run_token)
+    }
+    handle$pending_cleanup_tokens <- setdiff(
+      handle$pending_cleanup_tokens %||% character(), run_token)
     admitted <- TRUE
     .storeHandle(handle_symbol, handle)
   }, error = function(e) {
@@ -1545,6 +1636,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
                                      federation_id = NULL,
                                      ca_cert_pem = NULL,
                                      torch_backend = NULL) {
+  .dsflower_require_literal_arguments()
   handle <- .getHandle(handle_symbol)
 
   # Per-run torch backend the researcher requested (cpu/gpu/auto). Recorded so
@@ -1613,7 +1705,9 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   # package may run only if it is byte-identical to it. This is the content-hash
   # verification that makes the trusted training loop guaranteed, without trusting
   # the researcher who provisioned the app.
-  harness_hash <- .compute_harness_hash()
+  harness_hash <- tryCatch(
+    suppressWarnings(suppressMessages(.compute_harness_hash())),
+    error = function(e) "")
   if (!nzchar(harness_hash)) {
     stop("The canonical runner (dsflower_runner) is not installed on this node.",
          call. = FALSE)
@@ -1675,7 +1769,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 
   # Revalidate the root secret and stateless policy after every non-private
   # preflight, but before a ClientApp can release a model.
-  .privacy_runtime_bootstrap()
+  .public_privacy_runtime_bootstrap()
   manifest_path <- file.path(handle$staging_dir, "manifest.json")
   manifest <- tryCatch(
     jsonlite::fromJSON(manifest_path, simplifyVector = FALSE),
@@ -1683,17 +1777,26 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
                              call. = FALSE))
   num_rounds <- suppressWarnings(as.integer(
     manifest[["num-server-rounds"]] %||% NA_integer_))
-  contract <- .privacy_training_contract(handle$run_token, num_rounds)
+  imaging_unit_policy <- if (identical(handle$source, "descriptor") &&
+      identical(handle$source_kind, "image_bundle")) {
+    .imagingPrivacyUnitPolicy(handle$descriptor)
+  } else {
+    NULL
+  }
+  contract <- .privacy_training_contract(
+    handle$run_token, num_rounds, imaging_unit_policy)
   .apply_privacy_contract(handle$staging_dir, contract)
 
   # Ensure SuperNode via singleton registry
-  entry <- .supernode_ensure(
-    superlink_address = superlink_address,
-    manifest_dir      = handle$staging_dir,
-    python_path       = handle$python_path,
-    ca_cert_path      = ca_cert_path,
-    insecure          = via_tunnel
-  )
+  entry <- tryCatch(
+    suppressWarnings(suppressMessages(.supernode_ensure(
+      superlink_address = superlink_address,
+      manifest_dir      = handle$staging_dir,
+      python_path       = handle$python_path,
+      ca_cert_path      = ca_cert_path,
+      insecure          = via_tunnel
+    ))),
+    error = function(e) stop("SuperNode is unavailable.", call. = FALSE))
 
   handle$superlink_address <- superlink_address
   handle$federation_id     <- federation_id
@@ -1712,7 +1815,12 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
 #' @return Updated handle with reset state.
 #' @export
 flowerCleanupRunDS <- function(handle_symbol) {
-  handle <- .validateHandleStaging(.getHandle(handle_symbol))
+  .dsflower_require_literal_arguments()
+  # An interrupted earlier cleanup may already have removed the exact staging
+  # directory while leaving this private handle state intact. Validate its
+  # canonical location without requiring it to remain present so retry converges.
+  handle <- .validateHandleStaging(
+    .getHandle(handle_symbol), must_exist = FALSE)
 
   # Stop SuperNode if associated. This must happen before staging deletion
   # because orphan cleanup uses the manifest_dir embedded in the process args.
@@ -1724,6 +1832,7 @@ flowerCleanupRunDS <- function(handle_symbol) {
   if (!is.null(handle$run_token)) {
     .cleanupStaging(handle$run_token)
   }
+  handle <- .cleanupPendingStaging(handle)
 
   handle$run_token       <- NULL
   handle$staging_dir     <- NULL
@@ -1738,13 +1847,46 @@ flowerCleanupRunDS <- function(handle_symbol) {
 #' Destroy Flower Handle
 #'
 #' DataSHIELD ASSIGN method. Full cleanup: removes staging, stops
-#' the associated SuperNode, and removes the handle.
+#' the associated SuperNode, and removes the handle. A retry is idempotent only
+#' when the same session still contains the well-formed opaque reference after
+#' its private registry entry has already been removed.
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @return NULL.
 #' @export
 flowerDestroyDS <- function(handle_symbol) {
-  handle <- .validateHandleStaging(.getHandle(handle_symbol))
+  .dsflower_require_literal_arguments()
+  owner_env <- parent.frame()
+  unavailable <- function() {
+    stop("Unknown or unavailable Flower handle reference.", call. = FALSE)
+  }
+  if (!is.environment(owner_env) ||
+      !is.character(handle_symbol) || length(handle_symbol) != 1L ||
+      is.na(handle_symbol) || !nzchar(handle_symbol) ||
+      !exists(handle_symbol, envir = owner_env, inherits = FALSE)) {
+    unavailable()
+  }
+  reference <- get(handle_symbol, envir = owner_env, inherits = FALSE)
+  if (!.is_handle_reference(reference) ||
+      bindingIsLocked(handle_symbol, owner_env)) {
+    unavailable()
+  }
+  capability <- .validate_handle_capability(reference$capability)
+  entry <- .handle_registry[[capability]]
+  if (is.null(entry)) {
+    # Idempotent retry after authoritative state was removed but the session
+    # symbol could not be cleared (for example, a lost destroy response).
+    rm(list = handle_symbol, envir = owner_env)
+    return(NULL)
+  }
+  if (!is.list(entry) || !is.list(entry$handle) ||
+      !is.environment(entry$owner_env) ||
+      !identical(entry$owner_env, owner_env)) {
+    unavailable()
+  }
+  # Accept the same safe partial-cleanup state as flowerCleanupRunDS(): the
+  # directory may be gone, but its token/path binding must still be exact.
+  handle <- .validateHandleStaging(entry$handle, must_exist = FALSE)
 
   # Stop SuperNode if associated
   if (!is.null(handle$staging_dir)) {
@@ -1754,8 +1896,10 @@ flowerDestroyDS <- function(handle_symbol) {
   if (!is.null(handle$run_token)) {
     .cleanupStaging(handle$run_token)
   }
+  handle <- .cleanupPendingStaging(handle)
 
-  .removeHandle(handle_symbol, cleanup = FALSE)
+  .handle_registry[[capability]] <- NULL
+  rm(list = handle_symbol, envir = owner_env)
   NULL
 }
 
@@ -1769,6 +1913,7 @@ flowerDestroyDS <- function(handle_symbol) {
 #' @return Named list with status, version, timestamp.
 #' @export
 flowerPingDS <- function() {
+  .dsflower_require_literal_arguments()
   list(
     status = "ok",
     package = "dsFlower",
@@ -1798,9 +1943,20 @@ flowerPingDS <- function() {
 #' @export
 flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
                                     association_probe = "none") {
+  .dsflower_require_literal_arguments()
   native_tree_probe <- .validate_native_tree_probe(native_tree_probe)
   association_probe <- .validate_association_probe(association_probe)
-  runtime <- .python_runtime_capabilities()
+  runtime <- tryCatch(
+    suppressWarnings(suppressMessages(.python_runtime_capabilities())),
+    error = function(e) list(
+      python_version = "unavailable",
+      flower_version = "unavailable",
+      torch_version = "unavailable",
+      opacus_version = "unavailable",
+      runtime_versions_sha256 = "unavailable"))
+  runner_sha256 <- tryCatch(
+    suppressWarnings(suppressMessages(.compute_harness_hash())),
+    error = function(e) "unavailable")
 
   # Disclosure settings
   settings <- .flowerDisclosureSettings()
@@ -1841,7 +1997,7 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
     native_tree         = native_tree,
     association         = association,
     max_rounds          = settings$max_rounds,
-    min_samples         = 0L,
+    min_samples         = .disclosure_min_rows(),
     min_clients_per_round = 1L,
     dp_required         = TRUE,
     privacy_accountant  = "stateless-per-training-v1",
@@ -1853,7 +2009,7 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
     privacy_unit        = privacy_policy$dp_unit,
     privacy_patient_column = privacy_policy$patient_column,
     runner_abi          = 3L,
-    runner_sha256       = .compute_harness_hash(),
+    runner_sha256       = runner_sha256,
     dp_app_schema_versions = 1L,
     hook_abi            = 2L,
     hook_enabled        = hook_enabled,
@@ -1881,6 +2037,7 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
 #' @return Named list with status information.
 #' @export
 flowerStatusDS <- function(handle_symbol) {
+  .dsflower_require_literal_arguments()
   handle <- .validateHandleStaging(.getHandle(handle_symbol))
 
   supernode_running <- FALSE
@@ -1906,6 +2063,7 @@ flowerStatusDS <- function(handle_symbol) {
 #' @return Named list describing the server-owned per-training privacy policy.
 #' @export
 flowerPrivacyPolicyDS <- function() {
+  .dsflower_require_literal_arguments()
   .privacy_policy_status()
 }
 
@@ -1919,6 +2077,7 @@ flowerPrivacyPolicyDS <- function() {
 #' @return Named list with \code{reachable} (logical) and \code{error} (char).
 #' @export
 flowerCheckConnectivityDS <- function(address, timeout_secs = 3) {
+  .dsflower_require_literal_arguments()
   parts <- strsplit(address, ":", fixed = TRUE)[[1]]
   if (length(parts) != 2) {
     return(list(reachable = FALSE,

@@ -117,6 +117,64 @@ test_that("handle capabilities are stale after destroy and bound to one session"
   evalq(dsFlower:::.removeHandle("owned_handle"), owner_a)
 })
 
+test_that("flowerDestroyDS retries only owner-local opaque tombstones", {
+  owner_a <- new.env(parent = globalenv())
+  owner_b <- new.env(parent = globalenv())
+  assign("flowerDestroyDS", dsFlower::flowerDestroyDS, envir = owner_a)
+  assign("flowerDestroyDS", dsFlower::flowerDestroyDS, envir = owner_b)
+
+  active <- dsFlower:::.registerHandle(mock_handle(), owner_env = owner_a)
+  assign("active", active, envir = owner_a)
+  assign("active", active, envir = owner_b)
+  expect_error(evalq(flowerDestroyDS("active"), owner_b), "unavailable")
+  expect_true(exists(active$capability, envir = dsFlower:::.handle_registry,
+                     inherits = FALSE))
+
+  rm(list = active$capability, envir = dsFlower:::.handle_registry)
+  expect_null(evalq(flowerDestroyDS("active"), owner_a))
+  expect_false(exists("active", envir = owner_a, inherits = FALSE))
+
+  forged <- structure(list(capability = paste0("hdl_", strrep("f", 32))),
+                      class = "dsflower_handle_ref")
+  assign("forged", forged, envir = owner_a)
+  expect_null(evalq(flowerDestroyDS("forged"), owner_a))
+  expect_false(exists("forged", envir = owner_a, inherits = FALSE))
+
+  assign("malformed", list(capability = "not-a-capability"), envir = owner_a)
+  expect_error(evalq(flowerDestroyDS("malformed"), owner_a), "unavailable")
+  expect_true(exists("malformed", envir = owner_a, inherits = FALSE))
+})
+
+test_that("handle resolution never falls back to a global session", {
+  local_interface_privacy_state()
+  global_reference <- dsFlower:::.registerHandle(
+    mock_handle(), owner_env = .GlobalEnv)
+  registry <- dsFlower:::.handle_registry
+  assign("global_only_flower_handle", global_reference, envir = .GlobalEnv)
+  withr::defer({
+    if (exists("global_only_flower_handle", envir = .GlobalEnv,
+               inherits = FALSE)) {
+      rm("global_only_flower_handle", envir = .GlobalEnv)
+    }
+    registry[[global_reference$capability]] <- NULL
+  })
+
+  session <- new.env(parent = globalenv())
+  expect_error(
+    evalq(dsFlower:::.getHandle("global_only_flower_handle"), session),
+    "Call flowerInitDS first"
+  )
+
+  session_reference <- dsFlower:::.registerHandle(
+    mock_handle(data_path = "session.csv"), owner_env = session)
+  assign("session_flower_handle", session_reference, envir = session)
+  expect_identical(
+    evalq(dsFlower:::.getHandle("session_flower_handle"), session)$data_path,
+    "session.csv"
+  )
+  evalq(dsFlower:::.removeHandle("session_flower_handle"), session)
+})
+
 test_that("opaque handles preserve the legitimate DSLite assign flow", {
   local_interface_privacy_state()
   skip_if_not_installed("DSLite")
@@ -154,40 +212,237 @@ test_that("opaque handles preserve the legitimate DSLite assign flow", {
 
 test_that("flowerInitDS consumes an independent dsImaging handle", {
   local_interface_privacy_state()
+  skip_if_not_installed("dsImaging")
+  withr::local_options(list(
+    dsimaging.nfilter.subset = 3L,
+    dsflower.dp_unit = "row",
+    dsflower.patient_column = "wrong_global_column"))
+  root <- withr::local_tempdir()
+  image_root <- file.path(root, "source", "images")
+  metadata_root <- file.path(root, "metadata")
+  index_root <- file.path(root, "indexes")
+  dir.create(image_root, recursive = TRUE)
+  dir.create(metadata_root, recursive = TRUE)
+  dir.create(index_root, recursive = TRUE)
+  metadata_path <- file.path(metadata_root, "samples.csv")
+  relative_paths <- paste0("scan-", 1:4, ".png")
+  image_paths <- file.path(image_root, relative_paths)
+  for (i in seq_along(image_paths)) {
+    writeBin(charToRaw(paste0("image-", i)), image_paths[[i]])
+  }
+  hashes <- vapply(image_paths, digest::digest, character(1),
+                   algo = "sha256", file = TRUE)
+  utils::write.csv(data.frame(
+    sample_id = paste0("scan-", 1:4),
+    patient_id = c(" patient-1 ", "patient-1", "patient-2", "patient-3"),
+    source_kind = "single_file", n_files = 1L,
+    relative_path = relative_paths,
+    target = c(0L, 1L, 0L, 1L)
+  ), metadata_path, row.names = FALSE)
+  sample_manifests_path <- file.path(metadata_root, "sample_manifests.csv")
+  utils::write.csv(data.frame(
+    sample_id = paste0("scan-", 1:4), source_kind = "single_file",
+    primary_uri = relative_paths,
+    files_json = vapply(relative_paths, function(path) jsonlite::toJSON(
+      list(list(path = path, role = "primary")), auto_unbox = TRUE),
+      character(1)),
+    content_hash = hashes, n_files = 1L),
+    sample_manifests_path, row.names = FALSE)
+  content_index_path <- file.path(index_root, "content_hash_index.csv")
+  utils::write.csv(data.frame(
+    sample_id = paste0("scan-", 1:4), uri = image_paths,
+    content_hash = hashes, size = as.numeric(file.info(image_paths)$size),
+    source_kind = "single_file"), content_index_path, row.names = FALSE)
   manifest <- list(
+    schema_version = 1L,
     dataset_id = "pathmnist.site",
-    metadata = list(uri = "s3://imaging/pathmnist/metadata/samples.parquet"),
+    metadata = list(
+      uri = metadata_path, file = metadata_path, format = "csv",
+      id_col = "sample_id", privacy_unit = "patient",
+      privacy_unit_col = "patient_id",
+      privacy_unit_canonicalization = "trim-utf8-v2",
+      label_col = "target"),
     assets = list(images = list(
-      type = "image_root", uri = "s3://imaging/pathmnist/source/images/"))
+      type = "image_root", uri = image_root, path_col = "relative_path")),
+    sample_manifests = list(uri = sample_manifests_path, format = "csv"),
+    content_hash_index = list(uri = content_index_path, format = "csv")
   )
-  descriptor <- structure(list(
-    dataset_id = manifest$dataset_id,
-    source_kind = "image_bundle",
-    metadata = manifest$metadata,
-    assets = manifest$assets,
-    manifest = manifest
-  ), class = "ImagingDatasetDescriptor")
-  backend <- structure(list(type = "s3"), class = "dsimaging_backend")
-  imaging <- list(
-    source = "imaging_resource",
-    descriptor = descriptor,
-    manifest = manifest,
-    backend = backend,
-    manifest_uri = "s3://imaging/pathmnist/manifest.yaml"
-  )
+  manifest_path <- file.path(root, "manifest.yaml")
+  yaml::write_yaml(manifest, manifest_path)
+  descriptor <- dsImaging::imaging_dataset_descriptor(manifest)
+  imaging <- dsImaging:::.make_imaging_handle(
+    descriptor, "img", backend = dsImaging::storage_backend("file"),
+    manifest_uri = manifest_path, require_snapshot = TRUE)
 
   env <- new.env(parent = globalenv())
-  assign("img", imaging, envir = env)
+  resolver_owner_envs <- list()
+  original_imaging_resolver <- utils::getFromNamespace(
+    ".resolve_imaging_handle_for_consumer", "dsImaging")
+  testthat::local_mocked_bindings(
+    .resolve_imaging_handle_for_consumer = function(
+        symbol, expected_capability = NULL, owner_env = NULL) {
+      resolver_owner_envs[[length(resolver_owner_envs) + 1L]] <<- owner_env
+      original_imaging_resolver(
+        symbol, expected_capability = expected_capability,
+        owner_env = owner_env)
+    },
+    .package = "dsImaging")
+  reference <- dsImaging:::.register_imaging_handle(imaging, env)
+  assign("img", reference, envir = env)
   assign("flowerInitDS", dsFlower::flowerInitDS, envir = env)
-  reference <- eval(quote(flowerInitDS("img")), envir = env)
-  assign("flower", reference, envir = env)
+  assign("flowerPrepareRunDS", dsFlower::flowerPrepareRunDS, envir = env)
+  flower_reference <- eval(quote(flowerInitDS("img")), envir = env)
+  assign("flower", flower_reference, envir = env)
   state <- evalq(dsFlower:::.getHandle("flower"), envir = env)
 
-  expect_identical(state$descriptor$backend, backend)
-  expect_identical(
-    state$descriptor$manifest_uri, "s3://imaging/pathmnist/manifest.yaml")
   expect_identical(state$descriptor$manifest, manifest)
+  expect_identical(state$imaging_handle_symbol, "img")
+  expect_identical(state$imaging_handle_capability, reference$capability)
+  expect_no_error(eval(
+    quote(flowerPrepareRunDS("flower", "target")), envir = env))
+  prepared <- evalq(dsFlower:::.getHandle("flower"), envir = env)
+  expect_true(prepared$prepared)
+  expect_gte(length(resolver_owner_envs), 3L)
+  expect_true(all(vapply(resolver_owner_envs[seq_len(3L)],
+    identical, logical(1), y = env)))
+  staged_manifest <- jsonlite::fromJSON(
+    file.path(prepared$staging_dir, "manifest.json"), simplifyVector = FALSE)
+  expect_identical(staged_manifest[["dp-unit"]], "patient")
+  expect_identical(staged_manifest$patient_column, "patient_id")
+  expect_identical(staged_manifest$n_units, 3L)
+  expect_identical(
+    staged_manifest[["patient-id-canonicalization"]], "trim-utf8-v2")
+  expect_error(
+    eval(quote(flowerPrepareRunDS("flower", "relative_path")), envir = env),
+    "manifest-declared label_col")
+  after_rejected_prepare <- evalq(dsFlower:::.getHandle("flower"), envir = env)
+  expect_identical(after_rejected_prepare$run_token, prepared$run_token)
+  expect_true(dir.exists(after_rejected_prepare$staging_dir))
+
+  # A Flower handle remains bound to the exact dsImaging capability it
+  # consumed. Rebinding the source symbol, even to the same dataset, must not
+  # silently authorize a different handle at prepare time.
+  assign("img", reference, envir = env)
+  flower_reference_2 <- eval(quote(flowerInitDS("img")), envir = env)
+  assign("flower2", flower_reference_2, envir = env)
+  replacement <- dsImaging:::.register_imaging_handle(imaging, env)
+  assign("img", replacement, envir = env)
+  expect_error(
+    eval(quote(flowerPrepareRunDS("flower2", "target")), envir = env),
+    "Private data preparation failed"
+  )
+  evalq(dsFlower:::.removeHandle("flower2"), envir = env)
+
+  # An active binding cannot swap capabilities between flowerInitDS reading
+  # the opaque reference and dsImaging authorizing it.
+  rm("img", envir = env)
+  binding_reads <- 0L
+  makeActiveBinding("img", function(value) {
+    if (!missing(value)) stop("read-only test binding")
+    binding_reads <<- binding_reads + 1L
+    if (binding_reads == 1L) reference else replacement
+  }, env)
+  expect_error(
+    eval(quote(flowerInitDS("img")), envir = env),
+    "capability changed"
+  )
+  rm("img", envir = env)
+
+  other_env <- new.env(parent = globalenv())
+  assign("img", reference, envir = other_env)
+  assign("flowerInitDS", dsFlower::flowerInitDS, envir = other_env)
+  expect_error(
+    eval(quote(flowerInitDS("img")), envir = other_env),
+    "cross-session"
+  )
+
+  if (requireNamespace("DSLite", quietly = TRUE)) {
+    server <- DSLite::newDSLiteServer(config = list())
+    server$assignMethod("flowerInitDS", "dsFlower::flowerInitDS")
+    server_name <- paste0("dsflower_owner_server_", Sys.getpid())
+    assign(server_name, server, envir = .GlobalEnv)
+    withr::defer(rm(list = server_name, envir = .GlobalEnv))
+    connection_a <- DSLite::dsConnect(
+      DSLite::DSLite(), name = "site_a", url = server_name)
+    connection_b <- DSLite::dsConnect(
+      DSLite::DSLite(), name = "site_b", url = server_name)
+    withr::defer(DSLite::dsDisconnect(connection_a))
+    withr::defer(DSLite::dsDisconnect(connection_b))
+    session_a <- server$getSession(connection_a@sid)
+    session_b <- server$getSession(connection_b@sid)
+    imaging_registry <- dsImaging:::.imaging_handle_registry
+    dslite_reference <- dsImaging:::.register_imaging_handle(
+      imaging, session_a)
+    assign("img", dslite_reference, envir = session_a)
+    assign("img", dslite_reference, envir = session_b)
+
+    expect_no_error(DSLite::dsAssignExpr(
+      connection_a, "flower", 'flowerInitDS("img")', async = FALSE))
+    expect_error(DSLite::dsAssignExpr(
+      connection_b, "flower", 'flowerInitDS("img")', async = FALSE),
+      "cross-session")
+
+    evalq(dsFlower:::.removeHandle("flower"), session_a)
+    imaging_registry[[dslite_reference$capability]] <- NULL
+    rm("img", envir = session_a)
+    rm("img", envir = session_b)
+  }
   evalq(dsFlower:::.removeHandle("flower"), envir = env)
+})
+
+test_that("flowerInitDS rejects imaging inputs that bypass dsImaging admission", {
+  local_interface_privacy_state()
+  manifest <- list(
+    dataset_id = "unadmitted",
+    metadata = list(
+      id_col = "sample_id", privacy_unit = "patient",
+      privacy_unit_col = "patient_id",
+      privacy_unit_canonicalization = "trim-utf8-v2"),
+    assets = list())
+  imaging_descriptor <- structure(list(
+    dataset_id = "unadmitted", source_kind = "image_bundle",
+    metadata = manifest$metadata, assets = list(), manifest = manifest
+  ), class = "ImagingDatasetDescriptor")
+  flower_descriptor <- flower_dataset_descriptor(
+    "unadmitted", "image_bundle", metadata = manifest$metadata,
+    manifest = manifest)
+  values <- list(
+    imaging_descriptor,
+    flower_descriptor,
+    list(url = "imaging+dataset://bucket/unadmitted"),
+    list(descriptor = imaging_descriptor),
+    list(asset_ref = list(dataset_id = "unadmitted", alias_or_id = "x"))
+  )
+
+  for (i in seq_along(values)) {
+    env <- new.env(parent = globalenv())
+    assign("candidate", values[[i]], envir = env)
+    assign("flowerInitDS", dsFlower::flowerInitDS, envir = env)
+    expect_error(
+      eval(quote(flowerInitDS("candidate")), envir = env),
+      "imagingInitDS|imagingLoadAssetDS|Legacy imaging"
+    )
+  }
+})
+
+test_that("forged internal image handles cannot reach preparation", {
+  local_interface_privacy_state()
+  descriptor <- flower_dataset_descriptor(
+    dataset_id = "forged.image",
+    source_kind = "image_bundle",
+    metadata = list(),
+    manifest = list(metadata = list()),
+    table_data = data.frame(
+      subject_code = "person-1", relative_path = "scan.png", target = 0L),
+    assets = list(images = list(
+      type = "image_root", root = tempdir(), path_col = "relative_path"))
+  )
+  name <- "test_forged_imaging_handle"
+  dsFlower:::.setHandle(name, dsFlower:::.createHandleFromDescriptor(descriptor))
+  withr::defer(dsFlower:::.removeHandle(name))
+
+  expect_error(
+    flowerPrepareRunDS(name, "target"), "authorized dsImaging handle")
 })
 
 test_that(".ds_arg handles JSON strings", {
@@ -570,8 +825,9 @@ test_that("validation preparation persists the public contract before execution"
   expect_error(
     flowerPrepareRunDS(name, "outcome", NULL, config),
     "explicit ordered public feature contract")
+  feature_columns <- c("age", "marker")
   expect_no_error(flowerPrepareRunDS(
-    name, "outcome", c("age", "marker"), config))
+    name, "outcome", feature_columns, config))
   handle <- dsFlower:::.getHandle(name)
   manifest <- jsonlite::fromJSON(
     file.path(handle$staging_dir, "manifest.json"), simplifyVector = FALSE)
@@ -648,7 +904,7 @@ test_that("vision validation contract has a cross-package schema-2 wire", {
       changed_profile, NULL, "diagnosis", "patient")))
 })
 
-test_that("vision validation preflights pins before empty private staging", {
+test_that("table-backed vision cannot bypass dsImaging admission", {
   local_interface_privacy_state()
   image_root <- withr::local_tempdir()
   withr::local_options(list(dsflower.image_data_root = image_root))
@@ -663,34 +919,15 @@ test_that("vision validation preflights pins before empty private staging", {
     dsFlower:::.validationContractSha256(
       normalized, NULL, "diagnosis", dsFlower:::.dpUnitPolicy()$dp_unit)
 
-  tampered <- config
-  tampered[["image-size"]] <- 129L
   expect_error(
-    flowerPrepareRunDS(name, "diagnosis", NULL, tampered),
-    "contract SHA-256 does not match")
+    flowerPrepareRunDS(name, "diagnosis", NULL, config),
+    "data_type disagrees with the server-side dataset descriptor")
   expect_null(dsFlower:::.getHandle(name)$run_token)
 
   expect_error(
     flowerPrepareRunDS(name, "diagnosis", "relative_path", config),
-    "does not accept tabular feature columns")
+    "data_type disagrees with the server-side dataset descriptor")
   expect_null(dsFlower:::.getHandle(name)$run_token)
-
-  expect_no_error(flowerPrepareRunDS(name, "diagnosis", NULL, config))
-  handle <- dsFlower:::.getHandle(name)
-  manifest <- jsonlite::fromJSON(
-    file.path(handle$staging_dir, "manifest.json"), simplifyVector = FALSE)
-  expect_identical(manifest$data_type, "image")
-  expect_identical(manifest$n_samples, 0L)
-  expect_identical(manifest$backbone, "densenet121_3d")
-  expect_identical(manifest[["image-size"]], 128L)
-  expect_identical(
-    manifest[["vision-extractor-profile"]],
-    "dsflower-densenet121-monai-seed0-extractor-v1")
-  expect_identical(manifest[["num-features"]], 1024L)
-  expect_identical(
-    manifest[["validation-artifact-sha256"]], strrep("a", 64L))
-  expect_false("feature_columns" %in% names(manifest))
-  expect_false("feature-bounds" %in% names(manifest))
 })
 
 test_that("flowerPrepareRunDS stages data correctly", {
@@ -704,7 +941,8 @@ test_that("flowerPrepareRunDS stages data correctly", {
   on.exit(dsFlower:::.removeHandle("test_prepare"), add = TRUE)
 
   # Prepare the run
-  result <- flowerPrepareRunDS("test_prepare", "target", c("f1", "f2", "f3"))
+  feature_columns <- c("f1", "f2", "f3")
+  result <- flowerPrepareRunDS("test_prepare", "target", feature_columns)
   expect_named(result, "capability")
   state <- dsFlower:::.getHandle("test_prepare")
 
@@ -727,24 +965,57 @@ test_that("flowerPrepareRunDS stages data correctly", {
   expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
 })
 
-test_that("flowerPrepareRunDS does not expose a minimum-size admission bit", {
+test_that("assigned data frames and matrices obey the privacy-unit minimum", {
   local_interface_privacy_state()
-  # Create tiny dataset
-  tiny_dir <- tempdir()
-  tiny_path <- file.path(tiny_dir, "tiny_test.csv")
-  utils::write.csv(data.frame(f1 = 1:2, target = 0:1), tiny_path, row.names = FALSE)
-  on.exit(unlink(tiny_path))
+  threshold <- 4L
+  withr::local_options(list(
+    nfilter.subset = threshold,
+    dsflower.min_train_rows = NULL))
 
-  handle <- mock_handle(data_path = tiny_path, data_format = "csv")
-  dsFlower:::.setHandle("test_tiny", handle)
-  on.exit(dsFlower:::.removeHandle("test_tiny"), add = TRUE)
+  prepare_assigned <- function(value) {
+    env <- new.env(parent = globalenv())
+    assign("D", value, envir = env)
+    assign("flowerInitDS", dsFlower::flowerInitDS, envir = env)
+    assign("flowerPrepareRunDS", dsFlower::flowerPrepareRunDS, envir = env)
+    assign("flowerDestroyDS", dsFlower::flowerDestroyDS, envir = env)
+    assign("flower", evalq(flowerInitDS("D"), envir = env), envir = env)
+    on.exit(try(evalq(flowerDestroyDS("flower"), envir = env), silent = TRUE))
 
-  expect_no_error(flowerPrepareRunDS("test_tiny", "target"))
-  state <- dsFlower:::.getHandle("test_tiny")
-  manifest <- jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
-  expect_equal(manifest$n_samples, 2L)
-  expect_equal(manifest$n_units, 2L)
-  expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
+    error <- tryCatch({
+      evalq(flowerPrepareRunDS("flower", "target", "f1"), envir = env)
+      NULL
+    }, error = identity)
+    state <- evalq(dsFlower:::.getHandle("flower"), envir = env)
+    manifest <- if (isTRUE(state$prepared)) {
+      jsonlite::fromJSON(file.path(state$staging_dir, "manifest.json"))
+    } else {
+      NULL
+    }
+    list(error = error, state = state, manifest = manifest)
+  }
+
+  make_table <- function(n, as_matrix) {
+    value <- data.frame(
+      f1 = seq_len(n), target = rep(0:1, length.out = n))
+    if (as_matrix) as.matrix(value) else value
+  }
+
+  for (as_matrix in c(FALSE, TRUE)) {
+    below <- prepare_assigned(make_table(threshold - 1L, as_matrix))
+    expect_s3_class(below$error, "error")
+    expect_identical(
+      conditionMessage(below$error),
+      paste0("Private data preparation failed on this node; contact the node ",
+             "administrator."))
+    expect_false(below$state$prepared)
+    expect_null(below$state$run_token)
+
+    boundary <- prepare_assigned(make_table(threshold, as_matrix))
+    expect_null(boundary$error)
+    expect_true(boundary$state$prepared)
+    expect_equal(boundary$manifest$n_samples, threshold)
+    expect_equal(boundary$manifest$n_units, threshold)
+  }
 })
 
 test_that("failed preparation does not alter a later training contract", {
@@ -769,6 +1040,49 @@ test_that("failed preparation does not alter a later training contract", {
   expect_gt(manifest[["privacy-epsilon"]], 0)
   expect_gt(manifest[["privacy-delta"]], 0)
   expect_match(manifest[["privacy-policy-sha256"]], "^[0-9a-f]{64}$")
+})
+
+test_that("failed prepare retains an exact staging rollback token", {
+  local_interface_privacy_state()
+  withr::local_options(list(
+    nfilter.subset = 4L,
+    dsflower.min_train_rows = NULL
+  ))
+  symbol <- "test_prepare_cleanup_retry"
+  dsFlower:::.setHandle(symbol, mock_handle(table_data = data.frame(
+    f1 = 1:3, target = c(0L, 1L, 0L))))
+  withr::defer(try(dsFlower:::.removeHandle(symbol), silent = TRUE))
+
+  fail_cleanup <- TRUE
+  real_cleanup <- dsFlower:::.cleanupStaging
+  local_mocked_bindings(
+    .cleanupStaging = function(run_token) {
+      if (fail_cleanup) {
+        fail_cleanup <<- FALSE
+        stop("mock rollback deletion failed")
+      }
+      real_cleanup(run_token)
+    },
+    .package = "dsFlower"
+  )
+
+  expect_error(
+    flowerPrepareRunDS(symbol, "target", "f1"),
+    "Private data preparation failed on this node",
+    fixed = TRUE
+  )
+  retained <- dsFlower:::.getHandle(symbol)
+  expect_false(retained$prepared)
+  expect_null(retained$run_token)
+  expect_length(retained$pending_cleanup_tokens, 1L)
+  staging_dirs <- dsFlower:::.expectedStagingDirs(
+    retained$pending_cleanup_tokens, create_roots = FALSE)
+  expect_true(any(dir.exists(staging_dirs)))
+
+  expect_no_error(flowerCleanupRunDS(symbol))
+  cleaned <- dsFlower:::.getHandle(symbol)
+  expect_null(cleaned$pending_cleanup_tokens)
+  expect_false(any(dir.exists(staging_dirs)))
 })
 
 test_that("run admission is independent of a rare target class", {
@@ -813,6 +1127,25 @@ test_that("run admission fails closed without one exact privacy-unit count", {
   )
 })
 
+test_that("minimum-size admission uses privacy units rather than sample rows", {
+  withr::local_options(list(
+    nfilter.subset = 4L,
+    dsflower.min_train_rows = NULL))
+  base_args <- list(
+    handle = NULL, target_column = "target",
+    n_samples = 40L, target_data = NULL,
+    run_config = list("privacy-clipping_norm" = 1),
+    data_type = "image"
+  )
+  expect_error(
+    do.call(dsFlower:::.enforceDisclosureAndDp,
+            c(base_args, list(n_units = 3L))),
+    "Disclosive: operation blocked")
+  expect_no_error(
+    do.call(dsFlower:::.enforceDisclosureAndDp,
+            c(base_args, list(n_units = 4L))))
+})
+
 # --- TLS ca.pem handling ---
 
 test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
@@ -825,7 +1158,8 @@ test_that("flowerEnsureSuperNodeDS writes ca.pem when ca_cert_pem provided", {
   on.exit(dsFlower:::.removeHandle("test_tls"), add = TRUE)
 
   # Prepare the handle first
-  flowerPrepareRunDS("test_tls", "target", c("f1", "f2", "f3"))
+  feature_columns <- c("f1", "f2", "f3")
+  flowerPrepareRunDS("test_tls", "target", feature_columns)
   staging_dir <- dsFlower:::.getHandle("test_tls")$staging_dir
 
   # B64-encode a mock CA cert PEM (same as client would send)
@@ -877,7 +1211,8 @@ test_that("flowerEnsureSuperNodeDS works without ca_cert_pem", {
   dsFlower:::.setHandle("test_no_tls", handle)
   on.exit(dsFlower:::.removeHandle("test_no_tls"), add = TRUE)
 
-  flowerPrepareRunDS("test_no_tls", "target", c("f1", "f2", "f3"))
+  feature_columns <- c("f1", "f2", "f3")
+  flowerPrepareRunDS("test_no_tls", "target", feature_columns)
 
   local_mocked_bindings(
     .active_tunnel_port = function() 18080L,
@@ -974,7 +1309,126 @@ test_that("flowerCleanupRunDS stops associated SuperNode before reset", {
   expect_equal(stopped, handle$staging_dir)
 })
 
+test_that("flowerCleanupRunDS preserves state on failure and retries exactly", {
+  run_token <- dsFlower:::.generate_run_token()
+  staging_dir <- dsFlower:::.ensureStagingDir(run_token)
+  handle <- mock_handle(
+    run_token = run_token,
+    staging_dir = staging_dir,
+    target_column = "target",
+    prepared = TRUE,
+    node_ensured = TRUE
+  )
+  dsFlower:::.setHandle("test_cleanup_retry", handle)
+  withr::defer(try(
+    dsFlower:::.removeHandle("test_cleanup_retry"), silent = TRUE))
+
+  attempts <- 0L
+  real_cleanup <- dsFlower:::.cleanupStaging
+  local_mocked_bindings(
+    .supernode_stop = function(...) invisible(TRUE),
+    .cleanupStaging = function(token) {
+      attempts <<- attempts + 1L
+      if (attempts == 1L) stop("mock staging deletion failed")
+      real_cleanup(token)
+    },
+    .package = "dsFlower"
+  )
+
+  expect_error(
+    flowerCleanupRunDS("test_cleanup_retry"),
+    "mock staging deletion failed",
+    fixed = TRUE
+  )
+  retained <- dsFlower:::.getHandle("test_cleanup_retry")
+  expect_identical(retained$run_token, run_token)
+  expect_identical(retained$staging_dir, staging_dir)
+  expect_true(retained$prepared)
+
+  expect_no_error(flowerCleanupRunDS("test_cleanup_retry"))
+  cleaned <- dsFlower:::.getHandle("test_cleanup_retry")
+  expect_null(cleaned$run_token)
+  expect_null(cleaned$staging_dir)
+  expect_false(cleaned$prepared)
+  expect_false(dir.exists(staging_dir))
+})
+
+test_that("cleanup and destroy retry after staging is already absent", {
+  make_partial <- function(symbol) {
+    run_token <- dsFlower:::.generate_run_token()
+    staging_dir <- dsFlower:::.ensureStagingDir(run_token)
+    unlink(staging_dir, recursive = TRUE)
+    dsFlower:::.setHandle(symbol, mock_handle(
+      run_token = run_token, staging_dir = staging_dir,
+      target_column = "target", prepared = TRUE, node_ensured = TRUE),
+      owner_env = parent.frame())
+    list(token = run_token, path = staging_dir)
+  }
+
+  cleanup_partial <- make_partial("test_cleanup_absent")
+  withr::defer(try(
+    dsFlower:::.removeHandle("test_cleanup_absent"), silent = TRUE))
+  expect_no_error(flowerCleanupRunDS("test_cleanup_absent"))
+  cleaned <- dsFlower:::.getHandle("test_cleanup_absent")
+  expect_null(cleaned$run_token)
+  expect_null(cleaned$staging_dir)
+  expect_false(cleaned$prepared)
+  expect_false(dir.exists(cleanup_partial$path))
+
+  destroy_partial <- make_partial("test_destroy_absent")
+  expect_no_error(flowerDestroyDS("test_destroy_absent"))
+  expect_error(
+    dsFlower:::.getHandle("test_destroy_absent"),
+    "No Flower handle",
+    fixed = TRUE
+  )
+  expect_false(dir.exists(destroy_partial$path))
+})
+
+test_that("flowerDestroyDS retains its registry entry until cleanup succeeds", {
+  run_token <- dsFlower:::.generate_run_token()
+  staging_dir <- dsFlower:::.ensureStagingDir(run_token)
+  handle <- mock_handle(
+    run_token = run_token, staging_dir = staging_dir,
+    target_column = "target", prepared = TRUE, node_ensured = TRUE)
+  dsFlower:::.setHandle("test_destroy_retry", handle)
+  withr::defer(try(
+    dsFlower:::.removeHandle("test_destroy_retry"), silent = TRUE))
+
+  attempts <- 0L
+  real_cleanup <- dsFlower:::.cleanupStaging
+  local_mocked_bindings(
+    .supernode_stop = function(...) invisible(TRUE),
+    .cleanupStaging = function(token) {
+      attempts <<- attempts + 1L
+      if (attempts == 1L) stop("mock staging deletion failed")
+      real_cleanup(token)
+    },
+    .package = "dsFlower"
+  )
+
+  expect_error(
+    flowerDestroyDS("test_destroy_retry"),
+    "mock staging deletion failed",
+    fixed = TRUE
+  )
+  retained <- dsFlower:::.getHandle("test_destroy_retry")
+  expect_identical(retained$run_token, run_token)
+  expect_identical(retained$staging_dir, staging_dir)
+
+  expect_no_error(flowerDestroyDS("test_destroy_retry"))
+  expect_error(
+    dsFlower:::.getHandle("test_destroy_retry"),
+    "No Flower handle",
+    fixed = TRUE
+  )
+  expect_false(dir.exists(staging_dir))
+})
+
 test_that("flowerGetCapabilitiesDS returns expected structure", {
+  withr::local_options(list(
+    nfilter.subset = 4L,
+    dsflower.min_train_rows = 6L))
   xgboost_calls <- 0L
   pure_calls <- list()
   local_mocked_bindings(
@@ -1042,7 +1496,7 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_identical(caps$resampling$cross_validation$folds, c(2L, 10L))
   expect_true(caps$resampling$cross_validation$pooled_only)
   expect_true("max_rounds" %in% names(caps))
-  expect_true("min_samples" %in% names(caps))
+  expect_identical(caps$min_samples, 6L)
   expect_false("secure_aggregation_supported" %in% names(caps))
   expect_false(caps$hook_execution_configured)
 
@@ -1058,10 +1512,9 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
 })
 
 test_that("unsupported run configuration fails before private preparation", {
-  expect_identical(
+  expect_error(
     dsFlower:::.validate_client_run_config(list(label_set = "clinical")),
-    list(label_set = "clinical")
-  )
+    "unsupported")
   expect_error(
     dsFlower:::.addDpConfigToRunConfig(list(
       "dp-track" = "trees", "num-server-rounds" = 1L)),

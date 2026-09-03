@@ -112,8 +112,9 @@ test_that("native validation preparation stages only the bounded public pins", {
       TRUE
     },
     .package = "dsFlower")
+  feature_columns <- c("age", "marker")
   expect_no_error(flowerPrepareRunDS(
-    name, "outcome", c("age", "marker"), config))
+    name, "outcome", feature_columns, config))
   handle <- dsFlower:::.getHandle(name)
   manifest <- jsonlite::fromJSON(
     file.path(handle$staging_dir, "manifest.json"), simplifyVector = FALSE)
@@ -142,8 +143,9 @@ test_that("native validation rejects image routing before private staging", {
       dsFlower:::.dpUnitPolicy()$dp_unit)
   config$data_type <- "image"
 
+  feature_columns <- c("age", "marker")
   expect_error(flowerPrepareRunDS(
-    name, "outcome", c("age", "marker"), config),
+    name, "outcome", feature_columns, config),
     "Native-tree validation accepts tabular data only")
 })
 

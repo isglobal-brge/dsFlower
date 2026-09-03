@@ -43,6 +43,55 @@ test_that("as_flower_dataset.FlowerDatasetDescriptor is pass-through", {
   expect_identical(result, desc)
 })
 
+test_that("generic ResourceClient cannot materialize an imaging resource", {
+  skip_if_not_installed("resourcer")
+  skip_if_not_installed("R6")
+
+  fake_class <- R6::R6Class(
+    "FakeImagingSchemeResourceClient",
+    inherit = resourcer::ResourceClient,
+    public = list(
+      materialized = FALSE,
+      asDataFrame = function(...) {
+        self$materialized <- TRUE
+        data.frame(patient = seq_len(5L), value = seq_len(5L))
+      }
+    )
+  )
+  client <- fake_class$new(resourcer::newResource(
+    name = "images",
+    url = "imaging+dataset://example.invalid/bucket/site"
+  ))
+
+  expect_error(
+    as_flower_dataset.ResourceClient(client),
+    "initialized with imagingInitDS"
+  )
+  expect_false(client$materialized)
+})
+
+test_that("generic ResourceClient still materializes a tabular resource", {
+  skip_if_not_installed("resourcer")
+  skip_if_not_installed("R6")
+
+  fake_class <- R6::R6Class(
+    "FakeTabularResourceClient",
+    inherit = resourcer::ResourceClient,
+    public = list(
+      asDataFrame = function(...) data.frame(x = seq_len(5L))
+    )
+  )
+  client <- fake_class$new(resourcer::newResource(
+    name = "table",
+    url = "file:///srv/data/table.csv"
+  ))
+
+  descriptor <- as_flower_dataset.ResourceClient(client)
+  expect_s3_class(descriptor, "FlowerDatasetDescriptor")
+  expect_identical(descriptor$source_kind, "in_memory_df")
+  expect_identical(descriptor$metadata$n_samples, 5L)
+})
+
 test_that("ImagingDatasetResourceClient keeps its storage context", {
   manifest <- list(
     dataset_id = "pathmnist.site",

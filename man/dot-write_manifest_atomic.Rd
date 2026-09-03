@@ -7,6 +7,14 @@
 .write_manifest_atomic(manifest, manifest_path)
 }
 \description{
-Atomically replace a JSON manifest in its own directory
+Doubles are written with 17 significant digits (\code{digits = I(17)}), not
+the 15 of \code{digits = NA}: the manifest is the authoritative privacy
+contract, and the trusted runner's release guard revalidates the fixed
+cross-validation/holdout budget split against its own IEEE recomputation at
+\code{rel_tol = 1e-15}. A 15-digit decimal loses the low bits of computed
+allocations (for example \code{epsilon * 0.8 / 3}), which made every live
+cross-validation round fail closed as unavailable; 17 digits round-trip the
+exact double (worst case one ulp, ~2.2e-16 relative, inside the guard's
+tolerance).
 }
 \keyword{internal}

@@ -46,29 +46,40 @@
   )
 )
 
+#' Normalize a DataSHIELD disclosure threshold without weakening its floor
+#' @keywords internal
+.normaliseDisclosureThreshold <- function(value, fallback = 3L,
+                                          minimum = fallback) {
+  numeric_value <- tryCatch(suppressWarnings(as.numeric(value)),
+    error = function(e) numeric(0))
+  if (length(numeric_value) != 1L || is.na(numeric_value) ||
+      !is.finite(numeric_value)) {
+    return(as.integer(fallback))
+  }
+  numeric_value <- max(minimum, ceiling(numeric_value))
+  if (numeric_value > .Machine$integer.max) return(.Machine$integer.max)
+  as.integer(numeric_value)
+}
+
 
 #' Bucket a count to prevent exact sample sizes from leaking
 #'
-#' Delegates to \code{dsImaging::safe_metadata_count()} for consistent
-#' profile-aware bucketing across all DS packages. Falls back to local
-#' power-of-two bucketing if dsImaging is unavailable.
+#' Uses dsFlower's own server-side threshold. The optional dsImaging package
+#' has a separate trust profile and must not change dsFlower's disclosure
+#' behavior merely by being installed.
 #'
 #' @param n Integer; the exact count.
 #' @return Integer; the bucketed count.
 #' @keywords internal
 .bucket_count <- function(n) {
-  if (requireNamespace("dsImaging", quietly = TRUE)) {
-    return(dsImaging::safe_metadata_count(as.integer(n)))
+  n <- suppressWarnings(as.numeric(n))
+  if (length(n) != 1L || is.na(n) || !is.finite(n) || n < 0) {
+    return(NA_integer_)
   }
-  # Fallback: local power-of-two bucketing
-  n <- as.integer(n)
-  if (is.na(n) || n <= 0) return(0L)
-  # Suppress small counts: returning 1/2/3 exactly discloses a near-empty
-  # stratum. Counts at or below the DataSHIELD subset filter report as 0.
-  thr <- as.integer(getOption("nfilter.subset",
-                              getOption("default.nfilter.subset", 3)))
-  if (n <= thr) return(0L)
-  as.integer(2^round(log2(n)))
+  thr <- .normaliseDisclosureThreshold(
+    getOption("nfilter.subset", getOption("default.nfilter.subset", 3)))
+  if (n < thr) return(NA_integer_)
+  as.integer(2^ceiling(log2(max(n, 4))))
 }
 
 #' Read all disclosure settings from DataSHIELD server options
@@ -82,12 +93,14 @@
 .flowerDisclosureSettings <- function() {
   list(
     # --- Standard DataSHIELD thresholds (inherited, not redefined) ---
-    nfilter_subset = as.numeric(getOption("nfilter.subset",
-                        getOption("default.nfilter.subset", 3))),
-    nfilter_tab = as.numeric(getOption("nfilter.tab",
-                        getOption("default.nfilter.tab", 3))),
-    nfilter_levels_max = as.numeric(getOption("nfilter.levels.max",
-                        getOption("default.nfilter.levels.max", 40))),
+    nfilter_subset = .normaliseDisclosureThreshold(
+      getOption("nfilter.subset", getOption("default.nfilter.subset", 3))),
+    nfilter_tab = .normaliseDisclosureThreshold(
+      getOption("nfilter.tab", getOption("default.nfilter.tab", 3))),
+    nfilter_levels_max = .normaliseDisclosureThreshold(
+      getOption("nfilter.levels.max",
+        getOption("default.nfilter.levels.max", 40)),
+      fallback = 40L, minimum = 1L),
     # --- dsFlower-specific settings ---
     max_rounds = as.numeric(.dsf_option("max_rounds", 500)),
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
@@ -102,9 +115,10 @@
 #' admin may raise it via \code{dsflower.min_cell_count}.
 #' @keywords internal
 .disclosure_min_cell <- function() {
-  base <- as.integer(getOption("nfilter.tab", getOption("default.nfilter.tab", 3)))
-  ov <- suppressWarnings(as.integer(.dsf_option("min_cell_count", NA)))
-  max(base, if (is.na(ov)) base else ov, na.rm = TRUE)
+  base <- .normaliseDisclosureThreshold(
+    getOption("nfilter.tab", getOption("default.nfilter.tab", 3)))
+  .normaliseDisclosureThreshold(
+    .dsf_option("min_cell_count", base), fallback = base, minimum = base)
 }
 
 #' Minimum training rows to allow a run.
@@ -114,10 +128,10 @@
 #' vision models that need far more data for a meaningful DP guarantee).
 #' @keywords internal
 .disclosure_min_rows <- function() {
-  base <- as.integer(getOption("nfilter.subset",
-                               getOption("default.nfilter.subset", 3)))
-  ov <- suppressWarnings(as.integer(.dsf_option("min_train_rows", NA)))
-  max(base, if (is.na(ov)) base else ov, na.rm = TRUE)
+  base <- .normaliseDisclosureThreshold(
+    getOption("nfilter.subset", getOption("default.nfilter.subset", 3)))
+  .normaliseDisclosureThreshold(
+    .dsf_option("min_train_rows", base), fallback = base, minimum = base)
 }
 
 #' Assert minimum training samples
@@ -178,6 +192,26 @@
   list(
     dp_unit = unit,
     patient_column = patient_column,
+    canonicalization = "trim-utf8-v2"
+  )
+}
+
+# Resolve an optional server-authored privacy-unit policy. Imaging manifests
+# carry a per-dataset patient unit; other data sources keep the node-wide policy.
+.resolvePrivacyUnitPolicy <- function(unit_policy = NULL) {
+  if (is.null(unit_policy)) return(.dpUnitPolicy())
+  if (!is.list(unit_policy) ||
+      !identical(unit_policy$dp_unit, "patient") ||
+      !is.character(unit_policy$patient_column) ||
+      length(unit_policy$patient_column) != 1L ||
+      is.na(unit_policy$patient_column) ||
+      !nzchar(trimws(unit_policy$patient_column)) ||
+      !identical(unit_policy$canonicalization, "trim-utf8-v2")) {
+    stop("Invalid server-authored privacy-unit policy.", call. = FALSE)
+  }
+  list(
+    dp_unit = "patient",
+    patient_column = unit_policy$patient_column,
     canonicalization = "trim-utf8-v2"
   )
 }

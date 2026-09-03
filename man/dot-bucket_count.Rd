@@ -13,8 +13,8 @@
 Integer; the bucketed count.
 }
 \description{
-Delegates to \code{dsImaging::safe_metadata_count()} for consistent
-profile-aware bucketing across all DS packages. Falls back to local
-power-of-two bucketing if dsImaging is unavailable.
+Uses dsFlower's own server-side threshold. The optional dsImaging package
+has a separate trust profile and must not change dsFlower's disclosure
+behavior merely by being installed.
 }
 \keyword{internal}

@@ -5,12 +5,12 @@
 # semantic identity in the trusted runner. Historical use never disables a new
 # operation.
 
-.privacy_policy <- function() {
+.privacy_policy <- function(unit_policy = NULL) {
   epsilon <- suppressWarnings(as.numeric(
     .dsf_option("dp_per_training_epsilon", 1.0)))
   delta <- suppressWarnings(as.numeric(
     .dsf_option("dp_per_training_delta", 1e-6)))
-  unit_policy <- .dpUnitPolicy()
+  unit_policy <- .resolvePrivacyUnitPolicy(unit_policy)
   adjacency <- "replace_one"
 
   if (length(epsilon) != 1L || !is.finite(epsilon) ||
@@ -138,7 +138,8 @@
   uid
 }
 
-.privacy_training_contract <- function(run_token, num_rounds) {
+.privacy_training_contract <- function(run_token, num_rounds,
+                                       unit_policy = NULL) {
   run_token <- .validate_run_token(run_token)
   horizon <- suppressWarnings(as.numeric(num_rounds))
   if (length(horizon) != 1L || !is.finite(horizon) || horizon < 1 ||
@@ -146,7 +147,7 @@
     stop("num_rounds must be a positive integer.", call. = FALSE)
   }
   horizon <- .validateMaxRounds(as.integer(horizon))
-  policy <- .privacy_policy()
+  policy <- .privacy_policy(unit_policy)
   list(
     epsilon = policy$per_training_epsilon,
     delta = policy$per_training_delta,
@@ -196,6 +197,15 @@ flowerPrivacyBootstrap <- function() {
     },
     secret_path = secret_path
   )
+}
+
+# Registered DataSHIELD methods must not relay secret-file diagnostics, which
+# can include the node's absolute privacy-state path.
+.public_privacy_runtime_bootstrap <- function() {
+  tryCatch(
+    suppressWarnings(suppressMessages(.privacy_runtime_bootstrap())),
+    error = function(e) stop("dsFlower privacy state is unavailable.",
+                             call. = FALSE))
 }
 
 .privacy_policy_status <- function() {

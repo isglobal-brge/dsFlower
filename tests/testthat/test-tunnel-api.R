@@ -354,8 +354,9 @@ test_that("512 KiB tunnel chunks traverse real DSI and DSLite", {
 test_that("generation fencing rejects stale reconnect traffic", {
   cid <- paste0("dsf_", strrep("1", 32))
   spool <- .activate_test_tunnel(cid, generation = 2)
+  stale_payload <- dsFlower:::.tunnel_enc(charToRaw("stale"))
   result <- dsFlower::flowerTunnelExchangeDS(
-    cid, pa = 0, pd = dsFlower:::.tunnel_enc(charToRaw("stale")),
+    cid, pa = 0, pd = stale_payload,
     pf = 0, g = 1
   )
   expect_identical(result, list(
@@ -364,10 +365,9 @@ test_that("generation fencing rejects stale reconnect traffic", {
     spool, "down.bin"
   )$bytes, 0)
 
+  current_payload <- dsFlower:::.tunnel_enc(charToRaw("current"))
   result <- dsFlower::flowerTunnelExchangeDS(
-    cid, pa = 0, pd = dsFlower:::.tunnel_enc(charToRaw("current")),
-    pf = 0, g = 2
-  )
+    cid, pa = 0, pd = current_payload, pf = 0, g = 2)
   expect_identical(result$sz, 7)
   expect_identical(
     dsFlower:::.tunnel_read_at(spool, "down.bin", 0, max_bytes = 7)$data,
@@ -397,10 +397,9 @@ test_that("downstream backpressure still drains the upstream stream", {
   upstream <- charToRaw("upstream-must-progress")
   dsFlower:::.tunnel_append(spool, "up.bin", upstream)
 
+  downstream <- dsFlower:::.tunnel_enc(as.raw(rep(0x33, chunk)))
   result <- dsFlower::flowerTunnelExchangeDS(
-    cid, pa = cap,
-    pd = dsFlower:::.tunnel_enc(as.raw(rep(0x33, chunk))),
-    pf = 0, g = 1
+    cid, pa = cap, pd = downstream, pf = 0, g = 1
   )
 
   expect_identical(result$sz, as.numeric(cap))

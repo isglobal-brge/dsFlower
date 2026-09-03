@@ -23,11 +23,18 @@ test_that("dsflower.* options can raise (never lower) the floors", {
 
 test_that(".bucket_count suppresses small counts and buckets the rest", {
   withr::local_options(list(nfilter.subset = 3))
-  expect_equal(dsFlower:::.bucket_count(0), 0L)
-  # Small counts are never returned exactly larger than the input; large counts
-  # stay positive. (Exact-zero suppression is the no-dsImaging fallback.)
-  expect_lte(dsFlower:::.bucket_count(2), 2L)
+  expect_true(is.na(dsFlower:::.bucket_count(0)))
+  expect_true(is.na(dsFlower:::.bucket_count(2)))
   expect_gt(dsFlower:::.bucket_count(100), 0L)
+})
+
+test_that("malformed thresholds cannot lower the DataSHIELD floor", {
+  for (value in list(0, -1, NA_real_, Inf, c(1, 100), "invalid")) {
+    withr::local_options(list(nfilter.subset = value, nfilter.tab = value))
+    expect_gte(dsFlower:::.disclosure_min_rows(), 3L)
+    expect_gte(dsFlower:::.disclosure_min_cell(), 3L)
+    expect_true(is.na(dsFlower:::.bucket_count(2L)))
+  }
 })
 
 test_that(".assertMinSamples blocks tiny datasets generically", {

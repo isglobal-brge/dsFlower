@@ -15,6 +15,7 @@ on:
       - "inst/flower_app/dsflower_runner/association_*.py"
       - "inst/flower_app/dsflower_runner/client_app.py"
       - "inst/flower_app/dsflower_runner/dp_harness.py"
+      - "inst/flower_app/dsflower_runner/model_spec.py"
       - "inst/flower_app/dsflower_runner/server_app.py"
       - "inst/flower_app/dsflower_runner/release_guard.py"
       - "inst/flower_app/dsflower_runner/resampling.py"
@@ -22,7 +23,10 @@ on:
       - "inst/flower_app/dsflower_runner/vision.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
+      - "inst/flower_app/dsflower_runner/tier2_lib.py"
+      - "inst/python/dsi_tunnel_forward.py"
       - "inst/python/sitecustomize.py"
+      - "inst/python/supernode_reaper.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
       - "inst/python/tests/test_native_tree_*.py"
       - "inst/python/tests/test_boosting_*.py"
@@ -31,11 +35,16 @@ on:
       - "inst/python/tests/test_tree_release.py"
       - "inst/python/tests/test_cross_validation.py"
       - "inst/python/tests/test_dpsgd_guards.py"
+      - "inst/python/tests/test_dp_safety.py"
       - "inst/python/tests/test_holdout.py"
       - "inst/python/tests/test_epi_association.py"
       - "inst/python/tests/test_association_flower_app.py"
       - "inst/python/tests/test_validation_dp.py"
       - "inst/python/tests/test_sitecustomize.py"
+      - "inst/python/tests/test_release_guard.py"
+      - "inst/python/tests/test_runner_contracts.py"
+      - "inst/python/tests/test_supernode_reaper.py"
+      - "inst/python/tests/test_tunnel_forwarder.py"
       - "inst/python/tests/test_xgboost_*.py"
       - "native/xgboost/**"
       - "native/dp_primitives/**"
@@ -59,6 +68,7 @@ on:
       - "inst/flower_app/dsflower_runner/association_*.py"
       - "inst/flower_app/dsflower_runner/client_app.py"
       - "inst/flower_app/dsflower_runner/dp_harness.py"
+      - "inst/flower_app/dsflower_runner/model_spec.py"
       - "inst/flower_app/dsflower_runner/server_app.py"
       - "inst/flower_app/dsflower_runner/release_guard.py"
       - "inst/flower_app/dsflower_runner/resampling.py"
@@ -66,7 +76,10 @@ on:
       - "inst/flower_app/dsflower_runner/vision.py"
       - "inst/flower_app/dsflower_runner/seeding.py"
       - "inst/flower_app/dsflower_runner/task.py"
+      - "inst/flower_app/dsflower_runner/tier2_lib.py"
+      - "inst/python/dsi_tunnel_forward.py"
       - "inst/python/sitecustomize.py"
+      - "inst/python/supernode_reaper.py"
       - "inst/flower_app/dsflower_runner/xgboost_*.py"
       - "inst/python/tests/test_native_tree_*.py"
       - "inst/python/tests/test_boosting_*.py"
@@ -75,11 +88,16 @@ on:
       - "inst/python/tests/test_tree_release.py"
       - "inst/python/tests/test_cross_validation.py"
       - "inst/python/tests/test_dpsgd_guards.py"
+      - "inst/python/tests/test_dp_safety.py"
       - "inst/python/tests/test_holdout.py"
       - "inst/python/tests/test_epi_association.py"
       - "inst/python/tests/test_association_flower_app.py"
       - "inst/python/tests/test_validation_dp.py"
       - "inst/python/tests/test_sitecustomize.py"
+      - "inst/python/tests/test_release_guard.py"
+      - "inst/python/tests/test_runner_contracts.py"
+      - "inst/python/tests/test_supernode_reaper.py"
+      - "inst/python/tests/test_tunnel_forwarder.py"
       - "inst/python/tests/test_xgboost_*.py"
       - "native/xgboost/**"
       - "native/dp_primitives/**"
@@ -177,6 +195,12 @@ jobs:
             inst/python/tests/test_xgboost_bundle.py \
             inst/python/tests/test_xgboost_native.py \
             inst/python/tests/test_xgboost_predictor.py
+          "$contract_python" -m unittest -v \
+            inst/python/tests/test_release_guard.py \
+            inst/python/tests/test_runner_contracts.py \
+            inst/python/tests/test_supernode_reaper.py \
+            inst/python/tests/test_tunnel_forwarder.py
+          "$contract_python" inst/python/tests/test_dp_safety.py
       - name: Verify fail-closed build and curated DP bundle
         shell: bash
         run: |

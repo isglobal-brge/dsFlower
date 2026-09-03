@@ -318,6 +318,7 @@
 #' @export
 flowerTunnelExchangeDS <- function(conn_id, pa = NULL, pd = "", pf = 0,
                                    g = NULL) {
+  .dsflower_require_literal_arguments()
   cid <- .tunnel_conn_id(conn_id)
   p <- .dsflower_env[[.tunnel_forwarder_key(cid)]]
   if (!identical(.dsflower_env$tunnel_conn_id, cid) ||
@@ -453,6 +454,7 @@ flowerTunnelExchangeDS <- function(conn_id, pa = NULL, pd = "", pf = 0,
 #' @export
 flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
                              protocol_abi = NULL) {
+  .dsflower_require_literal_arguments()
   cid <- .tunnel_conn_id(conn_id)
   port <- .tunnel_port(listen_port)
   abi <- suppressWarnings(as.numeric(protocol_abi))
@@ -562,6 +564,7 @@ flowerTunnelUpDS <- function(conn_id, listen_port, node_name = "",
 #' @keywords internal
 #' @export
 flowerTunnelDownDS <- function(conn_id) {
+  .dsflower_require_literal_arguments()
   cid <- .tunnel_conn_id(conn_id)
   .cleanup_tunnel(cid)
   TRUE

@@ -13,7 +13,7 @@
 Invisible TRUE.
 }
 \description{
-Sends SIGTERM, waits 5 seconds, then SIGKILL if needed.
-Removes from registry.
+Sends SIGTERM, waits for the configured grace period, then SIGKILL if needed.
+Removes from the registry only after termination is verified.
 }
 \keyword{internal}

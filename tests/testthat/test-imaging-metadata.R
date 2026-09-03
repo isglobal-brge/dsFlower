@@ -4,11 +4,12 @@ test_that("imaging discovery returns only public structural manifest fields", {
     dataset_id = "public.dataset",
     source_kind = "image_bundle",
     manifest = list(
+      metadata = list(label_col = "diagnosis"),
       labels = list(
         list(
-          name = "diagnosis", type = "categorical",
-          columns = c("diagnosis_code", "diagnosis_group"),
-          description = "Public label schema",
+          name = "legacy_private_label", type = "categorical",
+          columns = c("legacy_private_label", "diagnosis_group"),
+          description = "Legacy schema must be ignored",
           uri = "s3://private/labels.parquet",
           private_values = c("case", "control")
         )
@@ -38,7 +39,9 @@ test_that("imaging discovery returns only public structural manifest fields", {
   labels <- flowerImageLabelsDS(name)
   expect_named(labels, c("name", "type", "columns", "description"))
   expect_equal(labels$name, "diagnosis")
-  expect_equal(labels$columns, "diagnosis_code, diagnosis_group")
+  expect_equal(labels$type, "declared_label")
+  expect_equal(labels$columns, "diagnosis")
+  expect_false("legacy_private_label" %in% labels$name)
   expect_false(any(c("uri", "private_values") %in% names(labels)))
 
   assets <- flowerImageAssetsDS(name)
@@ -53,6 +56,68 @@ test_that("imaging discovery returns only public structural manifest fields", {
   expect_equal(masks$alias, "tumour_masks")
   expect_equal(masks$status, "declared")
   expect_false(any(c("n_valid", "root", "path") %in% names(masks)))
+})
+
+test_that("imaging discovery never reflects path-like declarative fields", {
+  name <- "test_canonical_image_metadata"
+  descriptor <- structure(list(
+    dataset_id = "public.dataset",
+    source_kind = "image_bundle",
+    manifest = list(metadata = list(label_col = "diagnosis")),
+    assets = list(
+      path_provider = list(kind = "feature_table",
+        provider = "/srv/private/models/model.pt"),
+      uri_processor = list(kind = "feature_table",
+        processor = "s3://private-bucket/features"),
+      scheme_segmenter = list(kind = "mask_root",
+        segmenter = "file:private-mask"),
+      bad_kind = list(kind = "private kind", provider = "safe-provider"),
+      `s3://private-bucket/asset` = list(
+        kind = "image_root", provider = "safe-provider")
+    )
+  ), class = "FlowerDatasetDescriptor")
+  dsFlower:::.setHandle(name, list(
+    source = "descriptor", source_kind = "image_bundle",
+    descriptor = descriptor, prepared = FALSE, node_ensured = FALSE
+  ))
+  withr::defer(dsFlower:::.removeHandle(name))
+
+  assets <- flowerImageAssetsDS(name)
+  expect_equal(assets$alias,
+    c("path_provider", "uri_processor", "scheme_segmenter", "bad_kind"))
+  expect_equal(assets$provider,
+    c("unknown", "unknown", "unknown", "safe-provider"))
+  expect_equal(assets$kind,
+    c("feature_table", "feature_table", "mask_root", "unknown"))
+  public <- jsonlite::toJSON(assets)
+  expect_false(grepl("/srv/private", public, fixed = TRUE))
+  expect_false(grepl("s3://", public, fixed = TRUE))
+  expect_false(grepl("file:private", public, fixed = TRUE))
+  expect_false(grepl("private kind", public, fixed = TRUE))
+})
+
+test_that("imaging label discovery accepts only canonical public identifiers", {
+  private_values <- c(
+    "/srv/private/labels.parquet", "s3://private-bucket/labels",
+    "file:private-label", "patient label")
+
+  for (i in seq_along(private_values)) {
+    name <- paste0("test_private_label_column_", i)
+    descriptor <- structure(list(
+      source_kind = "image_bundle",
+      manifest = list(metadata = list(label_col = private_values[[i]]))
+    ), class = "FlowerDatasetDescriptor")
+    dsFlower:::.setHandle(name, list(
+      source = "descriptor", source_kind = "image_bundle",
+      descriptor = descriptor, prepared = FALSE, node_ensured = FALSE
+    ))
+
+    labels <- flowerImageLabelsDS(name)
+    dsFlower:::.removeHandle(name)
+    expect_equal(nrow(labels), 0L)
+    expect_false(grepl(private_values[[i]], jsonlite::toJSON(labels),
+                       fixed = TRUE))
+  }
 })
 
 test_that("imaging discovery is type-stable for non-imaging handles", {

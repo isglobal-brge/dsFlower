@@ -24,10 +24,15 @@
   )
 }
 
-.publicManifestText <- function(value, default = NA_character_) {
+.publicManifestIdentifier <- function(value, default = NA_character_) {
   if (is.null(value) || is.list(value) || length(value) != 1L) return(default)
-  value <- as.character(value)
-  if (is.na(value) || !nzchar(value)) default else value
+  value <- enc2utf8(as.character(value))
+  valid <- !is.na(value) && nzchar(value) &&
+    nchar(value, type = "bytes") <= 128L &&
+    grepl("^[A-Za-z0-9][A-Za-z0-9._:-]*$", value) &&
+    !grepl("..", value, fixed = TRUE) &&
+    !grepl("^[A-Za-z][A-Za-z0-9+.-]*:", value)
+  if (isTRUE(valid)) unname(value) else default
 }
 
 .publicImageDescriptor <- function(handle_symbol) {
@@ -51,32 +56,18 @@
 #' @return A data.frame with public label names, types, columns, and descriptions.
 #' @export
 flowerImageLabelsDS <- function(handle_symbol) {
+  .dsflower_require_literal_arguments()
   descriptor <- .publicImageDescriptor(handle_symbol)
   if (is.null(descriptor)) return(.emptyImageLabels())
-
-  labels <- descriptor$manifest$labels %||% list()
-  if (!is.list(labels) || length(labels) == 0L) return(.emptyImageLabels())
-
-  rows <- lapply(labels, function(label) {
-    if (!is.list(label)) return(NULL)
-    columns <- label$columns
-    if (is.null(columns) || is.list(columns)) {
-      columns <- character(0)
-    } else {
-      columns <- as.character(columns)
-      columns <- columns[!is.na(columns) & nzchar(columns)]
-    }
-    data.frame(
-      name = .publicManifestText(label$name),
-      type = .publicManifestText(label$type),
-      columns = paste(columns, collapse = ", "),
-      description = .publicManifestText(label$description),
-      stringsAsFactors = FALSE
-    )
-  })
-  rows <- Filter(Negate(is.null), rows)
-  if (length(rows) == 0L) return(.emptyImageLabels())
-  do.call(rbind, rows)
+  metadata <- descriptor$manifest$metadata %||% list()
+  label_column <- .publicManifestIdentifier(metadata$label_col)
+  if (is.na(label_column)) return(.emptyImageLabels())
+  data.frame(
+    name = label_column,
+    type = "declared_label",
+    columns = label_column,
+    description = NA_character_,
+    stringsAsFactors = FALSE)
 }
 
 #' List public imaging asset definitions
@@ -89,6 +80,7 @@ flowerImageLabelsDS <- function(handle_symbol) {
 #' @return A data.frame with public asset aliases, kinds, and providers.
 #' @export
 flowerImageAssetsDS <- function(handle_symbol) {
+  .dsflower_require_literal_arguments()
   descriptor <- .publicImageDescriptor(handle_symbol)
   if (is.null(descriptor)) return(.emptyImageAssets())
 
@@ -100,16 +92,20 @@ flowerImageAssetsDS <- function(handle_symbol) {
   rows <- lapply(seq_along(assets), function(i) {
     asset <- assets[[i]]
     if (!is.list(asset)) return(NULL)
-    alias <- .publicManifestText(
-      asset_names[[i]], .publicManifestText(asset$alias, .publicManifestText(asset$name))
+    alias <- .publicManifestIdentifier(
+      asset_names[[i]], .publicManifestIdentifier(
+        asset$alias, .publicManifestIdentifier(asset$name))
     )
     if (is.na(alias)) return(NULL)
     data.frame(
       alias = alias,
-      kind = .publicManifestText(asset$kind, .publicManifestText(asset$type, "unknown")),
-      provider = .publicManifestText(
+      kind = .publicManifestIdentifier(
+        asset$kind, .publicManifestIdentifier(asset$type, "unknown")),
+      provider = .publicManifestIdentifier(
         asset$provider,
-        .publicManifestText(asset$processor, .publicManifestText(asset$segmenter))
+        .publicManifestIdentifier(
+          asset$processor,
+          .publicManifestIdentifier(asset$segmenter, "unknown"))
       ),
       stringsAsFactors = FALSE
     )
@@ -130,6 +126,7 @@ flowerImageAssetsDS <- function(handle_symbol) {
 #'   status \code{"declared"}.
 #' @export
 flowerImageMasksDS <- function(handle_symbol) {
+  .dsflower_require_literal_arguments()
   assets <- flowerImageAssetsDS(handle_symbol)
   masks <- assets[assets$kind == "mask_root", c("alias", "provider"), drop = FALSE]
   if (nrow(masks) == 0L) return(.emptyImageMasks())

@@ -635,15 +635,16 @@ test_that("native-tree prepare rejects an unavailable runtime before private IO"
     },
     .package = "dsFlower")
 
+  feature_columns <- c("age", "marker")
   expect_error(
     flowerPrepareRunDS(
-      "native_tree_probe_false", "outcome", c("age", "marker"), config),
+      "native_tree_probe_false", "outcome", feature_columns, config),
     "trusted native-tree runtime for 'xgboost' is unavailable")
   image_config <- config
   image_config$data_type <- "image"
   expect_error(
     flowerPrepareRunDS(
-      "native_tree_probe_false", "outcome", c("age", "marker"), image_config),
-    "accepts tabular data only")
+      "native_tree_probe_false", "outcome", feature_columns, image_config),
+    "data_type disagrees with the server-side dataset descriptor")
   expect_false(private_io)
 })

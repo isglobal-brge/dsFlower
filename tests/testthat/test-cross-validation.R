@@ -163,8 +163,9 @@ test_that("CV job mismatch is rejected before private staging", {
       stop("private staging reached")
     },
     .package = "dsFlower")
+  feature_columns <- c("x1", "x2")
   expect_error(
-    flowerPrepareRunDS(name, "y", c("x1", "x2"), config),
+    flowerPrepareRunDS(name, "y", feature_columns, config),
     "cv-job-sha256")
   expect_false(reached_staging)
 })

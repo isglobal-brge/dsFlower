@@ -76,20 +76,34 @@ as_flower_dataset.data.frame <- function(x, dataset_id = NULL, ...) {
 
 #' @describeIn as_flower_dataset Convert a resourcer ResourceClient.
 #'
-#' Calls \code{resourcer::as.data.frame()} on the client to materialize
-#' the resource, then wraps the result. If the client has class
-#' \code{ImagingDatasetResourceClient} (from dsImaging), delegates to
-#' its own method.
+#' Calls \code{resourcer::as.data.frame()} on a declared non-imaging client to
+#' materialize the resource, then wraps the result. Imaging resources must
+#' first be admitted by dsImaging and passed to dsFlower as an opaque handle.
 #'
 #' @export
 as_flower_dataset.ResourceClient <- function(x, ...) {
-  # If dsImaging provides a specialized subclass, dispatch to it
-
+  # S3 normally dispatches this subclass to the more specific method below,
+  # but keep this check for callers that invoke the method directly.
   if (inherits(x, "ImagingDatasetResourceClient")) {
-    return(as_flower_dataset.ImagingDatasetResourceClient(x, ...))
+    stop("Imaging resources must be initialized with imagingInitDS() before ",
+         "flowerInitDS().", call. = FALSE)
   }
 
-  # Default: materialize to data.frame
+  # Inspect the ResourceClient's public descriptor before materializing it.
+  # Class names are not a security boundary: a resolver can return a generic
+  # ResourceClient for an imaging+dataset URL.
+  resource <- tryCatch(x$getResource(), error = function(e) NULL)
+  url <- if (is.list(resource)) resource$url else NULL
+  if (!is.character(url) || length(url) != 1L || is.na(url) || !nzchar(url)) {
+    stop("ResourceClient does not expose a valid resource URL.", call. = FALSE)
+  }
+  scheme <- tolower(sub(":.*$", "", trimws(url)))
+  if (identical(scheme, "imaging+dataset")) {
+    stop("Imaging resources must be initialized with imagingInitDS() before ",
+         "flowerInitDS().", call. = FALSE)
+  }
+
+  # Default: materialize a declared tabular resource to data.frame.
   if (!requireNamespace("resourcer", quietly = TRUE)) {
     stop("Package 'resourcer' is required for ResourceClient support.",
          call. = FALSE)

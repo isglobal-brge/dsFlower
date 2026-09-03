@@ -174,6 +174,186 @@ test_that(".supernode_stop is safe for unknown manifest_dir", {
   expect_true(dsFlower:::.supernode_stop("/nonexistent/path"))
 })
 
+test_that(".terminate_supernode_pid fails if SIGKILL has no postcondition", {
+  signals <- integer()
+  withr::local_options(list(dsflower.supernode_term_grace = 1))
+  local_mocked_bindings(
+    .pid_is_alive = function(pid) TRUE,
+    .package = "dsFlower"
+  )
+  local_mocked_bindings(
+    pskill = function(pid, signal) {
+      signals <<- c(signals, signal)
+      TRUE
+    },
+    .package = "tools"
+  )
+  local_mocked_bindings(
+    Sys.sleep = function(...) invisible(NULL),
+    .package = "base"
+  )
+
+  expect_error(
+    dsFlower:::.terminate_supernode_pid(999999L),
+    "SuperNode cleanup did not complete",
+    fixed = TRUE
+  )
+  expect_identical(signals, c(15L, 9L))
+})
+
+test_that(".terminate_supernode_pid does not ACK rejected signals", {
+  withr::local_options(list(dsflower.supernode_term_grace = 1))
+  local_mocked_bindings(
+    .pid_is_alive = function(pid) TRUE,
+    .package = "dsFlower"
+  )
+  local_mocked_bindings(
+    pskill = function(pid, signal) FALSE,
+    .package = "tools"
+  )
+  local_mocked_bindings(
+    Sys.sleep = function(...) invisible(NULL),
+    .package = "base"
+  )
+
+  expect_error(
+    dsFlower:::.terminate_supernode_pid(999994L),
+    "SuperNode cleanup did not complete",
+    fixed = TRUE
+  )
+})
+
+test_that(".remove_supernode_pid refuses to ACK a surviving PID file", {
+  pid_dir <- withr::local_tempdir()
+  pid <- 999995L
+  pid_file <- file.path(pid_dir, paste0(pid, ".pid"))
+  writeLines(as.character(pid), pid_file)
+  local_mocked_bindings(
+    .supernode_pid_dir = function() pid_dir,
+    .package = "dsFlower"
+  )
+  local_mocked_bindings(
+    unlink = function(...) 0L,
+    .package = "base"
+  )
+
+  expect_error(
+    dsFlower:::.remove_supernode_pid(pid),
+    "SuperNode cleanup did not complete",
+    fixed = TRUE
+  )
+  expect_true(file.exists(pid_file))
+})
+
+test_that(".supernode_stop retains registry state until retry succeeds", {
+  registry <- dsFlower:::.supernode_registry
+  manifest_dir <- file.path(tempdir(), "retryable-supernode")
+  pid <- 999998L
+  alive <- TRUE
+  fail_first <- TRUE
+  removed <- integer()
+  process <- list(
+    is_alive = function() alive,
+    signal = function(...) stop("mock process signal failed"),
+    wait = function(...) invisible(NULL),
+    kill = function(...) invisible(NULL)
+  )
+  assign(manifest_dir, list(process = process, pid = pid), envir = registry)
+  withr::defer(if (exists(manifest_dir, envir = registry, inherits = FALSE)) {
+    rm(list = manifest_dir, envir = registry)
+  })
+
+  local_mocked_bindings(
+    .pid_is_alive = function(candidate) alive,
+    .terminate_supernode_pid = function(candidate) {
+      if (fail_first) {
+        fail_first <<- FALSE
+        stop("mock termination failed")
+      }
+      alive <<- FALSE
+      invisible(TRUE)
+    },
+    .remove_supernode_pid = function(candidate) {
+      removed <<- c(removed, candidate)
+      invisible(TRUE)
+    },
+    .list_supernode_processes = function() data.frame(
+      pid = integer(), manifest_dir = character()),
+    .package = "dsFlower"
+  )
+
+  expect_error(
+    dsFlower:::.supernode_stop(manifest_dir),
+    "mock termination failed",
+    fixed = TRUE
+  )
+  expect_true(exists(manifest_dir, envir = registry, inherits = FALSE))
+  expect_length(removed, 0L)
+
+  expect_true(dsFlower:::.supernode_stop(manifest_dir))
+  expect_false(exists(manifest_dir, envir = registry, inherits = FALSE))
+  expect_identical(removed, pid)
+})
+
+test_that(".supernode_stop does not signal a reused tracked PID", {
+  registry <- dsFlower:::.supernode_registry
+  manifest_dir <- file.path(tempdir(), "reused-supernode-pid")
+  pid <- 999997L
+  process <- list(is_alive = function() FALSE)
+  assign(manifest_dir, list(process = process, pid = pid), envir = registry)
+  withr::defer(if (exists(manifest_dir, envir = registry, inherits = FALSE)) {
+    rm(list = manifest_dir, envir = registry)
+  })
+
+  terminated <- integer()
+  local_mocked_bindings(
+    .pid_is_alive = function(candidate) TRUE,
+    .terminate_supernode_pid = function(candidate) {
+      terminated <<- c(terminated, candidate)
+      invisible(TRUE)
+    },
+    .remove_supernode_pid = function(...) invisible(TRUE),
+    .list_supernode_processes = function() data.frame(
+      pid = integer(), manifest_dir = character()),
+    .package = "dsFlower"
+  )
+
+  expect_true(dsFlower:::.supernode_stop(manifest_dir))
+  expect_length(terminated, 0L)
+  expect_false(exists(manifest_dir, envir = registry, inherits = FALSE))
+})
+
+test_that(".supernode_stop retains state when PID identity is unknown", {
+  registry <- dsFlower:::.supernode_registry
+  manifest_dir <- file.path(tempdir(), "unknown-supernode-pid")
+  pid <- 999996L
+  assign(manifest_dir, list(process = NULL, pid = pid), envir = registry)
+  withr::defer(if (exists(manifest_dir, envir = registry, inherits = FALSE)) {
+    rm(list = manifest_dir, envir = registry)
+  })
+
+  terminated <- integer()
+  local_mocked_bindings(
+    .pid_is_alive = function(candidate) TRUE,
+    .terminate_supernode_pid = function(candidate) {
+      terminated <<- c(terminated, candidate)
+      invisible(TRUE)
+    },
+    .remove_supernode_pid = function(...) invisible(TRUE),
+    .list_supernode_processes = function() data.frame(
+      pid = integer(), manifest_dir = character()),
+    .package = "dsFlower"
+  )
+
+  expect_error(
+    dsFlower:::.supernode_stop(manifest_dir),
+    "SuperNode cleanup did not complete",
+    fixed = TRUE
+  )
+  expect_length(terminated, 0L)
+  expect_true(exists(manifest_dir, envir = registry, inherits = FALSE))
+})
+
 test_that("Registry behavior works with mock process", {
   reg <- dsFlower:::.supernode_registry
   rm(list = ls(reg), envir = reg)

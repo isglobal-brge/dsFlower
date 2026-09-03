@@ -14,14 +14,14 @@
 # Build (after staging the tarballs here and publishing the reviewed base):
 #   docker build -f docker/Dockerfile.vision \
 #     --build-arg DSFLOWER_BASE_IMAGE='davidsarrat/dsflower-rock@sha256:<digest>' \
-#     -t davidsarrat/dsflower-vision:0.4.1 docker/
+#     -t davidsarrat/dsflower-vision:0.4.3 docker/
 # ---------------------------------------------------------------------------
 # No mutable default: make the reviewed parent image an explicit build input.
 ARG DSFLOWER_BASE_IMAGE
 FROM ${DSFLOWER_BASE_IMAGE}
 
 ARG DSFLOWER_BASE_IMAGE
-ARG DSFLOWER_VERSION=0.4.1
+ARG DSFLOWER_VERSION=0.4.3
 
 LABEL org.opencontainers.image.title="dsflower-vision" \
       org.opencontainers.image.description="dsFlower vision FL node: dsflower-rock + dsImaging (+dsHPC) for federated medical-image models" \

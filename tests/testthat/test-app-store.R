@@ -63,23 +63,25 @@ test_that("chunked push + install verifies a FAB by sha256 and unpacks it", {
   withr::defer(dsFlower::flowerAppDeleteDS(token))
 
   half <- floor(length(raw) / 2)
-  r1 <- dsFlower::flowerAppPushDS(token, .enc_b64(raw[1:half]), 0)
+  first_chunk <- .enc_b64(raw[1:half])
+  second_chunk <- .enc_b64(raw[(half + 1):length(raw)])
+  r1 <- dsFlower::flowerAppPushDS(token, first_chunk, 0)
   expect_equal(r1$size, half)
-  r2 <- dsFlower::flowerAppPushDS(token, .enc_b64(raw[(half + 1):length(raw)]), half)
+  r2 <- dsFlower::flowerAppPushDS(token, second_chunk, half)
   expect_equal(r2$size, length(raw))
 
   # idempotent: re-pushing the last chunk at the same offset does not grow the file
-  r2b <- dsFlower::flowerAppPushDS(token, .enc_b64(raw[(half + 1):length(raw)]), half)
+  r2b <- dsFlower::flowerAppPushDS(token, second_chunk, half)
   expect_true(r2b$ok)
   expect_equal(r2b$size, length(raw))
   conflict <- raw[(half + 1):length(raw)]
   conflict[[1L]] <- as.raw(bitwXor(as.integer(conflict[[1L]]), 1L))
-  bad_content <- dsFlower::flowerAppPushDS(
-    token, .enc_b64(conflict), half)
+  conflict_chunk <- .enc_b64(conflict)
+  bad_content <- dsFlower::flowerAppPushDS(token, conflict_chunk, half)
   expect_false(bad_content$ok)
   expect_identical(bad_content$error, "conflict")
-  bad_length <- dsFlower::flowerAppPushDS(
-    token, .enc_b64(raw[(half + 1):(length(raw) - 1L)]), half)
+  short_chunk <- .enc_b64(raw[(half + 1):(length(raw) - 1L)])
+  bad_length <- dsFlower::flowerAppPushDS(token, short_chunk, half)
   expect_false(bad_length$ok)
   expect_identical(bad_length$error, "conflict")
   expect_equal(file.size(file.path(
@@ -102,13 +104,31 @@ test_that("install rejects a hash mismatch and destroys the spool", {
   token <- .test_app_token(2)
   withr::defer(dsFlower::flowerAppDeleteDS(token))
 
-  dsFlower::flowerAppPushDS(token, .enc_b64(raw), 0)
+  chunk <- .enc_b64(raw)
+  dsFlower::flowerAppPushDS(token, chunk, 0)
   expect_error(
     dsFlower::flowerAppInstallDS(token, "deadbeef_wrong_hash"),
     "integrity check"
   )
   # spool destroyed -> a second install finds nothing
   expect_error(dsFlower::flowerAppInstallDS(token, "x"), "No uploaded app")
+})
+
+test_that("registered app-store errors do not reflect the configured root", {
+  private_root <- "/dev/null/private-appstore/patient-007"
+  withr::local_options(list(dsflower.app_spool_root = private_root))
+  withr::local_envvar(c(DSFLOWER_TEST_ALLOW_EPHEMERAL_APP_SPOOL = ""))
+  token <- .test_app_token(99)
+  chunk <- .enc_b64(charToRaw("x"))
+
+  error <- tryCatch(
+    dsFlower::flowerAppPushDS(token, chunk, 0),
+    error = identity)
+  expect_s3_class(error, "error")
+  expect_identical(conditionMessage(error),
+                   "App spool storage is unavailable.")
+  expect_false(grepl(private_root, conditionMessage(error), fixed = TRUE))
+  expect_false(grepl("patient-007", conditionMessage(error), fixed = TRUE))
 })
 
 test_that("install rejects an app that fails the exfiltration scan", {
@@ -123,8 +143,35 @@ test_that("install rejects an app that fails the exfiltration scan", {
   token <- .test_app_token(3)
   withr::defer(dsFlower::flowerAppDeleteDS(token))
 
-  dsFlower::flowerAppPushDS(token, .enc_b64(raw), 0)
+  chunk <- .enc_b64(raw)
+  dsFlower::flowerAppPushDS(token, chunk, 0)
   expect_error(dsFlower::flowerAppInstallDS(token, sha), "safety scan")
+})
+
+test_that("archive extraction failures do not reflect private spool paths", {
+  .local_app_spool()
+  payload <- charToRaw("not-a-zip")
+  token <- .test_app_token(100)
+  chunk <- .enc_b64(payload)
+  sha <- digest::digest(payload, algo = "sha256", serialize = FALSE)
+  private <- paste(
+    "Errno 63", "/var/lib/dsflower/appstore/private-candidate",
+    "patient-007")
+  withr::defer(try(dsFlower::flowerAppDeleteDS(token), silent = TRUE))
+  dsFlower::flowerAppPushDS(token, chunk, 0)
+  testthat::local_mocked_bindings(
+    .safe_extract_fab = function(...) list(ok = FALSE, first = private),
+    .package = "dsFlower")
+
+  error <- tryCatch(
+    dsFlower::flowerAppInstallDS(token, sha), error = identity)
+  expect_s3_class(error, "error")
+  expect_identical(conditionMessage(error),
+                   "Uploaded app is an unsafe FAB archive; rejected.")
+  expect_false(grepl(private, conditionMessage(error), fixed = TRUE))
+  expect_false(grepl("/var/lib/dsflower", conditionMessage(error),
+                     fixed = TRUE))
+  expect_false(grepl("patient-007", conditionMessage(error), fixed = TRUE))
 })
 
 test_that("install enforces the max_fab_bytes cap", {
@@ -135,10 +182,12 @@ test_that("install enforces the max_fab_bytes cap", {
   token <- .test_app_token(4)
   withr::defer(dsFlower::flowerAppDeleteDS(token))
 
-  dsFlower::flowerAppPushDS(token, .enc_b64(raw), 0)
+  chunk <- .enc_b64(raw)
+  dsFlower::flowerAppPushDS(token, chunk, 0)
   withr::local_options(list(dsflower.max_fab_bytes = 1))
+  sha <- digest::digest(file = fab, algo = "sha256")
   expect_error(
-    dsFlower::flowerAppInstallDS(token, digest::digest(file = fab, algo = "sha256")),
+    dsFlower::flowerAppInstallDS(token, sha),
     "max_fab_bytes"
   )
 })
@@ -211,18 +260,21 @@ test_that("global byte cap is enforced without a catalogue-count quota", {
   ))
   first <- .test_app_token(31)
   second <- .test_app_token(32)
-  dsFlower::flowerAppPushDS(first, .enc_b64(as.raw(c(1, 2))), 0)
+  first_chunk <- .enc_b64(as.raw(c(1, 2)))
+  second_chunk <- .enc_b64(as.raw(c(3, 4)))
+  dsFlower::flowerAppPushDS(first, first_chunk, 0)
   expect_error(
-    dsFlower::flowerAppPushDS(second, .enc_b64(as.raw(c(3, 4))), 0),
+    dsFlower::flowerAppPushDS(second, second_chunk, 0),
     "app_spool_max_bytes"
   )
   expect_false(dir.exists(file.path(root, second)))
 
   dsFlower::flowerAppDeleteDS(first)
   withr::local_options(list(dsflower.app_spool_max_bytes = 100))
-  dsFlower::flowerAppPushDS(first, .enc_b64(as.raw(1)), 0)
-  expect_true(dsFlower::flowerAppPushDS(
-    second, .enc_b64(as.raw(2)), 0)$ok)
+  first_chunk <- .enc_b64(as.raw(1))
+  second_chunk <- .enc_b64(as.raw(2))
+  dsFlower::flowerAppPushDS(first, first_chunk, 0)
+  expect_true(dsFlower::flowerAppPushDS(second, second_chunk, 0)$ok)
   expect_equal(dsFlower:::.app_spool_usage(root)$uploads, 2L)
 })
 
@@ -348,13 +400,14 @@ test_that("a live run lease makes verified app bytes immutable", {
   withr::defer(dsFlower:::.cleanupStaging(run_token))
   dsFlower:::.record_app_run_lease(spool, run_token)
 
+  chunk <- .enc_b64(as.raw(2))
   expect_error(
-    dsFlower::flowerAppPushDS(token, .enc_b64(as.raw(2)), 1),
+    dsFlower::flowerAppPushDS(token, chunk, 1),
     "pinned by an active run"
   )
+  sha <- digest::digest(file = fab, algo = "sha256")
   expect_error(
-    dsFlower::flowerAppInstallDS(
-      token, digest::digest(file = fab, algo = "sha256")),
+    dsFlower::flowerAppInstallDS(token, sha),
     "pinned by an active run"
   )
   expect_error(
@@ -375,7 +428,8 @@ test_that("push enforces max_fab_bytes before appending", {
   withr::defer(dsFlower::flowerAppDeleteDS(token))
   withr::local_options(list(dsflower.max_fab_bytes = length(raw) - 1))
 
-  expect_error(dsFlower::flowerAppPushDS(token, .enc_b64(raw), 0),
+  chunk <- .enc_b64(raw)
+  expect_error(dsFlower::flowerAppPushDS(token, chunk, 0),
                "max_fab_bytes")
   expect_false(file.exists(file.path(
     dsFlower:::.app_spool_dir(token, create = FALSE), "app.fab")))
@@ -397,10 +451,11 @@ test_that("install rejects traversal, absolute paths, and ZIP symlinks", {
     raw <- readBin(fab, "raw", file.size(fab))
     token <- .test_app_token(10 + i)
     withr::defer(dsFlower::flowerAppDeleteDS(token))
-    dsFlower::flowerAppPushDS(token, .enc_b64(raw), 0)
+    chunk <- .enc_b64(raw)
+    dsFlower::flowerAppPushDS(token, chunk, 0)
+    sha <- digest::digest(file = fab, algo = "sha256")
     expect_error(
-      dsFlower::flowerAppInstallDS(
-        token, digest::digest(file = fab, algo = "sha256")),
+      dsFlower::flowerAppInstallDS(token, sha),
       "unsafe FAB archive"
     )
   }
@@ -451,6 +506,39 @@ test_that("Tier-2 pinning derives one authoritative module without returning pat
   expect_true(file.exists(file.path(
     dsFlower:::.app_spool_dir(token, create = FALSE),
     ".active_runs", run_token)))
+})
+
+test_that("Tier-2 pinning keeps private staging diagnostics out of errors", {
+  .local_app_spool()
+  run_token <- dsFlower:::.generate_run_token()
+  staging <- dsFlower:::.ensureStagingDir(run_token)
+  handle_name <- "test_tier2_private_manifest_error"
+  dsFlower:::.setHandle(handle_name, list(
+    data_path = "unused", run_token = run_token, staging_dir = staging,
+    prepared = TRUE, node_ensured = FALSE))
+
+  token <- .test_app_token(22, "usr")
+  withr::defer(dsFlower::flowerAppDeleteDS(token))
+  withr::defer(dsFlower:::.cleanupStaging(run_token))
+  withr::defer(dsFlower:::.removeHandle(handle_name))
+  apps <- file.path(dsFlower:::.app_spool_dir(token), "unpacked")
+  dir.create(file.path(apps, "hookpkg"), recursive = TRUE)
+  writeLines("x = 1", file.path(apps, "hookpkg", "__init__.py"))
+
+  warnings <- character()
+  error <- tryCatch(
+    withCallingHandlers(
+      dsFlower::flowerTier2PinDS(handle_name, token),
+      warning = function(w) {
+        warnings <<- c(warnings, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      }
+    ),
+    error = conditionMessage
+  )
+  expect_identical(error, "Prepared run manifest is unreadable.")
+  expect_length(warnings, 0L)
+  expect_false(any(grepl(staging, c(error, warnings), fixed = TRUE)))
 })
 
 test_that("Tier-2 pinning rejects ambiguous and reserved package sets", {

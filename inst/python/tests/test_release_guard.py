@@ -1,10 +1,11 @@
-"""Stateless release guard and deterministic-CSPRNG security invariants.
+"""Sticky release guard and deterministic-CSPRNG security invariants.
 
 Run with:
     python3 dsFlower/inst/python/tests/test_release_guard.py
 """
 
 import json
+import multiprocessing
 import os
 import stat
 import sys
@@ -48,6 +49,19 @@ class _Message:
         if include_config:
             records["config"] = ConfigRecord({"server-round": server_round})
         self.content = RecordDict(records)
+
+
+def _claim_from_fresh_process(manifest_dir, start, ready, results, message_id,
+                              values):
+    context = _Context(manifest_dir)
+    ready.put(True)
+    start.wait()
+    try:
+        claim = release_guard.claim_release(
+            context, _Message(message_id, values=values))
+        results.put(("ok", claim["status"]))
+    except Exception as exc:  # pragma: no cover - asserted in the parent
+        results.put(("error", str(exc)))
 
 
 class ReleaseGuardTest(unittest.TestCase):
@@ -97,11 +111,12 @@ class ReleaseGuardTest(unittest.TestCase):
         self.assertEqual(different_message["status"], "replay")
         self.assertEqual(first["request_id"], different_message["request_id"])
 
-    def test_lost_reply_cache_recomputes_instead_of_blocking(self):
+    def test_lost_reply_cache_fails_closed_instead_of_releasing_again(self):
         first = release_guard.claim_release(self.context, _Message("m1"))
         self._cache(first, include_arrays=False)
-        retried = release_guard.claim_release(self.context, _Message("m1"))
-        self.assertEqual(retried["status"], "new")
+        with self.assertRaisesRegex(
+                RuntimeError, "already claimed.*reply is unavailable"):
+            release_guard.claim_release(self.context, _Message("m1"))
 
     def test_payload_collision_for_provisional_round_fails_before_private_work(self):
         first = release_guard.claim_release(self.context, _Message("m1"))
@@ -139,18 +154,77 @@ class ReleaseGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "canonical stateless"):
             release_guard.claim_release(self.context, _Message("m1"))
 
-    def test_runtime_needs_no_persistent_accounting_state(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            claim = release_guard.claim_release(
-                _Context(self.root), _Message("m1"))
+    def test_claim_is_stored_before_private_work(self):
+        claim = release_guard.claim_release(self.context, _Message("m1"))
         self.assertEqual(claim["status"], "new")
+        ledger = self.context.state["dsflower-release-claim-ledger-v1"]
+        self.assertEqual(ledger["claim:train:0:1"], claim["request_id"])
 
-    def test_stateless_claims_do_not_exhaust(self):
-        for index in range(1000):
-            claim = release_guard.claim_release(
-                _Context(self.root), _Message("call-%d" % index))
-            self.assertEqual(claim["status"], "new")
-            self.assertEqual(claim["num_rounds"], 2)
+        unavailable = _Context(self.root)
+        unavailable.state = None
+        with self.assertRaisesRegex(RuntimeError, "persistent per-run state"):
+            release_guard.claim_release(unavailable, _Message("m2"))
+
+    def test_claim_survives_fresh_context_for_the_same_run(self):
+        release_guard.claim_release(self.context, _Message("m1"))
+
+        restarted = _Context(self.root)
+        with self.assertRaisesRegex(
+                RuntimeError, "already claimed.*reply is unavailable"):
+            release_guard.claim_release(restarted, _Message("m2"))
+
+    def test_concurrent_processes_cannot_both_claim_one_coordinate(self):
+        process_context = multiprocessing.get_context("spawn")
+        start = process_context.Event()
+        ready = process_context.Queue()
+        results = process_context.Queue()
+        workers = [
+            process_context.Process(
+                target=_claim_from_fresh_process,
+                args=(self.root, start, ready, results, "m%d" % index, values))
+            for index, values in enumerate(((1.0, 2.0), (1.0, 3.0)))
+        ]
+        for worker in workers:
+            worker.start()
+        try:
+            for _ in workers:
+                self.assertTrue(ready.get(timeout=15))
+            start.set()
+            outcomes = [results.get(timeout=15) for _ in workers]
+        finally:
+            start.set()
+            for worker in workers:
+                worker.join(timeout=15)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=5)
+
+        self.assertEqual([worker.exitcode for worker in workers], [0, 0])
+        self.assertEqual(sum(outcome == ("ok", "new")
+                             for outcome in outcomes), 1)
+        errors = [detail for status, detail in outcomes if status == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(
+            errors[0], "claimed release coordinate.*request payload")
+
+    def test_alternating_rounds_cannot_reroll_an_older_coordinate(self):
+        first_msg = _Message("round-1", server_round=1)
+        first = release_guard.claim_release(self.context, first_msg)
+        self._cache(first)
+
+        second = release_guard.claim_release(
+            self.context, _Message("round-2", server_round=2))
+        self._cache(second)
+
+        with self.assertRaisesRegex(
+                RuntimeError, "claimed release coordinate.*request payload"):
+            release_guard.claim_release(
+                self.context,
+                _Message("round-1-changed", server_round=1,
+                         values=(1.0, 3.0)))
+        with self.assertRaisesRegex(
+                RuntimeError, "already claimed.*reply is unavailable"):
+            release_guard.claim_release(self.context, first_msg)
 
 class SeedDerivationTest(unittest.TestCase):
     def setUp(self):

@@ -175,6 +175,11 @@ class ReleaseGuardHoldoutTests(unittest.TestCase):
             release_guard.claim_release(
                 self.context, self.message("holdout-evaluate", 2))
 
+    def test_holdout_release_is_pinned_to_the_final_round(self):
+        with self.assertRaisesRegex(RuntimeError, "final training round"):
+            release_guard.claim_release(
+                self.context, self.message("holdout-evaluate", 1))
+
 
 class NeuralHoldoutTests(unittest.TestCase):
     def test_training_receives_only_complement_and_evaluation_only_test(self):

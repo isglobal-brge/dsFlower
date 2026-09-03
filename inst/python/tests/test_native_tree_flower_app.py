@@ -796,26 +796,28 @@ class NativeTreeServerTests(unittest.TestCase):
         request, request_b64, request_sha256 = _request_wire()
         with tempfile.TemporaryDirectory() as root, \
                 tempfile.TemporaryDirectory() as results_dir:
-            pd.DataFrame({
+            frame = pd.DataFrame({
                 "age": [10.0, 20.0, 60.0, 70.0],
                 "marker": [-1.0, -0.5, 0.5, 1.0],
                 "outcome": [0, 1, 0, 1],
-            }).to_csv(os.path.join(root, "train.csv"), index=False)
+            })
             manifest, contract = _cv_manifest(
                 request_b64, request_sha256, folds=2, nodes=2)
             manifest["n_units"] = 4
-            with open(os.path.join(root, "manifest.json"), "w",
-                      encoding="utf-8") as handle:
-                json.dump(manifest, handle)
             cfg = _cv_run_config(
                 request_b64, request_sha256, results_dir,
                 folds=2, nodes=2)
-            contexts = {
-                node_id: SimpleNamespace(
-                    node_config={"manifest-dir": root},
+            contexts = {}
+            for node_id in (11, 22):
+                node_root = os.path.join(root, "node-%d" % node_id)
+                os.mkdir(node_root)
+                frame.to_csv(os.path.join(node_root, "train.csv"), index=False)
+                with open(os.path.join(node_root, "manifest.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump(manifest, handle)
+                contexts[node_id] = SimpleNamespace(
+                    node_config={"manifest-dir": node_root},
                     run_config=cfg, state=RecordDict())
-                for node_id in (11, 22)
-            }
             grid = _HoldoutGrid(contexts)
             assigned = np.asarray([1, 1, 2, 2], dtype=np.int16)
             original_load = task.load_native_tree_data
@@ -1119,26 +1121,28 @@ class NativeTreeServerTests(unittest.TestCase):
         holdout = resampling.holdout_contract(500_000, "row")
         with tempfile.TemporaryDirectory() as root, \
                 tempfile.TemporaryDirectory() as results_dir:
-            pd.DataFrame({
+            frame = pd.DataFrame({
                 "age": [10.0, 20.0, 60.0, 70.0],
                 "marker": [-1.0, -0.5, 0.5, 1.0],
                 "outcome": [0, 1, 0, 1],
-            }).to_csv(os.path.join(root, "train.csv"), index=False)
+            })
             manifest = _node_manifest(
                 request_b64, request_sha256, holdout=holdout)
             manifest["n_units"] = 4
-            with open(os.path.join(root, "manifest.json"), "w",
-                      encoding="utf-8") as handle:
-                json.dump(manifest, handle)
             cfg = _run_config(
                 request_b64, request_sha256, results_dir, nodes=2,
                 holdout=holdout)
-            contexts = {
-                node_id: SimpleNamespace(
-                    node_config={"manifest-dir": root},
+            contexts = {}
+            for node_id in (11, 22):
+                node_root = os.path.join(root, "node-%d" % node_id)
+                os.mkdir(node_root)
+                frame.to_csv(os.path.join(node_root, "train.csv"), index=False)
+                with open(os.path.join(node_root, "manifest.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump(manifest, handle)
+                contexts[node_id] = SimpleNamespace(
+                    node_config={"manifest-dir": node_root},
                     run_config=cfg, state=RecordDict())
-                for node_id in (11, 22)
-            }
             grid = _HoldoutGrid(contexts)
             original_load = task.load_native_tree_data
 

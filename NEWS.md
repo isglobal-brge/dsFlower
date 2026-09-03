@@ -1,3 +1,38 @@
+# dsFlower 0.4.3
+
+### Disclosure admission
+
+* The Python release guard now keeps a bounded, run- and policy-bound SQLite
+  ledger of every claimed operation/fold/round coordinate in private staging
+  before work begins and mirrors it into Flower `NodeState`. Claims are atomic
+  across ClientApp processes and survive process restarts while the run remains.
+  Alternating rounds can no longer evict replay history, changed payloads for a
+  claimed coordinate fail closed, and holdout evaluation is restricted to the
+  single final round budgeted by the manifest.
+* Training preparation now enforces the server-owned DataSHIELD minimum on the
+  staged privacy-unit count: rows for row-level adjacency and distinct patients
+  for patient-level adjacency, including image runs. Below-threshold data frames
+  and matrices fail with the same generic node error, while
+  `flowerGetCapabilitiesDS()` advertises the effective threshold. This remains a
+  per-training DP contract; it does not add or claim a cumulative privacy-budget
+  ledger.
+
+### dsImaging session boundary
+
+* `flowerInitDS()` accepts an imaging collection only through an opaque,
+  same-session dsImaging handle created by `imagingInitDS()`. Raw imaging
+  resources, manifests, descriptors, storage references, legacy handles, and
+  direct derived-asset references fail closed.
+* The Flower handle is bound to the exact dsImaging capability and admitted
+  sample-to-patient roster. Preparation checks the publish lock and roster
+  immediately before and after staging, then verifies the exact staged mapping
+  before training can start.
+* Image targets/features cannot replace the protected patient identifier, and
+  the staged manifest carries the server-authored patient privacy-unit
+  contract used by the DP runner.
+* Generic `ResourceClient` objects are inspected before materialization and
+  cannot disguise an `imaging+dataset` resource to bypass dsImaging admission.
+
 # dsFlower 0.4.2
 
 ### Fixes

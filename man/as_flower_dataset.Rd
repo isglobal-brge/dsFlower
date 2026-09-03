@@ -45,10 +45,9 @@ any class that provides its own method.
 
 \item \code{as_flower_dataset(ResourceClient)}: Convert a resourcer ResourceClient.
 
-Calls \code{resourcer::as.data.frame()} on the client to materialize
-the resource, then wraps the result. If the client has class
-\code{ImagingDatasetResourceClient} (from dsImaging), delegates to
-its own method.
+Calls \code{resourcer::as.data.frame()} on a declared non-imaging client to
+materialize the resource, then wraps the result. Imaging resources must
+first be admitted by dsImaging and passed to dsFlower as an opaque handle.
 
 \item \code{as_flower_dataset(ImagingDatasetResourceClient)}: Convert an ImagingDatasetResourceClient.
 

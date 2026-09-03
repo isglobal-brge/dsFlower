@@ -4,6 +4,14 @@
   paste0("run_", sprintf("%032x", as.integer(index)))
 }
 
+.test_imaging_metadata <- function(privacy_unit_col, ...) {
+  c(list(
+    privacy_unit = "patient",
+    privacy_unit_col = privacy_unit_col,
+    privacy_unit_canonicalization = "trim-utf8-v2"
+  ), list(...))
+}
+
 test_that(".generate_run_token produces expected format", {
   token <- dsFlower:::.generate_run_token()
   expect_type(token, "character")
@@ -632,11 +640,13 @@ test_that("image descriptor and root failures remain global preconditions", {
     "configured image asset root is unavailable"
   )
 
+  metadata <- .test_imaging_metadata(
+    "patient_id", uri = "s3://imaging/site/metadata/samples.parquet")
   s3_desc <- list(
-    metadata = list(uri = "s3://imaging/site/metadata/samples.parquet"),
+    metadata = metadata,
     assets = list(images = list(
       type = "image_root", uri = "s3://imaging/site/source/images/")),
-    manifest = list(),
+    manifest = list(metadata = metadata),
     dataset_id = "site"
   )
   expect_error(
@@ -695,13 +705,16 @@ test_that("S3 image descriptors stage metadata and assets without credentials", 
     config = list(resource = list(
       identity = "private-access-key", secret = "private-secret-key"))
   ), class = "dsimaging_backend")
+  metadata <- .test_imaging_metadata(
+    "patient_id", uri = metadata_uri, format = "csv")
   desc <- list(
-    metadata = list(uri = metadata_uri, format = "csv"),
+    metadata = metadata,
     assets = list(images = list(
       type = "image_root", uri = image_root_uri,
       path_col = "relative_path")),
-    manifest = list(sample_manifests = list(
-      uri = manifests_uri, format = "csv")),
+    manifest = list(
+      metadata = metadata,
+      sample_manifests = list(uri = manifests_uri, format = "csv")),
     backend = backend,
     dataset_id = "site"
   )
@@ -731,24 +744,28 @@ test_that("S3 image descriptors stage metadata and assets without credentials", 
   expect_false(grepl("private-secret-key", manifest_text, fixed = TRUE))
 })
 
-test_that("image label joins are stable one-to-one and totalizable", {
-  samples <- data.frame(
-    row_marker = 1:4,
-    sample_id = c("p2", " ", "p1", "p1"),
-    existing = letters[1:4]
-  )
-  labels <- data.frame(
-    sample_id = c("p1", "p2", "p2", NA),
-    target = c(1L, 1L, 0L, 1L)
-  )
+test_that("vision staging rejects multi-file samples before materialization", {
+  root <- withr::local_tempdir()
+  metadata <- file.path(root, "samples.csv")
+  utils::write.csv(data.frame(
+    sample_id = paste0("series-", 1:3),
+    patient_id = paste0("patient-", 1:3), diagnosis = c(0L, 1L, 0L)),
+    metadata, row.names = FALSE)
+  desc <- flower_dataset_descriptor(
+    "dicom.series", "image_bundle",
+    metadata = .test_imaging_metadata("patient_id", uri = metadata,
+      file = metadata, format = "csv", label_col = "diagnosis"),
+    assets = list(images = list(type = "image_root", uri = root)),
+    manifest = list(metadata = .test_imaging_metadata(
+      "patient_id", uri = metadata, file = metadata, format = "csv",
+      label_col = "diagnosis")))
+  desc$.collection_snapshot <- list(records = lapply(1:3, function(i) list(
+    source_kind = "dicom_series", n_files = 2L)))
 
-  joined <- dsFlower:::.leftJoinImageLabels(samples, labels)
-  expect_equal(joined$row_marker, 1:4)
-  expect_equal(nrow(joined), nrow(samples))
-  expect_equal(joined$target, c(NA, NA, 1L, 1L))
-
-  totalized <- dsFlower:::.transformPublicTarget(joined, "target", list())
-  expect_equal(totalized$target, c(0L, 0L, 1L, 1L))
+  expect_error(
+    dsFlower:::.stageFromDescriptor_image(
+      desc, paste0("run_", strrep("a", 32)), "diagnosis", NULL, list()),
+    "Convert DICOM series to one NIfTI")
 })
 
 test_that("image metadata paths cannot escape their configured root", {
@@ -806,20 +823,129 @@ test_that("image path failures become one fixed non-identifying marker", {
   expect_equal(out$relative_path, "__dsflower_invalid_image__")
 })
 
+test_that("image descriptors require an exact server-authored patient unit", {
+  descriptor <- list(manifest = list(metadata = list()))
+  expect_error(
+    dsFlower:::.imagingPrivacyUnitPolicy(descriptor),
+    "privacy_unit='patient'"
+  )
+
+  wrong_unit <- .test_imaging_metadata("patient_id")
+  wrong_unit$privacy_unit <- "row"
+  wrong_canonicalization <- .test_imaging_metadata("patient_id")
+  wrong_canonicalization$privacy_unit_canonicalization <- "trim-utf8-v1"
+  invalid <- list(
+    wrong_unit,
+    .test_imaging_metadata(""),
+    .test_imaging_metadata("   "),
+    .test_imaging_metadata(c("patient_id", "subject_id")),
+    wrong_canonicalization
+  )
+  for (metadata in invalid) {
+    expect_error(
+      dsFlower:::.imagingPrivacyUnitPolicy(
+        list(manifest = list(metadata = metadata))),
+      "privacy_unit='patient'"
+    )
+  }
+})
+
+test_that("image staging counts distinct canonical patients, not scans", {
+  root <- withr::local_tempdir()
+  writeLines("image", file.path(root, "scan.png"))
+  withr::local_options(list(
+    dsflower.dp_unit = "row",
+    dsflower.patient_column = "wrong_global_column"
+  ))
+  n_scans <- as.integer(getOption(
+    "nfilter.subset", getOption("default.nfilter.subset", 3))) + 1L
+  metadata <- .test_imaging_metadata("subject_code")
+  descriptor <- list(
+    dataset_id = "one-patient-many-scans",
+    metadata = metadata,
+    manifest = list(metadata = metadata),
+    table_data = data.frame(
+      subject_code = rep(c(" patient-1 ", "patient-1"), length.out = n_scans),
+      sample_id = paste0("scan-", seq_len(n_scans)),
+      relative_path = rep("scan.png", n_scans),
+      target = rep(0:1, length.out = n_scans)),
+    assets = list(images = list(
+      type = "image_root", root = root, path_col = "relative_path"))
+  )
+
+  staging_dir <- dsFlower:::.stageFromDescriptor_image(
+    descriptor, .test_run_token(16), "target", NULL, list())
+  withr::defer(unlink(staging_dir, recursive = TRUE))
+  manifest <- jsonlite::fromJSON(file.path(staging_dir, "manifest.json"))
+  staged <- dsFlower:::.readStagedSamples(
+    file.path(staging_dir, manifest$samples_file))
+
+  expect_equal(manifest$n_samples, n_scans)
+  expect_equal(manifest$n_units, 1L)
+  expect_identical(manifest[["dp-unit"]], "patient")
+  expect_identical(manifest$patient_column, "subject_code")
+  expect_identical(
+    manifest[["patient-id-canonicalization"]], "trim-utf8-v2")
+  expect_identical(unique(staged$subject_code), "patient-1")
+
+  expect_error(
+    dsFlower:::.stageFromDescriptor_image(
+      descriptor, .test_run_token(19), "subject_code", NULL, list()),
+    "privacy-unit column cannot be a model target"
+  )
+})
+
+test_that("image datasets keep their own privacy-unit column", {
+  root <- withr::local_tempdir()
+  writeLines("image", file.path(root, "scan.png"))
+  stage_dataset <- function(dataset_id, privacy_column, token_index) {
+    metadata <- .test_imaging_metadata(privacy_column)
+    samples <- data.frame(
+      sample_id = c("scan-a", "scan-b"),
+      relative_path = "scan.png",
+      target = c(0L, 1L), stringsAsFactors = FALSE)
+    samples[[privacy_column]] <- c("person-a", "person-b")
+    descriptor <- list(
+      dataset_id = dataset_id,
+      metadata = metadata,
+      manifest = list(metadata = metadata),
+      table_data = samples,
+      assets = list(images = list(
+        type = "image_root", root = root, path_col = "relative_path"))
+    )
+    dsFlower:::.stageFromDescriptor_image(
+      descriptor, .test_run_token(token_index), "target", NULL, list())
+  }
+
+  first <- stage_dataset("dataset-a", "subject_id", 17)
+  second <- stage_dataset("dataset-b", "case_owner", 18)
+  withr::defer(unlink(first, recursive = TRUE))
+  withr::defer(unlink(second, recursive = TRUE))
+  first_manifest <- jsonlite::fromJSON(file.path(first, "manifest.json"))
+  second_manifest <- jsonlite::fromJSON(file.path(second, "manifest.json"))
+
+  expect_identical(first_manifest$patient_column, "subject_id")
+  expect_identical(second_manifest$patient_column, "case_owner")
+  expect_equal(first_manifest$n_units, 2L)
+  expect_equal(second_manifest$n_units, 2L)
+})
+
 test_that("image descriptor staging totalizes private rows end to end", {
   root <- withr::local_tempdir()
   writeLines("image", file.path(root, "valid.png"))
+  metadata <- .test_imaging_metadata("patient_key")
   desc <- list(
-    metadata = list(),
+    metadata = metadata,
     table_data = data.frame(
       row_marker = 1:3,
+      patient_key = c(" patient-a ", "patient-a", "patient-b"),
       sample_id = c("valid", "unsafe", "missing"),
       relative_path = c("valid.png", "../private", "missing.png"),
       target = c(1L, 99L, NA)
     ),
     assets = list(images = list(
       type = "image_root", root = root, path_col = "relative_path")),
-    manifest = list(),
+    manifest = list(metadata = metadata),
     dataset_id = "private-image-test"
   )
   staging_dir <- dsFlower:::.stageFromDescriptor_image(
@@ -830,6 +956,10 @@ test_that("image descriptor staging totalizes private rows end to end", {
   staged <- dsFlower:::.readStagedSamples(
     file.path(staging_dir, manifest$samples_file))
   expect_equal(manifest$n_samples, 3L)
+  expect_equal(manifest$n_units, 2L)
+  expect_identical(manifest[["dp-unit"]], "patient")
+  expect_identical(manifest$patient_column, "patient_key")
+  expect_equal(staged$patient_key, c("patient-a", "patient-a", "patient-b"))
   expect_equal(staged$row_marker, 1:3)
   expect_equal(
     staged$relative_path,
@@ -839,12 +969,13 @@ test_that("image descriptor staging totalizes private rows end to end", {
 })
 
 test_that("image descriptor asset names cannot traverse staging", {
+  metadata <- .test_imaging_metadata("patient_id")
   desc <- list(
-    metadata = list(),
+    metadata = metadata,
     assets = stats::setNames(
       list(list(type = "image_root", root = tempdir())),
       "../escape"),
-    manifest = list()
+    manifest = list(metadata = metadata)
   )
   expect_error(
     dsFlower:::.stageFromDescriptor_image(
@@ -862,6 +993,27 @@ test_that(".cleanupStaging removes the directory", {
   expect_true(dir.exists(staging_dir))
   dsFlower:::.cleanupStaging(token)
   expect_false(dir.exists(staging_dir))
+})
+
+test_that(".cleanupStaging refuses to ACK a surviving directory", {
+  token <- .test_run_token(111)
+  staging_dir <- file.path(tempdir(), "dsflower", token)
+  dir.create(staging_dir, recursive = TRUE, showWarnings = FALSE)
+  writeLines("private", file.path(staging_dir, "private.txt"))
+  withr::defer(unlink(staging_dir, recursive = TRUE))
+
+  # Model unlink() reporting success without establishing the required
+  # postcondition. The retry target must remain visible to its caller.
+  local_mocked_bindings(
+    unlink = function(...) 0L,
+    .package = "base"
+  )
+  expect_error(
+    dsFlower:::.cleanupStaging(token),
+    "Staging cleanup did not complete",
+    fixed = TRUE
+  )
+  expect_true(dir.exists(staging_dir))
 })
 
 test_that(".cleanupStaging is safe for NULL token", {

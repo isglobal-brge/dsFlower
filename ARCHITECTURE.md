@@ -275,11 +275,15 @@ Server-owned structural manifest fields cannot be duplicated or overridden by
 the client. The trusted runner validates the server-authored mechanism, round count,
 epsilon, delta and canonical semantic identity before private computation.
 
-`manifest.json` is a run-local staging contract, not privacy history or a
-memoization database. It pins the effective schema, mechanism and public
-parameters for the active process, and `.cleanupStaging()` removes it with the
-rest of that run's staged inputs. Losing it after cleanup cannot change sticky
-randomness; an equivalent new training reconstructs the same semantic PRF input.
+`manifest.json` is a run-local staging contract, not cross-training privacy
+history or a memoization database. It pins the effective schema, mechanism and
+public parameters. A separate hidden SQLite ledger in the same private staging
+directory atomically records the bounded release coordinates already claimed by
+that run and is mirrored into Flower `NodeState`; this survives ClientApp
+process restarts without becoming a budget shared across trainings.
+`.cleanupStaging()` removes both the inputs and that per-run ledger. Losing them
+after the run is cleaned cannot change sticky randomness; an equivalent new
+training reconstructs the same semantic PRF input.
 
 The node pins the recursive runner hash. The client's bundled runner must be
 byte-identical. The coordinated release check
@@ -328,8 +332,11 @@ execution and mounted read-only in the HookApp sandbox.
   supported.
 - Admission does not inspect class/event frequencies, because success versus
   error would otherwise be a label-dependent release outside DP. It has no
-  minimum row/patient threshold either: tiny and empty runs reach the trusted
-  mechanism instead of returning an exact prepare-time count predicate.
+  class-cell threshold. It does enforce the server-owned DataSHIELD minimum on
+  the staged privacy-unit count (`n_units`): rows for row adjacency and distinct
+  canonical patients for patient adjacency, including image runs.
+  Below-threshold runs receive one generic refusal without an exact count or
+  shortfall.
 - Adjacency is explicitly bounded/replace-one with a fixed number of privacy
   units. Neighbours replace one row, or one complete configured patient unit.
   The package does not claim unbounded add/remove membership privacy for a
@@ -478,10 +485,11 @@ from the canonical mechanisms. It does not claim protection against:
   dsFlower;
 - composition across overlapping node populations.
 
-The R preparation layer totalises target-domain, selected-feature completeness,
-minimum-size and missing-patient-ID cases. Other schema, storage, image-decoding
-and runtime failures can still depend on inputs outside the supported mechanism
-domain.
+The R preparation layer totalises target-domain, selected-feature completeness
+and missing-patient-ID cases. Minimum-size admission is the explicit
+DataSHIELD privacy-unit gate and returns one generic refusal. Other schema,
+storage, image-decoding and runtime failures can still depend on inputs outside
+the supported mechanism domain.
 
 The ClientApp transport boundary catches ordinary Python exceptions and returns
 the same Flower record schema with a constant aggregation weight, public/no-op

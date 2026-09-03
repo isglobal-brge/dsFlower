@@ -1,9 +1,13 @@
-"""Stateless release identity and exact-request replay guard.
+"""Sticky release identity and exact-request replay guard.
 
 The node-written manifest pins one training's privacy contract and Flower's
 per-message ConfigRecord supplies its public round coordinate. A message
 identifier is used only to find an in-memory reply cache; it never selects
-privacy randomness or authorizes a release.
+privacy randomness or authorizes a release.  Every release coordinate is
+atomically claimed in the run's private staging directory before private work
+begins and mirrored into Flower's NodeState.  Once the single reply cache
+advances, an older coordinate fails closed rather than recomputing a second
+private release.
 """
 
 import hashlib
@@ -11,6 +15,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 
 from flwr.common import ArrayRecord, ConfigRecord
 
@@ -21,14 +26,24 @@ _MAX_ARRAYS = 256
 _MAX_SERIALIZED_ARRAY_BYTES = 64 * 1024 * 1024 + _MAX_ARRAYS * 4096
 _CACHE_META_KEY = "dsflower-last-release-meta"
 _CACHE_ARRAYS_KEY = "dsflower-last-release"
+_CLAIM_LEDGER_KEY = "dsflower-release-claim-ledger-v1"
+_CLAIM_LEDGER_VERSION = "dsflower-release-claim-ledger-v1"
+_CLAIM_LEDGER_FILENAME = ".dsflower-release-claim-ledger-v1.sqlite3"
+_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _manifest(context):
+def _manifest_dir(context):
     manifest_dir = context.node_config.get("manifest-dir")
     if not manifest_dir:
         manifest_dir = os.environ.get("DSFLOWER_MANIFEST_DIR")
     if not manifest_dir:
         raise RuntimeError("privacy guard has no manifest directory")
+    return manifest_dir
+
+
+def _manifest(context, manifest_dir=None):
+    if manifest_dir is None:
+        manifest_dir = _manifest_dir(context)
     path = os.path.join(manifest_dir, "manifest.json")
     with open(path, encoding="utf-8") as fh:
         value = json.load(fh)
@@ -58,7 +73,8 @@ def _finite_float(value, label, lower, upper):
 
 
 def _fixed_manifest(context):
-    manifest = _manifest(context)
+    manifest_dir = _manifest_dir(context)
+    manifest = _manifest(context, manifest_dir)
     token = str(manifest.get("run_token", ""))
     if not _TOKEN_RE.fullmatch(token):
         raise RuntimeError("invalid privacy run token in manifest")
@@ -157,13 +173,21 @@ def _fixed_manifest(context):
                 actual["privacy-cv-oof-delta"]),
             "cv-abort": (0.0, 0.0),
         }
+    max_claims = (cv_folds * (num_rounds + 1) + 2
+                  if cross_validation else
+                  num_rounds + (1 if holdout else 0))
     return {
         "num_rounds": num_rounds,
         "policy_hash": policy_hash,
+        "run_fingerprint": hashlib.sha256(
+            b"dsflower/release-ledger/run/v1\x00" + token.encode("ascii")
+        ).hexdigest(),
         "budgets": budgets,
         "holdout": holdout,
         "cross_validation": cross_validation,
         "cv_folds": cv_folds,
+        "max_claims": max_claims,
+        "ledger_path": os.path.join(manifest_dir, _CLAIM_LEDGER_FILENAME),
     }
 
 
@@ -204,6 +228,10 @@ def _fold_coordinate(msg, fixed, operation, round_index):
         if supplied is not None:
             raise RuntimeError(
                 "fold coordinate requires a cross-validation contract")
+        if (operation == "holdout-evaluate"
+                and round_index != fixed["num_rounds"]):
+            raise RuntimeError(
+                "holdout evaluation requires the final training round")
         return 0
     folds = int(fixed["cv_folds"])
     fold = _exact_int(
@@ -312,8 +340,148 @@ def _cached_status(context, message_id, operation, fold, round_index,
     return "new"
 
 
+def _claim_key(operation, fold, round_index):
+    return "claim:%s:%d:%d" % (operation, int(fold), int(round_index))
+
+
+def _claim_ledger(context, fixed):
+    """Load and validate the bounded NodeState ledger projection."""
+    state = getattr(context, "state", None)
+    if (state is None or not hasattr(state, "get")
+            or not hasattr(state, "__setitem__")):
+        raise RuntimeError("privacy guard has no persistent per-run state")
+    binding = {
+        "version": _CLAIM_LEDGER_VERSION,
+        "run-fingerprint": fixed["run_fingerprint"],
+        "policy-hash": fixed["policy_hash"],
+    }
+    ledger = state.get(_CLAIM_LEDGER_KEY)
+    if ledger is None:
+        return state, ConfigRecord(binding)
+    if not isinstance(ledger, ConfigRecord):
+        raise RuntimeError("privacy release claim ledger is invalid")
+    if any(ledger.get(key) != value for key, value in binding.items()):
+        raise RuntimeError("privacy release claim ledger binding changed")
+    claims = {key: value for key, value in ledger.items()
+              if key not in binding}
+    if (len(claims) > fixed["max_claims"]
+            or any(not key.startswith("claim:")
+                   or not isinstance(value, str)
+                   or _REQUEST_ID_RE.fullmatch(value) is None
+                   for key, value in claims.items())):
+        raise RuntimeError("privacy release claim ledger is invalid")
+    return state, ledger
+
+
+def _durable_claim(fixed, ledger, key, request_id):
+    """Atomically claim a coordinate across ClientApp processes and restarts."""
+    binding = {
+        "version": _CLAIM_LEDGER_VERSION,
+        "run-fingerprint": fixed["run_fingerprint"],
+        "policy-hash": fixed["policy_hash"],
+    }
+    connection = None
+    try:
+        connection = sqlite3.connect(
+            fixed["ledger_path"], timeout=30.0, isolation_level=None)
+        if os.name != "nt":
+            os.chmod(fixed["ledger_path"], 0o600)
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS ledger ("
+            "ledger_key TEXT PRIMARY KEY, ledger_value TEXT NOT NULL"
+            ") WITHOUT ROWID")
+        stored = dict(connection.execute(
+            "SELECT ledger_key, ledger_value FROM ledger"))
+        if not stored:
+            connection.executemany(
+                "INSERT INTO ledger (ledger_key, ledger_value) VALUES (?, ?)",
+                binding.items())
+            stored.update(binding)
+        if any(stored.get(name) != value
+               for name, value in binding.items()):
+            raise RuntimeError("privacy release claim ledger binding changed")
+
+        claims = {name: value for name, value in stored.items()
+                  if name not in binding}
+        if (len(claims) > fixed["max_claims"]
+                or any(not name.startswith("claim:")
+                       or not isinstance(value, str)
+                       or _REQUEST_ID_RE.fullmatch(value) is None
+                       for name, value in claims.items())):
+            raise RuntimeError("privacy release claim ledger is invalid")
+
+        for name, value in ledger.items():
+            if name in binding:
+                continue
+            durable_value = stored.get(name)
+            if durable_value is not None and durable_value != value:
+                raise RuntimeError("privacy release claim ledger diverged")
+            if durable_value is None:
+                connection.execute(
+                    "INSERT INTO ledger (ledger_key, ledger_value) VALUES (?, ?)",
+                    (name, value))
+                stored[name] = value
+
+        claimed_request = stored.get(key)
+        claim_count = len(stored) - len(binding)
+        if claim_count > fixed["max_claims"]:
+            raise RuntimeError("privacy release claim ledger is invalid")
+        if claimed_request is None:
+            if claim_count >= fixed["max_claims"]:
+                raise RuntimeError("privacy release claim ledger is exhausted")
+            connection.execute(
+                "INSERT INTO ledger (ledger_key, ledger_value) VALUES (?, ?)",
+                (key, request_id))
+            stored[key] = request_id
+        connection.commit()
+        return ConfigRecord(stored), claimed_request
+    except RuntimeError:
+        if connection is not None:
+            connection.rollback()
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        if connection is not None:
+            connection.rollback()
+        raise RuntimeError(
+            "privacy release coordinate could not be claimed") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _sticky_status(context, fixed, message_id, operation, fold, round_index,
+                   request_id):
+    """Claim one coordinate before private work or replay its exact last reply."""
+    state, ledger = _claim_ledger(context, fixed)
+    key = _claim_key(operation, fold, round_index)
+    cache_status = _cached_status(
+        context, message_id, operation, fold, round_index, request_id)
+    updated, claimed_request = _durable_claim(
+        fixed, ledger, key, request_id)
+    try:
+        state[_CLAIM_LEDGER_KEY] = updated
+    except Exception as exc:
+        raise RuntimeError("privacy release coordinate could not be claimed") from exc
+    persisted = state.get(_CLAIM_LEDGER_KEY)
+    if (not isinstance(persisted, ConfigRecord)
+            or persisted.get(key) != updated.get(key)):
+        raise RuntimeError("privacy release coordinate could not be claimed")
+
+    if claimed_request is not None:
+        if claimed_request != request_id:
+            raise RuntimeError(
+                "claimed release coordinate does not match request payload")
+        if cache_status == "replay":
+            return "replay"
+        raise RuntimeError(
+            "release coordinate was already claimed and its exact reply is unavailable")
+    return cache_status
+
+
 def claim_release(context, msg):
-    """Return a stateless round claim, optionally replaying an exact RAM cache."""
+    """Reserve one sticky round claim, optionally replaying the exact last reply."""
     fixed = _fixed_manifest(context)
     num_rounds = fixed["num_rounds"]
     operation = _operation(msg, fixed)
@@ -322,8 +490,8 @@ def claim_release(context, msg):
     fold = _fold_coordinate(msg, fixed, operation, round_index)
     request_id = _request_id(msg, operation, fold, round_index)
     message_id = _message_id(msg)
-    status = _cached_status(
-        context, message_id, operation, fold, round_index, request_id)
+    status = _sticky_status(
+        context, fixed, message_id, operation, fold, round_index, request_id)
     return {
         "status": status,
         "operation": operation,
