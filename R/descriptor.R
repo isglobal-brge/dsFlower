@@ -101,8 +101,8 @@ as_flower_dataset.ResourceClient <- function(x, ...) {
 
 #' @describeIn as_flower_dataset Convert an ImagingDatasetResourceClient.
 #'
-#' Extracts the imaging manifest and builds a descriptor with
-#' \code{source_kind = "image_bundle"}.
+#' Extracts the imaging manifest and storage backend and builds a descriptor
+#' with \code{source_kind = "image_bundle"}.
 #'
 #' @export
 as_flower_dataset.ImagingDatasetResourceClient <- function(x, ...) {
@@ -118,7 +118,32 @@ as_flower_dataset.ImagingDatasetResourceClient <- function(x, ...) {
     source_kind = "image_bundle",
     metadata    = manifest$metadata,
     assets      = manifest$assets %||% list(),
-    manifest    = manifest
+    manifest    = manifest,
+    backend     = x$getBackend(),
+    manifest_uri = x$getManifestUri()
+  )
+}
+
+#' @describeIn as_flower_dataset Convert an ImagingDatasetDescriptor.
+#'
+#' dsImaging descriptors remain package-independent; dsFlower owns the
+#' conversion into its training descriptor.
+#'
+#' @export
+as_flower_dataset.ImagingDatasetDescriptor <- function(x, ...) {
+  manifest <- x$manifest
+  if (is.null(manifest)) {
+    stop("ImagingDatasetDescriptor has no manifest.", call. = FALSE)
+  }
+
+  flower_dataset_descriptor(
+    dataset_id  = x$dataset_id %||% manifest$dataset_id,
+    source_kind = "image_bundle",
+    metadata    = x$metadata %||% manifest$metadata,
+    assets      = x$assets %||% manifest$assets %||% list(),
+    manifest    = manifest,
+    backend     = x$backend %||% NULL,
+    manifest_uri = x$manifest_uri %||% NULL
   )
 }
 
@@ -134,7 +159,7 @@ as_flower_dataset.default <- function(x, ...) {
   stop(
     "Cannot convert object of class '", paste(class(x), collapse = "/"),
     "' to a FlowerDatasetDescriptor. ",
-    "Supported types: data.frame, ResourceClient, ",
+    "Supported types: data.frame, ResourceClient, ImagingDatasetDescriptor, ",
     "ImagingDatasetResourceClient, FlowerDatasetDescriptor.",
     call. = FALSE
   )

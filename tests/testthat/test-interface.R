@@ -152,6 +152,44 @@ test_that("opaque handles preserve the legitimate DSLite assign flow", {
   expect_null(server$getSessionData(connection@sid, "flower"))
 })
 
+test_that("flowerInitDS consumes an independent dsImaging handle", {
+  local_interface_privacy_state()
+  manifest <- list(
+    dataset_id = "pathmnist.site",
+    metadata = list(uri = "s3://imaging/pathmnist/metadata/samples.parquet"),
+    assets = list(images = list(
+      type = "image_root", uri = "s3://imaging/pathmnist/source/images/"))
+  )
+  descriptor <- structure(list(
+    dataset_id = manifest$dataset_id,
+    source_kind = "image_bundle",
+    metadata = manifest$metadata,
+    assets = manifest$assets,
+    manifest = manifest
+  ), class = "ImagingDatasetDescriptor")
+  backend <- structure(list(type = "s3"), class = "dsimaging_backend")
+  imaging <- list(
+    source = "imaging_resource",
+    descriptor = descriptor,
+    manifest = manifest,
+    backend = backend,
+    manifest_uri = "s3://imaging/pathmnist/manifest.yaml"
+  )
+
+  env <- new.env(parent = globalenv())
+  assign("img", imaging, envir = env)
+  assign("flowerInitDS", dsFlower::flowerInitDS, envir = env)
+  reference <- eval(quote(flowerInitDS("img")), envir = env)
+  assign("flower", reference, envir = env)
+  state <- evalq(dsFlower:::.getHandle("flower"), envir = env)
+
+  expect_identical(state$descriptor$backend, backend)
+  expect_identical(
+    state$descriptor$manifest_uri, "s3://imaging/pathmnist/manifest.yaml")
+  expect_identical(state$descriptor$manifest, manifest)
+  evalq(dsFlower:::.removeHandle("flower"), envir = env)
+})
+
 test_that(".ds_arg handles JSON strings", {
   result <- dsFlower:::.ds_arg('{"key": "value"}')
   expect_type(result, "list")

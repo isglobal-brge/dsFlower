@@ -5,6 +5,7 @@
 \alias{as_flower_dataset.data.frame}
 \alias{as_flower_dataset.ResourceClient}
 \alias{as_flower_dataset.ImagingDatasetResourceClient}
+\alias{as_flower_dataset.ImagingDatasetDescriptor}
 \alias{as_flower_dataset.FlowerDatasetDescriptor}
 \alias{as_flower_dataset.default}
 \title{Convert an object to a FlowerDatasetDescriptor}
@@ -16,6 +17,8 @@ as_flower_dataset(x, ...)
 \method{as_flower_dataset}{ResourceClient}(x, ...)
 
 \method{as_flower_dataset}{ImagingDatasetResourceClient}(x, ...)
+
+\method{as_flower_dataset}{ImagingDatasetDescriptor}(x, ...)
 
 \method{as_flower_dataset}{FlowerDatasetDescriptor}(x, ...)
 
@@ -49,8 +52,13 @@ its own method.
 
 \item \code{as_flower_dataset(ImagingDatasetResourceClient)}: Convert an ImagingDatasetResourceClient.
 
-Extracts the imaging manifest and builds a descriptor with
-\code{source_kind = "image_bundle"}.
+Extracts the imaging manifest and storage backend and builds a descriptor
+with \code{source_kind = "image_bundle"}.
+
+\item \code{as_flower_dataset(ImagingDatasetDescriptor)}: Convert an ImagingDatasetDescriptor.
+
+dsImaging descriptors remain package-independent; dsFlower owns the
+conversion into its training descriptor.
 
 \item \code{as_flower_dataset(FlowerDatasetDescriptor)}: Pass through an existing descriptor.
 

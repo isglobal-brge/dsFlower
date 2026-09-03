@@ -631,6 +631,104 @@ test_that("image descriptor and root failures remain global preconditions", {
     ),
     "configured image asset root is unavailable"
   )
+
+  s3_desc <- list(
+    metadata = list(uri = "s3://imaging/site/metadata/samples.parquet"),
+    assets = list(images = list(
+      type = "image_root", uri = "s3://imaging/site/source/images/")),
+    manifest = list(),
+    dataset_id = "site"
+  )
+  expect_error(
+    dsFlower:::.stageFromDescriptor_image(
+      s3_desc, .test_run_token(14), "label", NULL, list()),
+    "has no storage backend"
+  )
+})
+
+test_that("S3 image descriptors stage metadata and assets without credentials", {
+  root <- withr::local_tempdir()
+  withr::local_options(list(dsflower.staging_root = root))
+  metadata_uri <- "s3://imaging/site/metadata/samples.csv"
+  manifests_uri <- "s3://imaging/site/metadata/sample_manifests.csv"
+  image_root_uri <- "s3://imaging/site/source/images/"
+  image_uris <- paste0(
+    image_root_uri, c("case1.png", "nested/case2.png"))
+  calls <- new.env(parent = emptyenv())
+  calls$list <- character()
+  calls$head <- character()
+  calls$get <- character()
+
+  local_mocked_bindings(
+    backend_list = function(backend, prefix) {
+      calls$list <- c(calls$list, prefix)
+      image_uris
+    },
+    backend_head = function(backend, uri) {
+      calls$head <- c(calls$head, uri)
+      list(exists = TRUE, size = 5L)
+    },
+    backend_get_file = function(backend, uri, dest, overwrite = FALSE) {
+      calls$get <- c(calls$get, uri)
+      dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+      if (identical(uri, metadata_uri)) {
+        utils::write.csv(data.frame(
+          sample_id = c("case1", "case2"),
+          patient_id = c("patient1", "patient2"),
+          label = c("negative", "positive")), dest, row.names = FALSE)
+      } else if (identical(uri, manifests_uri)) {
+        utils::write.csv(data.frame(
+          sample_id = c("case1", "case2"), primary_uri = image_uris),
+          dest, row.names = FALSE)
+      } else if (uri %in% image_uris) {
+        writeBin(charToRaw("image"), dest)
+      } else {
+        stop("Unexpected mocked S3 URI: ", uri)
+      }
+      invisible(dest)
+    },
+    .package = "dsImaging"
+  )
+
+  backend <- structure(list(
+    type = "s3",
+    config = list(resource = list(
+      identity = "private-access-key", secret = "private-secret-key"))
+  ), class = "dsimaging_backend")
+  desc <- list(
+    metadata = list(uri = metadata_uri, format = "csv"),
+    assets = list(images = list(
+      type = "image_root", uri = image_root_uri,
+      path_col = "relative_path")),
+    manifest = list(sample_manifests = list(
+      uri = manifests_uri, format = "csv")),
+    backend = backend,
+    dataset_id = "site"
+  )
+
+  staging_dir <- dsFlower:::.stageFromDescriptor_image(
+    desc, .test_run_token(15), "label", NULL,
+    list("target-levels" = list(
+           type = "character", values = c("negative", "positive")),
+         "num-classes" = 2L))
+  withr::defer(unlink(staging_dir, recursive = TRUE))
+
+  manifest_path <- file.path(staging_dir, "manifest.json")
+  manifest <- jsonlite::fromJSON(manifest_path)
+  samples <- dsFlower:::.readStagedSamples(
+    file.path(staging_dir, manifest$samples_file))
+
+  expect_identical(calls$list, image_root_uri)
+  expect_setequal(calls$head, image_uris)
+  expect_setequal(
+    calls$get, c(metadata_uri, manifests_uri, image_uris))
+  expect_equal(samples$relative_path, c("case1.png", "nested/case2.png"))
+  expect_equal(samples$label, c(0L, 1L))
+  expect_true(all(file.exists(file.path(
+    manifest$assets$images$root, samples$relative_path))))
+  manifest_text <- paste(readLines(manifest_path, warn = FALSE), collapse = "\n")
+  expect_false(grepl("private-access-key", manifest_text, fixed = TRUE))
+  expect_false(grepl("private-secret-key", manifest_text, fixed = TRUE))
 })
 
 test_that("image label joins are stable one-to-one and totalizable", {

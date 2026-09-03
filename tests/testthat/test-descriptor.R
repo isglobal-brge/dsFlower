@@ -43,6 +43,51 @@ test_that("as_flower_dataset.FlowerDatasetDescriptor is pass-through", {
   expect_identical(result, desc)
 })
 
+test_that("ImagingDatasetResourceClient keeps its storage context", {
+  manifest <- list(
+    dataset_id = "pathmnist.site",
+    metadata = list(uri = "s3://imaging/pathmnist/metadata/samples.parquet"),
+    assets = list(images = list(
+      type = "image_root", uri = "s3://imaging/pathmnist/source/images/"))
+  )
+  backend <- structure(list(type = "s3"), class = "dsimaging_backend")
+  client <- list(
+    getManifest = function() manifest,
+    getBackend = function() backend,
+    getManifestUri = function() "s3://imaging/pathmnist/manifest.yaml"
+  )
+  class(client) <- c("ImagingDatasetResourceClient", "ResourceClient")
+
+  desc <- as_flower_dataset(client)
+
+  expect_s3_class(desc, "FlowerDatasetDescriptor")
+  expect_identical(desc$backend, backend)
+  expect_identical(
+    desc$manifest_uri, "s3://imaging/pathmnist/manifest.yaml")
+})
+
+test_that("dsFlower owns conversion of an independent imaging descriptor", {
+  manifest <- list(
+    dataset_id = "pathmnist.site",
+    metadata = list(file = "samples.csv"),
+    assets = list(images = list(type = "image_root", root = "images"))
+  )
+  imaging <- structure(list(
+    dataset_id = manifest$dataset_id,
+    source_kind = "image_bundle",
+    metadata = manifest$metadata,
+    assets = manifest$assets,
+    manifest = manifest
+  ), class = "ImagingDatasetDescriptor")
+
+  desc <- as_flower_dataset(imaging)
+
+  expect_s3_class(desc, "FlowerDatasetDescriptor")
+  expect_equal(desc$dataset_id, "pathmnist.site")
+  expect_equal(desc$source_kind, "image_bundle")
+  expect_identical(desc$manifest, manifest)
+})
+
 test_that("as_flower_dataset.default errors with helpful message", {
   expect_error(
     as_flower_dataset(42),

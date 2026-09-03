@@ -274,10 +274,17 @@ flowerInitDS <- function(data_symbol) {
       .createHandleFromTable(obj, data_symbol = data_symbol), owner_env))
   }
 
-  # Descriptor path: FlowerDatasetDescriptor or ResourceClient
+  # Descriptor path: dsFlower descriptor, independent dsImaging descriptor,
+  # or a resource client supplied by the resourcer ecosystem.
   if (inherits(obj, "FlowerDatasetDescriptor")) {
     return(.registerHandle(
       .createHandleFromDescriptor(obj, data_symbol = data_symbol), owner_env))
+  }
+
+  if (inherits(obj, "ImagingDatasetDescriptor")) {
+    desc <- as_flower_dataset(obj)
+    return(.registerHandle(
+      .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
   }
 
   if (inherits(obj, "ResourceClient")) {
@@ -295,6 +302,9 @@ flowerInitDS <- function(data_symbol) {
     if (!is.null(obj$backend) && is.null(desc$backend)) {
       desc$backend <- obj$backend
     }
+    if (!is.null(obj$manifest_uri) && is.null(desc$manifest_uri)) {
+      desc$manifest_uri <- obj$manifest_uri
+    }
     if (inherits(desc, "FlowerDatasetDescriptor")) {
       return(.registerHandle(
         .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
@@ -310,6 +320,7 @@ flowerInitDS <- function(data_symbol) {
         table_data  = desc$table_data
       )
       desc$backend <- obj$backend
+      desc$manifest_uri <- obj$manifest_uri %||% NULL
       return(.registerHandle(
         .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
     }
@@ -319,12 +330,8 @@ flowerInitDS <- function(data_symbol) {
   if (is.list(obj) && !is.null(obj$url) &&
       grepl("^imaging\\+dataset://", obj$url %||% "")) {
     if (requireNamespace("dsImaging", quietly = TRUE)) {
-      dataset_id <- sub("^imaging\\+dataset://", "", strsplit(obj$url, "\\?")[[1]][1])
-      resolve_dataset <- utils::getFromNamespace("resolve_dataset", "dsImaging")
-      parse_manifest <- utils::getFromNamespace("parse_manifest", "dsImaging")
-      resolved <- resolve_dataset(dataset_id)
-      manifest <- parse_manifest(resolved$manifest_uri, resolved$backend)
-      desc <- dsImaging::imaging_dataset_descriptor(manifest)
+      client <- dsImaging::ImagingDatasetResourceClient$new(obj)
+      desc <- as_flower_dataset(client)
       return(.registerHandle(
         .createHandleFromDescriptor(desc, data_symbol = data_symbol), owner_env))
     }
@@ -346,7 +353,8 @@ flowerInitDS <- function(data_symbol) {
   }
 
   stop("Symbol '", data_symbol, "' is not a data.frame, matrix, ",
-       "FlowerDatasetDescriptor, ResourceClient, or imaging handle. ",
+       "FlowerDatasetDescriptor, ImagingDatasetDescriptor, ResourceClient, ",
+       "or imaging handle. ",
        "Assign your data first with datashield.assign.table(), ",
        "imagingInitDS(), or similar.",
        call. = FALSE)

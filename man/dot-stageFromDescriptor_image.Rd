@@ -13,9 +13,9 @@
 )
 }
 \description{
-Handles multi-root image assets from the descriptor. Metadata is staged
-(CSV/Parquet), images remain on disk (zero-copy). The manifest includes
-an \code{assets} key mapping asset names to their validated root paths.
+Handles multi-root image assets from the descriptor. Local images remain in
+place; S3-backed images are copied into private run staging. The manifest
+includes an \code{assets} key mapping asset names to their validated roots.
 Private record values are totalized: an invalid/unavailable path becomes a
 fixed zero-image marker, invalid labels become their public target default,
 and no row is removed. Descriptor shape, metadata source, backend, and asset

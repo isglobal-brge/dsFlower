@@ -1747,9 +1747,9 @@
 
 #' Stage from an image bundle descriptor
 #'
-#' Handles multi-root image assets from the descriptor. Metadata is staged
-#' (CSV/Parquet), images remain on disk (zero-copy). The manifest includes
-#' an \code{assets} key mapping asset names to their validated root paths.
+#' Handles multi-root image assets from the descriptor. Local images remain in
+#' place; S3-backed images are copied into private run staging. The manifest
+#' includes an \code{assets} key mapping asset names to their validated roots.
 #' Private record values are totalized: an invalid/unavailable path becomes a
 #' fixed zero-image marker, invalid labels become their public target default,
 #' and no row is removed. Descriptor shape, metadata source, backend, and asset
@@ -1776,6 +1776,35 @@
   dir_asset_types <- c("image_root", "mask_root", "wsi_root",
                        "dicom_series_root", "rt_struct_root")
   file_asset_types <- c("feature_table", "rt_dose_file", "rt_plan_file")
+
+  s3_metadata <- !is.null(meta$uri) && grepl("^s3://", meta$uri)
+  s3_sample_manifests <- !is.null(desc$manifest$sample_manifests$uri) &&
+    grepl("^s3://", desc$manifest$sample_manifests$uri)
+  selected_label <- extra_config[["label_set"]] %||% NULL
+  selected_label_uri <- NULL
+  if (!is.null(selected_label)) {
+    for (label in desc$manifest$labels %||% list()) {
+      if (identical(label$name, selected_label)) {
+        selected_label_uri <- label$uri %||% NULL
+        break
+      }
+    }
+  }
+  s3_labels <- !is.null(selected_label_uri) &&
+    grepl("^s3://", selected_label_uri)
+  s3_assets <- any(vapply(names(assets), function(asset_name) {
+    asset <- assets[[asset_name]]
+    asset_type <- asset$type %||% asset$kind %||% "unknown"
+    uri <- asset$uri %||% ""
+    .imageAssetNeedsStaging(asset_name, asset_type, extra_config) &&
+      grepl("^s3://", uri)
+  }, logical(1)))
+  if (is.null(desc$backend) &&
+      (s3_metadata || s3_sample_manifests || s3_labels || s3_assets)) {
+    stop("Image bundle descriptor uses S3 objects but has no storage backend. ",
+         "Initialize it with dsImaging before passing it to dsFlower.",
+         call. = FALSE)
+  }
 
   s3_asset_plans <- list()
   required_bytes <- 0
