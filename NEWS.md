@@ -1,3 +1,10 @@
+# dsFlower 0.4.5
+
+* SuperNode startup now revalidates opaque dsImaging feature views with the
+  same server-authored patient privacy unit used during preparation. This fixes
+  the linked clinical-radiomics workflow when several images belong to one
+  patient without weakening its patient-level DP contract.
+
 # dsFlower 0.4.4
 
 ### Complete dsImaging feature handoff

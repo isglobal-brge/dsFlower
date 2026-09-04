@@ -9,7 +9,7 @@ local_feature_view_privacy_state <- function(.local_envir = parent.frame()) {
   invisible(state_dir)
 }
 
-imaging_feature_fixture <- function(owner_env) {
+imaging_feature_fixture <- function(owner_env, label_col = "diagnosis") {
   rows <- data.frame(
     sample_id = paste0("scan", 1:4),
     patient_id = c("patient1", "patient1", "patient2", "patient3"),
@@ -17,14 +17,18 @@ imaging_feature_fixture <- function(owner_env) {
     stringsAsFactors = FALSE)
   metadata_path <- tempfile(fileext = ".csv")
   utils::write.csv(rows, metadata_path, row.names = FALSE)
+  metadata <- list(
+    uri = metadata_path, file = metadata_path, format = "csv",
+    id_col = "sample_id", privacy_unit = "patient",
+    privacy_unit_col = "patient_id",
+    privacy_unit_canonicalization = "trim-utf8-v2")
+  if (!is.null(label_col)) {
+    metadata$label_col <- label_col
+    metadata$label_levels <- c("case", "control")
+  }
   manifest <- list(
     schema_version = 1L, dataset_id = "radiomics.site", modality = "image",
-    metadata = list(
-      uri = metadata_path, file = metadata_path, format = "csv",
-      id_col = "sample_id", privacy_unit = "patient",
-      privacy_unit_col = "patient_id",
-      privacy_unit_canonicalization = "trim-utf8-v2",
-      label_col = "diagnosis", label_levels = c("case", "control")),
+    metadata = metadata,
     assets = list(images = list(
       type = "image_root", uri = dirname(metadata_path))))
   admission <- dsImaging:::.imaging_privacy_admission(manifest)
@@ -68,6 +72,7 @@ test_that("opaque imaging features stage with patient DP and exact roster", {
   assign("imagingFeatureViewDS", dsImaging::imagingFeatureViewDS, env)
   assign("flowerInitDS", dsFlower::flowerInitDS, env)
   assign("flowerPrepareRunDS", dsFlower::flowerPrepareRunDS, env)
+  assign("flowerEnsureSuperNodeDS", dsFlower::flowerEnsureSuperNodeDS, env)
 
   feature_reference <- evalq(
     imagingFeatureViewDS("img", asset_id), envir = env)
@@ -92,7 +97,15 @@ test_that("opaque imaging features stage with patient DP and exact roster", {
   assign("config", config, envir = env)
   expect_no_error(evalq(flowerPrepareRunDS(
     "flower", "diagnosis", "radiomics_mean", config), envir = env))
+  testthat::local_mocked_bindings(
+    .active_tunnel_port = function() 18080L,
+    .compute_harness_hash = function() strrep("a", 64L),
+    .supernode_ensure = function(...) list(process = NULL),
+    .package = "dsFlower")
+  expect_no_error(evalq(flowerEnsureSuperNodeDS(
+    "flower", "ignored.example:9092", "imaging-feature-test"), envir = env))
   prepared <- evalq(dsFlower:::.getHandle("flower"), envir = env)
+  expect_true(prepared$node_ensured)
   manifest <- jsonlite::fromJSON(
     file.path(prepared$staging_dir, "manifest.json"), simplifyVector = FALSE)
   staged <- dsFlower:::.readStagedSamples(file.path(
@@ -107,6 +120,104 @@ test_that("opaque imaging features stage with patient DP and exact roster", {
   expect_identical(
     staged$patient_id[match(fixture$rows$sample_id, staged$sample_id)],
     fixture$rows$patient_id)
+})
+
+test_that("externally linked clinical data prepare a patient-DP logreg study", {
+  local_feature_view_privacy_state()
+  skip_if_not_installed("dsImaging")
+  skip_if_not("clinical_symbol" %in% names(formals(
+    dsImaging::imagingFeatureViewDS)))
+  withr::local_options(list(
+    dsimaging.asset_db = tempfile(fileext = ".sqlite"),
+    dsimaging.nfilter.subset = 3L,
+    dsflower.nfilter.subset = 3L,
+    dsflower.dp_unit = "row",
+    dsflower.patient_column = "wrong_global_column"))
+  env <- new.env(parent = globalenv())
+  fixture <- imaging_feature_fixture(env, label_col = NULL)
+  clinical <- data.frame(
+    patient_id = c("patient2", "patient1", "patient3"),
+    age = c(59, 48, 67),
+    bmi = c(26.5, 28.0, 24.5),
+    outcome = c("case", "control", "case"),
+    stringsAsFactors = FALSE)
+  assign("clinical", clinical, envir = env)
+  assign("clinical_columns", dsImaging:::.dsr_encode(c("age", "bmi")),
+         envir = env)
+  assign("target_levels", dsImaging:::.dsr_encode(c("control", "case")),
+         envir = env)
+  assign("imagingFeatureViewDS", dsImaging::imagingFeatureViewDS, env)
+  assign("flowerInitDS", dsFlower::flowerInitDS, env)
+  assign("flowerPrepareRunDS", dsFlower::flowerPrepareRunDS, env)
+
+  feature_reference <- evalq(imagingFeatureViewDS(
+    "img", asset_id, columns = "radiomics_mean",
+    clinical_symbol = "clinical", clinical_id_col = "patient_id",
+    clinical_columns = clinical_columns, target_col = "outcome",
+    target_levels = target_levels), envir = env)
+  assign("study", feature_reference, envir = env)
+  flower_reference <- evalq(flowerInitDS("study"), envir = env)
+  assign("flower", flower_reference, envir = env)
+  withr::defer(evalq(dsFlower:::.removeHandle("flower"), envir = env))
+
+  model_spec <- list(
+    kind = "sequential",
+    layers = list(list(op = "linear", out = "@out")))
+  model_spec_b64 <- gsub("[\r\n]", "", jsonlite::base64_enc(charToRaw(
+    as.character(jsonlite::toJSON(
+      model_spec, auto_unbox = TRUE, null = "null")))))
+  config <- list(
+    "dp-track" = "neural", "task-type" = "classification",
+    "num-server-rounds" = 1L, "num-features" = 3L,
+    "num-classes" = 2L, "num-labels" = 2L,
+    "model-spec-b64" = model_spec_b64, "loss-name" = "bce_logits",
+    "target-levels" = c("control", "case"))
+  assign("config", config, envir = env)
+  assign("bad_features", dsImaging:::.dsr_encode(c(
+    "radiomics_mean", "age", "patient_id")), envir = env)
+  assign("study_features", dsImaging:::.dsr_encode(c(
+    "radiomics_mean", "age", "bmi")), envir = env)
+
+  expect_error(evalq(flowerPrepareRunDS(
+    "flower", "outcome", bad_features, config), envir = env),
+    "sample and patient identifiers")
+  expect_null(evalq(dsFlower:::.getHandle("flower")$run_token, envir = env))
+
+  expect_no_error(evalq(flowerPrepareRunDS(
+    "flower", "outcome", study_features, config), envir = env))
+  prepared <- evalq(dsFlower:::.getHandle("flower"), envir = env)
+  manifest <- jsonlite::fromJSON(
+    file.path(prepared$staging_dir, "manifest.json"), simplifyVector = FALSE)
+  staged <- dsFlower:::.readStagedSamples(file.path(
+    prepared$staging_dir, manifest$data_file))
+
+  expect_identical(manifest$data_type, "tabular")
+  expect_identical(manifest$target_column, "outcome")
+  expect_identical(manifest[["dp-unit"]], "patient")
+  expect_identical(manifest$patient_column, "patient_id")
+  expect_identical(manifest$n_samples, 4L)
+  expect_identical(manifest$n_units, 3L)
+  expect_identical(
+    unlist(manifest$feature_columns, use.names = FALSE),
+    c("radiomics_mean", "age", "bmi"))
+  expect_identical(manifest[["loss-name"]], "bce_logits")
+  expect_identical(manifest[["model-spec-b64"]], model_spec_b64)
+  expect_identical(
+    jsonlite::fromJSON(rawToChar(jsonlite::base64_dec(
+      manifest[["model-spec-b64"]])), simplifyVector = FALSE),
+    model_spec)
+
+  expected_clinical <- clinical[match(
+    fixture$rows$patient_id, clinical$patient_id), , drop = FALSE]
+  staged_index <- match(fixture$rows$sample_id, staged$sample_id)
+  expect_false(anyNA(staged_index))
+  expect_identical(staged$patient_id[staged_index], fixture$rows$patient_id)
+  expect_equal(staged$radiomics_mean[staged_index], c(1.5, 2.5, 3.5, 4.5))
+  expect_equal(staged$age[staged_index], expected_clinical$age)
+  expect_equal(staged$bmi[staged_index], expected_clinical$bmi)
+  expect_identical(
+    as.integer(staged$outcome[staged_index]),
+    match(expected_clinical$outcome, c("control", "case")) - 1L)
 })
 
 test_that("imaging association uses the manifest patient privacy unit", {

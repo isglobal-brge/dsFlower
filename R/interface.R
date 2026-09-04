@@ -1900,7 +1900,7 @@ flowerEnsureSuperNodeDS <- function(handle_symbol, superlink_address,
   num_rounds <- suppressWarnings(as.integer(
     manifest[["num-server-rounds"]] %||% NA_integer_))
   imaging_unit_policy <- if (identical(handle$source, "descriptor") &&
-      identical(handle$source_kind, "image_bundle")) {
+      handle$source_kind %in% c("image_bundle", "imaging_feature_view")) {
     .imagingPrivacyUnitPolicy(handle$descriptor)
   } else {
     NULL
