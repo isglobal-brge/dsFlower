@@ -382,3 +382,65 @@ def test_encoder_loads_the_exact_verified_bytes_despite_cache_replacement(tmp_pa
             mock.patch.object(models, "resnet18", side_effect=replace_cache):
         encoder, _ = seg.prepare_encoder(config())
     torch.testing.assert_close(encoder[0].weight.cpu(), expected, rtol=0, atol=0)
+
+
+def test_two_round_dp_adam_matches_independent_subject_gradient_reference(tmp_path):
+    """The production loop must match explicit clipping/noise for every parameter."""
+    import hashlib
+    import math
+
+    cfg = dict(config(), **{"dp-unit": "patient", "optimizer-name": "adam",
+        "learning-rate": .001, "batch-size": 2, "local-epochs": 1,
+        "num-server-rounds": 2})
+    (tmp_path / "manifest.json").write_text(json.dumps(cfg))
+    pins = task.load_run_pins(SimpleNamespace(node_config={"manifest-dir": str(tmp_path)}))
+    torch.manual_seed(713)
+    x = torch.randn(3, seg.FEATURE_DIM) * 5.
+    y = targets()
+    y[2, 1] = 0  # Retained invalid subject, including its Poisson inclusion.
+    reference = decoder()
+    initial = [a.copy() for a in params.get_torch_params(reference)]
+    actual = [a.copy() for a in initial]
+    mechanism = dp_harness.effective_dpsgd_mechanism(8, 1e-5, 1., 3, 2, 1, 2)
+    sigma = mechanism["noise_multiplier"]
+    steps = math.ceil(len(x) / 2)
+    divisor = max(1, len(x) // steps)
+    clipped_subjects = 0
+    for rnd in (1, 2):
+        master = hashlib.sha256(("public-reference-%d" % rnd).encode()).digest()
+        optimizer = torch.optim.Adam(reference.parameters(), lr=.001)
+        sampler = seeding.np_rng(seeding.sub_seed(master, "sample"))
+        noise = seeding.np_rng(seeding.sub_seed(master, "noise"))
+        for _ in range(steps):
+            indices = np.flatnonzero(sampler.bernoulli_mask_one_in(steps, len(x)))
+            sums = [torch.zeros_like(p) for p in reference.parameters()]
+            for i in indices:
+                reference.zero_grad()
+                z = reference(x[i:i + 1])
+                mask = y[i:i + 1, :1]
+                bce = torch.nn.functional.binary_cross_entropy_with_logits(z, mask)
+                prob = z.sigmoid()
+                dice = (2 * (prob * mask).sum() + 1) / (prob.sum() + mask.sum() + 1)
+                (y[i, 1, 0, 0] * (.5 * bce + .5 * (1 - dice))).backward()
+                gradients = [p.grad.detach().clamp(-1, 1) for p in reference.parameters()]
+                norm = torch.stack([g.square().sum() for g in gradients]).sum().sqrt()
+                clipped_subjects += int(norm > 1)
+                factor = (1 / (norm + 1e-6)).clamp(max=1)
+                for total, g in zip(sums, gradients):
+                    total.add_(g * factor)
+            optimizer.zero_grad()
+            for p, total in zip(reference.parameters(), sums):
+                sampled = torch.as_tensor(noise.normal(0., sigma, size=tuple(p.shape)), dtype=p.dtype)
+                p.grad = (total + sampled) / divisor
+            optimizer.step()
+        production = decoder()
+        params.set_torch_params(production, actual)
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            actual, n = client_app._dp_fit(production, x.numpy(), y.numpy(),
+                {"epsilon": 8, "delta": 1e-5, "clipping_norm": 1., "n_samples": 3},
+                dict(pins, round_index=rnd), 3, cfg, master, sigma)
+        assert n == 3
+        for observed, expected in zip(actual, params.get_torch_params(reference)):
+            np.testing.assert_allclose(observed, expected, atol=2e-7, rtol=2e-5)
+    assert clipped_subjects > 0
+    assert all(not np.array_equal(a, b) for a, b in zip(initial, actual))
