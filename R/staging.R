@@ -1216,7 +1216,8 @@
       }
       samples_data <- as.data.frame(arrow::read_parquet(samples_data))
     } else {
-      samples_data <- utils::read.csv(samples_data, stringsAsFactors = FALSE)
+      samples_data <- utils::read.csv(samples_data, stringsAsFactors = FALSE,
+                                     colClasses = if (segmentation) "character" else NA)
     }
   } else {
     stop("samples_data must be a data.frame or a path to an existing file.",
@@ -1488,14 +1489,15 @@
   staging_dir
 }
 
-.readStagedSamples <- function(path) {
+.readStagedSamples <- function(path, preserve_strings = FALSE) {
   if (grepl("\\.parquet$", path, ignore.case = TRUE)) {
     if (!requireNamespace("arrow", quietly = TRUE)) {
       stop("arrow package required for Parquet image metadata.", call. = FALSE)
     }
     return(as.data.frame(arrow::read_parquet(path)))
   }
-  utils::read.csv(path, stringsAsFactors = FALSE)
+  utils::read.csv(path, stringsAsFactors = FALSE,
+                 colClasses = if (preserve_strings) "character" else NA)
 }
 
 .writeStagedSamples <- function(data, path) {
@@ -2114,7 +2116,7 @@
          call. = FALSE)
   }
 
-  samples_df <- .readStagedSamples(staged_samples)
+  samples_df <- .readStagedSamples(staged_samples, preserve_strings = segmentation)
   samples_df <- .transformPublicTarget(
     samples_df, target_column, extra_config)
   unit <- .prepareImagingPrivacyUnitFrame(samples_df, imaging_unit_policy)

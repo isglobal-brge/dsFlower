@@ -281,6 +281,40 @@ server exposes no log, metric or exact feature-statistics endpoint. The global
 model is the intended DP release; DP bounds an individual's influence on its
 distribution, not the possibility of every form of model inversion.
 
+## Binary 2D segmentation (experimental)
+
+`pytorch_resnet18_segmentation` adds patient-level binary segmentation to the
+declarative neural track. This implementation is awaiting reviewer promotion;
+the preregistered BrEaST/BUS-BRA utility campaign has no F5 scores yet. Its
+presence in the API is not a validated practical-utility claim.
+
+The public `resnet18_layer2_128_v1` profile uses the frozen pretrained ResNet18
+encoder through `layer2`, followed by a small trainable convolutional decoder.
+Only the decoder is DP-trained and released. The encoder remains node-local in
+evaluation mode with immutable BatchNorm statistics. Its exact checkpoint and
+128-by-128 preprocessing are pinned; there is no random-weight fallback.
+
+Each subject contributes the lexicographically first canonical image ID. Masks
+attached to that image are unioned; conflicting image paths invalidate that
+subject. The loss is the per-image mixture of BCE and Dice (alpha 0.5, smoothing
+1; alpha 1 is the BCE ablation). Image inputs are PNG/JPEG, masks are single-channel
+PNG with an explicit `0,1` or `0,255` vocabulary. Invalid pairs produce fixed safe
+tensors with zero validity and remain in the subject census. Empty masks require
+an actual empty PNG or an explicit empty annotation.
+
+Direct metadata tables require custodian options `dsflower.dp_unit="patient"`,
+`dsflower.patient_column`, `dsflower.image_data_root` and
+`dsflower.mask_data_root`. The public schema declares distinct image-ID,
+image-path and mask-path columns, plus an optional empty-annotation column.
+The mask-path column is the target. Authorized dsImaging image bundles can use
+their declared `mask_root` asset and retain their existing patient roster checks.
+Neither route accepts an analyst-supplied filesystem root.
+
+Private validation, holdout, CV and HPO reject during public preflight. Dice and
+IoU, including empty/foreground strata, are available only for public or
+authorized local evaluation at threshold 0.5; both-empty Dice is 1. Local
+predictions use the canonical 128-by-128 grid.
+
 ## Custodian options
 
 Options use the `dsflower.*` prefix, with the standard
@@ -299,6 +333,8 @@ controls remain normal DataSHIELD profile options.
 | `dp_per_training_delta` | `1e-6` | Administrator-pinned delta for every training release; maximum `1e-3`. |
 | `dp_unit` | `row` | Adjacency unit: exactly `row` or `patient`. |
 | `patient_column` | unset | Required explicit stable identifier when `dp_unit="patient"`; never auto-detected. |
+| `image_data_root` | unset | Custodian image root for direct segmentation metadata; declared paths must remain within it. |
+| `mask_data_root` | unset | Custodian PNG-mask root for direct segmentation metadata; declared paths must remain within it. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |
 | `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; `DSFLOWER_NODE_SECRET_FILE` takes precedence when a deployment selects a service or secret-manager path. |
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |

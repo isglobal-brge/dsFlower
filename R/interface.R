@@ -1651,7 +1651,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
           expected_capability = handle$imaging_handle_capability,
           owner_env = owner_env)
         staged_data <- .readStagedSamples(file.path(
-          staging_dir, staged_manifest$samples_file))
+          staging_dir, staged_manifest$samples_file),
+          preserve_strings = .segmentationRequested(run_config))
         privacy <- imaging_authorized$privacy
         assert_roster <- utils::getFromNamespace(
           ".assert_exact_imaging_roster", "dsImaging")
@@ -1706,6 +1707,9 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 
     if (identical(handle$source, "table") && !is.null(handle$table_data)) {
       data <- handle$table_data
+    } else if (.segmentationRequested(run_config) &&
+               identical(tolower(handle$data_format %||% "csv"), "csv")) {
+      data <- .readStagedSamples(handle$data_path, preserve_strings = TRUE)
     } else {
       data <- .loadTrainingData(handle$data_path, handle$data_format)
     }

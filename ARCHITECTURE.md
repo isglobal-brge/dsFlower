@@ -186,6 +186,48 @@ Extending the same engine-agnostic resampling contract to another backend
 requires a reviewed backend-specific training/evaluation adapter; accepting a
 contract without executing both sides is forbidden.
 
+### Binary 2D segmentation
+
+The experimental `pytorch_resnet18_segmentation` contract uses the neural
+mechanism with a mandatory custodian-selected patient privacy unit. It is
+implemented but not promoted: F5 public-data utility results and reviewer
+approval remain outstanding. Private validation, atomic holdout, CV and HPO
+are outside this contract and fail public preflight.
+
+The frozen `resnet18_layer2_128_v1` encoder resides outside the released module.
+It runs under `eval()` and `no_grad()` with fixed pretrained BatchNorm statistics.
+The public ResNet18 IMAGENET1K_V1 checkpoint SHA-256 is
+`f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec`.
+The decoder maps 128-by-16-by-16 features to a 1-by-128-by-128 logit image using
+three convolutions and nearest-neighbour upsampling. It has no BatchNorm or
+frozen encoder buffers. The trusted BCE/Dice mixture reduces over pixels within
+each subject before the subject mean; batch-wide Dice is excluded.
+
+Staging keeps all M source rows and the separate N-subject census. The trusted
+runner selects one image per subject by the pinned canonical image-ID ordering,
+unions all masks on ties that identify the same image path, and produces exactly
+N subject tensors. Conflicting paths, invalid image IDs, unavailable/corrupt
+assets, incompatible original geometry and out-of-vocabulary masks map to fixed
+safe tensors with validity zero. The subject remains in sampling and accounting.
+An explicit empty annotation authorizes an absent mask only when its original
+path was absent/blank; it cannot conceal an invalid supplied path.
+
+Direct-table preparation requires the custodian image and mask root options.
+The dsImaging route verifies image/sample/mask roles against the admitted
+descriptor and preserves the declared `mask_root` asset. Both use the existing
+containment checks, and segmentation does not guess replacement filenames for
+invalid paths. Individual S3 download failures remove partial files and become
+invalid records. Numeric-looking identity strings retain their exact text across
+CSV staging. The source census, masks, features and validity summaries remain
+node-local. Effective tensors, selection/profile/preprocessing and checkpoint
+pins contribute to sticky semantic identity; path names alone do not identify
+the training data.
+
+Only DP-trained decoder parameters and public reconstruction metadata are
+released. Public or authorized local evaluation uses the canonical output grid,
+threshold 0.5 and subject-mean Dice/IoU, with foreground and empty-mask strata.
+Both-empty Dice is 1 and one-empty Dice is 0; these are not private metric routes.
+
 ## 3. Per-training privacy
 
 The custodian pins a positive epsilon/delta pair for each training. Its rounds
@@ -369,6 +411,8 @@ session/profile options.
 | `dp_per_training_delta` | `1e-6` | Fixed delta per training release, maximum `1e-3` |
 | `dp_unit` | `row` | Adjacency unit (`row` or `patient`) |
 | `patient_column` | unset | Required explicit stable ID column in patient mode |
+| `image_data_root` | unset | Custodian root for direct segmentation image paths |
+| `mask_data_root` | unset | Custodian root for direct segmentation PNG-mask paths |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound |
 | `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV takes precedence when it selects another path |
 | `tunnel_chunk_bytes` | `524288` | Per-exchange decoded tunnel payload cap (16--512 KiB); larger streams use multiple exact chunks below DSI's expression-parser limit |

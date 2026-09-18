@@ -210,6 +210,96 @@ test_that("failed S3 mask records preserve successful staging without partial ma
   expect_true(file.exists(file.path(root, "good.png")))
 })
 
+test_that("segmentation CSV routes preserve numeric-looking patient and image IDs", {
+  roots <- local_segmentation_roots()
+  config <- segmentation_config()
+  config$data_type <- NULL
+  data <- data.frame(patient_id = c("001", "01", "1"),
+                     image_id = c("002", "02", "2"),
+                     relative_path = rep("a.png", 3),
+                     mask_path = rep("a.png", 3),
+                     mask_empty = c("TRUE", "FALSE", "invalid"))
+  source <- file.path(roots$root, "source.csv")
+  utils::write.csv(data, source, row.names = FALSE)
+  metadata <- list(file = source, id_col = "image_id", privacy_unit = "patient",
+                   privacy_unit_col = "patient_id",
+                   privacy_unit_canonicalization = "trim-utf8-v2")
+  desc <- list(source_kind = "image_bundle", dataset_id = "numeric-id-fixture",
+               metadata = metadata, manifest = list(metadata = metadata),
+               assets = list(images = list(type = "image_root", root = roots$image,
+                                           path_col = "relative_path"),
+                             masks = list(type = "mask_root", root = roots$mask,
+                                          path_col = "mask_path")))
+  for (route in c("direct", "descriptor")) {
+    token <- dsFlower:::.generate_run_token()
+    staged <- if (identical(route, "direct")) {
+      dsFlower:::.stage_image_manifest(token, "mask_path", source, config)
+    } else {
+      dsFlower:::.stageFromDescriptor_image(desc, token, "mask_path", NULL, config)
+    }
+    manifest <- jsonlite::fromJSON(file.path(staged, "manifest.json"))
+    actual <- dsFlower:::.readStagedSamples(
+      file.path(staged, manifest$samples_file), preserve_strings = TRUE)
+    expect_identical(manifest$n_samples, 3L)
+    expect_identical(manifest$n_units, 3L)
+    expect_identical(actual$patient_id, data$patient_id)
+    expect_identical(actual$image_id, data$image_id)
+    expect_identical(actual$mask_empty, data$mask_empty)
+    expect_identical(actual$mask_path, data$mask_path)
+    dsFlower:::.cleanupStaging(token)
+  }
+})
+
+test_that("sealed imaging snapshots retain the declared segmentation mask asset", {
+  skip_if_not_installed("dsImaging")
+  roots <- local_segmentation_roots()
+  config <- segmentation_config()
+  config$data_type <- NULL
+  config$mask_asset <- "lesion_masks"
+  samples <- data.frame(patient_id = c("001", "01", "1"),
+                        image_id = c("003", "03", "3"),
+                        relative_path = rep("untrusted-metadata.png", 3),
+                        mask_path = rep("a.png", 3), mask_empty = rep(FALSE, 3))
+  metadata <- list(id_col = "image_id", privacy_unit = "patient",
+                   privacy_unit_col = "patient_id",
+                   privacy_unit_canonicalization = "trim-utf8-v2")
+  snapshot <- list(
+    records = lapply(samples$image_id, function(id) {
+      list(sample_id = id, relative_path = "a.png", source_kind = "single_file",
+           n_files = 1L, size = 1)
+    }),
+    artifacts = list(metadata = list(format = "csv"),
+                     sample_manifests = list(format = "csv")))
+  local_mocked_bindings(
+    .copy_imaging_snapshot_artifact = function(snapshot, backend, key, destination) {
+      data <- if (identical(key, "metadata")) samples else data.frame(
+        sample_id = samples$image_id, primary_uri = rep("a.png", 3))
+      utils::write.csv(data, destination, row.names = FALSE)
+    },
+    .materialize_imaging_snapshot = function(snapshot, backend, destination) {
+      list(root = roots$image, relative_paths = "a.png")
+    }, .package = "dsImaging")
+  desc <- list(source_kind = "image_bundle", dataset_id = "sealed-segmentation",
+               metadata = metadata, manifest = list(metadata = metadata),
+               .collection_snapshot = snapshot,
+               assets = list(images = list(type = "image_root", root = roots$image,
+                                           path_col = "relative_path"),
+                             lesion_masks = list(type = "mask_root", root = roots$mask,
+                                                  path_col = "mask_path")))
+  token <- dsFlower:::.generate_run_token()
+  staged <- dsFlower:::.stageFromDescriptor_image(desc, token, "mask_path", NULL, config)
+  withr::defer(dsFlower:::.cleanupStaging(token))
+  manifest <- jsonlite::fromJSON(file.path(staged, "manifest.json"))
+  actual <- dsFlower:::.readStagedSamples(
+    file.path(staged, manifest$samples_file), preserve_strings = TRUE)
+  expect_identical(manifest$n_units, 3L)
+  expect_named(manifest$assets, c("images", "lesion_masks"))
+  expect_identical(actual$image_id, samples$image_id)
+  expect_identical(actual$patient_id, samples$patient_id)
+  expect_identical(actual$relative_path, rep("a.png", 3))
+  expect_identical(actual$mask_path, samples$mask_path)
+})
+
 test_that("direct prepare uses image routing only for the segmentation contract", {
   roots <- local_segmentation_roots()
   withr::local_envvar(c(
