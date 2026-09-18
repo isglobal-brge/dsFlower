@@ -96,7 +96,7 @@
     }
     edges <- unlist(value$edges, use.names = FALSE)
     if (edges[[1L]] != 0 || any(diff(edges) <= 0) ||
-        tail(edges, 1L) != value$horizon) {
+        utils::tail(edges, 1L) != value$horizon) {
       stop("Hazard edges must increase strictly from zero to horizon.", call. = FALSE)
     }
     value$edges <- edges
