@@ -1001,6 +1001,7 @@ flowerInitDS <- function(data_symbol) {
       mse = "regression", huber = "regression", quantile = "regression",
       gamma_nll = "regression",
       poisson_nll = "count", negbin_nll = "count",
+      aft_weibull_nll = "survival", aft_lognormal_nll = "survival",
       "classification")
   } else if (identical(track, "native_tree")) {
     request <- .validate_native_tree_request_wire(
@@ -1269,6 +1270,7 @@ flowerInitDS <- function(data_symbol) {
   }
   track <- tolower(track)
   run_config[["dp-track"]] <- track
+  run_config <- .normalizeSurvivalConfig(run_config, track, unit_policy)
   run_config <- .normalizeAssociationConfig(run_config, track, unit_policy)
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
@@ -1463,6 +1465,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     target_column, feature_columns, run_config)
   target_column <- columns$target_column
   feature_columns <- columns$feature_columns
+  .validateSurvivalColumns(run_config, target_column, feature_columns,
+                           imaging_unit_policy)
   if (!is.null(imaging_unit_policy)) {
     label_column <- handle$descriptor$manifest$metadata$label_col %||% NULL
     if (!is.character(label_column) || length(label_column) != 1L ||

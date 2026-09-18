@@ -24,7 +24,7 @@
   declarative_losses = c(
     "bce_logits", "cross_entropy", "mse", "poisson_nll",
     "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
-    "huber", "quantile"
+    "huber", "quantile", "aft_weibull_nll", "aft_lognormal_nll"
   ),
   aggregation_strategies = c(
     "fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm"
