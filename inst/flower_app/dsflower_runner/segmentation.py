@@ -1,6 +1,7 @@
 """Pinned binary image/subject contract. Only decoder parameters are released."""
 
 import hashlib
+import io
 import os
 import unicodedata
 import warnings
@@ -124,14 +125,16 @@ def prepare_encoder(cfg):
     if not os.path.isfile(path):
         raise ValueError("segmentation pretrained checkpoint is unavailable")
     with open(path, "rb") as handle:
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-        digest = digest.hexdigest()
-    if digest != CHECKPOINT_SHA256:
+        checkpoint = handle.read(46_830_571 + 1)
+    if (len(checkpoint) != 46_830_571
+            or hashlib.sha256(checkpoint).hexdigest() != CHECKPOINT_SHA256):
         raise ValueError("segmentation pretrained checkpoint digest mismatch")
+    # Consume exactly the verified bytes. Asking torchvision to load weights
+    # here would reopen its cache (or fetch again) after the hash check.
+    state = torch.load(io.BytesIO(checkpoint), map_location="cpu", weights_only=True)
     with torch.random.fork_rng(devices=[]):
-        net = resnet18(weights=weights)
+        net = resnet18(weights=None)
+        net.load_state_dict(state, strict=True)
     encoder = torch.nn.Sequential(*list(net.children())[:6])
     encoder.eval()
     encoder.requires_grad_(False)

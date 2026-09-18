@@ -360,3 +360,25 @@ def test_segmentation_pins_full_float32_arithmetic():
     finally:
         torch.backends.cuda.matmul.allow_tf32 = matmul
         torch.backends.cudnn.allow_tf32 = cudnn
+
+
+def test_encoder_loads_the_exact_verified_bytes_despite_cache_replacement(tmp_path):
+    import shutil
+    import torchvision.models as models
+    source = os.path.join(torch.hub.get_dir(), "checkpoints", "resnet18-f37072fd.pth")
+    if not os.path.isfile(source):
+        pytest.skip("custodian-pinned checkpoint not seeded in local cache")
+    cache = tmp_path / "checkpoints"
+    cache.mkdir()
+    target = cache / "resnet18-f37072fd.pth"
+    shutil.copyfile(source, target)
+    expected = torch.load(source, map_location="cpu", weights_only=True)["conv1.weight"]
+    original = models.resnet18
+    def replace_cache(*, weights):
+        assert weights is None  # never let torchvision reopen/fetch its cache
+        target.write_bytes(b"replaced after verification")
+        return original(weights=None)
+    with mock.patch.object(torch.hub, "get_dir", return_value=str(tmp_path)), \
+            mock.patch.object(models, "resnet18", side_effect=replace_cache):
+        encoder, _ = seg.prepare_encoder(config())
+    torch.testing.assert_close(encoder[0].weight.cpu(), expected, rtol=0, atol=0)
