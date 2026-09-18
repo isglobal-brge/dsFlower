@@ -11,6 +11,7 @@ import os
 import sys
 import unittest
 import tempfile
+import shutil
 from types import SimpleNamespace
 
 import pandas as pd
@@ -311,6 +312,19 @@ class SurvivalRunnerTests(unittest.TestCase):
         self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
         with self.assertRaises(RuntimeError):self.task.load_survival_data(self.context)
 
+    def test_hazard_preserves_adjacent_float_interval_boundary(self):
+        self.hazard_fixture()
+        value=np.nextafter(5.,np.inf)
+        self.subjects["__survival_time"]=self.subjects["__survival_time"].astype(float)
+        source=pd.read_csv(os.path.join(self.temp.name,"source.csv"),dtype={"id":str},keep_default_na=False)
+        source["time"]=source["time"].astype(float)
+        source.loc[0,"time"]=value
+        source.to_csv(os.path.join(self.temp.name,"source.csv"),index=False)
+        self.subjects.loc[0,["__survival_time","__survival_d_1","__survival_d_2","__survival_m_2"]]=[value,0,1,1]
+        self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        _,y,_,_=self.task.load_survival_data(self.context)
+        np.testing.assert_array_equal(y[0],[0,1,0,1,1,0,1])
+
     def test_hazard_training_dispatch_preserves_N_and_M(self):
         from dsflower_runner import client_app
         self.hazard_fixture()
@@ -424,6 +438,67 @@ class SurvivalRunnerTests(unittest.TestCase):
         self.assertNotEqual(baseline,digest(features=changed))
         changed_pins={**pins,"loss_name":"aft_lognormal_nll"}
         self.assertNotEqual(baseline,digest(wire(config("lognormal")),pinned=changed_pins))
+
+    def test_sticky_repeated_released_arrays_and_effective_changes(self):
+        from dsflower_runner import client_app,params
+        def execute(changed_incoming=False,operational=False):
+            pins={**self.task.load_run_pins(self.context),"round_index":1}
+            cfg=self.task.load_pinned_run_config(self.context)
+            if operational:cfg.update({"run-token":"different-token","results-dir":"different-path"})
+            width=len(self.cfg["edges"])-1 if "edges" in self.cfg else 1
+            net=model(width).float()
+            net._dsflower_release_keys=tuple(name for name,_ in net.named_parameters())
+            if changed_incoming:
+                with torch.no_grad():next(net.parameters()).add_(.01)
+            pcfg={"epsilon":4.,"delta":1e-5,"clipping_norm":1.,"n_samples":8}
+            with mock.patch.object(client_app.seeding,"_node_secret",return_value=b"s"*32):
+                result,_=client_app._train_neural(self.context,cfg,pcfg,pins,net,2,False)
+            return [a.copy() for a in result]
+        def same(a,b):return all(np.array_equal(x,y) for x,y in zip(a,b))
+        first=execute()
+        self.assertTrue(same(first,execute()))
+        self.assertTrue(same(first,execute(operational=True)))
+        rebound=os.path.join(self.temp.name,"rebound")
+        os.mkdir(rebound)
+        for name in ("source.csv","subjects.csv","manifest.json"):
+            shutil.copyfile(os.path.join(self.temp.name,name),os.path.join(rebound,name))
+        self.context.node_config["manifest-dir"]=rebound
+        self.assertTrue(same(first,execute(operational=True)))
+        self.context.node_config["manifest-dir"]=self.temp.name
+        self.assertFalse(same(first,execute(changed_incoming=True)))
+        # A public dispersion/distribution change rekeys actual noise and training.
+        self.cfg=config(dispersion=2.)
+        self.manifest.update({"survival-config":self.cfg,**wire(self.cfg)})
+        self.context.run_config=wire(self.cfg);self.write_manifest()
+        self.assertFalse(same(first,execute()))
+        self.cfg=config("lognormal")
+        self.manifest.update({"survival-config":self.cfg,**wire(self.cfg),"loss-name":"aft_lognormal_nll"})
+        self.context.run_config=wire(self.cfg);self.write_manifest()
+        self.assertFalse(same(first,execute()))
+        # Complete grid vectors also bind retries; both grids have identical K.
+        self.hazard_fixture()
+        hazard_first=execute()
+        self.cfg=config(edges=[0.,6.,10.,20.])
+        self.manifest.update({"survival-config":self.cfg,**wire(self.cfg)})
+        self.context.run_config=wire(self.cfg);self.write_manifest()
+        self.assertFalse(same(hazard_first,execute()))
+        # A newly invalid subject preserves N, changes effective y and rekeys.
+        source=pd.read_csv(os.path.join(self.temp.name,"source.csv"),dtype={"id":str},keep_default_na=False)
+        source.loc[0,"event"]=2
+        source.to_csv(os.path.join(self.temp.name,"source.csv"),index=False)
+        self.subjects.loc[0,self.subjects.columns[1:]]=0.
+        self.subjects.loc[0,"__survival_time"]=1.
+        self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        self.assertFalse(same(hazard_first,execute()))
+
+    def test_reply_releases_only_parameters_and_fixed_weight(self):
+        from dsflower_runner import client_app
+        from flwr.common import Message,RecordDict,ArrayRecord
+        message=Message(content=RecordDict({"arrays":ArrayRecord(numpy_ndarrays=[np.ones(2,dtype=np.float32)])}),
+                        dst_node_id=1,message_type="train")
+        reply=client_app._reply(message,[np.zeros(2,dtype=np.float32)])
+        self.assertEqual(set(reply.content),{"arrays","metrics"})
+        self.assertEqual(dict(reply.content["metrics"]),{"num-examples":1})
 
     def test_all_invalid_runs_normal_noisy_optimizer(self):
         from dsflower_runner import client_app,params

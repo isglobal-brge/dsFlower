@@ -689,7 +689,7 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
             raise ValueError(
                 "resampling requires a positive pinned privacy-unit count")
 
-    survival_run = pins["loss_name"] in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
+    survival_run = pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
     if survival_run and (has_holdout or has_cv or manifest_image):
         raise ValueError("survival private validation/resampling and image inputs are unsupported")
     if survival_run:

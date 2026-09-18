@@ -192,6 +192,7 @@ def _read_staged_frame(path, manifest):
         na_filter=False,
         encoding="utf-8",
         encoding_errors="strict",
+        float_precision=("round_trip" if manifest.get("task-type") == "survival" else None),
     )
 
 
