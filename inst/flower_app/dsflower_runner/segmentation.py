@@ -23,6 +23,13 @@ PIN_KEYS = (
 )
 
 
+def configure_runtime():
+    """This profile uses full float32 convolution and matrix arithmetic."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+
+
 def validate_config(cfg):
     """Public-only admission; called before resolving any private path."""
     if "data_type" in cfg:
@@ -108,6 +115,7 @@ def prepare_encoder(cfg):
     from .vision import pick_device
 
     validate_config(cfg)
+    configure_runtime()
     weights = ResNet18_Weights.IMAGENET1K_V1
     path = os.path.join(torch.hub.get_dir(), "checkpoints",
                         os.path.basename(weights.url))

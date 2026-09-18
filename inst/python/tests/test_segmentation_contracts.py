@@ -345,3 +345,18 @@ def test_encoder_preflight_failure_does_not_read_private_records(tmp_path):
         with pytest.raises(ValueError, match="checkpoint"):
             client_app._train_segmentation(context, config(), {}, {}, decoder())
     load.assert_not_called()
+
+
+def test_segmentation_pins_full_float32_arithmetic():
+    matmul = torch.backends.cuda.matmul.allow_tf32
+    cudnn = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        decoder()
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul
+        torch.backends.cudnn.allow_tf32 = cudnn

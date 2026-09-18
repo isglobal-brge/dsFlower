@@ -104,6 +104,7 @@ def load_user_model(cfg, input_dim, loss_name):
         except ImportError:
             import segmentation
         segmentation.validate_config(cfg)
+        segmentation.configure_runtime()
         spatial["output_shape"] = segmentation.OUTPUT_SHAPE
     out_dim = model_spec.output_width(loss_name, cfg)
     num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None

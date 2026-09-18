@@ -111,6 +111,7 @@ def _build_initial_model(cfg):
     if loss_name == "segmentation_bce_dice":
         from . import segmentation
         segmentation.validate_config(cfg)
+        segmentation.configure_runtime()
         spatial["output_shape"] = segmentation.OUTPUT_SHAPE
     model = model_spec.build_from_spec(spec, in_dim=in_dim, out_dim=out_dim,
                                        num_labels=num_labels, **spatial)
