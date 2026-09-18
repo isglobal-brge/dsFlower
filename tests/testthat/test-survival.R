@@ -284,3 +284,24 @@ test_that("survival CSV round-trips precise interval boundaries and numeric outc
   expect_equal(actual$`__survival_d_1`, c(1, 1, 0))
   expect_equal(actual$`__survival_d_2`, c(0, 0, 1))
 })
+
+test_that("survival fixes irrelevant class pins to one sticky identity", {
+  .survival_patient_options()
+  for (wire in list(.survival_wire_fixture(), .hazard_wire_fixture())) {
+    default <- dsFlower:::.addDpConfigToRunConfig(wire)
+    explicit <- wire
+    explicit[["num-classes"]] <- 2
+    explicit[["num-labels"]] <- 2
+    expect_identical(dsFlower:::.addDpConfigToRunConfig(explicit), default)
+    expect_identical(default[["num-classes"]], 2L)
+    expect_identical(default[["num-labels"]], 2L)
+    for (field in c("num-classes", "num-labels")) {
+      for (value in list(1, 3, TRUE, "2", c(2, 2), NA_real_)) {
+        bad <- wire
+        bad[[field]] <- value
+        expect_error(dsFlower:::.addDpConfigToRunConfig(bad),
+                     "compatibility pins must equal 2")
+      }
+    }
+  }
+})

@@ -56,6 +56,16 @@
   scalar_number <- function(x) {
     is.numeric(x) && length(x) == 1L && is.finite(x)
   }
+  # Survival head width comes only from its loss/grid, never class vocabulary.
+  # Pin unused compatibility fields so they cannot create fresh sticky noise.
+  for (field in c("num-classes", "num-labels")) {
+    pin <- run_config[[field]] %||% 2L
+    if (!scalar_number(pin) || pin != 2) {
+      stop("Survival num-classes and num-labels compatibility pins must equal 2.",
+           call. = FALSE)
+    }
+    run_config[[field]] <- 2L
+  }
   n_features <- run_config[["num-features"]]
   if (!scalar_number(n_features) || n_features < 1 ||
       n_features != floor(n_features)) {
