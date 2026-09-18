@@ -250,15 +250,27 @@ test_that("changing one subject cannot change other derived subject contribution
                      time = c(2, 4, 4, 6), event = c(1, 0, 0, 1))
   for (wire in list(.survival_wire_fixture(), .hazard_wire_fixture())) {
     config <- dsFlower:::.addDpConfigToRunConfig(wire)
-    derived <- lapply(c(FALSE, TRUE), function(change) {
+    derived <- lapply(c("original", "invalid_duplicate", "valid_subject"), function(change) {
       frame <- data
-      if (change) frame[frame$id == "b", c("x", "time", "event")] <- NA
+      if (change == "invalid_duplicate") {
+        frame[frame$id == "b", c("x", "time", "event")] <- NA
+      }
+      if (change == "valid_subject") {
+        frame[frame$id == "a", c("x", "time", "event")] <- c(9, 9, 0)
+      }
       token <- dsFlower:::.generate_run_token()
       on.exit(dsFlower:::.cleanupStaging(token))
       path <- dsFlower:::.stageData(frame, token, c("time", "event"), "x", config)
       utils::read.csv(file.path(path, "survival_subjects.csv"), check.names = FALSE)
     })
     expect_identical(derived[[1]], derived[[2]])
+    own <- derived[[1]]$id == "a"
+    expect_false(identical(derived[[1]][own, ], derived[[3]][own, ]))
+    expect_identical(derived[[1]][!own, ], derived[[3]][!own, ])
+    expect_equal(derived[[3]]$x[own], 9)
+    expect_equal(derived[[3]]$`__survival_time`[own], 9)
+    expect_equal(derived[[3]]$`__survival_event`[own], 0)
+    expect_equal(derived[[3]]$`__survival_valid`[own], 1)
   }
 })
 
