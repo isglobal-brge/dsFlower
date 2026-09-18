@@ -54,6 +54,24 @@ granularity of an `nn.Module` because the trusted runner owns the training loop
 and can observe per-sample gradients. Adding a reviewed operation to this
 declarative vocabulary is the safe extension path.
 
+The survival contracts `pytorch_aft` and `pytorch_discrete_hazard` require
+custodian-configured patient privacy and an explicit stable subject identifier.
+They accept numeric baseline features and ordered `(time, event)` targets in days
+from baseline, with public resolution and administrative horizon. AFT supports
+Weibull or log-normal likelihoods with fixed public dispersion in `{0.5, 1, 2}`.
+Discrete hazard uses a public grid of at most 64 intervals and one fixed-width
+outcome/mask vector per subject; its masked BCE sum is divided by public `K`.
+Both sample, clip and account once per subject, including invalid subjects.
+Duplicate rows, unusable identifiers and invalid outcomes become safe zero-loss
+subject contributions. Source rows and subjects are never removed or disclosed.
+Cox remains excluded because its risk-set loss couples different subjects.
+
+Survival evaluation uses the released model on public or independently
+authorized analyst-local held-out data (channel B). Private validation, atomic
+holdout, CV and private metric-based HPO reject these tasks at public preflight.
+Predictive utility is an empirical question; implementing the contract does not
+establish a useful concordance score for any dataset or privacy budget.
+
 A HookApp is more restricted than a general Flower App. It exposes
 `initial_arrays()` and `local_update()` and is never imported into the trusted
 parent. Arbitrary code cannot generically receive DP-SGD-level guarantees:
@@ -117,7 +135,8 @@ If any expected node does not provide the fixed private release, the pooled
 artifact reports `available=false` and omits metrics. It never substitutes exact
 or zero-filled metrics, and this does not introduce a query-count lockout.
 
-Atomic holdout is available for tabular neural/native-tree training and native
+Atomic holdout is available for supported classification/regression/count
+tabular neural/native-tree training and native
 dsFlower 2D/3D vision models. Nodes derive the same secret-keyed row/patient
 split before training, spend the fixed 80/20 job budget on training and one
 pooled test release, and publish the model plus metrics only after the exact
