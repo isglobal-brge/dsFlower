@@ -253,6 +253,9 @@ def _survival_public_contract(manifest):
             or manifest.get("patient-id-canonicalization") != "trim-utf8-v2"
             or manifest.get("data_type") != "tabular"):
         raise ValueError("survival requires tabular neural training and custodian patient privacy")
+    if any(type(manifest.get(key)) is not int or manifest[key] != 2
+           for key in ("num-classes", "num-labels")):
+        raise ValueError("survival requires canonical class/label pins equal to 2")
     encoded = survival.config_from_run(
         {"survival-config-b64": manifest.get("survival-config-b64")}, loss_name)
     if encoded != config:
@@ -943,6 +946,9 @@ def load_pinned_run_config(context=None):
     if str(manifest.get("dp-track", "")).lower() == "neural":
         if manifest.get("task-type") == "survival":
             _survival_public_contract(manifest)
+            if any(key in cfg and (type(cfg[key]) is not int or cfg[key] != 2)
+                   for key in ("num-classes", "num-labels")):
+                raise ValueError("Flower survival class/label pins must equal 2")
             if (cfg.get("survival-config-b64") != manifest.get("survival-config-b64")
                     or ("survival-config" in cfg
                         and cfg["survival-config"] != manifest["survival-config"])):

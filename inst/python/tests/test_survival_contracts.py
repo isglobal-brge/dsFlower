@@ -267,7 +267,7 @@ class SurvivalRunnerTests(unittest.TestCase):
             "survival_schema":"subject_survival_v1","survival_file":"subjects.csv",
             "survival_shape":[7,2,3],"survival_feature_columns":["x","z"],
             "survival_target_columns":list(survival.TARGET_COLUMNS),
-            "n_samples":8,"n_units":7,"num-classes":2,"batch-size":3,
+            "n_samples":8,"n_units":7,"num-classes":2,"num-labels":2,"batch-size":3,
             "local-epochs":1,"num-server-rounds":1}
         self.context=SimpleNamespace(node_config={"manifest-dir":self.temp.name},
                                      run_config=wire(self.cfg))
@@ -409,6 +409,22 @@ class SurvivalRunnerTests(unittest.TestCase):
         self.context.run_config=wire(self.cfg)
         self.context.run_config["survival-config"]=config("lognormal")
         with self.assertRaises(ValueError):self.task.load_pinned_run_config(self.context)
+
+    def test_irrelevant_class_pins_are_canonical_and_cannot_rekey(self):
+        from dsflower_runner import client_app
+        pins=self.task.load_run_pins(self.context)
+        base,_=client_app._neural_seed_contract(wire(self.cfg),pins,{})
+        explicit={**wire(self.cfg),"num-classes":2,"num-labels":2}
+        self.assertEqual(base,client_app._neural_seed_contract(explicit,pins,{})[0])
+        for key in ("num-classes","num-labels"):
+            self.context.run_config={**wire(self.cfg),key:3}
+            with self.assertRaises(ValueError):self.task.load_pinned_run_config(self.context)
+            self.context.run_config=wire(self.cfg)
+            for value in (3,2.,True,None):
+                self.manifest[key]=value;self.write_manifest()
+                with mock.patch.object(self.task,"_read_staged_frame",side_effect=AssertionError("private read")):
+                    with self.assertRaises(ValueError):self.task.load_survival_data(self.context)
+            self.manifest[key]=2;self.write_manifest()
 
     def test_loss_pins_and_release_shapes(self):
         from dsflower_runner import client_app,model_spec

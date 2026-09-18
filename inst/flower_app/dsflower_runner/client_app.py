@@ -80,6 +80,8 @@ def _neural_seed_contract(cfg, pins, _pcfg, geometry_n_units=None):
     if pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         from . import survival
         run["survival-config"] = survival.config_from_run(cfg, pins["loss_name"])
+        run["num-classes"] = 2
+        run["num-labels"] = 2
     bounds = _effective_feature_bounds(cfg)
     run.pop("feature-bounds-b64", None)
     if bounds is not None:
