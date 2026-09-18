@@ -19,9 +19,23 @@
                        .local_envir = .local_envir)
 }
 
+.hazard_wire_fixture <- function(edges = c(0, 2, 5, 10)) {
+  value <- list(schema_version = 1L, time_unit = "days", time_origin = "baseline",
+                t_min = 1, horizon = 10, edges = edges)
+  wire <- .survival_wire_fixture(value)
+  wire[["loss-name"]] <- "discrete_hazard_nll"
+  wire
+}
+
 test_that("survival public pins are strict and custodian patient units mandatory", {
   withr::local_options(list(dsflower.dp_unit = "row"))
   expect_error(dsFlower:::.addDpConfigToRunConfig(.survival_wire_fixture()),
+               "custodian-configured patient")
+  uppercase <- .survival_wire_fixture()
+  uppercase[["task-type"]] <- "SURVIVAL"
+  uppercase[["loss-name"]] <- "AFT_WEIBULL_NLL"
+  uppercase[["survival-config-b64"]] <- NULL
+  expect_error(dsFlower:::.addDpConfigToRunConfig(uppercase),
                "custodian-configured patient")
   .survival_patient_options()
   for (distribution in c("weibull", "lognormal")) {
@@ -121,6 +135,9 @@ test_that("AFT staging preserves rows and units while totalizing invalid subject
   withr::defer(dsFlower:::.cleanupStaging(token))
   path <- dsFlower:::.stageData(data, token, c("time", "event"), "x", config)
   manifest <- jsonlite::read_json(file.path(path, "manifest.json"), simplifyVector = TRUE)
+  manifest_arrays <- jsonlite::read_json(file.path(path, "manifest.json"))
+  expect_type(manifest_arrays$feature_columns, "list")
+  expect_type(manifest_arrays$survival_feature_columns, "list")
   result <- utils::read.csv(file.path(path, manifest$survival_file), check.names = FALSE)
   expect_equal(manifest$n_samples, nrow(data))
   expect_equal(manifest$n_input_samples, nrow(data))
@@ -160,4 +177,85 @@ test_that("survival data-frame and parquet descriptors preserve the same subject
   })
   expect_identical(results[[1]], results[[2]])
   expect_identical(results[[1]], results[[3]])
+})
+
+test_that("hazard pins require a strict fixed public grid with K at most 64", {
+  .survival_patient_options()
+  config <- dsFlower:::.addDpConfigToRunConfig(.hazard_wire_fixture())
+  expect_identical(config[["task-type"]], "survival")
+  expect_equal(config[["survival-config"]]$edges, c(0, 2, 5, 10))
+  for (edges in list(c(1, 10), c(0, 5, 5, 10), c(0, 10, 5), c(0, 5, 9),
+                     c(0, NA, 10), seq(0, 10, length.out = 66), list(0, TRUE, 10))) {
+    expect_error(dsFlower:::.addDpConfigToRunConfig(.hazard_wire_fixture(edges)),
+                 "Hazard edges")
+  }
+  expect_no_error(dsFlower:::.addDpConfigToRunConfig(
+    .hazard_wire_fixture(seq(0, 10, length.out = 65))))
+})
+
+test_that("hazard staging applies interval-end event and censor conventions", {
+  .survival_patient_options()
+  config <- dsFlower:::.addDpConfigToRunConfig(.hazard_wire_fixture())
+  data <- data.frame(id = letters[1:10], x = seq_len(10),
+                     time = c(1, 2, 3, 5, 10, 11, 1, 2, 3, 5),
+                     event = c(1, 1, 1, 1, 1, 1, 0, 0, 0, 0))
+  token <- dsFlower:::.generate_run_token()
+  withr::defer(dsFlower:::.cleanupStaging(token))
+  path <- dsFlower:::.stageData(data, token, c("time", "event"), "x", config)
+  manifest <- jsonlite::read_json(file.path(path, "manifest.json"), simplifyVector = TRUE)
+  result <- utils::read.csv(file.path(path, manifest$survival_file), check.names = FALSE)
+  expected_d <- rbind(c(1, 0, 0), c(1, 0, 0), c(0, 1, 0), c(0, 1, 0),
+                      c(0, 0, 1), c(0, 0, 0), c(0, 0, 0), c(0, 0, 0),
+                      c(0, 0, 0), c(0, 0, 0))
+  expected_m <- rbind(c(1, 0, 0), c(1, 0, 0), c(1, 1, 0), c(1, 1, 0),
+                      c(1, 1, 1), c(1, 1, 1), c(0, 0, 0), c(1, 0, 0),
+                      c(1, 0, 0), c(1, 1, 0))
+  expect_equal(unname(as.matrix(result[paste0("__survival_d_", 1:3)])), expected_d)
+  expect_equal(unname(as.matrix(result[paste0("__survival_m_", 1:3)])), expected_m)
+  expect_equal(result$`__survival_valid`, rep(1, 10))
+  expect_equal(result$`__survival_event`, c(rep(1, 5), rep(0, 5)))
+  expect_equal(manifest$survival_shape, c(nrow(data), 1, 9))
+  expect_equal(manifest$n_units, nrow(data))
+  expect_equal(manifest$n_samples, nrow(data))
+})
+
+test_that("K and invalid records never shrink or multiply the subject census", {
+  .survival_patient_options()
+  data <- data.frame(id = c("a", "b", "b", "", "bad", "subresolution"),
+                     x = 1:6, time = c(2, 3, 3, 4, Inf, .5), event = 1)
+  for (k in c(1L, 3L, 64L)) {
+    wire <- .hazard_wire_fixture(seq(0, 10, length.out = k + 1L))
+    config <- dsFlower:::.addDpConfigToRunConfig(wire)
+    token <- dsFlower:::.generate_run_token()
+    path <- dsFlower:::.stageData(data, token, c("time", "event"), "x", config)
+    manifest <- jsonlite::read_json(file.path(path, "manifest.json"), simplifyVector = TRUE)
+    result <- utils::read.csv(file.path(path, manifest$survival_file), check.names = FALSE)
+    expect_equal(manifest$n_samples, nrow(data))
+    expect_equal(manifest$n_units, 5)
+    expect_equal(manifest$survival_shape, c(5, 1, 3 + 2 * k))
+    expect_equal(result$`__survival_valid`, c(1, 0, 0, 0, 0))
+    expect_true(all(as.matrix(result[-1, paste0("__survival_d_", seq_len(k)),
+                                     drop = FALSE]) == 0))
+    expect_true(all(as.matrix(result[-1, paste0("__survival_m_", seq_len(k)),
+                                     drop = FALSE]) == 0))
+    dsFlower:::.cleanupStaging(token)
+  }
+})
+
+test_that("changing one subject cannot change other derived subject contributions", {
+  .survival_patient_options()
+  data <- data.frame(id = c("a", "b", "b", "c"), x = c(1, 2, 3, 4),
+                     time = c(2, 4, 4, 6), event = c(1, 0, 0, 1))
+  for (wire in list(.survival_wire_fixture(), .hazard_wire_fixture())) {
+    config <- dsFlower:::.addDpConfigToRunConfig(wire)
+    derived <- lapply(c(FALSE, TRUE), function(change) {
+      frame <- data
+      if (change) frame[frame$id == "b", c("x", "time", "event")] <- NA
+      token <- dsFlower:::.generate_run_token()
+      on.exit(dsFlower:::.cleanupStaging(token))
+      path <- dsFlower:::.stageData(frame, token, c("time", "event"), "x", config)
+      utils::read.csv(file.path(path, "survival_subjects.csv"), check.names = FALSE)
+    })
+    expect_identical(derived[[1]], derived[[2]])
+  }
 })

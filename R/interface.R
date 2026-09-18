@@ -1002,6 +1002,7 @@ flowerInitDS <- function(data_symbol) {
       gamma_nll = "regression",
       poisson_nll = "count", negbin_nll = "count",
       aft_weibull_nll = "survival", aft_lognormal_nll = "survival",
+      discrete_hazard_nll = "survival",
       "classification")
   } else if (identical(track, "native_tree")) {
     request <- .validate_native_tree_request_wire(

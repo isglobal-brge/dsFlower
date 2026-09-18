@@ -1,6 +1,6 @@
 # Public survival semantics and node-local subject assembly. All counts and
 # validity bits remain in the staging directory; they are never release fields.
-.SURVIVAL_LOSSES <- c("aft_weibull_nll", "aft_lognormal_nll")
+.SURVIVAL_LOSSES <- c("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
 
 .isSurvivalConfig <- function(run_config) {
   identical(run_config[["task-type"]], "survival") ||
@@ -9,8 +9,11 @@
 
 .normalizeSurvivalConfig <- function(run_config, track, unit_policy = NULL) {
   supplied <- run_config[["survival-config-b64"]] %||% NULL
-  requested <- run_config[["task-type"]] %||% run_config[["task_type"]] %||% ""
-  loss <- run_config[["loss-name"]] %||% ""
+  requested <- tolower(as.character(unlist(
+    run_config[["task-type"]] %||% run_config[["task_type"]] %||% "",
+    use.names = FALSE)))
+  loss <- tolower(as.character(unlist(run_config[["loss-name"]] %||% "",
+                                     use.names = FALSE)))
   survival <- identical(requested, "survival") ||
     isTRUE(loss %in% .SURVIVAL_LOSSES) || !is.null(supplied)
   if (!survival) return(run_config)
@@ -18,6 +21,7 @@
     stop("Survival requires the trusted neural survival loss contract; private ",
          "validation and other tracks are unsupported.", call. = FALSE)
   }
+  run_config[["loss-name"]] <- loss
   if (any(grepl("^(validation-|resampling-|holdout-|cv-)", names(run_config)))) {
     stop("Survival private validation, holdout and CV are unsupported.",
          call. = FALSE)
@@ -42,7 +46,9 @@
   value <- tryCatch(jsonlite::fromJSON(rawToChar(decoded), simplifyVector = FALSE),
                     error = function(e) NULL)
   common <- c("schema_version", "time_unit", "time_origin", "t_min", "horizon")
-  required <- c(common, "time_scale", "distribution", "dispersion")
+  hazard <- identical(loss, "discrete_hazard_nll")
+  required <- c(common, if (hazard) "edges" else
+                  c("time_scale", "distribution", "dispersion"))
   if (!is.list(value) || is.null(names(value)) || anyDuplicated(names(value)) ||
       !setequal(names(value), required)) {
     stop("survival-config has missing, unknown or duplicate fields.", call. = FALSE)
@@ -61,7 +67,7 @@
     stop("Survival schema 1 requires time_unit='days' and time_origin='baseline'.",
          call. = FALSE)
   }
-  for (field in c("t_min", "horizon", "time_scale")) {
+  for (field in c("t_min", "horizon", if (!hazard) "time_scale")) {
     if (!scalar_number(value[[field]]) || value[[field]] < 1e-6 ||
         value[[field]] > 1e6) {
       stop("Survival public time fields must be finite numbers in [1e-6, 1e6].",
@@ -71,16 +77,31 @@
   if (value$t_min > value$horizon) {
     stop("Survival t_min must not exceed horizon.", call. = FALSE)
   }
-  expected <- if (identical(loss, "aft_weibull_nll")) "weibull" else "lognormal"
-  if (!identical(value$distribution, expected) ||
-      !scalar_number(value$dispersion) || !value$dispersion %in% c(0.5, 1, 2)) {
-    stop("AFT distribution must match its loss and dispersion must be 0.5, 1 or 2.",
-         call. = FALSE)
-  }
-  if (identical(expected, "weibull") &&
-      value$dispersion * (log(value$horizon / value$time_scale) + 10) > 60) {
-    stop("Weibull public time domain exceeds the safe exponent bound.",
-         call. = FALSE)
+  if (hazard) {
+    if (!is.list(value$edges) || !is.null(names(value$edges)) ||
+        length(value$edges) < 2L || length(value$edges) > 65L ||
+        !all(vapply(value$edges, scalar_number, logical(1)))) {
+      stop("Hazard edges must define between 1 and 64 finite public intervals.",
+           call. = FALSE)
+    }
+    edges <- unlist(value$edges, use.names = FALSE)
+    if (edges[[1L]] != 0 || any(diff(edges) <= 0) ||
+        tail(edges, 1L) != value$horizon) {
+      stop("Hazard edges must increase strictly from zero to horizon.", call. = FALSE)
+    }
+    value$edges <- edges
+  } else {
+    expected <- if (identical(loss, "aft_weibull_nll")) "weibull" else "lognormal"
+    if (!identical(value$distribution, expected) ||
+        !scalar_number(value$dispersion) || !value$dispersion %in% c(0.5, 1, 2)) {
+      stop("AFT distribution must match its loss and dispersion must be 0.5, 1 or 2.",
+           call. = FALSE)
+    }
+    if (identical(expected, "weibull") &&
+        value$dispersion * (log(value$horizon / value$time_scale) + 10) > 60) {
+      stop("Weibull public time domain exceeds the safe exponent bound.",
+           call. = FALSE)
+    }
   }
   value <- value[required]
   value$schema_version <- 1L
@@ -141,13 +162,41 @@
   subject_data[["__survival_event"]] <- event
   subject_data[["__survival_valid"]] <- as.integer(valid)
   targets <- c("__survival_time", "__survival_event", "__survival_valid")
+  if (identical(manifest[["loss-name"]], "discrete_hazard_nll")) {
+    periods <- .stageHazardTargets(time, event, valid, config$edges)
+    subject_data <- cbind(subject_data, periods)
+    targets <- c(targets, names(periods))
+  }
   file <- "survival_subjects.csv"
   utils::write.csv(subject_data, file.path(staging_dir, file), row.names = FALSE)
   Sys.chmod(file.path(staging_dir, file), "0600")
   manifest$survival_file <- file
   manifest$survival_schema <- "subject_survival_v1"
   manifest$survival_shape <- c(length(subjects), length(features), length(targets))
-  manifest$survival_feature_columns <- features
+  # Keep the public ordered feature contract an array even for one covariate.
+  manifest$feature_columns <- as.list(features)
+  manifest$survival_feature_columns <- as.list(features)
   manifest$survival_target_columns <- targets
   manifest
+}
+
+# A censor contributes only through completed interval ends. An event includes
+# its terminal interval, including an event exactly on an interval end.
+.stageHazardTargets <- function(time, event, valid, edges) {
+  ends <- edges[-1L]
+  k <- length(ends)
+  d <- matrix(0, nrow = length(time), ncol = k)
+  m <- matrix(0, nrow = length(time), ncol = k)
+  for (i in which(valid)) {
+    if (event[[i]] == 1) {
+      terminal <- which(time[[i]] <= ends)[[1L]]
+      d[i, terminal] <- 1
+      m[i, seq_len(terminal)] <- 1
+    } else {
+      m[i, ] <- as.numeric(ends <= time[[i]])
+    }
+  }
+  colnames(d) <- paste0("__survival_d_", seq_len(k))
+  colnames(m) <- paste0("__survival_m_", seq_len(k))
+  as.data.frame(cbind(d, m), check.names = FALSE)
 }
