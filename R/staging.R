@@ -428,6 +428,7 @@
   }
   loss_name <- tolower(as.character(unlist(
     run_config[["loss-name"]] %||% "", use.names = FALSE)))
+  if (identical(loss_name, "segmentation_bce_dice")) return(data)
   if (identical(loss_name, "multilabel_bce")) {
     num_labels <- suppressWarnings(as.integer(unlist(
       run_config[["num-labels"]] %||% NA_integer_, use.names = FALSE)))
@@ -712,6 +713,13 @@
 
   levels <- run_config[["target-levels"]] %||% NULL
   bounds <- run_config[["target-bounds"]] %||% NULL
+  if (identical(task_type, "segmentation")) {
+    if (!is.null(levels) || !is.null(bounds)) {
+      stop("Segmentation target is a declared mask path, not a scalar label.",
+           call. = FALSE)
+    }
+    return(run_config)
+  }
   numeric_task <- task_type %in% c("regression", "count", "continuous")
   loss_name <- tolower(as.character(unlist(
     run_config[["loss-name"]] %||% "", use.names = FALSE)))
@@ -877,7 +885,8 @@
     "association-outcome-levels", "association-exposure-levels",
     "association-contract-sha256", "association-n-nodes",
     "association-job-sha256",
-    "app-params-b64"
+    "app-params-b64",
+    .segmentationConfigFields()
   )
 }
 
@@ -1188,6 +1197,15 @@
                                    samples_data, extra_config = list()) {
   extra_config <- .validate_manifest_extra_config(extra_config)
   data_root <- .resolve_image_data_root()
+  segmentation <- .segmentationRequested(extra_config)
+  if (segmentation) {
+    .validateSegmentationColumns(extra_config, target_column)
+    if (!identical(.dpUnitPolicy()$dp_unit, "patient")) {
+      stop("Segmentation requires the custodian patient privacy-unit policy.",
+           call. = FALSE)
+    }
+    mask_root <- .resolve_mask_data_root()
+  }
   if (is.data.frame(samples_data)) {
     samples_basename <- "samples.csv"
   } else if (is.character(samples_data) && file.exists(samples_data)) {
@@ -1217,6 +1235,14 @@
     patient_column = unit$patient_column
   )
   samples_data <- prepared$data
+  assets <- list(images = list(
+    type = "image_root", root = data_root, path_col = "relative_path"))
+  if (segmentation) {
+    assets$images$path_col <- extra_config$image_path_col
+    assets[[extra_config$mask_asset]] <- list(
+      type = "mask_root", root = mask_root, path_col = extra_config$mask_path_col)
+    samples_data <- .totalizeSegmentationPaths(samples_data, extra_config, assets)
+  }
 
   staging_dir <- .ensureStagingDir(run_token)
   staged_samples <- file.path(staging_dir, samples_basename)
@@ -1237,8 +1263,7 @@
     patient_column = unit$patient_column,
     "patient-id-canonicalization" = unit$canonicalization,
     "target-preencoded" = TRUE,
-    assets = list(images = list(
-      type = "image_root", root = data_root, path_col = "relative_path")),
+    assets = assets,
     staged_at    = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
 
@@ -1603,7 +1628,8 @@
   )
 }
 
-.downloadS3DirectoryAsset <- function(backend, s3_uri, local_root, files) {
+.downloadS3DirectoryAsset <- function(backend, s3_uri, local_root, files,
+                                       totalize_records = FALSE) {
   dir.create(local_root, recursive = TRUE, showWarnings = FALSE)
   local_root <- normalizePath(local_root, winslash = "/", mustWork = TRUE)
   rel_paths <- character(0)
@@ -1622,19 +1648,32 @@
     if (!(identical(parent, local_root) ||
           startsWith(parent, paste0(local_root, "/"))) ||
         .path_is_symlink(local_path)) {
+      if (isTRUE(totalize_records)) next
       stop("Image metadata resolves outside its staged asset root.",
            call. = FALSE)
     }
     if (!file.exists(local_path)) {
-      dsImaging::backend_get_file(backend, f, local_path)
+      downloaded <- tryCatch({
+        dsImaging::backend_get_file(backend, f, local_path)
+        TRUE
+      }, error = function(e) {
+        if (!isTRUE(totalize_records)) stop(e)
+        FALSE
+      })
+      if (!downloaded) {
+        unlink(local_path)
+        next
+      }
     }
     if (!file.exists(local_path) || dir.exists(local_path) ||
         .path_is_symlink(local_path)) {
+      if (isTRUE(totalize_records)) next
       stop("The image backend did not produce a safe regular file.",
            call. = FALSE)
     }
     resolved <- normalizePath(local_path, winslash = "/", mustWork = TRUE)
     if (!startsWith(resolved, paste0(local_root, "/"))) {
+      if (isTRUE(totalize_records)) next
       stop("Image metadata resolves outside its staged asset root.",
            call. = FALSE)
     }
@@ -1936,6 +1975,10 @@
 .stageFromDescriptor_image <- function(desc, run_token, target_column,
                                         feature_columns, extra_config) {
   extra_config <- .validate_manifest_extra_config(extra_config)
+  segmentation <- .segmentationRequested(extra_config)
+  if (segmentation) {
+    .validateSegmentationColumns(extra_config, target_column, feature_columns, desc)
+  }
   collection_snapshot <- desc$.collection_snapshot %||% NULL
   if (!is.null(collection_snapshot)) {
     records <- collection_snapshot$records %||% list()
@@ -1960,9 +2003,10 @@
   meta <- desc$metadata
   assets <- desc$assets
   if (!is.null(collection_snapshot)) {
-    # The current vision consumer is authorized only for the primary image
-    # pack. Other manifest assets require their own complete snapshot contract.
-    assets <- assets[intersect(names(assets), "images")]
+    # Segmentation additionally consumes its explicitly declared mask asset;
+    # both roots retain descriptor containment and record path checks.
+    selected_assets <- c("images", if (segmentation) extra_config$mask_asset)
+    assets <- assets[intersect(names(assets), selected_assets)]
   }
   if (!is.list(assets) ||
       (length(assets) > 0L &&
@@ -2126,7 +2170,8 @@
         plan <- s3_asset_plans[[asset_name]] %||%
           .stageS3DirectoryAssetPlan(desc$backend, s3_uri)
         rels <- .downloadS3DirectoryAsset(desc$backend, s3_uri, local_root,
-                                          plan$files)
+                                          plan$files,
+                                          totalize_records = segmentation)
         downloaded_rels[[asset_name]] <- rels
         root <- local_root
         message("  Asset staging complete")
@@ -2201,16 +2246,22 @@
       # to the exact object path from the sealed content index.
       samples_df[[image_path_col]] <- record_paths[match(sample_ids, record_ids)]
     }
-    samples_df <- .ensureImagePathColumn(
-      samples_df,
-      path_col = image_path_col,
-      sample_manifests = sample_manifests,
-      image_root = validated_assets$images$root,
-      image_uri = image_asset$uri %||% NULL,
-      downloaded_rels = downloaded_rels$images %||% character(0)
-    )
-    .validateImagePayloadContract(
-      samples_df[[image_path_col]], validated_assets$images$root)
+    if (!segmentation) {
+      samples_df <- .ensureImagePathColumn(
+        samples_df,
+        path_col = image_path_col,
+        sample_manifests = sample_manifests,
+        image_root = validated_assets$images$root,
+        image_uri = image_asset$uri %||% NULL,
+        downloaded_rels = downloaded_rels$images %||% character(0)
+      )
+      .validateImagePayloadContract(
+        samples_df[[image_path_col]], validated_assets$images$root)
+    }
+  }
+  if (segmentation) {
+    samples_df <- .totalizeSegmentationPaths(
+      samples_df, extra_config, validated_assets)
   }
   .writeStagedSamples(samples_df, staged_samples)
   n_samples <- nrow(samples_df)
