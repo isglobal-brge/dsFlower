@@ -418,7 +418,7 @@ _OPS = {
 
 
 def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
-                    output_limit=_MAX_OUTPUT_ABS):
+                    output_limit=_MAX_OUTPUT_ABS, output_shape=None):
     """Build a genuinely-stock nn.Module from a declarative spec. No researcher code
     executes. ``in_dim`` (@in) and ``out_dim`` (@out) are node-decided -- the latter
     from the pinned loss -- so the researcher controls only the hidden structure. The
@@ -430,6 +430,14 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
         raise ValueError("output_limit must be in (0, %g]" % _MAX_ACTIVATION_ABS)
     if not isinstance(spec, dict):
         raise ValueError("spec must be a JSON object, got %s" % type(spec).__name__)
+    if output_shape is not None:
+        try:
+            from .segmentation import OUTPUT_SHAPE, FEATURE_DIM, validate_decoder_spec
+        except ImportError:
+            from segmentation import OUTPUT_SHAPE, FEATURE_DIM, validate_decoder_spec
+        if tuple(output_shape) != OUTPUT_SHAPE or in_dim != FEATURE_DIM or out_dim != 1:
+            raise ValueError("unsupported spatial output contract")
+        validate_decoder_spec(spec)
     kind = spec.get("kind", "sequential")
     if kind == "graph":
         return build_from_graph(
@@ -442,7 +450,8 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
         raise ValueError("spec.layers must be a non-empty list")
     if len(layers) > _MAX_LAYERS:
         raise ValueError("spec has %d layers (cap %d)" % (len(layers), _MAX_LAYERS))
-    if not isinstance(layers[-1], dict) or layers[-1].get("op") != "linear":
+    final_op = "linear" if output_shape is None else "conv2d"
+    if not isinstance(layers[-1], dict) or layers[-1].get("op") != final_op:
         raise ValueError("the final layer must be 'linear' (the head emits logits)")
 
     dims = _BuildDims({"@in": _pos_int(in_dim, "in_dim"),
@@ -467,7 +476,8 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
     # The head must emit raw logits at the loss-determined width: the final layer is
     # a linear projection onto @out. A trailing activation (would double-apply with
     # the pinned loss) or a wrong width is rejected here, before any training.
-    if shape != (dims["@out"],):
+    required_shape = (dims["@out"],) if output_shape is None else tuple(output_shape)
+    if shape != required_shape:
         raise ValueError("spec output shape %r != required (%d,) (end with a linear to @out)"
                          % (shape, out_dim))
 

@@ -58,6 +58,10 @@ _NEURAL_SEED_CONFIG_KEYS = frozenset({
     "backbone", "model", "image-size", "data-kind",
     "target-bounds", "nb-dispersion", "gamma-shape", "huber-delta",
     "quantile-level",
+    "mask-vocabulary",
+    "segmentation-alpha", "segmentation-smooth", "segmentation-selection",
+    "segmentation-preprocessing", "segmentation-checkpoint-sha256",
+    "segmentation-output-shape",
 })
 _NEURAL_PUBLIC_INIT_POLICY_HASH = hashlib.sha256(
     b"dsflower/neural-public-init-policy/v1").hexdigest()
@@ -77,6 +81,8 @@ def _reply_cache_allowed(claim):
 def _neural_seed_contract(cfg, pins, _pcfg, geometry_n_units=None):
     """Exact public inputs which can affect trusted neural execution."""
     run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
+    if cfg.get("loss-name") == "segmentation_bce_dice":
+        run["vision-extractor-profile"] = cfg.get("vision-extractor-profile")
     bounds = _effective_feature_bounds(cfg)
     run.pop("feature-bounds-b64", None)
     if bounds is not None:
@@ -360,7 +366,7 @@ def _prep_target(y, loss_name, n_classes):
     only used by encodings that need the class/level count (ordinal)."""
     if loss_name in ("cross_entropy", "hinge"):
         return torch.from_numpy(y).long()              # [N], multi-logit output (CE / hinge-SVM)
-    if loss_name == "multilabel_bce":
+    if loss_name in ("multilabel_bce", "segmentation_bce_dice"):
         return torch.from_numpy(y).float()             # [N, L]
     if loss_name == "ordinal":
         # CORN cumulative encoding: K-1 binary tasks, column j = 1{level > j}. The
@@ -664,6 +670,9 @@ def _apply_feature_bounds(X, cfg):
 
 def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
                   cv_fold=None, on_private_start=None):
+    if pins.get("loss_name") == "segmentation_bce_dice":
+        return _train_segmentation(context, cfg, pcfg, pins, model,
+                                   on_private_start=on_private_start)
     n_classes = int(pins["n_classes"])
     has_holdout = cfg.get("resampling-contract-sha256") is not None
     has_cv = cfg.get("cv-contract-sha256") is not None
@@ -763,6 +772,34 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         model, fit_X, fit_y, pcfg, pins, n_staged, cfg, master=master,
         noise_multiplier=effective_privacy["noise_multiplier"],
         geometry_n_units=geometry_n_units, **fit_options)
+
+
+def _train_segmentation(context, cfg, pcfg, pins, model, on_private_start=None):
+    from . import segmentation
+    segmentation.validate_config(cfg)
+    manifest = task_module._load_manifest(context)
+    if manifest.get("dp-unit") != "patient":
+        raise ValueError("segmentation requires custodian patient privacy")
+    encoder, device = segmentation.prepare_encoder(cfg)
+    if on_private_start is not None:
+        on_private_start()
+    X, y, subjects, n_staged = segmentation.load_subject_tensors(
+        context, cfg, encoder, device)
+    # The encoder is never passed to the optimizer or the release module.
+    del encoder
+    X = _totalize_private_features(X)
+    effective = dp_harness.effective_dpsgd_mechanism(
+        epsilon=pcfg["epsilon"], delta=pcfg["delta"],
+        clipping_norm=pcfg["clipping_norm"], n_samples=len(subjects),
+        batch_size=int(pins["batch_size"]), local_epochs=int(pins["local_epochs"]),
+        num_rounds=int(pins["num_rounds"]))
+    effective["privacy_unit"] = "patient"
+    seed_config, _ = _neural_seed_contract(cfg, pins, pcfg)
+    master = seeding.master_seed(
+        "neural-dpsgd/v1", seed_config, effective, int(pins["round_index"]),
+        public_arrays=get_torch_params(model), private_arrays=(X, y))
+    return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master,
+                   noise_multiplier=effective["noise_multiplier"])
 
 
 def _holdout_partition(context, X, y, unit_ids, *, subset):

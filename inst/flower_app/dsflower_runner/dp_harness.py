@@ -917,6 +917,14 @@ def _quantile_factory(cfg):
     return quantile_loss
 
 
+def _segmentation_factory(cfg):
+    try:
+        from .segmentation import loss_factory
+    except ImportError:
+        from segmentation import loss_factory
+    return loss_factory(cfg)
+
+
 # Custom TRUSTED per-sample losses (node code, never client code): name -> factory(cfg).
 # Each MUST decompose per sample with mean reduction so the DP-SGD sensitivity bound
 # holds; enforced by per_sample_independence_probe + the DP safety suite. Hyperparams
@@ -927,6 +935,7 @@ _CUSTOM_LOSS_FACTORY = {
     "gamma_nll": _gamma_nll_factory,
     "huber": _huber_factory,
     "quantile": _quantile_factory,
+    "segmentation_bce_dice": _segmentation_factory,
 }
 
 
