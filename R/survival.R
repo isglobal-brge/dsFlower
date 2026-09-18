@@ -177,6 +177,10 @@
   manifest$feature_columns <- as.list(features)
   manifest$survival_feature_columns <- as.list(features)
   manifest$survival_target_columns <- targets
+  if (!is.null(manifest[["feature-bounds"]])) {
+    manifest[["feature-bounds"]]$lower <- as.list(manifest[["feature-bounds"]]$lower)
+    manifest[["feature-bounds"]]$upper <- as.list(manifest[["feature-bounds"]]$upper)
+  }
   manifest
 }
 

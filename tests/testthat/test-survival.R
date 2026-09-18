@@ -138,6 +138,8 @@ test_that("AFT staging preserves rows and units while totalizing invalid subject
   manifest_arrays <- jsonlite::read_json(file.path(path, "manifest.json"))
   expect_type(manifest_arrays$feature_columns, "list")
   expect_type(manifest_arrays$survival_feature_columns, "list")
+  expect_type(manifest_arrays[["feature-bounds"]]$lower, "list")
+  expect_type(manifest_arrays[["feature-bounds"]]$upper, "list")
   result <- utils::read.csv(file.path(path, manifest$survival_file), check.names = FALSE)
   expect_equal(manifest$n_samples, nrow(data))
   expect_equal(manifest$n_input_samples, nrow(data))
