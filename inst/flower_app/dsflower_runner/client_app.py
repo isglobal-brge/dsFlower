@@ -79,6 +79,9 @@ def _neural_seed_contract(cfg, pins, _pcfg, geometry_n_units=None):
     run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
     if pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         from . import survival
+        # These accepted wire aliases have no effect on survival execution.
+        for key in ("model", "data-kind", "target-bounds"):
+            run.pop(key, None)
         run["survival-config"] = survival.config_from_run(cfg, pins["loss_name"])
         run["num-classes"] = 2
         run["num-labels"] = 2

@@ -455,10 +455,40 @@ class SurvivalRunnerTests(unittest.TestCase):
         changed_pins={**pins,"loss_name":"aft_lognormal_nll"}
         self.assertNotEqual(baseline,digest(wire(config("lognormal")),pinned=changed_pins))
 
+    def test_inert_survival_wire_fields_preserve_semantics(self):
+        from dsflower_runner import client_app,seeding
+        extras=({"model":"unused_public_alias"},{"data-kind":"tabular"},
+                {"target-bounds":"unused"})
+        for variant in ("weibull","lognormal","hazard"):
+            if variant=="hazard":
+                self.hazard_fixture()
+            else:
+                self.cfg=config(variant)
+                self.manifest.update({"survival-config":self.cfg,**wire(self.cfg),
+                                      "loss-name":"aft_%s_nll"%variant})
+                self.write_manifest()
+            pins=self.task.load_run_pins(self.context)
+            def digest(extra):
+                self.context.run_config={**wire(self.cfg),**extra}
+                cfg=self.task.load_pinned_run_config(self.context)
+                semantic,_=client_app._neural_seed_contract(cfg,pins,{})
+                return seeding._semantic_digest("survival-wire-test",semantic,
+                    {"policy_hash":"f"*64},1,execution_fingerprint={})
+            baseline=digest({})
+            for extra in extras:
+                with self.subTest(variant=variant,field=next(iter(extra))):
+                    self.assertEqual(baseline,digest(extra))
+        # Existing contracts retain their prior handling of these public keys.
+        for extra in extras:
+            semantic,_=client_app._neural_seed_contract(
+                {"loss-name":"mse",**extra},{"loss_name":"mse"},{})
+            for key,value in extra.items():self.assertEqual(semantic["run"][key],value)
+
     def test_sticky_repeated_released_arrays_and_effective_changes(self):
         from dsflower_runner import client_app,params
-        def execute(changed_incoming=False,operational=False):
+        def execute(changed_incoming=False,operational=False,extra=None):
             pins={**self.task.load_run_pins(self.context),"round_index":1}
+            self.context.run_config={**wire(self.cfg),**(extra or {})}
             cfg=self.task.load_pinned_run_config(self.context)
             if operational:cfg.update({"run-token":"different-token","results-dir":"different-path"})
             width=len(self.cfg["edges"])-1 if "edges" in self.cfg else 1
@@ -474,6 +504,9 @@ class SurvivalRunnerTests(unittest.TestCase):
         first=execute()
         self.assertTrue(same(first,execute()))
         self.assertTrue(same(first,execute(operational=True)))
+        extras=({"model":"unused_public_alias"},{"data-kind":"tabular"},
+                {"target-bounds":"unused"})
+        for extra in extras:self.assertTrue(same(first,execute(extra=extra)))
         rebound=os.path.join(self.temp.name,"rebound")
         os.mkdir(rebound)
         for name in ("source.csv","subjects.csv","manifest.json"):
@@ -491,9 +524,12 @@ class SurvivalRunnerTests(unittest.TestCase):
         self.manifest.update({"survival-config":self.cfg,**wire(self.cfg),"loss-name":"aft_lognormal_nll"})
         self.context.run_config=wire(self.cfg);self.write_manifest()
         self.assertFalse(same(first,execute()))
+        lognormal_first=execute()
+        for extra in extras:self.assertTrue(same(lognormal_first,execute(extra=extra)))
         # Complete grid vectors also bind retries; both grids have identical K.
         self.hazard_fixture()
         hazard_first=execute()
+        for extra in extras:self.assertTrue(same(hazard_first,execute(extra=extra)))
         self.cfg=config(edges=[0.,6.,10.,20.])
         self.manifest.update({"survival-config":self.cfg,**wire(self.cfg)})
         self.context.run_config=wire(self.cfg);self.write_manifest()
