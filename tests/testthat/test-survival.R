@@ -129,10 +129,10 @@ test_that("AFT staging preserves rows and units while totalizing invalid subject
   expect_equal(manifest$survival_shape, c(8, 1, 3))
   expect_identical(result$id, c("a", "b", "c", "dup", "__dsflower_missing_patient_unit__",
                                "bad", "tiny", "nf"))
-  expect_equal(result$`__survival_valid`, c(1, 1, 1, 0, 0, 0, 1, 0))
+  expect_equal(result$`__survival_valid`, c(1, 1, 1, 0, 0, 0, 0, 0))
   expect_equal(result$`__survival_time`, c(2, 10, 10, 1, 1, 1, 1, 1))
   expect_equal(result$`__survival_event`, c(1, 1, 0, 0, 0, 0, 0, 0))
-  expect_equal(result$x, c(1, 1, 3, 0, 0, 0, 9, 0))
+  expect_equal(result$x, c(1, 1, 3, 0, 0, 0, 0, 0))
   expect_false(manifest$allow_exact_num_examples)
   expect_false(manifest$allow_per_node_metrics)
 })

@@ -131,7 +131,7 @@
   time <- .coerceNumericOrMissing(data[[manifest$target_column[[1L]]]])[first]
   event <- .coerceNumericOrMissing(data[[manifest$target_column[[2L]]]])[first]
   valid <- single & subjects != "__dsflower_missing_patient_unit__" &
-    is.finite(time) & time > 0 & is.finite(event) & event %in% c(0, 1)
+    is.finite(time) & time >= config$t_min & is.finite(event) & event %in% c(0, 1)
   event[!valid | time > config$horizon] <- 0
   time <- pmin(config$horizon, pmax(config$t_min, time))
   time[!valid] <- config$t_min
