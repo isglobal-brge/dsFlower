@@ -103,6 +103,12 @@ class SurvivalLossTests(unittest.TestCase):
                     [0,0,0,0,0,0,1],[0,0,0,1,1,1,1]]
         np.testing.assert_array_equal(target,expected)
 
+    def test_period_admin_censor_and_invalid_totalization(self):
+        cfg=config(edges=[0.,5.,10.,20.])
+        actual=survival.period_targets([21.,20.,.5,float("nan")],[1.,1.,1.,0.],np.ones(4),cfg)
+        np.testing.assert_array_equal(actual,[[0,0,0,1,1,1,1],[0,0,1,1,1,1,1],
+                                              [0,0,0,0,0,0,0],[0,0,0,0,0,0,0]])
+
     def test_hazard_hand_likelihood_and_all_censored(self):
         cfg = config(edges=[0.,5.,10.,20.])
         target = survival.period_targets([5.,6.,20.],[1.,0.,0.],np.ones(3),cfg)
@@ -281,6 +287,76 @@ class SurvivalRunnerTests(unittest.TestCase):
     def write_manifest(self):
         with open(os.path.join(self.temp.name,"manifest.json"),"w") as f:
             json.dump(self.manifest,f)
+
+    def hazard_fixture(self):
+        self.cfg=config(edges=[0.,5.,10.,20.])
+        self.manifest.update({"survival-config":self.cfg,**wire(self.cfg),
+            "loss-name":"discrete_hazard_nll","survival_shape":[7,2,9]})
+        self.context.run_config=wire(self.cfg)
+        d=np.array([[1,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,1],[0,0,0],[0,0,0]])
+        mask=np.array([[1,0,0],[1,1,1],[0,0,0],[0,0,0],[1,1,1],[0,0,0],[0,0,0]])
+        for prefix,values in (("d",d),("m",mask)):
+            for j in range(3):self.subjects["__survival_%s_%d"%(prefix,j+1)]=values[:,j]
+        self.manifest["survival_target_columns"]=list(self.subjects.columns[3:])
+        self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        self.write_manifest()
+
+    def test_hazard_artifact_reconstruction_and_authority(self):
+        self.hazard_fixture()
+        x,y,ids,m=self.task.load_survival_data(self.context)
+        self.assertEqual(m,8);self.assertEqual(y.shape,(7,7))
+        np.testing.assert_array_equal(y[0],[1,0,0,1,0,0,1])
+        np.testing.assert_array_equal(y[1],[0,0,0,1,1,1,1])
+        self.subjects.loc[0,"__survival_m_2"]=1
+        self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        with self.assertRaises(RuntimeError):self.task.load_survival_data(self.context)
+
+    def test_hazard_training_dispatch_preserves_N_and_M(self):
+        from dsflower_runner import client_app
+        self.hazard_fixture()
+        pins={**self.task.load_run_pins(self.context),"round_index":1}
+        cfg=self.task.load_pinned_run_config(self.context)
+        pcfg={"epsilon":4.,"delta":1e-5,"clipping_norm":1.,"n_samples":8}
+        with mock.patch.object(client_app,"_pool_by_patient",side_effect=AssertionError("generic pooling")), \
+             mock.patch.object(client_app,"_dp_fit",return_value=([],7)) as fit, \
+             mock.patch.object(client_app.seeding,"master_seed",return_value=b"a"*32), \
+             mock.patch.object(client_app.dp_harness,"effective_dpsgd_mechanism",
+                return_value={"noise_multiplier":1.,"policy_hash":"f"*64}) as effective:
+            client_app._train_neural(self.context,cfg,pcfg,pins,model(3).float(),2,False)
+        self.assertEqual(effective.call_args.kwargs["n_samples"],7)
+        args=fit.call_args.args
+        self.assertEqual(args[1].shape,(7,2))
+        self.assertEqual(args[2].shape,(7,7))
+        self.assertEqual(args[5],8)
+        self.assertEqual(fit.call_args.kwargs["geometry_n_units"],None)
+
+    def test_survival_private_validation_and_resampling_are_rejected(self):
+        from dsflower_runner import validation
+        for loss in survival.SURVIVAL_LOSSES:
+            # Even a hostile existing-task label cannot sneak in a survival loss.
+            cfg={"loss-name":loss,"validation-task":"binary","task-type":"regression",
+                 "target-bounds":{"lower":0.,"upper":20.}}
+            for loader in (validation.layout_from_config,validation.holdout_layout_from_config,
+                           validation.cross_validation_layout_from_config):
+                with self.assertRaises(ValueError):loader(cfg)
+
+    def test_hazard_width_sticky_grid_and_initialization(self):
+        from dsflower_runner import client_app,model_spec,seeding,server_app,params
+        self.hazard_fixture()
+        pins=self.task.load_run_pins(self.context)
+        cfg=self.task.load_pinned_run_config(self.context)
+        self.assertEqual(model_spec.output_width("discrete_hazard_nll",cfg),3)
+        self.assertEqual(client_app._prep_target(np.zeros((7,7)),pins["loss_name"],2).shape,(7,7))
+        first,_=client_app._neural_seed_contract(cfg,pins,{})
+        second,_=client_app._neural_seed_contract(wire(config(edges=[0.,4.,10.,20.])),pins,{})
+        self.assertNotEqual(first,second)
+        cfg.update({"num-features":2,"model-spec-b64":base64.b64encode(
+            json.dumps({"layers":[{"op":"linear","out":"@out"}]}).encode()).decode()})
+        torch.manual_seed(13);a=server_app._build_initial_model(cfg)
+        torch.manual_seed(71);b=server_app._build_initial_model(cfg)
+        self.assertEqual(a(torch.zeros((2,2))).shape,(2,3))
+        for aa,bb in zip(params.get_torch_params(a),params.get_torch_params(b)):
+            np.testing.assert_array_equal(aa,bb)
 
     def test_source_and_subject_census_and_invalid_totalization(self):
         x,y,ids,m=self.task.load_survival_data(self.context)

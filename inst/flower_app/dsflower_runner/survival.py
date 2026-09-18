@@ -89,6 +89,12 @@ def period_targets(times, events, valid, config):
     times = np.asarray(times, dtype=np.float64)
     events = np.asarray(events, dtype=np.float64)
     valid = np.asarray(valid, dtype=np.float64)
+    if (times.ndim != 1 or events.shape != times.shape or valid.shape != times.shape):
+        raise ValueError("period inputs require the same one-dimensional subject axis")
+    valid = ((valid == 1) & np.isfinite(times) & (times >= config["t_min"])
+             & np.isin(events, (0.,1.))).astype(np.float64)
+    events = np.where(times > config["horizon"], 0., events)
+    times = np.where(valid == 1, np.minimum(times, config["horizon"]), config["t_min"])
     k = len(edges) - 1
     index = np.clip(np.searchsorted(edges[1:], times, side="left"), 0, k-1)
     event = (events == 1) & (valid == 1)

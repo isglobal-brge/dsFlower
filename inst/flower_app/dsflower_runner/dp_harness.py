@@ -939,6 +939,7 @@ _CUSTOM_LOSS_FACTORY = {
     "quantile": _quantile_factory,
     "aft_weibull_nll": _survival_loss_factory("aft_weibull_nll"),
     "aft_lognormal_nll": _survival_loss_factory("aft_lognormal_nll"),
+    "discrete_hazard_nll": _survival_loss_factory("discrete_hazard_nll"),
 }
 
 

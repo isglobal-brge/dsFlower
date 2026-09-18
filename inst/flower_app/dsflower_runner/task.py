@@ -728,10 +728,10 @@ def load_run_pins(context=None):
         "bce_logits", "cross_entropy", "mse", "poisson_nll",
         "multilabel_bce", "hinge", "negbin_nll", "gamma_nll",
         "huber", "quantile", "ordinal",
-        "aft_weibull_nll", "aft_lognormal_nll"}
+        "aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"}
     if loss_name not in allowed_losses:
         raise ValueError("loss-name is not on the trusted allowlist")
-    if loss_name in ("aft_weibull_nll", "aft_lognormal_nll"):
+    if loss_name in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         _survival_public_contract(manifest)
     elif "survival-config" in manifest or "survival-config-b64" in manifest:
         raise ValueError("survival configuration requires a survival loss")

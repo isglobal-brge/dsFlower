@@ -172,6 +172,10 @@ def layout_from_config(cfg):
         raise ValueError("validation configuration must be an object")
     task = str(cfg.get("validation-task", "")).lower()
     loss = str(cfg.get("loss-name", "")).lower()
+    if (loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
+            or str(cfg.get("task-type", "")).lower() == "survival"
+            or str(cfg.get("validation-task", "")).lower() == "survival"):
+        raise ValueError("survival private validation/resampling is unsupported")
     bins = cfg.get("validation-bins", 32)
     if loss == "bce_logits" and task != "binary":
         raise ValueError("bce_logits validation is binary only")
@@ -205,6 +209,10 @@ def holdout_layout_from_config(cfg):
     if not isinstance(cfg, dict):
         raise ValueError("holdout configuration must be an object")
     loss = str(cfg.get("loss-name", "")).lower()
+    if (loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
+            or str(cfg.get("task-type", "")).lower() == "survival"
+            or str(cfg.get("validation-task", "")).lower() == "survival"):
+        raise ValueError("survival private validation/resampling is unsupported")
     task = str(cfg.get("task-type", "")).lower()
     bins = cfg.get("holdout-validation-bins", 32)
     if loss == "bce_logits":

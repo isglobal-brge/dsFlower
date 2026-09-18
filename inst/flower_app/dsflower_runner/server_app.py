@@ -107,7 +107,7 @@ def _build_initial_model(cfg):
     loss_name = str(cfg.get("loss-name", "bce_logits"))
     out_dim = model_spec.output_width(loss_name, cfg)
     num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None
-    if loss_name in ("aft_weibull_nll", "aft_lognormal_nll"):
+    if loss_name in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         # Public fixed initialization makes exact benchmark twins reproducible.
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(0)
