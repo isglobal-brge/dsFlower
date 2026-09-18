@@ -73,6 +73,8 @@ def config_from_run(cfg, loss_name=None):
     config = cfg.get("survival-config")
     if config is None:
         try:
+            if not isinstance(cfg.get("survival-config-b64"), str) or len(cfg["survival-config-b64"]) > 65536:
+                raise ValueError("survival configuration encoding is oversized")
             config = json.loads(base64.b64decode(
                 cfg["survival-config-b64"], validate=True).decode("utf-8"))
         except (KeyError, TypeError, ValueError, UnicodeError) as exc:

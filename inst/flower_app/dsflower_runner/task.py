@@ -241,6 +241,106 @@ def load_data(context=None, *, include_unit_ids=False):
     return X, y
 
 
+def _survival_public_contract(manifest):
+    """Check survival roles/policy/config before any source or artifact read."""
+    from . import survival
+    loss_name = manifest.get("loss-name")
+    config = survival.config_from_run(manifest, loss_name)
+    if (manifest.get("task-type") != "survival"
+            or manifest.get("dp-track") != "neural"
+            or manifest.get("dp-unit") != "patient"
+            or manifest.get("patient-id-canonicalization") != "trim-utf8-v2"
+            or manifest.get("data_type") != "tabular"):
+        raise ValueError("survival requires tabular neural training and custodian patient privacy")
+    encoded = survival.config_from_run(
+        {"survival-config-b64": manifest.get("survival-config-b64")}, loss_name)
+    if encoded != config:
+        raise ValueError("survival manifest configuration pins disagree")
+    if any(str(key).startswith(("resampling-", "cv-", "validation-", "holdout-"))
+           for key in manifest):
+        raise ValueError("survival private validation/resampling is unsupported")
+    targets = manifest.get("target_column")
+    features = manifest.get("feature_columns")
+    patient = manifest.get("patient_column")
+    if (not isinstance(targets, list) or len(targets) != 2
+            or not isinstance(features, list) or not features
+            or not isinstance(patient, str) or not patient):
+        raise ValueError("survival requires public feature and time/event/subject roles")
+    roles = features + targets + [patient]
+    if (any(not isinstance(x, str) or not x or x.startswith("__survival_") for x in roles)
+            or len(set(roles)) != len(roles)):
+        raise ValueError("survival column roles must be distinct and non-reserved")
+    return config
+
+
+def load_survival_data(context=None):
+    """Verify M source rows/N subjects and their server-staged subject tensors.
+
+    Duplicate subject rows and invalid private outcomes are zero contributions;
+    they never shrink either census or enter generic patient averaging.
+    """
+    from . import survival
+    manifest = _load_manifest(context)
+    config = _survival_public_contract(manifest)
+    directory = _get_manifest_dir(context)
+    source = _read_staged_frame(os.path.join(directory, manifest["data_file"]), manifest)
+    ids = _load_patient_ids(source, manifest)
+    assert_pinned_unit_count(context, len(source), ids, manifest=manifest)
+    if len(source) != manifest.get("n_samples"):
+        raise RuntimeError("survival source census changed after staging")
+    features = manifest["feature_columns"]
+    target_cols = list(survival.TARGET_COLUMNS)
+    hazard = manifest["loss-name"] == "discrete_hazard_nll"
+    if hazard:
+        k = len(config["edges"])-1
+        target_cols += ["__survival_d_%d" % j for j in range(1,k+1)]
+        target_cols += ["__survival_m_%d" % j for j in range(1,k+1)]
+    n = pinned_unit_count_from_manifest(manifest)
+    if (manifest.get("survival_schema") != "subject_survival_v1"
+            or manifest.get("survival_shape") != [n,len(features),len(target_cols)]
+            or manifest.get("survival_feature_columns") != features
+            or manifest.get("survival_target_columns") != target_cols):
+        raise ValueError("survival artifact schema/shape does not match public pins")
+    relative = manifest.get("survival_file")
+    if (not isinstance(relative,str) or not relative or relative != os.path.basename(relative)
+            or relative in (".","..") or "\\" in relative):
+        raise ValueError("survival artifact path must be a staging basename")
+    artifact = _read_staged_frame(os.path.join(directory,relative),
+                                  {**manifest,"data_format":"csv"})
+    if (list(artifact.columns) != [manifest["patient_column"]]+features+target_cols
+            or len(artifact) != n):
+        raise RuntimeError("survival artifact census or columns changed after staging")
+    unique = list(dict.fromkeys(ids.tolist()))
+    if _load_patient_ids(artifact,manifest).tolist() != unique:
+        raise RuntimeError("survival artifact subject roster changed after staging")
+    source_x = _load_features(source[features],manifest)
+    numeric = source[manifest["target_column"]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+    expected_x = np.zeros((n,len(features)),dtype=np.float32)
+    expected_y = np.tile([config["t_min"],0.,0.],(n,1))
+    for i,subject in enumerate(unique):
+        rows = np.flatnonzero(ids == subject)
+        if len(rows) != 1 or subject == _MISSING_PATIENT_UNIT:
+            continue
+        row = rows[0]
+        time,event = numeric[row]
+        if not (math.isfinite(time) and time >= config["t_min"] and event in (0.,1.)):
+            continue
+        expected_x[i] = source_x[row]
+        expected_y[i] = [max(config["t_min"],min(time,config["horizon"])),
+                         event if time <= config["horizon"] else 0.,1.]
+    train_y = expected_y
+    if hazard:
+        train_y = survival.period_targets(*expected_y.T,config)
+        expected_y = np.column_stack((expected_y,train_y[:,:-1]))
+    actual_x = artifact[features].apply(pd.to_numeric,errors="coerce").to_numpy(dtype=np.float64)
+    actual_y = artifact[target_cols].apply(pd.to_numeric,errors="coerce").to_numpy(dtype=np.float64)
+    if (not np.all(np.isfinite(actual_x)) or not np.all(np.isfinite(actual_y))
+            or not np.allclose(actual_x,expected_x,rtol=2e-7,atol=1e-8)
+            or not np.allclose(actual_y,expected_y,rtol=2e-7,atol=1e-8)):
+        raise RuntimeError("survival artifact values do not match the staged source contract")
+    return expected_x,train_y.astype(np.float32),np.asarray(unique),len(source)
+
+
 def load_native_tree_data(context=None, *, manifest=None):
     """Load one tabular native-tree input without reopening its staged table."""
     if manifest is None:
@@ -627,9 +727,14 @@ def load_run_pins(context=None):
     allowed_losses = {
         "bce_logits", "cross_entropy", "mse", "poisson_nll",
         "multilabel_bce", "hinge", "negbin_nll", "gamma_nll",
-        "huber", "quantile", "ordinal"}
+        "huber", "quantile", "ordinal",
+        "aft_weibull_nll", "aft_lognormal_nll"}
     if loss_name not in allowed_losses:
         raise ValueError("loss-name is not on the trusted allowlist")
+    if loss_name in ("aft_weibull_nll", "aft_lognormal_nll"):
+        _survival_public_contract(manifest)
+    elif "survival-config" in manifest or "survival-config-b64" in manifest:
+        raise ValueError("survival configuration requires a survival loss")
     loss_fields = {"nb-dispersion", "gamma-shape", "huber-delta", "quantile-level"}
     selected_loss_field = {
         "negbin_nll": "nb-dispersion",
@@ -827,7 +932,7 @@ def load_pinned_run_config(context=None):
                 raise ValueError("Flower HookApp config does not match manifest pin")
     neural_public_keys = {
         "learning-rate", "nb-dispersion", "gamma-shape", "huber-delta",
-        "quantile-level",
+        "quantile-level", "survival-config-b64",
         "weight-decay",
         "l1-penalty", "optimizer-name", "optimizer-momentum",
         "optimizer-nesterov", "optimizer-beta1", "optimizer-beta2",
@@ -835,6 +940,12 @@ def load_pinned_run_config(context=None):
         "scheduler-name", "scheduler-step-size", "scheduler-gamma",
         "scheduler-min-lr"}
     if str(manifest.get("dp-track", "")).lower() == "neural":
+        if manifest.get("task-type") == "survival":
+            _survival_public_contract(manifest)
+            if (cfg.get("survival-config-b64") != manifest.get("survival-config-b64")
+                    or ("survival-config" in cfg
+                        and cfg["survival-config"] != manifest["survival-config"])):
+                raise ValueError("Flower survival config does not match manifest pin")
         for key in neural_public_keys:
             if key in cfg and (key not in manifest or cfg[key] != manifest[key]):
                 raise ValueError("Flower neural config does not match manifest pin")
@@ -1049,6 +1160,7 @@ def load_pinned_run_config(context=None):
     cfg.pop("user-module", None)
     keys = (
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
+        "survival-config", "survival-config-b64",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",
         "feature-bounds", "backbone", "image-size", "user-module",
         "vision-extractor-profile",

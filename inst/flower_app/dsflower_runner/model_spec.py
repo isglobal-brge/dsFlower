@@ -59,6 +59,8 @@ _MAX_PUBLIC_SCALAR_ABS = 1.0e6
 
 def output_limit_for_loss(loss_name):
     """Finite head domain: wide for direct regression, tight for logits/log-links."""
+    if str(loss_name) in ("aft_weibull_nll", "aft_lognormal_nll"):
+        return 10.0
     return (_MAX_ACTIVATION_ABS
             if str(loss_name) in ("mse", "huber", "quantile") else _MAX_OUTPUT_ABS)
 

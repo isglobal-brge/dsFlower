@@ -57,7 +57,7 @@ _NEURAL_SEED_CONFIG_KEYS = frozenset({
     "num-features", "feature-bounds", "feature-bounds-b64",
     "backbone", "model", "image-size", "data-kind",
     "target-bounds", "nb-dispersion", "gamma-shape", "huber-delta",
-    "quantile-level",
+    "quantile-level", "survival-config",
 })
 _NEURAL_PUBLIC_INIT_POLICY_HASH = hashlib.sha256(
     b"dsflower/neural-public-init-policy/v1").hexdigest()
@@ -77,6 +77,9 @@ def _reply_cache_allowed(claim):
 def _neural_seed_contract(cfg, pins, _pcfg, geometry_n_units=None):
     """Exact public inputs which can affect trusted neural execution."""
     run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
+    if pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll"):
+        from . import survival
+        run["survival-config"] = survival.config_from_run(cfg, pins["loss_name"])
     bounds = _effective_feature_bounds(cfg)
     run.pop("feature-bounds-b64", None)
     if bounds is not None:
@@ -360,6 +363,8 @@ def _prep_target(y, loss_name, n_classes):
     only used by encodings that need the class/level count (ordinal)."""
     if loss_name in ("cross_entropy", "hinge"):
         return torch.from_numpy(y).long()              # [N], multi-logit output (CE / hinge-SVM)
+    if loss_name in ("aft_weibull_nll", "aft_lognormal_nll"):
+        return torch.from_numpy(y).float()             # [N, time/event/valid]
     if loss_name == "multilabel_bce":
         return torch.from_numpy(y).float()             # [N, L]
     if loss_name == "ordinal":
@@ -684,7 +689,14 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
             raise ValueError(
                 "resampling requires a positive pinned privacy-unit count")
 
-    if manifest_image:
+    survival_run = pins["loss_name"] in ("aft_weibull_nll", "aft_lognormal_nll")
+    if survival_run and (has_holdout or has_cv or manifest_image):
+        raise ValueError("survival private validation/resampling and image inputs are unsupported")
+    if survival_run:
+        values, y, groups, n_staged = task_module.load_survival_data(context)
+        if values.ndim != 2 or int(values.shape[1]) != int(input_dim):
+            raise RuntimeError("staged feature width changed after model validation")
+    elif manifest_image:
         from . import vision
         encoder, image_size, is_3d, device = vision.prepare_backbone(
             cfg.get("backbone", cfg.get("model", "resnet18")),
@@ -697,7 +709,8 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         values, y, groups = load_data(context, include_unit_ids=True)
         if values.ndim != 2 or int(values.shape[1]) != int(input_dim):
             raise RuntimeError("staged feature width changed after model validation")
-    n_staged = len(y)                          # pre-pool staged count (== manifest n_samples)
+    if not survival_run:
+        n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
 
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=groups, manifest=resampling_manifest)
@@ -716,9 +729,11 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         X = values
         X = _apply_feature_bounds(X, cfg)
     X = _totalize_private_features(X)
+    if survival_run:
+        X[y[:, -1] == 0] = 0.0
     if not empty_training and pins["loss_name"] in _CLASSIFICATION_LOSSES:
         _assert_label_range(y, n_classes)
-    if not empty_training and groups is not None:
+    if not empty_training and groups is not None and not survival_run:
         X, y = _pool_by_patient(X, y, groups, pins["loss_name"])
         X = _totalize_private_features(X)
     # Bind every stochastic DP-SGD axis only after preprocessing has produced

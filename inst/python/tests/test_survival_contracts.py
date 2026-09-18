@@ -10,6 +10,10 @@ import math
 import os
 import sys
 import unittest
+import tempfile
+from types import SimpleNamespace
+
+import pandas as pd
 from unittest import mock
 
 import numpy as np
@@ -239,6 +243,126 @@ class SurvivalAccountingTests(unittest.TestCase):
         accountant.history=[(p["noise_multiplier"],p["sample_rate"],p["total_steps"])]
         epsilon0=accountant.get_epsilon(delta=1e-5/(1+math.exp(2.)))
         self.assertLessEqual(2*epsilon0,4.01)
+
+
+class SurvivalRunnerTests(unittest.TestCase):
+    def setUp(self):
+        from dsflower_runner import task
+        self.task = task
+        workspace=os.path.abspath(os.path.join(os.path.dirname(__file__),"..","..","..",".."))
+        self.temp=tempfile.TemporaryDirectory(dir=workspace)
+        self.cfg=config()
+        self.manifest={"task-type":"survival","dp-track":"neural","dp-unit":"patient",
+            "patient_column":"id","patient-id-canonicalization":"trim-utf8-v2",
+            "data_type":"tabular","data_format":"csv","data_file":"source.csv",
+            "target_column":["time","event"],"feature_columns":["x","z"],
+            "survival-config":self.cfg,**wire(self.cfg),"loss-name":"aft_weibull_nll",
+            "survival_schema":"subject_survival_v1","survival_file":"subjects.csv",
+            "survival_shape":[7,2,3],"survival_feature_columns":["x","z"],
+            "survival_target_columns":list(survival.TARGET_COLUMNS),
+            "n_samples":8,"n_units":7,"num-classes":2,"batch-size":3,
+            "local-epochs":1,"num-server-rounds":1}
+        self.context=SimpleNamespace(node_config={"manifest-dir":self.temp.name},
+                                     run_config=wire(self.cfg))
+        source=pd.DataFrame({"id":["001","b","c","c","d","e","f","NA"],
+            "x":[1,2,3,4,5,6,7,8],"z":[.1,.2,.3,.4,.5,.6,.7,.8],
+            "time":[5,21,6,6,.5,20,8,7],"event":[1,1,0,0,1,1,2,0]})
+        self.subjects=pd.DataFrame({"id":["001","b","c","d","e","f",task._MISSING_PATIENT_UNIT],
+            "x":[1,2,0,0,6,0,0],"z":[.1,.2,0,0,.6,0,0],
+            "__survival_time":[5,20,1,1,20,1,1],"__survival_event":[1,0,0,0,1,0,0],
+            "__survival_valid":[1,1,0,0,1,0,0]})
+        source.to_csv(os.path.join(self.temp.name,"source.csv"),index=False)
+        self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        self.write_manifest()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_manifest(self):
+        with open(os.path.join(self.temp.name,"manifest.json"),"w") as f:
+            json.dump(self.manifest,f)
+
+    def test_source_and_subject_census_and_invalid_totalization(self):
+        x,y,ids,m=self.task.load_survival_data(self.context)
+        self.assertEqual(m,8);self.assertEqual(len(y),7)
+        np.testing.assert_array_equal(y[:,2],[1,1,0,0,1,0,0])
+        np.testing.assert_array_equal(x[y[:,2]==0],np.zeros((4,2)))
+        np.testing.assert_array_equal(y[:,0],[5,20,1,1,20,1,1])
+        self.assertEqual(ids[0],"001")
+
+    def test_staging_tamper_fails_closed(self):
+        for key,value in (("n_samples",7),("n_units",6),("survival_shape",[8,2,3])):
+            original=self.manifest[key];self.manifest[key]=value;self.write_manifest()
+            with self.assertRaises((RuntimeError,ValueError)):
+                self.task.load_survival_data(self.context)
+            self.manifest[key]=original
+        self.write_manifest()
+        self.subjects.loc[0,"__survival_valid"]=0
+        self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        with self.assertRaises(RuntimeError):self.task.load_survival_data(self.context)
+
+    def test_public_preflight_before_private_reads(self):
+        for key,value in (("dp-unit","row"),("task-type","classification"),
+                          ("target_column",["time","x"]),
+                          ("cv-contract-sha256","a"*64)):
+            previous=self.manifest.copy();self.manifest[key]=value;self.write_manifest()
+            with mock.patch.object(self.task,"_read_staged_frame",side_effect=AssertionError("private read")):
+                with self.assertRaises(ValueError):self.task.load_survival_data(self.context)
+            self.manifest=previous
+        self.write_manifest()
+
+    def test_server_config_cannot_be_overridden(self):
+        pinned=self.task.load_pinned_run_config(self.context)
+        self.assertEqual(pinned["survival-config"],self.cfg)
+        self.context.run_config=wire(config(dispersion=2.))
+        with self.assertRaises(ValueError):self.task.load_pinned_run_config(self.context)
+        self.context.run_config=wire(self.cfg)
+        self.context.run_config["survival-config"]=config("lognormal")
+        with self.assertRaises(ValueError):self.task.load_pinned_run_config(self.context)
+
+    def test_loss_pins_and_release_shapes(self):
+        from dsflower_runner import client_app,model_spec
+        pins=self.task.load_run_pins(self.context)
+        self.assertEqual(pins["loss_name"],"aft_weibull_nll")
+        self.assertEqual(model_spec.output_limit_for_loss(pins["loss_name"]),10.)
+        y=np.array([[5,1,1],[1,0,0]],dtype=np.float32)
+        self.assertEqual(tuple(client_app._prep_target(y,pins["loss_name"],2).shape),(2,3))
+        self.assertIsNotNone(dp_harness.loss_from_allowlist(pins["loss_name"],wire(self.cfg)))
+
+    def test_sticky_effective_semantics(self):
+        from dsflower_runner import client_app,seeding
+        pins=self.task.load_run_pins(self.context)
+        x,y,ids,m=self.task.load_survival_data(self.context)
+        privacy={"policy_hash":"f"*64}
+        def digest(cfg=wire(self.cfg),target=y,features=x,pinned=pins):
+            semantic,_=client_app._neural_seed_contract(cfg,pinned,{})
+            return seeding._semantic_digest("survival-test",semantic,privacy,1,
+                    private_arrays=(features,target),execution_fingerprint={})
+        baseline=digest()
+        moved=wire(self.cfg);moved["run-token"]="new-token";moved["results-dir"]="new-path"
+        self.assertEqual(baseline,digest(moved))
+        self.assertNotEqual(baseline,digest(wire(config(dispersion=2.))))
+        changed=y.copy();changed[0,2]=0
+        self.assertNotEqual(baseline,digest(target=changed))
+        changed=x.copy();changed[0,0]+=1
+        self.assertNotEqual(baseline,digest(features=changed))
+        changed_pins={**pins,"loss_name":"aft_lognormal_nll"}
+        self.assertNotEqual(baseline,digest(wire(config("lognormal")),pinned=changed_pins))
+
+    def test_all_invalid_runs_normal_noisy_optimizer(self):
+        from dsflower_runner import client_app,params
+        pins={**self.task.load_run_pins(self.context),"round_index":1}
+        cfg=wire(self.cfg)
+        pcfg={"epsilon":4.,"delta":1e-5,"clipping_norm":1.,"n_samples":8}
+        x=np.zeros((7,2),dtype=np.float32)
+        y=np.tile([1.,0.,0.],(7,1)).astype(np.float32)
+        net=model(1).float()
+        net._dsflower_release_keys=tuple(name for name,_ in net.named_parameters())
+        before=[a.copy() for a in params.get_torch_params(net)]
+        result,n=client_app._dp_fit(net,x,y,pcfg,pins,8,cfg,b"a"*32,1.)
+        self.assertEqual(n,7)
+        self.assertTrue(any(not np.array_equal(a,b) for a,b in zip(result,before)))
+        self.assertTrue(all(np.isfinite(a).all() for a in result))
 
 
 if __name__ == "__main__":
