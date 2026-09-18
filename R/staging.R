@@ -431,7 +431,12 @@
     stop("Target columns must be unique, non-empty, and present in the data.",
          call. = FALSE)
   }
-  if (.isSurvivalConfig(run_config)) return(data)
+  if (.isSurvivalConfig(run_config)) {
+    for (column in target_column) {
+      data[[column]] <- .coerceNumericOrMissing(data[[column]])
+    }
+    return(data)
+  }
   loss_name <- tolower(as.character(unlist(
     run_config[["loss-name"]] %||% "", use.names = FALSE)))
   if (identical(loss_name, "multilabel_bce")) {
@@ -1105,7 +1110,11 @@
   } else {
     data_file <- "train.csv"
     data_format <- "csv"
-    utils::write.csv(data, file.path(staging_dir, data_file), row.names = FALSE)
+    if (.isSurvivalConfig(extra_config)) {
+      .writeSurvivalCsv(data, file.path(staging_dir, data_file))
+    } else {
+      utils::write.csv(data, file.path(staging_dir, data_file), row.names = FALSE)
+    }
   }
 
   # Strict file permissions

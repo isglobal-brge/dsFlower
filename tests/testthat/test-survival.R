@@ -259,3 +259,26 @@ test_that("changing one subject cannot change other derived subject contribution
     expect_identical(derived[[1]], derived[[2]])
   }
 })
+
+test_that("survival CSV round-trips precise interval boundaries and numeric outcomes", {
+  .survival_patient_options()
+  config <- dsFlower:::.addDpConfigToRunConfig(.hazard_wire_fixture())
+  times <- c(2 - .Machine$double.eps, 2, 2 + 2 * .Machine$double.eps)
+  data <- data.frame(id = c("a", "b", "c"), x = c(1, 2, 3),
+                     time = times, event = c(TRUE, TRUE, TRUE))
+  transformed <- dsFlower:::.transformPublicTarget(data, c("time", "event"), config)
+  expect_identical(transformed$event, c(1, 1, 1))
+  path <- withr::local_tempfile(fileext = ".csv")
+  dsFlower:::.writeSurvivalCsv(transformed, path)
+  restored <- utils::read.csv(path, check.names = FALSE)
+  text <- utils::read.csv(path, colClasses = "character", check.names = FALSE)
+  expect_identical(text$time, format(times, digits = 17L, scientific = TRUE, trim = TRUE))
+  expected <- dsFlower:::.stageHazardTargets(times, rep(1, 3), rep(TRUE, 3),
+                                             config[["survival-config"]]$edges)
+  actual <- dsFlower:::.stageHazardTargets(restored$time, restored$event,
+                                           rep(TRUE, 3),
+                                           config[["survival-config"]]$edges)
+  expect_identical(actual, expected)
+  expect_equal(actual$`__survival_d_1`, c(1, 1, 0))
+  expect_equal(actual$`__survival_d_2`, c(0, 0, 1))
+})

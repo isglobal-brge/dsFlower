@@ -1501,7 +1501,8 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
     caps$declarative_losses,
     c("bce_logits", "cross_entropy", "mse", "poisson_nll",
       "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
-      "huber", "quantile")
+      "huber", "quantile", "aft_weibull_nll", "aft_lognormal_nll",
+      "discrete_hazard_nll")
   )
   expect_false("tree_objectives" %in% names(caps))
   expect_identical(caps$native_tree$contract,

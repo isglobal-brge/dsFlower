@@ -168,7 +168,7 @@
     targets <- c(targets, names(periods))
   }
   file <- "survival_subjects.csv"
-  utils::write.csv(subject_data, file.path(staging_dir, file), row.names = FALSE)
+  .writeSurvivalCsv(subject_data, file.path(staging_dir, file))
   Sys.chmod(file.path(staging_dir, file), "0600")
   manifest$survival_file <- file
   manifest$survival_schema <- "subject_survival_v1"
@@ -178,6 +178,18 @@
   manifest$survival_feature_columns <- as.list(features)
   manifest$survival_target_columns <- targets
   manifest
+}
+
+# Preserve interval-boundary doubles on installations without Arrow. The
+# default CSV writer can round across a public edge before Python revalidation.
+.writeSurvivalCsv <- function(data, path) {
+  for (column in names(data)) {
+    if (is.numeric(data[[column]])) {
+      data[[column]] <- format(data[[column]], digits = 17L, scientific = TRUE,
+                               trim = TRUE)
+    }
+  }
+  utils::write.csv(data, path, row.names = FALSE)
 }
 
 # A censor contributes only through completed interval ends. An event includes
