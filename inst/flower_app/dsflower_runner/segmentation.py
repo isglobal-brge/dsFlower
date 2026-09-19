@@ -62,12 +62,21 @@ def validate_config(cfg):
         raise ValueError("segmentation private validation, holdout and CV are unsupported")
 
 
-def decoder_spec():
+def decoder_spec(variant="current"):
+    if variant == "pointwise":
+        return {"kind": "sequential", "layers": [
+            {"op": "reshape", "shape": [128, 16, 16]},
+            {"op": "conv2d", "out_channels": 1, "kernel_size": 1},
+            {"op": "upsample", "scale_factor": 8},
+        ]}
+    if variant not in ("current", "narrow"):
+        raise ValueError("unknown pinned segmentation decoder")
+    first, second = (32, 16) if variant == "current" else (8, 4)
     return {"kind": "sequential", "layers": [
         {"op": "reshape", "shape": [128, 16, 16]},
-        {"op": "conv2d", "out_channels": 32, "kernel_size": 3, "padding": 1},
+        {"op": "conv2d", "out_channels": first, "kernel_size": 3, "padding": 1},
         {"op": "relu"}, {"op": "upsample", "scale_factor": 2},
-        {"op": "conv2d", "out_channels": 16, "kernel_size": 3, "padding": 1},
+        {"op": "conv2d", "out_channels": second, "kernel_size": 3, "padding": 1},
         {"op": "relu"}, {"op": "upsample", "scale_factor": 4},
         {"op": "conv2d", "out_channels": 1, "kernel_size": 1},
     ]}
@@ -80,7 +89,7 @@ def validate_decoder_spec(spec):
     for layer in clean.get("layers", []):
         if layer.get("op") == "upsample" and layer.get("mode") == "nearest":
             layer.pop("mode")
-    if clean != decoder_spec():
+    if clean not in [decoder_spec(name) for name in ("current", "narrow", "pointwise")]:
         raise ValueError("segmentation requires the pinned convolutional decoder")
 
 

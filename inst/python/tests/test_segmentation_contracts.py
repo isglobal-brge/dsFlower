@@ -444,3 +444,32 @@ def test_two_round_dp_adam_matches_independent_subject_gradient_reference(tmp_pa
             np.testing.assert_allclose(observed, expected, atol=2e-7, rtol=2e-5)
     assert clipped_subjects > 0
     assert all(not np.array_equal(a, b) for a, b in zip(initial, actual))
+
+@pytest.mark.parametrize('device', ['cpu'] + (['cuda'] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize('variant,count', [('current', 41537), ('narrow', 9521), ('pointwise', 129)])
+def test_v4_decoder_exact_parameters_and_subject_gradients(variant, count, device):
+    cfg = config()
+    spec = seg.decoder_spec(variant)
+    seg.validate_decoder_spec(spec)
+    cfg['model-spec-b64'] = base64.b64encode(json.dumps(spec).encode()).decode()
+    model = params.load_user_model(cfg, seg.FEATURE_DIM, 'segmentation_bce_dice').to(device)
+    assert sum(p.numel() for p in model.parameters()) == count
+    assert not list(model.buffers())
+    dp_harness.assert_stock_architecture(model)
+    dp_harness.assert_releasable(model)
+    x, y = torch.randn(3, seg.FEATURE_DIM, device=device), targets().to(device)
+    y[2, 1] = 0
+    assert model(x).shape == (3, 1, 128, 128)
+    loss = seg.loss_factory(cfg)
+    gradients = grad_samples(model, x, y, loss)
+    for i in range(3):
+        model.zero_grad()
+        loss(model(x[i:i+1]), y[i:i+1]).backward()
+        for name, p in model.named_parameters():
+            torch.testing.assert_close(gradients[name][i], p.grad, atol=2e-6, rtol=2e-4)
+            if i == 2:
+                assert not torch.count_nonzero(p.grad)
+    bad = copy.deepcopy(spec)
+    bad['layers'][-1]['op'] = 'batchnorm2d'
+    with pytest.raises(ValueError):
+        seg.validate_decoder_spec(bad)

@@ -450,7 +450,8 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
         raise ValueError("spec.layers must be a non-empty list")
     if len(layers) > _MAX_LAYERS:
         raise ValueError("spec has %d layers (cap %d)" % (len(layers), _MAX_LAYERS))
-    final_op = "linear" if output_shape is None else "conv2d"
+    final_op = "linear" if output_shape is None else layers[-1].get("op")
+    # Spatial specs have already matched an exact trusted decoder above.
     if not isinstance(layers[-1], dict) or layers[-1].get("op") != final_op:
         raise ValueError("the final layer must be 'linear' (the head emits logits)")
 
