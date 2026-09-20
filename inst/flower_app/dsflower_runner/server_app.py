@@ -107,6 +107,12 @@ def _build_initial_model(cfg):
     loss_name = str(cfg.get("loss-name", "bce_logits"))
     out_dim = model_spec.output_width(loss_name, cfg)
     num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None
+    spatial = {}
+    if loss_name == "segmentation_bce_dice":
+        from . import segmentation
+        segmentation.validate_config(cfg)
+        segmentation.configure_runtime()
+        spatial["output_shape"] = segmentation.OUTPUT_SHAPE
     if loss_name in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         # Public fixed initialization makes exact benchmark twins reproducible.
         with torch.random.fork_rng(devices=[]):
@@ -116,7 +122,7 @@ def _build_initial_model(cfg):
                 output_limit=model_spec.output_limit_for_loss(loss_name))
     else:
         model = model_spec.build_from_spec(spec, in_dim=in_dim, out_dim=out_dim,
-                                           num_labels=num_labels)
+                                           num_labels=num_labels, **spatial)
     if not isinstance(model, torch.nn.Module):
         raise ValueError("build_from_spec must return a torch.nn.Module")
     return model

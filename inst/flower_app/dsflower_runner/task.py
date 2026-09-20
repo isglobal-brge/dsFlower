@@ -185,6 +185,12 @@ def _read_staged_frame(path, manifest):
         path_column = images.get("path_col", "relative_path")
         if isinstance(path_column, str) and path_column:
             string_columns.append(path_column)
+        if manifest.get("loss-name") == "segmentation_bce_dice":
+            masks = assets.get(manifest.get("mask_asset", "masks"), {}) or {}
+            for column in (manifest.get("sample_id_col"), masks.get("path_col"),
+                           manifest.get("mask_empty_col")):
+                if isinstance(column, str) and column:
+                    string_columns.append(column)
     return pd.read_csv(
         path,
         dtype={column: "string" for column in set(string_columns)},
@@ -732,13 +738,19 @@ def load_run_pins(context=None):
         "bce_logits", "cross_entropy", "mse", "poisson_nll",
         "multilabel_bce", "hinge", "negbin_nll", "gamma_nll",
         "huber", "quantile", "ordinal",
-        "aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"}
+        "aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll",
+        "segmentation_bce_dice"}
     if loss_name not in allowed_losses:
         raise ValueError("loss-name is not on the trusted allowlist")
     if loss_name in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         _survival_public_contract(manifest)
     elif "survival-config" in manifest or "survival-config-b64" in manifest:
         raise ValueError("survival configuration requires a survival loss")
+    if loss_name == "segmentation_bce_dice":
+        from . import segmentation
+        segmentation.validate_config(manifest)
+        if manifest.get("dp-unit") != "patient":
+            raise ValueError("segmentation requires custodian patient privacy")
     loss_fields = {"nb-dispersion", "gamma-shape", "huber-delta", "quantile-level"}
     selected_loss_field = {
         "negbin_nll": "nb-dispersion",
@@ -920,6 +932,18 @@ def load_pinned_run_config(context=None):
             raise ValueError(
                 "resampling requires a positive pinned privacy-unit count")
     cfg = _run_config(context)
+    if (manifest.get("loss-name") == "segmentation_bce_dice"
+            or cfg.get("loss-name") == "segmentation_bce_dice"
+            or manifest.get("task-type") == "segmentation"
+            or cfg.get("task-type") == "segmentation"):
+        from . import segmentation
+        segmentation.validate_config(manifest)
+        segmentation.validate_config(cfg)
+        if manifest.get("dp-unit") != "patient":
+            raise ValueError("segmentation requires custodian patient privacy")
+        for key in segmentation.PIN_KEYS:
+            if key not in cfg or cfg[key] != manifest[key]:
+                raise ValueError("Flower segmentation config does not match manifest pin")
     if manifest.get("cv-contract-sha256") is not None:
         _validate_cv_execution_config(manifest, cfg)
     if str(manifest.get("dp-track", "")).lower() == "egress":
@@ -1166,6 +1190,9 @@ def load_pinned_run_config(context=None):
     # written by flowerTier2PinDS after installation/hash verification.
     cfg.pop("user-module", None)
     keys = (
+        "segmentation-alpha", "segmentation-smooth", "mask-vocabulary",
+        "segmentation-selection", "segmentation-preprocessing",
+        "segmentation-checkpoint-sha256", "segmentation-output-shape",
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "survival-config", "survival-config-b64",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",

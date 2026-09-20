@@ -97,11 +97,20 @@ def load_user_model(cfg, input_dim, loss_name):
         from . import model_spec
 
     spec = model_spec.read_spec(cfg)
+    spatial = {}
+    if loss_name == "segmentation_bce_dice":
+        try:
+            from . import segmentation
+        except ImportError:
+            import segmentation
+        segmentation.validate_config(cfg)
+        segmentation.configure_runtime()
+        spatial["output_shape"] = segmentation.OUTPUT_SHAPE
     out_dim = model_spec.output_width(loss_name, cfg)
     num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None
     model = model_spec.build_from_spec(
         spec, in_dim=int(input_dim), out_dim=out_dim, num_labels=num_labels,
-        output_limit=model_spec.output_limit_for_loss(loss_name))
+        output_limit=model_spec.output_limit_for_loss(loss_name), **spatial)
 
     if not isinstance(model, torch.nn.Module):
         raise ValueError("build_from_spec must return a torch.nn.Module")

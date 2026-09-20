@@ -291,6 +291,7 @@ class ManifestPrivacyContractTests(unittest.TestCase):
 class NeuralSemanticConfigTests(unittest.TestCase):
     def test_frozen_extractor_profiles_are_exact_and_versioned(self):
         expected = {
+            "resnet18_layer2": "resnet18_layer2_128_v1",
             "resnet18": "dsflower-resnet18-imagenet1k-v1-extractor-v1",
             "densenet121": "dsflower-densenet121-imagenet1k-v1-extractor-v1",
             "resnet18_3d": "dsflower-resnet18-monai-seed0-extractor-v1",
@@ -366,6 +367,7 @@ class NeuralSemanticConfigTests(unittest.TestCase):
 
     def test_backbone_minimum_image_sizes_are_exact(self):
         expected = {
+            "resnet18_layer2": 128,
             "resnet18": 1, "resnet18_3d": 1,
             "densenet121": 29, "densenet121_3d": 128,
         }

@@ -475,6 +475,7 @@ flowerInitDS <- function(data_symbol) {
 }
 
 .normalizeVisionExtractorPins <- function(run_config, num_features = NULL) {
+  if (.segmentationRequested(run_config)) return(run_config)
   backbone <- as.character(unlist(
     run_config[["backbone"]], use.names = FALSE))
   image_size <- suppressWarnings(as.numeric(unlist(
@@ -1003,6 +1004,7 @@ flowerInitDS <- function(data_symbol) {
       poisson_nll = "count", negbin_nll = "count",
       aft_weibull_nll = "survival", aft_lognormal_nll = "survival",
       discrete_hazard_nll = "survival",
+      segmentation_bce_dice = "segmentation",
       "classification")
   } else if (identical(track, "native_tree")) {
     request <- .validate_native_tree_request_wire(
@@ -1272,6 +1274,7 @@ flowerInitDS <- function(data_symbol) {
   track <- tolower(track)
   run_config[["dp-track"]] <- track
   run_config <- .normalizeSurvivalConfig(run_config, track, unit_policy)
+  run_config <- .normalizeSegmentationConfig(run_config, track, unit_policy)
   run_config <- .normalizeAssociationConfig(run_config, track, unit_policy)
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
@@ -1408,10 +1411,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     # source_kind is copied into the handle at initialization, so routing does
     # not need to inspect private descriptor contents.
     if (identical(handle$source_kind, "image_bundle")) "image" else "tabular"
-  } else "tabular"
+  } else if (.segmentationRequested(run_config)) "image" else "tabular"
   imaging_backed <- identical(handle$source, "descriptor") &&
     handle$source_kind %in% c("image_bundle", "imaging_feature_view")
-  if (identical(descriptor_data_type, "image")) {
+  if (identical(descriptor_data_type, "image") && imaging_backed) {
     capability <- handle$imaging_handle_capability %||% ""
     if (!is.character(handle$imaging_handle_symbol) ||
         length(handle$imaging_handle_symbol) != 1L ||
@@ -1441,8 +1444,12 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     NULL
   }
   run_config <- .addDpConfigToRunConfig(run_config, imaging_unit_policy)
-  if (isTRUE(imaging_backed)) {
+  if (isTRUE(imaging_backed) && !.segmentationRequested(run_config)) {
     .validateImagingTargetLevels(handle$descriptor, run_config)
+  }
+  if (.segmentationRequested(run_config) && !isTRUE(imaging_backed)) {
+    .resolve_image_data_root()
+    .resolve_mask_data_root()
   }
   routed <- .takeRunDataType(run_config, expected = descriptor_data_type)
   run_config <- routed$run_config
@@ -1468,7 +1475,10 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   feature_columns <- columns$feature_columns
   .validateSurvivalColumns(run_config, target_column, feature_columns,
                            imaging_unit_policy)
-  if (!is.null(imaging_unit_policy)) {
+  .validateSegmentationColumns(
+    run_config, target_column, feature_columns,
+    if (identical(handle$source, "descriptor")) handle$descriptor else NULL)
+  if (!is.null(imaging_unit_policy) && !.segmentationRequested(run_config)) {
     label_column <- handle$descriptor$manifest$metadata$label_col %||% NULL
     if (!is.character(label_column) || length(label_column) != 1L ||
         is.na(label_column) || !nzchar(trimws(label_column)) ||
@@ -1646,7 +1656,8 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
           expected_capability = handle$imaging_handle_capability,
           owner_env = owner_env)
         staged_data <- .readStagedSamples(file.path(
-          staging_dir, staged_manifest$samples_file))
+          staging_dir, staged_manifest$samples_file),
+          preserve_strings = .segmentationRequested(run_config))
         privacy <- imaging_authorized$privacy
         assert_roster <- utils::getFromNamespace(
           ".assert_exact_imaging_roster", "dsImaging")
@@ -1701,15 +1712,21 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
 
     if (identical(handle$source, "table") && !is.null(handle$table_data)) {
       data <- handle$table_data
+    } else if (.segmentationRequested(run_config) &&
+               identical(tolower(handle$data_format %||% "csv"), "csv")) {
+      data <- .readStagedSamples(handle$data_path, preserve_strings = TRUE)
     } else {
       data <- .loadTrainingData(handle$data_path, handle$data_format)
     }
     .validateDataSchema(data, target_column, feature_columns)
 
-    # Non-descriptor handles are always tabular. Image collections must cross
-    # the dsImaging admission boundary above.
-    staging_dir <- .stageData(
-      data, run_token, target_column, feature_columns, run_config)
+    # Direct segmentation uses custodian image/mask roots and patient policy.
+    # Other image collections cross the dsImaging admission boundary above.
+    staging_dir <- if (.segmentationRequested(run_config)) {
+      .stage_image_manifest(run_token, target_column, data, run_config)
+    } else {
+      .stageData(data, run_token, target_column, feature_columns, run_config)
+    }
 
     staged_manifest <- jsonlite::fromJSON(
       file.path(staging_dir, "manifest.json"), simplifyVector = TRUE)

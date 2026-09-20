@@ -29,6 +29,7 @@ import numpy as np
 # backbone name -> (feature_dim, is_3d). Fixed so the ServerApp builds the head
 # without loading the backbone, and identical across nodes.
 _BACKBONES = {
+    "resnet18_layer2": (32768, False),
     "resnet18": (512, False),
     "resnet50": (2048, False),
     "densenet121": (1024, False),
@@ -36,12 +37,14 @@ _BACKBONES = {
     "densenet121_3d": (1024, True),
 }
 _EXTRACTOR_PROFILES = {
+    "resnet18_layer2": "resnet18_layer2_128_v1",
     "resnet18": "dsflower-resnet18-imagenet1k-v1-extractor-v1",
     "densenet121": "dsflower-densenet121-imagenet1k-v1-extractor-v1",
     "resnet18_3d": "dsflower-resnet18-monai-seed0-extractor-v1",
     "densenet121_3d": "dsflower-densenet121-monai-seed0-extractor-v1",
 }
 _MIN_BACKBONE_IMAGE_SIZE = {
+    "resnet18_layer2": 128,
     "resnet18": 1,
     "densenet121": 29,
     "resnet18_3d": 1,
@@ -131,6 +134,8 @@ def require_extractor_config(backbone, profile, num_features, image_size):
     name, feature_dim = require_extractor_geometry(
         backbone, profile, num_features)
     size = _validate_image_size(image_size)
+    if name == "resnet18_layer2" and size != 128:
+        raise ValueError("segmentation extractor requires image-size 128")
     if size < _MIN_BACKBONE_IMAGE_SIZE[name]:
         raise ValueError("image-size is too small for the vision backbone")
     return name, size, feature_dim
@@ -380,6 +385,8 @@ def build_backbone(backbone):
     import torch.nn as nn
 
     name = normalize_backbone(backbone)
+    if name == "resnet18_layer2":
+        raise ValueError("spatial encoder requires the full segmentation contract")
     feat_dim, is3d = _BACKBONES[name]
     torch.manual_seed(0)  # determinism for any non-pretrained fallback
 
