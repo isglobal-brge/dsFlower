@@ -1,3 +1,20 @@
+# dsFlower 0.5.0
+
+* Admit patient-level Weibull and lognormal AFT survival contracts, with bounded
+  subject likelihoods, server-authoritative staging, and sticky release semantics.
+* Add subject-level discrete-hazard training; the companion campaign packages
+  the preregistered hazard-v2 confirmation and its selected h06 schedule while
+  retaining the original v1 matrix as boundary evidence.
+* Add patient-level binary segmentation with verified public encoder bytes and
+  pinned spatial decoders. The companion campaign documents the public
+  initialisation benchmark route and retains random-initialisation comparisons
+  separately. Segmentation remains experimental (`vetted = FALSE`); the evidence
+  route does not add an analyst checkpoint-loading API.
+* Merge and synchronize the survival and segmentation runner contracts. The
+  companion dsFlowerClient 0.5.0 evidence package replaces stale segmentation
+  result files with verified protocol-v5 evidence and retains the v3/v4 boundary
+  results and stale-file reconciliation provenance under explicit version labels.
+
 # dsFlower 0.4.5
 
 * SuperNode startup now revalidates opaque dsImaging feature views with the
