@@ -67,6 +67,47 @@ fail-closed until a custodian explicitly configures its separately built,
 platform-specific verified bundle; `configure` never downloads or compiles that
 native trust artifact implicitly.
 
+### Subject-level survival
+
+`pytorch_aft` and `pytorch_discrete_hazard` use the existing neural DP-SGD
+mechanism and require custodian-owned `dp_unit="patient"` and `patient_column`.
+The public contract declares two distinct ordered time/event targets, explicit
+baseline features, days from baseline, minimum resolution and administrative
+horizon. Versioned `survival-config-b64` is strictly validated before private
+reads; the decoded `survival-config` and all derived artifact fields are
+server-owned. AFT pins Weibull shape or log-normal sigma to `{0.5,1,2}` and
+clamps the scalar location to `[-10,10]`; dispersion is never fitted privately.
+Cox losses remain outside the allowlist because risk sets couple subjects.
+
+The original staged frame retains `M` source rows (`n_samples=M`) and the
+canonical subject census (`n_units=N`). A separate server-written
+`survival_subjects.csv` holds exactly `N` subject feature/outcome rows. Duplicate
+subjects are invalid as a whole; missing identifiers retain the existing common
+protected sentinel and are invalid even when only one such row occurs. Invalid
+or nonfinite outcomes, nonbinary event codes and times below public `t_min`
+produce safe features and targets with `valid=0`. Those units stay in sampling
+and the batch-mean denominator. Finite times beyond the public horizon become
+administratively censored at the horizon; an event exactly at the horizon
+remains an event. No completeness, event or invalid-record counts are released.
+
+The hazard grid has `0=b0<...<bK=T` with `K<=64`. An event in
+`(b[j-1],b[j]]` contributes through interval `j`; a censor contributes only
+completed intervals whose end is no later than censoring. In-interval censoring
+does not label the unobserved interval end. Each subject loss is
+`valid * sum(mask * BCEWithLogits(logits,event)) / K`, followed by a mean over
+subjects. A whole period vector is one Opacus sample with one all-parameter
+clip. `K` never replaces `N` in sampling, clipping or accounting; budget
+conversion, secure Poisson sampling and the accountant are unchanged.
+
+The runner independently checks the source census, subject order, complete
+derived tensor geometry and totalization. Sticky identity binds distribution,
+dispersion, public time/grid conventions, validity and effective feature/target
+tensors. Only DP parameters and existing availability metadata leave the node;
+no training losses, subject weights, survival predictions or outcome tensors
+are added to the release. Evaluation belongs to channel B on public or
+independently authorized local held-out data. Private validation, holdout, CV
+and private metric-based HPO remain unsupported and fail public preflight.
+
 ### HookApp
 
 A HookApp exposes only:
@@ -129,8 +170,8 @@ artifacts and sanitized native-tree ensembles. Supported layouts cover binary,
 multiclass, ordinal and multilabel classification plus bounded regression/count
 outcomes. Probability bins are public and bounded at 512; class/label counts are
 public and bounded at 1024. Validation on an independently assigned dataset is
-external validation; evaluating training data is resubstitution. Tabular
-neural/native-tree and native dsFlower vision training have an atomic holdout
+external validation; evaluating training data is resubstitution. Eligible tabular
+classification/regression/count and native dsFlower vision training have an atomic holdout
 workflow. K-fold is tabular-only and supports neural models plus native-tree
 binary classification and bounded regression. K-fold runs use a
 canonical secret-keyed patient/row assignment, cleanly initialize and train all
@@ -141,7 +182,8 @@ metrics are never released.
 
 ### Atomic training holdout
 
-Tabular neural/native-tree and native dsFlower vision training may opt into one
+Eligible tabular classification/regression/count and native dsFlower vision
+training may opt into one
 holdout fraction. The client encodes that fraction exactly as integer
 millionths and the node combines
 the canonical contract with its custodial secret in an HMAC-SHA256 PRF. There is

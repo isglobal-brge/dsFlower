@@ -917,6 +917,16 @@ def _quantile_factory(cfg):
     return quantile_loss
 
 
+def _survival_loss_factory(name):
+    def factory(cfg):
+        if __package__:
+            from .survival import loss_factory
+        else:
+            from survival import loss_factory
+        return loss_factory(name, cfg)
+    return factory
+
+
 # Custom TRUSTED per-sample losses (node code, never client code): name -> factory(cfg).
 # Each MUST decompose per sample with mean reduction so the DP-SGD sensitivity bound
 # holds; enforced by per_sample_independence_probe + the DP safety suite. Hyperparams
@@ -927,6 +937,9 @@ _CUSTOM_LOSS_FACTORY = {
     "gamma_nll": _gamma_nll_factory,
     "huber": _huber_factory,
     "quantile": _quantile_factory,
+    "aft_weibull_nll": _survival_loss_factory("aft_weibull_nll"),
+    "aft_lognormal_nll": _survival_loss_factory("aft_lognormal_nll"),
+    "discrete_hazard_nll": _survival_loss_factory("discrete_hazard_nll"),
 }
 
 

@@ -126,13 +126,18 @@
   multilabel <- identical(tolower(as.character(unlist(
     run_config[["loss-name"]] %||% "", use.names = FALSE))),
     "multilabel_bce")
-  expected_targets <- if (multilabel) {
+  survival <- .isSurvivalConfig(run_config)
+  expected_targets <- if (survival) {
+    2L
+  } else if (multilabel) {
     as.integer(run_config[["num-labels"]])
   } else {
     1L
   }
   if (length(target_column) != expected_targets) {
-    stop(if (multilabel) {
+    stop(if (survival) {
+      "Survival requires exactly two ordered time/event target columns."
+    } else if (multilabel) {
       "target_column length must equal the public num-labels value."
     } else {
       "The enforced-DP runner requires exactly one target column."
@@ -426,6 +431,12 @@
     stop("Target columns must be unique, non-empty, and present in the data.",
          call. = FALSE)
   }
+  if (.isSurvivalConfig(run_config)) {
+    for (column in target_column) {
+      data[[column]] <- .coerceNumericOrMissing(data[[column]])
+    }
+    return(data)
+  }
   loss_name <- tolower(as.character(unlist(
     run_config[["loss-name"]] %||% "", use.names = FALSE)))
   if (identical(loss_name, "multilabel_bce")) {
@@ -669,6 +680,8 @@
     "n_input_samples", "dropped_missing", "target", "target_column",
     "feature_columns", "staged_at", "data_root", "dp-unit", "patient_column",
     "patient-id-canonicalization",
+    "survival_file", "survival_schema", "survival_shape",
+    "survival_feature_columns", "survival_target_columns",
     "target-preencoded", "association-preencoded",
     "group_column", "dataset_id", "source_kind", "assets", "data_type",
     "drop_missing"
@@ -712,6 +725,13 @@
 
   levels <- run_config[["target-levels"]] %||% NULL
   bounds <- run_config[["target-bounds"]] %||% NULL
+  if (identical(task_type, "survival")) {
+    if (!is.null(levels) || !is.null(bounds)) {
+      stop("Survival uses its time/event contract, not target levels or bounds.",
+           call. = FALSE)
+    }
+    return(run_config)
+  }
   numeric_task <- task_type %in% c("regression", "count", "continuous")
   loss_name <- tolower(as.character(unlist(
     run_config[["loss-name"]] %||% "", use.names = FALSE)))
@@ -837,7 +857,7 @@
     "privacy-egress_file_mb", "privacy-egress_processes",
     "privacy-hook_enabled", "user-module", "app-params-sha256",
     "association-contract", "association-privacy-unit",
-    "association-unit-semantics"
+    "association-unit-semantics", "survival-config"
   )
 }
 
@@ -849,6 +869,7 @@
     "num-server-rounds", "num-features", "num-classes", "num-labels",
     "feature-bounds", "target-bounds", "target-levels",
     "model-spec-b64", "loss-name", "local-epochs", "batch-size",
+    "survival-config-b64",
     "backbone", "image-size", "vision-extractor-profile",
     "learning-rate", "weight-decay", "l1-penalty",
     "nb-dispersion", "gamma-shape", "huber-delta", "quantile-level",
@@ -1052,6 +1073,7 @@
       data, run_token, target_column, feature_columns, extra_config,
       unit_policy = unit_policy, identity_columns = identity_columns))
   }
+  .validateSurvivalColumns(extra_config, target_column, feature_columns, unit_policy)
   data <- .transformPublicTarget(data, target_column, extra_config)
   unit <- if (is.null(unit_policy)) {
     .prepareDpUnitFrame(data)
@@ -1088,7 +1110,11 @@
   } else {
     data_file <- "train.csv"
     data_format <- "csv"
-    utils::write.csv(data, file.path(staging_dir, data_file), row.names = FALSE)
+    if (.isSurvivalConfig(extra_config)) {
+      .writeSurvivalCsv(data, file.path(staging_dir, data_file))
+    } else {
+      utils::write.csv(data, file.path(staging_dir, data_file), row.names = FALSE)
+    }
   }
 
   # Strict file permissions
@@ -1116,6 +1142,10 @@
 
   # Merge the server-authored mechanism and public run configuration.
   manifest <- .merge_manifest_config(manifest, extra_config)
+
+  if (.isSurvivalConfig(extra_config)) {
+    manifest <- .stageSurvivalTargets(data, manifest, staging_dir)
+  }
 
   # Write manifest
   manifest <- .normalize_dp_manifest(manifest)
@@ -1416,6 +1446,10 @@
   # Read with column selection, drop incomplete rows, and write to staging.
   all_of <- utils::getFromNamespace("all_of", "tidyselect")
   tbl <- arrow::read_parquet(src_path, col_select = all_of(cols_needed))
+  if (.isSurvivalConfig(extra_config)) {
+    return(.stageData(as.data.frame(tbl), run_token, target_column,
+                      feature_columns, extra_config))
+  }
   transformed <- .transformPublicTarget(
     as.data.frame(tbl), target_column, extra_config)
   unit <- .prepareDpUnitFrame(transformed)

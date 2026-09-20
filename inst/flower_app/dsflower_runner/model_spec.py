@@ -59,6 +59,8 @@ _MAX_PUBLIC_SCALAR_ABS = 1.0e6
 
 def output_limit_for_loss(loss_name):
     """Finite head domain: wide for direct regression, tight for logits/log-links."""
+    if str(loss_name) in ("aft_weibull_nll", "aft_lognormal_nll"):
+        return 10.0
     return (_MAX_ACTIVATION_ABS
             if str(loss_name) in ("mse", "huber", "quantile") else _MAX_OUTPUT_ABS)
 
@@ -87,6 +89,12 @@ def output_width(loss_name, cfg):
     specifies output width: the spec ends with a linear to the symbolic ``@out`` and
     the node fills it in from the loss it pinned, so a mis-sized head is impossible.
     Matches the declarative model contract and remains server-authoritative."""
+    if loss_name == "discrete_hazard_nll":
+        if __package__:
+            from .survival import config_from_run
+        else:
+            from survival import config_from_run
+        return len(config_from_run(cfg, loss_name)["edges"]) - 1
     nc = int(cfg.get("num-classes", 2))
     if loss_name in ("cross_entropy", "hinge"):
         return max(2, nc)                      # one logit per class (softmax-CE / margin-SVM)
