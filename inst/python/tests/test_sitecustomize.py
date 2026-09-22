@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,6 +29,113 @@ def _load_hook(manifest_dir):
 
 
 class ParentImportBoundaryTests(unittest.TestCase):
+    def test_generated_torch_template_requires_origin_and_exact_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            hook, finder = _load_hook(root)
+            name = "_remote_module_non_scriptable"
+            directory = os.path.join(root, "generated")
+            os.mkdir(directory)
+            origin = os.path.join(directory, name + ".py")
+            source = "VALUE = 42\n"
+            Path(origin).write_text(source)
+            torch_root = os.path.realpath(os.path.join(root, "installed", "torch"))
+            instantiator = SimpleNamespace(
+                __file__=os.path.join(torch_root, "distributed/nn/jit/instantiator.py"),
+                INSTANTIATED_TEMPLATE_DIR_PATH=directory,
+                _TEMP_DIR=SimpleNamespace(name=directory))
+            template = SimpleNamespace(
+                __file__=os.path.join(torch_root, "distributed/nn/jit/templates/remote_module_template.py"),
+                get_remote_module_template=lambda cuda: source)
+            modules = {
+                "torch": SimpleNamespace(__file__=os.path.join(torch_root, "__init__.py")),
+                "torch.distributed.nn.jit.instantiator": instantiator,
+                "torch.distributed.nn.jit.templates.remote_module_template": template,
+            }
+            def make_spec(path=origin):
+                return importlib.util.spec_from_file_location(name, path)
+
+            with (mock.patch.dict(sys.modules, modules),
+                  mock.patch.object(hook, "_SAFE_PREFIXES", (os.path.dirname(torch_root),))):
+                accepted = hook._torch_generated_spec(name, make_spec())
+                self.assertIsNotNone(accepted)
+                # The loader executes the verified snapshot even if a file or
+                # cached bytecode changes between verification and execution.
+                Path(origin).write_text("raise AssertionError('substitution')\n")
+                module = importlib.util.module_from_spec(accepted)
+                accepted.loader.exec_module(module)
+                self.assertEqual(module.VALUE, 42)
+                self.assertIsNone(hook._torch_generated_spec(name, make_spec()))
+                Path(origin).write_text(source)
+                self.assertIsNone(hook._torch_generated_spec(name + "_other", make_spec()))
+                shadow = os.path.join(root, name + ".py")
+                Path(shadow).write_text(source)
+                self.assertIsNone(hook._torch_generated_spec(name, make_spec(shadow)))
+                for item in (modules["torch"], instantiator, template):
+                    with mock.patch.object(item, "__file__", shadow):
+                        self.assertIsNone(hook._torch_generated_spec(name, make_spec()))
+                with mock.patch.object(instantiator._TEMP_DIR, "name", root):
+                    self.assertIsNone(hook._torch_generated_spec(name, make_spec()))
+                # A same-name shadow goes through the ordinary default-deny
+                # path, and HookApp rejection still precedes this exception.
+                with (mock.patch.object(hook._PathFinder, "find_spec", return_value=make_spec(shadow)),
+                      mock.patch.object(hook, "_abort", side_effect=RuntimeError("denied")),
+                      self.assertRaisesRegex(RuntimeError, "denied")):
+                    finder.find_spec(name)
+                with (mock.patch.object(hook, "_USER_MODULE", name),
+                      mock.patch.object(hook, "_abort", side_effect=RuntimeError("denied")),
+                      self.assertRaisesRegex(RuntimeError, "denied")):
+                    finder.find_spec(name)
+
+    @unittest.skipUnless(all(importlib.util.find_spec(p) for p in ("torch", "opacus", "flwr")),
+                         "requires the PyTorch training environment")
+    def test_recurrent_contracts_train_in_fresh_guarded_processes(self):
+        # Import dependencies only in a new interpreter: pre-importing Opacus
+        # would hide the generated-module regression by caching the module.
+        code = r'''
+import base64, json, os, sys
+import sitecustomize
+assert any(isinstance(f, sitecustomize._IntegrityFinder) for f in sys.meta_path)
+import numpy as np
+import torch
+from dsflower_runner import client_app, dp_harness, params
+assert "dsflower_runner" in sitecustomize._verified_packages
+torch.set_num_threads(2)
+spec = {"kind": "graph", "output": "out", "nodes": [
+    {"name": "x", "op": "reshape", "in": ["@in"], "shape": [128, 9]},
+    {"name": "h", "op": sys.argv[1], "in": ["x"], "hidden": 32},
+    {"name": "out", "op": "linear", "in": ["h"], "out": "@out"}]}
+cfg = {"model-spec-b64": base64.b64encode(json.dumps(spec).encode()).decode(),
+       "num-features": 1152, "num-classes": 6, "loss-name": "cross_entropy"}
+model = params.load_user_model(cfg, 1152, "cross_entropy")
+pins = {"loss_name": "cross_entropy", "batch_size": 32, "local_epochs": 1,
+        "num_rounds": 5, "round_index": 1, "n_classes": 6, "learning_rate": .001,
+        "optimizer": {"name": "sgd", "weight_decay": 0, "l1_penalty": 0,
+                      "momentum": 0, "nesterov": False}, "scheduler": {"name": "none"}}
+pcfg = {"epsilon": 4., "delta": 1e-6, "clipping_norm": 1., "n_samples": 7}
+mechanism = dp_harness.effective_dpsgd_mechanism(4., 1e-6, 1., 7, 32, 1, 5)
+x = np.zeros((7, 1152), dtype=np.float32)
+y = np.arange(7, dtype=np.int64) % 6
+arrays, count = client_app._dp_fit(model, x, y, pcfg, pins, 7, cfg,
+                                 os.urandom(32), mechanism["noise_multiplier"])
+assert count == 7 and all(np.isfinite(a).all() for a in arrays)
+print("guarded recurrent DP update passed", sys.argv[1])
+'''
+        with tempfile.TemporaryDirectory() as root:
+            hook, _ = _load_hook(root)
+            runner = Path(HOOK).resolve().parent.parent / "flower_app/dsflower_runner"
+            Path(root, "pinned_packages.json").write_text(json.dumps({
+                "dsflower_runner": hook._hash_package(str(runner))}))
+            Path(root, "manifest.json").write_text('{"dp-track": "neural"}')
+            env = dict(os.environ, DSFLOWER_MANIFEST_DIR=root,
+                       PYTHONPATH=os.pathsep.join((str(Path(HOOK).resolve().parent), str(runner.parent))),
+                       OMP_NUM_THREADS="2", OPENBLAS_NUM_THREADS="2")
+            for kind in ("lstm", "gru"):
+                with self.subTest(kind=kind):
+                    result = subprocess.run([sys.executable, "-c", code, kind], env=env,
+                                            capture_output=True, text=True, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("guarded recurrent DP update passed", result.stdout)
+
     def test_foreign_packages_require_the_single_pin_map_contract(self):
         with tempfile.TemporaryDirectory() as root:
             package = os.path.join(root, "foreignpkg")

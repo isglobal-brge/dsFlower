@@ -238,6 +238,67 @@ class _PostExecClientAppLoader(object):
         return getattr(self._wrapped, name)
 
 
+class _VerifiedGeneratedSourceLoader(object):
+    """Execute the source we checked, never a substituted file or cached pyc."""
+
+    def __init__(self, source, origin):
+        self._code = compile(source, origin, "exec")
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        exec(self._code, module.__dict__)
+
+
+def _torch_generated_spec(fullname, spec):
+    """Admit only torch's fixed non-scriptable RemoteModule template.
+
+    Opacus imports this eagerly through torch.distributed. Torch writes it to
+    a temporary directory, outside the trusted installation. It inherits the
+    installed torch runtime's trust only when its generator, location AND exact
+    source match that installation. No prefix/name-only or temp-dir exemption;
+    scriptable/user-supplied templates still require ordinary package pins.
+    """
+    if fullname != "_remote_module_non_scriptable":
+        return None
+    torch = sys.modules.get("torch")
+    torch_file = getattr(torch, "__file__", "")
+    if not torch_file or _is_foreign(torch_file):
+        return None
+    torch_dir = os.path.dirname(os.path.realpath(torch_file))
+    modules = []
+    for suffix in ("distributed.nn.jit.instantiator",
+                   "distributed.nn.jit.templates.remote_module_template"):
+        module = sys.modules.get("torch." + suffix)
+        filename = getattr(module, "__file__", "")
+        expected = os.path.join(torch_dir, *suffix.split(".")) + ".py"
+        if not filename or os.path.realpath(filename) != expected:
+            return None
+        modules.append(module)
+    instantiator, template = modules
+    directory = getattr(instantiator, "INSTANTIATED_TEMPLATE_DIR_PATH", "")
+    if not directory or directory != getattr(getattr(instantiator, "_TEMP_DIR", None), "name", None):
+        return None
+    origin = getattr(spec, "origin", "")
+    expected = os.path.join(os.path.realpath(directory), fullname + ".py")
+    if not origin or os.path.realpath(origin) != expected:
+        return None
+    try:
+        source = template.get_remote_module_template(True).format(
+            assign_module_interface_cls="module_interface_cls = None",
+            args="*args", kwargs="**kwargs", arg_types="*args, **kwargs",
+            arrow_and_return_type="", arrow_and_future_return_type="",
+            jit_script_decorator="")
+        with open(origin, encoding="utf-8") as handle:
+            if handle.read() != source:
+                return None
+    except (OSError, AttributeError, KeyError, ValueError):
+        return None
+    spec.loader = _VerifiedGeneratedSourceLoader(source, origin)
+    return spec
+
+
 class _IntegrityFinder(object):
     """A sys.meta_path finder that verifies foreign (delivered) code BEFORE
     the import machinery executes it. find_spec runs prior to exec_module, so
@@ -290,6 +351,10 @@ class _IntegrityFinder(object):
             return None
         if not _is_foreign(origin):
             return None  # trusted runtime: stdlib / site-packages
+
+        generated = _torch_generated_spec(fullname, spec)
+        if generated is not None:
+            return generated
 
         locs = getattr(spec, "submodule_search_locations", None)
         pkg_dir = locs[0] if locs else os.path.dirname(os.path.abspath(origin))
