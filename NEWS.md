@@ -1,3 +1,12 @@
+# dsFlower 0.5.1
+
+* Recognize PyTorch's generated non-scriptable RemoteModule as installed runtime
+  code only after checking its installed generator, private generation directory
+  and exact template source. Execute the checked source without loading cached
+  bytecode. All other foreign imports retain the default-deny package-pin rule.
+  This fixes guarded LSTM/GRU construction with torch 2.6 and Opacus 1.6 without
+  changing the canonical runner or any training/privacy mechanism.
+
 # dsFlower 0.5.0
 
 * Admit patient-level Weibull and lognormal AFT survival contracts, with bounded
