@@ -332,9 +332,11 @@ Neither route accepts an analyst-supplied filesystem root.
 The registry parameter `decoder_init` defaults to `"random"`. A custodian can
 enable `"public:<checkpoint-id>"` by installing a checkpoint in the protected
 node registry and allowlisting its exact manifest SHA-256. The
-[BUSI v5 public checkpoint bundle](inst/extdata/segmentation-public-checkpoints/README.md)
-contains the three epochs60 narrow decoders and the administrator installation
-procedure. For example, after installing a chosen bundle entry:
+[BUSI v5 checkpoint instructions](inst/extdata/segmentation-public-checkpoints/README.md)
+include the three epochs60 manifests, original provenance and a fetch-and-verify
+installation procedure. The original NPZ files are not included: retrieval from
+the stopped evaluation host remains pending. For example, after retrieving and
+installing a chosen entry:
 
 ```r
 options(dsflower.segmentation_public_checkpoints = c(

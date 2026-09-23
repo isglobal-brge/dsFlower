@@ -4,8 +4,10 @@
   checkpoint registry and manifest-hash allowlist. The node verifies checkpoint,
   tensor, evidence and frozen encoder digests before private staging, binds the
   public identity into request/seed contracts, and records provenance in the run
-  manifest and release record. The bundled BUSI v5 epochs60 narrow decoders can be
-  installed without campaign tooling. Random initialisation remains the default;
+  manifest and release record. BUSI v5 epochs60 manifests, original evidence and
+  a fetch-and-verify installation procedure are included; the three original
+  checkpoint binaries still require retrieval from the stopped evaluation host.
+  Installation and use require no campaign tooling. Random initialisation remains the default;
   the DP contract, accountant, clipping, sampler and training path are unchanged.
 * Correct deterministic release identity to include server-authored request
   selections, including source operands, ordered columns, public vocabularies, imaging roles and

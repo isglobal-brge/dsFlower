@@ -98,3 +98,13 @@ and Python package suites from clean committed checkouts and compare both runner
 trees byte-for-byte. Keep package versions unchanged; commit locally with no tag,
 push or thesis edits. Record exact counts, hashes and remaining limitations in
 `../SEGINIT_CONFIRMATION.md`.
+
+Implementation availability: the original NPZ files were absent from local
+files, archives and Git objects. The sole confirmed source was a stopped
+evaluation pod; approval to resume its billable compute was requested and has
+not been received. The package therefore currently contains the three registry
+manifests, original evidence, allowlist pins and a fetch-and-verify procedure.
+Expected NPZ sizes are derived from the preserved serialization source and
+NumPy version, not measured from the originals. Actual binary retrieval and
+end-to-end verification of those three original checkpoints remain open. This
+is an access limitation, not the package-size exception contemplated above.
