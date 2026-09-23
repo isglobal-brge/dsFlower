@@ -1056,7 +1056,7 @@ flowerInitDS <- function(data_symbol) {
       normalized, perl = TRUE
     ) ||
     grepl(
-      "(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping)($|_)",
+      "(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping|cache|deadline)($|_)",
       normalized, perl = TRUE
     )
 }
@@ -1371,7 +1371,8 @@ flowerInitDS <- function(data_symbol) {
 #'
 #' DataSHIELD ASSIGN method. Validates the fixed stateless per-training privacy
 #' contract, applies total public preprocessing and stages the training data.
-#' Earlier trainings never change admission or the per-training contract.
+#' Earlier trainings never change the per-training privacy contract; enabled
+#' Hooks additionally require public cache capacity admission.
 #'
 #' @param handle_symbol Character; symbol of the initialized handle.
 #' @param target_column Character; name of the target column.
@@ -1588,6 +1589,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   num_rounds <- as.integer(run_config[["num-server-rounds"]])
   contract <- .privacy_training_contract(
     run_token, num_rounds, imaging_unit_policy)
+  .release_cache_admit(run_token, run_config)
 
   # From this point onward errors can be caused by private storage/content or
   # third-party decoders. Keep their text inside the node: the exterior DSI

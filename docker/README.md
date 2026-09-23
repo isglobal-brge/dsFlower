@@ -59,7 +59,12 @@ runtime-generated 256-bit node secret, normally
 `/var/lib/dsflower/privacy/noise_root`, or provide a secret-manager path through
 `DSFLOWER_NODE_SECRET_FILE`. Preserve the private HookApp upload spool at
 `/var/lib/dsflower/appstore/` separately if verified uploads must survive
-container replacement.
+container replacement. Gated Hooks also require their durable release cache,
+by default `/var/lib/dsflower/privacy/release-cache`, to survive replacement for
+exact replay of nondeterministic applications. Administrator profile options
+`dsflower.release_cache_dir` and `dsflower.release_cache_bytes` select its path
+and logical capacity (default 1 GiB); `default.dsflower.*` fallbacks are supported.
+Provision additional space for SQLite journals and filesystem allocation overhead.
 
 Do not mount all of `/var/lib/dsflower` over this image: that would hide the baked
 `venvs/` directory. Mount the privacy and appstore subdirectories separately.
@@ -82,6 +87,16 @@ remain fail-closed. A rotation produces an independent deterministic-noise
 domain; it never introduces a query-count lockout. Do not clone the same secret
 to concurrent nodes. dsFlower deliberately declares no Docker `VOLUME`, because
 the correct persistent-volume wiring belongs to the Rock/orchestrator deployment.
+
+Cache directories require exact mode `0700` and cache files exact mode `0600`,
+owned by the service UID, with no symlinks or nonregular files. Keep the cache
+outside staging and all Hook mounts. Complete worst-case capacity is reserved
+before private work; live entries remain pinned until authoritative run cleanup.
+Crash recovery retains uncertain pins, so restore the same state and complete
+cleanup instead of removing the cache to recover space. Only unpinned entries
+are evictable. Cross-run replay is guaranteed while a release remains retained;
+eviction ends that guarantee for nondeterministic applications. The cache does
+not strengthen the existing minimum-duration envelope into a fixed deadline.
 
 Set `DSFLOWER_NODE_SECRET_FILE` to opt in to pre-service bootstrap. Without it,
 the wrapper does not guess: Opal and Armadillo inject profile R options only

@@ -29,7 +29,23 @@ Pooled CV release keys also bind the ordered public fold-model digests retained
 in existing node RAM; private statistic hashes do not enter this public block.
 
 Identical selections and identical effective inputs replay byte-identically
-within the same node-key/runtime domain. Different selected columns derive
+within the same node-key/runtime domain. Declarative tracks recompute their
+deterministic releases; every admitted HookApp uses a durable release cache,
+including applications with nondeterministic native code. The cache key is
+`seeding.sub_seed(master, "gated-release-cache-key/v1")`, derived before execution
+from the v2 Hook master. It is distinct from final-update-bound noise keys.
+Only exact released arrays and constant metrics are stored, together with
+operational bookkeeping; master seeds and noise keys are never persisted.
+
+Cache entries are pinned throughout active runs and identical concurrent
+requests serialize. Cross-run replay lasts only while an entry remains retained;
+only unpinned entries can be evicted. Capacity and cache paths are operational
+settings, excluded from semantic identity. Data identity is rechecked before a
+replay, and a committed coordinate cannot authorize another semantic key.
+The cache adds no further observation from application randomness and changes
+neither the calibrated mechanism nor the existing minimum-duration envelope.
+
+Different selected columns derive
 different keys even if their private contents coincide. Validation and
 association therefore cannot identify a request solely by an equal sufficient
 statistic. Public model arrays also distinguish validation requests whose

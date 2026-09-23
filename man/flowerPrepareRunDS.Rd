@@ -26,5 +26,6 @@ Updated handle with staging information.
 \description{
 DataSHIELD ASSIGN method. Validates the fixed stateless per-training privacy
 contract, applies total public preprocessing and stages the training data.
-Earlier trainings never change admission or the per-training contract.
+Earlier trainings never change the per-training privacy contract; enabled
+Hooks additionally require public cache capacity admission.
 }

@@ -1,3 +1,19 @@
+# dsFlower 0.6.0
+
+* Add a durable node-owned release cache for gated HookApps. Identical requests
+  replay the exact released arrays and constant metrics even for nondeterministic
+  applications. Cache keys are domain-separated from the v2 semantic identity,
+  including verified Hook contents, effective private data and node-authored
+  source/column selections; changed data or selections miss.
+* Reserve bounded cache capacity before private work, serialize identical
+  requests, and retain active-run pins through authoritative cleanup. Only
+  unpinned entries may be evicted; cross-run replay lasts while an entry remains
+  retained. Committed coordinates cannot authorize a second release.
+* Add administrator-only persistent cache directory and byte-capacity settings
+  with protected ownership and permissions. Declarative mechanisms, privacy
+  calibration and the existing minimum-duration Hook envelope are unchanged;
+  this release does not introduce a fixed-duration deadline.
+
 # dsFlower 0.5.2
 
 * Correct deterministic release identity to include server-authored request

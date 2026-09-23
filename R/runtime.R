@@ -131,7 +131,7 @@
   current_path <- Sys.getenv("PATH", "")
   # This is the final common boundary before trusted Python can make a private
   # release. Bootstrap here as defence in depth so a future launch path cannot
-  # accidentally omit the only persistent privacy state: the node root secret.
+  # accidentally omit the persistent root for privacy randomness.
   privacy_state <- .privacy_runtime_bootstrap()
   secret_path <- .validate_node_secret(privacy_state$secret_path)
   flwr_home <- file.path(staging_dir, ".flwr")
@@ -186,7 +186,7 @@
   if (!is.null(extra_pypath))
     env <- c(env, PYTHONPATH = extra_pypath)
 
-  env
+  c(env, .release_cache_environment(staging_dir))
 }
 
 #' Install the mandatory Python code-integrity bootstrap

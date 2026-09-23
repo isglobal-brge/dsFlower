@@ -1,7 +1,9 @@
 # Gated envelope and durable release cache
 
-Status: design review stopped before implementation. Neither feature is shipped.
-Baseline: dsFlower `eef214a`, dsFlowerClient `0837265`; semantic identity
+Status: durable cache implemented in 0.6.0. The fixed-duration envelope remains
+unimplemented; the existing minimum-duration envelope is unchanged. Its accepted
+feasibility review is preserved below.
+Design baseline: dsFlower `eef214a`, dsFlowerClient `0837265`; semantic identity
 `dsflower-semantic-randomness-v2`.
 
 ## Required release contract
@@ -80,9 +82,9 @@ the execution sequence alone neither proves nor disproves independence.
 
 ## Durable cache design
 
-The cache would apply only to gated Hooks. Declarative tracks retain their
+The cache applies only to gated Hooks. Declarative tracks retain their
 existing strict deterministic kernels and existing behavior; no optional cache
-would be added to them in this change.
+is added to them in this change.
 
 Use a domain-separated key derived from the existing Hook master seed, such as
 `seeding.sub_seed(master, "gated-release-cache-key/v1")`. The v2 master already
@@ -91,10 +93,12 @@ installed Hook digest, public model, application parameters, privacy policy,
 round and numerical runtime. Run tokens, message IDs, paths and timestamps stay
 out of the key. Do not store the master or noise keys themselves. A changed
 selection or data digest must miss even if an old in-memory reply exists.
-The effective new deadline and block/failure policy must also enter the Hook's
-semantic configuration because they can change its update; adding these inputs
-does not require changing the v2 encoder label. Cache paths and storage capacity
-remain operational settings and do not become noise-reroll axes.
+If a future release adds a deadline or changes block/failure policy, these must
+also enter the Hook's semantic configuration because they can change its update;
+adding these inputs does not require changing the v2 encoder label. The current
+cache-only implementation retains existing timeout, padding and failure policy.
+Cache paths and storage capacity remain operational settings and do not become
+noise-reroll axes.
 
 Persist the final noised arrays with exact dtype, shape and bytes, and constant
 reply metrics, using a bounded non-pickle encoding. Persist the noised-zero
@@ -103,7 +107,7 @@ executing the Hook. Flower transport metadata must still identify the current
 request; byte identity means released arrays and metric content, not the entire
 transport envelope.
 
-The node administrator would select a persistent protected directory, outside
+The node administrator selects a persistent protected directory, outside
 staging and outside Hook mounts, and a byte capacity. Require owner-only
 permissions (`0700` directories, `0600` files), safe ownership, regular files and
 no symlinks. Analyst configuration, nested application parameters and manifest
@@ -139,7 +143,7 @@ It does not make distinct requests free or create a cross-query privacy budget.
 This argument assumes the cache lookup, storage failure and hit/miss timing
 are not exposed as additional private-dependent transcript signals.
 
-## Why implementation stops
+## Why the fixed-duration implementation stopped
 
 The present runtime cannot enforce the complete contract above:
 
@@ -182,18 +186,21 @@ independent block slots, a safely prepared data identity/fallback, and an
 explicit enforceable resource/storage/transport fault model. These are new
 deployment guarantees, not consequences of the existing attestation or a larger
 timeout. This review does not claim fixed deadlines are inherently impossible
-in Flower. We stop rather than implement a timer-and-cache approximation: a
-complete implementation would require the additional deployment guarantees
-above, which cannot be established from the present controls. Production code,
-architecture claims, versions and feature release notes remain unchanged.
+in Flower. A complete fixed-duration implementation would require the additional
+deployment guarantees above, which cannot be established from the present
+controls. Version 0.6.0 implements the durable cache independently, without
+claiming these deadline guarantees or replacing the minimum-duration envelope.
 
-## Validation required before a future feature release
+## Validation required before a future fixed-duration release
 
 Exercise the actual Flower boundary for fast/slow Hooks, each independent block
 overrun, crash, invalid output, quota exhaustion, delayed cleanup, hashing,
 serialization and persistence. Verify one fixed release schedule, identical
 metric content and the existing noised-zero mechanism, including faults after
-private work. Test cache hits with a nondeterministic Hook across process
+private work. The independent cache regression suite tests nondeterministic
+Hook replay, data/selection changes, concurrency, pins and permissions; those
+tests cannot establish the fixed-duration deployment guarantee. For a combined
+future feature, test cache hits with a nondeterministic Hook across process
 restarts and earlier rounds, changed data/selections, concurrent identical
 requests, crash points around commit, protected permissions and active-run
 eviction. Run both complete R and Python package suites on clean checkouts and

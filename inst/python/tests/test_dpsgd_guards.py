@@ -1803,6 +1803,8 @@ class HookAppPublicConfigTests(unittest.TestCase):
             "status": "new", "message_id": "m1", "release_index": 1,
             "num_rounds": 2, "run_token": "run_" + "a" * 32,
             "epsilon": 1.0, "delta": 1e-5,
+            "run_fingerprint": "a" * 64, "request_id": "b" * 64,
+            "coordinate": "claim:train:0:1",
         }
         pcfg = {
             "epsilon": 1.0, "delta": 1e-5, "hook_enabled": True,
@@ -1813,7 +1815,12 @@ class HookAppPublicConfigTests(unittest.TestCase):
             seen["local"] = public_cfg
             return old
 
-        with (mock.patch.object(client_app.release_guard, "claim_release",
+        with (tempfile.TemporaryDirectory() as cache_root,
+              mock.patch.dict(os.environ, {
+                  "DSFLOWER_RELEASE_CACHE_DIR": os.path.realpath(cache_root) + "/cache",
+                  "DSFLOWER_RELEASE_CACHE_BYTES": str(1024**3),
+              }),
+              mock.patch.object(client_app.release_guard, "claim_release",
                                 return_value=claim),
               mock.patch.object(client_app, "load_pinned_run_config",
                                 return_value=cfg),
@@ -1833,6 +1840,7 @@ class HookAppPublicConfigTests(unittest.TestCase):
               mock.patch.object(tier2_lib, "pad_hook_release"),
               mock.patch.object(tier2_lib, "gated_local_update",
                                 side_effect=capture_update)):
+            context.node_config = {"manifest-dir": os.path.join(cache_root, "staging")}
             reply = client_app.train(msg, context)
 
         self.assertFalse(reply.has_error())

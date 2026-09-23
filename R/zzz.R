@@ -632,6 +632,10 @@
     if (!dir.exists(dsflower_dir)) next
     subdirs <- list.dirs(dsflower_dir, full.names = TRUE, recursive = FALSE)
     for (d in subdirs) {
+      # Age and process absence cannot authoritatively close a cached Hook run.
+      # Retain its receipt along with the durable uncertain-run pins.
+      receipt <- file.path(d, ".release-cache.json")
+      if (file.exists(receipt) || .privacy_path_is_link(receipt)) next
       canonical <- normalizePath(d, winslash = "/", mustWork = FALSE)
       if (canonical %in% active) next
       info <- file.info(d)

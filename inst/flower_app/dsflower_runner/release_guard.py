@@ -6,8 +6,9 @@ identifier is used only to find an in-memory reply cache; it never selects
 privacy randomness or authorizes a release.  Every release coordinate is
 atomically claimed in the run's private staging directory before private work
 begins and mirrored into Flower's NodeState.  Once the single reply cache
-advances, an older coordinate fails closed rather than recomputing a second
-private release.
+advances, a declarative coordinate fails closed rather than recomputing a second
+private release. Gated Hooks verify their full semantic identity before the
+durable release cache can replay any coordinate, including after a restart.
 """
 
 import hashlib
@@ -177,6 +178,8 @@ def _fixed_manifest(context):
                   if cross_validation else
                   num_rounds + (1 if holdout else 0))
     return {
+        "gated": (bool(manifest.get("user-module"))
+                  or manifest.get("dp-track") == "egress"),
         "num_rounds": num_rounds,
         "policy_hash": policy_hash,
         "run_fingerprint": hashlib.sha256(
@@ -199,6 +202,11 @@ def _message_config(msg):
         raise RuntimeError("train message is missing its ConfigRecord") from exc
     if not isinstance(config, ConfigRecord):
         raise RuntimeError("train message config must be a ConfigRecord")
+    for key in config:
+        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+        normalized = normalized.lower().replace("-", "_").replace(".", "_")
+        if re.search(r"(^|_)(cache|deadline)($|_)", normalized):
+            raise RuntimeError("cache and deadline controls are administrator-only")
     return config
 
 
@@ -456,8 +464,10 @@ def _sticky_status(context, fixed, message_id, operation, fold, round_index,
     """Claim one coordinate before private work or replay its exact last reply."""
     state, ledger = _claim_ledger(context, fixed)
     key = _claim_key(operation, fold, round_index)
-    cache_status = _cached_status(
-        context, message_id, operation, fold, round_index, request_id)
+    # A public payload match alone cannot establish a Hook's identity: the
+    # effective data and request selections must be checked on every retry.
+    cache_status = ("verify" if fixed["gated"] else _cached_status(
+        context, message_id, operation, fold, round_index, request_id))
     updated, claimed_request = _durable_claim(
         fixed, ledger, key, request_id)
     try:
@@ -473,8 +483,8 @@ def _sticky_status(context, fixed, message_id, operation, fold, round_index,
         if claimed_request != request_id:
             raise RuntimeError(
                 "claimed release coordinate does not match request payload")
-        if cache_status == "replay":
-            return "replay"
+        if cache_status in ("replay", "verify"):
+            return cache_status
         raise RuntimeError(
             "release coordinate was already claimed and its exact reply is unavailable")
     return cache_status
@@ -503,4 +513,6 @@ def claim_release(context, msg):
         "message_id": message_id,
         "request_id": request_id,
         "policy_hash": fixed["policy_hash"],
+        "run_fingerprint": fixed["run_fingerprint"],
+        "coordinate": _claim_key(operation, fold, round_index),
     }

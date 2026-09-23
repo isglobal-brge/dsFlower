@@ -103,7 +103,8 @@ _PATH_SECURITY_KEY = re.compile(
     r"(^|_)(path|dir|directory|file|filename|secret|token|password|credential|"
     r"requirements?|dependencies?)($|_)")
 _DP_KEY = re.compile(
-    r"(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping)($|_)")
+    r"(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping|"
+    r"cache|deadline)($|_)")
 
 
 def load_user_module(module_name):
@@ -351,7 +352,7 @@ def _sanitize_cfg(cfg):
 
 def hook_master_seed(module_name, global_arrays, X, y, cfg, pcfg,
                      unit_ids=None, *, request_selection=None):
-    """Bind Hook randomness to its exact effective inputs, without persistence."""
+    """Bind Hook randomness and release-cache identity to its effective inputs."""
     if not isinstance(module_name, str) or not module_name:
         raise RuntimeError("Hook semantic module identity is invalid")
     clean_cfg = _sanitize_cfg(cfg)

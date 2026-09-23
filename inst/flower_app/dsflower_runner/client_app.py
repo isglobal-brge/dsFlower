@@ -41,7 +41,7 @@ from .params import get_torch_params, set_torch_params, load_user_model
 # sys.path / PYTHONPATH cannot shadow dp_harness and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import (dp_harness, release_guard, resampling, seeding,
+from . import (dp_harness, release_cache, release_guard, resampling, seeding,
                task as task_module, validation)
 
 
@@ -1255,6 +1255,13 @@ def train(msg: Message, context: Context) -> Message:
                     msg, new_arrays, hook_executed=False,
                     public_preflight_unavailable=True)
 
+            cache = release_cache.ReleaseCache.from_env(forbidden_dirs=(
+                release_guard._manifest_dir(context),
+                os.environ.get("DSFLOWER_PINNED_APP_DIR", "")))
+            # Reserve the complete public worst case, including later rounds,
+            # before reading or hashing any private data. R reserves at run
+            # admission as well; this boundary revalidates the durable contract.
+            cache.reserve_run(claim["run_fingerprint"], num_rounds)
             hook_public_ready = True
             module_name = str(cfg["user-module"])
             hook_started = time.monotonic()
@@ -1267,19 +1274,34 @@ def train(msg: Message, context: Context) -> Message:
                     module_name, old, X, y, public_hook_cfg, pcfg_round,
                     unit_ids=unit_ids, request_selection=seeding.request_selection(
                         task_module._load_manifest(context)))
-                execution_seed = tier2_lib.hook_execution_seed(
-                    module_name, old, public_hook_cfg, pcfg_round,
-                    request_selection=seeding.request_selection(
-                        task_module._load_manifest(context)))
-                new_arrays = tier2_lib.gated_local_update(
-                    module_name, old, X, y, public_hook_cfg, pcfg_round,
-                    seed=seeding.sub_seed(master, "egress"),
-                    execution_seed=seeding.sub_seed(
-                        execution_seed, "egress-execution"),
-                    hook_caps=hook_caps, unit_ids=unit_ids,
-                    release_started=hook_started, pad_release=False)
+                with cache.release(
+                        claim["run_fingerprint"], claim["coordinate"],
+                        claim["request_id"], release_cache.cache_key(master)) as slot:
+                    if slot.cached is not None:
+                        new_arrays, metrics = slot.cached
+                    else:
+                        execution_seed = tier2_lib.hook_execution_seed(
+                            module_name, old, public_hook_cfg, pcfg_round,
+                            request_selection=seeding.request_selection(
+                                task_module._load_manifest(context)))
+                        new_arrays = tier2_lib.gated_local_update(
+                            module_name, old, X, y, public_hook_cfg, pcfg_round,
+                            seed=seeding.sub_seed(master, "egress"),
+                            execution_seed=seeding.sub_seed(
+                                execution_seed, "egress-execution"),
+                            hook_caps=hook_caps, unit_ids=unit_ids,
+                            release_started=hook_started, pad_release=False)
+                        metrics = {"num-examples": 1, "hook-executed": 1}
+                        slot.commit(new_arrays, metrics)
+                        new_arrays, metrics = slot.cached
             finally:
                 tier2_lib.pad_hook_release(hook_started, pcfg_round)
+            # These exact arrays and constant metrics are durable before any
+            # release. Only the Flower transport envelope belongs to this retry.
+            return Message(content=RecordDict({
+                "arrays": ArrayRecord(numpy_ndarrays=new_arrays),
+                "metrics": MetricRecord(metrics),
+            }), reply_to=msg)
         else:  # neural (tabular or image)
             if operation not in ("train", "cv-train"):
                 raise RuntimeError("unsupported neural release operation")

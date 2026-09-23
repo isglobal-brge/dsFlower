@@ -1,11 +1,12 @@
 """Stateless, semantic deterministic randomness for private releases.
 
-The only persistent state is a custodial 256-bit node key.  HMAC-SHA256 binds
+The randomness contract needs only a custodial 256-bit node key. HMAC-SHA256 binds
 each master key to the effective mechanism, public configuration, privacy
 policy, server round, incoming public arrays, and effective private inputs.
 Operational identities (run tokens, message ids, paths and timestamps) never
-enter this contract.  Recomputing the same semantic release therefore produces
-the same stream without a database, counter, cache, or historical budget.
+enter this contract. Recomputing the same semantic identity produces the same
+stream without a historical budget. Gated Hooks separately persist their first
+released output so application nondeterminism cannot create a second release.
 
 Numeric DP noise uses a ChaCha20 stream rather than NumPy's statistical PCG.
 Its unpredictability is computational and depends on keeping the node key

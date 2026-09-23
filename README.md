@@ -148,7 +148,9 @@ before pixel decode, so the backbone extracts only the selected side.
 Privacy is server-authoritative. The client cannot set epsilon, delta, clipping
 or HookApp controls. The custodian pins one positive epsilon/delta pair for each
 training, and its accountant composes that contract across the training's own
-rounds. There is no historical database, quota or resource-specific balance.
+rounds. There is no historical privacy-budget database, query quota or
+resource-specific privacy balance. Gated-Hook cache capacity is a separate
+storage admission limit.
 Distinct trainings are independent releases and compose in the standard way
 when an analyst chooses to reason about them together. Metric and threshold
 selection over one released DP model is ordinary post-processing; training a
@@ -210,17 +212,21 @@ Within one Flower run, a bounded claim ledger in the private staging directory
 reserves every operation/fold/round coordinate atomically before private work.
 It is mirrored into `NodeState`, survives ClientApp process restarts while that
 run's staging remains, and prevents concurrent processes from claiming the same
-coordinate. A changed payload cannot reuse a claim, and an older exact request
-fails closed once its cached reply has advanced. This per-run replay control is
+coordinate. A changed payload cannot reuse a claim. Declarative requests fail
+closed once their in-memory reply has advanced; gated Hooks can replay earlier
+committed rounds from the durable cache after rechecking semantic data identity.
+A changed cache key cannot reuse a committed coordinate. This per-run control is
 distinct from a cross-training privacy-budget ledger; separate authorized
 trainings still compose under the custodian's deployment policy.
 
 The trusted built-in tracks request strict deterministic Torch kernels. HookApps
 receive deterministic Python, NumPy and Torch seeds, and their final noise key is
 also bound to the validated clipped update. Arbitrary native user code cannot be
-certified deterministic by a static scanner, so exact stateless retry stickiness
-for HookApps applies only to deterministic HookApps. Hook execution is disabled
-by default and remains the deliberately weaker, custodian-gated extension path.
+certified deterministic by a static scanner. A durable node-owned cache therefore
+makes exact retry apply to every admitted HookApp, deterministic or not. Entries
+remain pinned throughout active runs; cross-run replay lasts while they remain
+retained. Hook execution is disabled by default and remains the deliberately
+weaker, custodian-gated extension path.
 
 The current Gaussian sampler is a hardened Box--Muller construction over
 IEEE-754 values. ChaCha20 makes its finite random choices unpredictable, but it
@@ -356,6 +362,8 @@ controls remain normal DataSHIELD profile options.
 | `mask_data_root` | unset | Custodian PNG-mask root for direct segmentation metadata; declared paths must remain within it. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |
 | `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; `DSFLOWER_NODE_SECRET_FILE` takes precedence when a deployment selects a service or secret-manager path. |
+| `release_cache_dir` | `release-cache` beside the node secret | Persistent gated-Hook release cache, outside staging and Hook mounts; requires service-owned `0700` directories and `0600` regular files, with no symlinks. |
+| `release_cache_bytes` | `1073741824` | Administrator-pinned logical byte capacity for encoded gated-Hook releases, bookkeeping and active-run reservations. Admission fails before private work if the complete public worst-case run reservation cannot fit without evicting pinned entries. |
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |
 | `max_fab_bytes` | `52428800` | Per-FAB compressed upload cap. |
 | `app_spool_max_bytes` | `1073741824` | Global logical-byte cap across all uploaded FABs and unpacked apps. |
@@ -382,6 +390,45 @@ child are confined by cgroup v2 memory, PID and CPU limits (`memory.max`,
 tmpfs or quota-enforced volume. Bubblewrap/RLIMIT alone do not satisfy this
 second gate. Without both attestations, the time envelope and `hook_enabled`, a
 HookApp remains a data-independent no-op.
+
+Every admitted HookApp uses the durable release cache. Identical semantic
+requests, including nondeterministic applications, replay the exact first
+released arrays and constant metrics without re-executing the Hook. The v2 key
+binds effective private data, source/column selections, verified application
+contents, public model, policy and round; run tokens, paths and cache capacity
+do not reroll the release. Changed data or selections miss, but cannot authorize
+a second release at a committed coordinate. The noised-zero failure outcome is
+cached in the same way.
+
+Configure cache location and capacity through administrator `dsflower.*` or
+`default.dsflower.*` options. Analyst run configuration, nested `app_params` and
+manifest overrides cannot set them. Keep the directory on persistent local
+storage, outside staging, the application spool and all Hook filesystem mounts.
+Unsafe permissions, ownership, symlinks and nonregular files fail closed. Cache
+files contain only exact noised releases and operational bookkeeping; master
+seeds and noise keys are never persisted there.
+
+Capacity is reserved from public model bounds and the round count before private
+staging: 65 MiB per round, plus 4 KiB + 2 KiB per round of run bookkeeping and
+64 KiB of shared bookkeeping. Provision extra physical disk headroom for SQLite
+journals and filesystem overhead; this logical reservation does not isolate
+storage faults. Concurrent identical requests serialize. Each active run pins every
+entry it uses, and cleanup closes that run before releasing its pins. Only
+unpinned entries are evicted, oldest first. Interrupted or crashed runs retain
+their uncertain pins until authoritative cleanup; do not manually delete their
+cache state to free space. Increasing the administrator's capacity or completing
+cleanup can restore admission. Cross-run exact replay lasts only while the
+entry remains retained; an evicted nondeterministic release cannot be recreated.
+Closed-run tombstones retain their metadata charge to reject late messages;
+enough retained bookkeeping can also exhaust admission capacity. If a crash
+loses the staging receipt or R handle, an administrator must stop the run's
+workers and explicitly close its stored run fingerprint with the trusted
+`release_cache.py close` command. Absence of a process or elapsed time never
+automatically removes uncertain pins.
+Preserve both the node secret and cache volume across service replacements.
+Declarative tracks do not use this cache. Cache availability and hit/miss timing
+remain outside the numeric DP guarantee, and the minimum-duration envelope is
+unchanged.
 
 Upload admission and writes are serialized by a node-global lock, so the
 physical byte cap is atomic across R sessions. There is no catalogue-entry or
@@ -427,6 +474,8 @@ options(
   default.dsflower.dp_per_training_delta = 1e-6,
   default.dsflower.dp_unit = "row",
   default.dsflower.node_secret_path = "/var/lib/dsflower/privacy/noise_root",
+  default.dsflower.release_cache_dir = "/var/lib/dsflower/privacy/release-cache",
+  default.dsflower.release_cache_bytes = 1024^3,
   default.dsflower.app_spool_root = "/var/lib/dsflower/appstore",
   default.dsflower.hook_enabled = FALSE
 )
@@ -463,7 +512,8 @@ base. If no `uv` is installed, dsFlower does not execute a mutable remote
 installer or a `latest` URL. Automatic Python bootstrap requires both an exact
 official release tag in `DSFLOWER_UV_VERSION` and its platform archive digest
 in `DSFLOWER_UV_SHA256`; a mismatch fails before extraction. For containers,
-persist `/var/lib/dsflower/privacy/noise_root` and the app-store directory. A
+persist `/var/lib/dsflower/privacy/noise_root`, the gated-release cache and the
+app-store directory. A
 secret-manager file may instead be selected through
 `DSFLOWER_NODE_SECRET_FILE`. Do not mount all of `/var/lib/dsflower`, because
 that path also contains the baked venvs.

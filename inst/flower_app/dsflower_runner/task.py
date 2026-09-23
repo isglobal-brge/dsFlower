@@ -926,12 +926,20 @@ def _validate_cv_execution_config(manifest, cfg):
 def load_pinned_run_config(context=None):
     """Overlay every node-pinned declarative field onto Flower run_config."""
     manifest = _load_manifest(context)
+    cfg = _run_config(context)
+    # Cache storage belongs to the administrator's launch environment, never
+    # the analyst's Flower configuration or manifest overrides.
+    for source in (manifest, cfg):
+        for key in source:
+            normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+            normalized = normalized.lower().replace("-", "_").replace(".", "_")
+            if re.search(r"(^|_)(cache|deadline)($|_)", normalized):
+                raise ValueError("cache and deadline controls are administrator-only")
     if (manifest.get("resampling-contract-sha256") is not None
             or manifest.get("cv-contract-sha256") is not None):
         if pinned_unit_count_from_manifest(manifest) < 1:
             raise ValueError(
                 "resampling requires a positive pinned privacy-unit count")
-    cfg = _run_config(context)
     if (manifest.get("loss-name") == "segmentation_bce_dice"
             or cfg.get("loss-name") == "segmentation_bce_dice"
             or manifest.get("task-type") == "segmentation"

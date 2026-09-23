@@ -354,9 +354,32 @@ different deterministic noise realizations. See the runner's
 Trusted built-in tracks request strict deterministic Torch kernels. HookApps are
 seeded for Python, NumPy and Torch and bind final noise to the validated clipped
 update, but arbitrary native uploaded code cannot be proven deterministic by
-static inspection. Stateless exact-retry stickiness therefore applies only to
-deterministic HookApps; this is one reason Hook execution is disabled by default
-and gated more strictly than declarative mechanisms.
+static inspection. Every admitted HookApp, deterministic or not, therefore uses
+a durable node-owned release cache. Its domain-separated key is derived from the
+v2 Hook master identity before execution. The cache stores exact final noised
+array dtype, shape and bytes and constant reply metrics, including noised-zero
+outcomes, without storing the master or noise keys. Exact retries replay that
+release without executing the application; current Flower transport metadata is
+reconstructed for the current request. Declarative tracks retain their existing
+deterministic kernels and do not use this cache.
+
+Cache capacity is reserved from public bounds before private work. Concurrent
+identical requests serialize, and entries are pinned throughout every active
+run that uses them. Only authoritative run closure releases those pins; crash
+recovery retains uncertain pins. Eviction removes only unpinned entries, oldest
+first. Exact retry thus applies to every Hook application throughout its active
+run and across runs while its release remains retained. Evicted nondeterministic
+releases cannot be reconstructed, so indefinite cross-run replay is not claimed.
+Changed private data or request selections miss even after an in-memory reply,
+and a committed coordinate cannot authorize a second release under another key.
+
+Replay is deterministic post-processing of the first mechanism output, without
+another observation from application randomness. It does not change clipping,
+sensitivity, noise calibration or accounting, make distinct requests free, or
+create a cross-training privacy budget. The numeric guarantee still assumes
+cache lookup, hit/miss timing and storage failures do not become additional
+private-dependent transcript signals. The existing minimum-duration envelope
+remains defense in depth; the cache does not establish a fixed-duration deadline.
 
 The Gaussian implementation uses a hardened Box--Muller transform over a finite
 IEEE-754 support. The keyed ChaCha20 stream prevents prediction and averaging,
@@ -374,6 +397,7 @@ The client can request a valid declarative computation but cannot set or weaken:
 - number of rounds in the current training;
 - DP unit, patient column and identifier canonicalisation;
 - HookApp enablement, sandbox attestation, timeout or timing envelope;
+- gated-release cache directory or byte capacity;
 - exact metrics, counts, logs or feature statistics.
 
 Server-owned structural manifest fields cannot be duplicated or overridden by
@@ -386,9 +410,13 @@ public parameters. A separate hidden SQLite ledger in the same private staging
 directory atomically records the bounded release coordinates already claimed by
 that run and is mirrored into Flower `NodeState`; this survives ClientApp
 process restarts without becoming a budget shared across trainings.
-`.cleanupStaging()` removes both the inputs and that per-run ledger. Losing them
-after the run is cleaned cannot change sticky randomness; an equivalent new
-training reconstructs the same semantic PRF input.
+For gated Hooks, committed coordinates additionally bind the semantic cache key;
+an older-round retry may replay its retained release after data identity is
+verified, but may never claim another key for that coordinate. Authoritative
+cleanup closes cache admission for the run before removing inputs and the
+per-run ledger and releasing cache pins. The durable cache lives separately from
+staging. An equivalent new declarative training reconstructs the same semantic
+PRF input; an equivalent new Hook training replays while its entry is retained.
 
 The node pins the recursive runner hash. The client's bundled runner must be
 byte-identical. The coordinated release check
@@ -510,6 +538,8 @@ options(
   default.dsflower.dp_per_training_delta = 1e-6,
   default.dsflower.dp_unit = "row",
   default.dsflower.node_secret_path = "/var/lib/dsflower/privacy/noise_root",
+  default.dsflower.release_cache_dir = "/var/lib/dsflower/privacy/release-cache",
+  default.dsflower.release_cache_bytes = 1024^3,
   default.dsflower.hook_enabled = FALSE
 )
 ```
@@ -573,7 +603,10 @@ image default.
 
 The node secret is runtime state, never image content. Container deployments
 should persist `/var/lib/dsflower/privacy/noise_root` when stable deterministic
-noise across replacements is desired. A missing seed is recoverable and creates
+noise across replacements is desired, together with the gated-Hook cache
+(default `/var/lib/dsflower/privacy/release-cache`) for exact replay of retained
+releases. Cache directories and files require service ownership, modes `0700`
+and `0600` respectively, and no symlinks. A missing seed is recoverable and creates
 an independent noise domain. Do not clone one secret to concurrent nodes.
 Mounting all of `/var/lib/dsflower` would hide the baked `venvs/` and is therefore
 not recommended. The package intentionally leaves volume wiring to the Rock or

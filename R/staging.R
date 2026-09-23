@@ -967,7 +967,9 @@
 
 .validate_manifest_extra_config <- function(extra_config) {
   extra_config <- .merge_manifest_config(list(), extra_config)
-  conflicts <- intersect(names(extra_config), .manifest_structural_fields())
+  conflicts <- unique(c(
+    intersect(names(extra_config), .manifest_structural_fields()),
+    names(extra_config)[.release_cache_control_key(names(extra_config))]))
   if (length(conflicts)) {
     stop("Manifest configuration cannot provide server-owned field(s): ",
          paste(conflicts, collapse = ", "), ".", call. = FALSE)
@@ -1189,9 +1191,12 @@
   if (is.null(run_token)) return(invisible(TRUE))
 
   run_token <- .validate_run_token(run_token)
+  staging_dirs <- vapply(.expectedStagingDirs(run_token, create_roots = FALSE),
+    .validateStagingDir, character(1), run_token = run_token, must_exist = FALSE)
+  .release_cache_close_staging(run_token, staging_dirs)
   # Check every permitted root. Exact token validation and canonical containment
   # happen before recursive deletion; traversal and symlink aliases fail closed.
-  for (staging_dir in .expectedStagingDirs(run_token, create_roots = FALSE)) {
+  for (staging_dir in staging_dirs) {
     staging_dir <- .validateStagingDir(
       staging_dir, run_token, must_exist = FALSE)
     if (file.exists(staging_dir) || dir.exists(staging_dir)) {
