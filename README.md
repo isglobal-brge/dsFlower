@@ -66,9 +66,10 @@ Duplicate rows, unusable identifiers and invalid outcomes become safe zero-loss
 subject contributions. Source rows and subjects are never removed or disclosed.
 Cox remains excluded because its risk-set loss couples different subjects.
 
-Survival evaluation uses the released model on public or independently
-authorized analyst-local held-out data (channel B). Private validation, atomic
-holdout, CV and private metric-based HPO reject these tasks at public preflight.
+Survival private validation, atomic holdout and CV release observed-status Brier
+at public horizons and bounded fitted NLL. Concordance remains a public-split or
+authorized analyst-local metric; private HPO remains unsupported. See
+[private validation and CV](PRIVATE_VALIDATION_CV.md) for the layouts and calls.
 Predictive utility is an empirical question; implementing the contract does not
 establish a useful concordance score for any dataset or privacy budget.
 
@@ -127,7 +128,8 @@ Each row or configured patient contributes one bounded
 histogram/sufficient-statistic vector. The node releases its sum once through the
 Gaussian mechanism; exact predictions, labels, counts and per-node metrics never
 leave the node. The ServerApp requires every selected node and derives binary,
-multiclass, ordinal, multilabel, bounded-regression or count metrics only by
+multiclass, ordinal, multilabel, bounded-regression, count and the patient
+segmentation/survival metrics only by
 post-processing the pooled DP vector. This is external validation when the
 assigned dataset is independent and resubstitution validation otherwise; it does
 not relabel reuse as cross-validation.
@@ -137,11 +139,12 @@ or zero-filled metrics, and this does not introduce a query-count lockout.
 
 Atomic holdout is available for supported classification/regression/count
 tabular neural/native-tree training and native
-dsFlower 2D/3D vision models. Nodes derive the same secret-keyed row/patient
+dsFlower 2D/3D vision models, patient segmentation and survival. Nodes derive the same secret-keyed row/patient
 split before training, spend the fixed 80/20 job budget on training and one
 pooled test release, and publish the model plus metrics only after the exact
 roster completes both phases. Vision paths and patient IDs are partitioned
-before pixel decode, so the backbone extracts only the selected side.
+before pixel decode for ordinary vision. Segmentation uses its canonical patient
+assembly and excludes the opposite side from training and metric contributions.
 
 ## Per-training privacy
 
@@ -378,10 +381,11 @@ Public initialisation does not change the DP accountant, clipping, sampler,
 training algorithm, release cache or identity-v2 machinery. Segmentation remains
 experimental; the mirror's licence declaration retains its original qualification.
 
-Private validation, holdout, CV and HPO reject during public preflight. Dice and
-IoU, including empty/foreground strata, are available only for public or
-authorized local evaluation at threshold 0.5; both-empty Dice is 1. Local
-predictions use the canonical 128-by-128 grid.
+Private validation, holdout and CV release bounded pooled foreground Dice.
+Mean patient Dice, IoU and empty/foreground strata remain public or authorized
+local metrics; local both-empty Dice is 1. Private HPO remains unsupported.
+See [private validation and CV](PRIVATE_VALIDATION_CV.md) for the distinction and
+public-initialisation calls. Local predictions use the canonical 128-by-128 grid.
 
 ## Custodian options
 

@@ -28,18 +28,38 @@
 }
 
 .public_initialisation_policy_status <- function() {
+  contracts <- c(.CHECKPOINT_CONTRACT, "declarative_neural")
   list(default = .public_initialisation_policy(NULL), contracts =
-    stats::setNames(list(.public_initialisation_policy()), .CHECKPOINT_CONTRACT))
+    stats::setNames(lapply(contracts, .public_initialisation_policy), contracts))
 }
 
-.require_checkpoint_policy <- function(origin) {
-  policy <- .public_initialisation_policy()
+.require_checkpoint_policy <- function(origin, contract = .CHECKPOINT_CONTRACT) {
+  policy <- .public_initialisation_policy(contract)
   if (identical(policy, "none") ||
       (identical(origin, "analyst-declared") &&
        !identical(policy, "analyst_or_resource"))) {
     stop("Public initialisation is refused by the custodian policy.", call. = FALSE)
   }
   policy
+}
+
+# The closed bundle profile is not known until public acquisition/verification.
+# Refuse ingress if neither supported profile is admitted; then enforce its
+# actual contract policy before creating a usable admission or opening data.
+.require_checkpoint_ingress_policy <- function(origin) {
+  policies <- vapply(c(.CHECKPOINT_CONTRACT, "declarative_neural"),
+                     .public_initialisation_policy, character(1))
+  allowed <- if (identical(origin, "analyst-declared"))
+    policies == "analyst_or_resource" else policies != "none"
+  if (!any(allowed)) stop("Public initialisation is refused by the custodian policy.",
+                         call. = FALSE)
+  invisible(TRUE)
+}
+
+.checkpoint_snapshot_policy <- function(snapshot, origin) {
+  contract <- if (identical(snapshot$provenance$manifest$role, "tabular_model"))
+    "declarative_neural" else .CHECKPOINT_CONTRACT
+  .require_checkpoint_policy(origin, contract)
 }
 
 .checkpoint_cache_root <- function() {
@@ -293,7 +313,7 @@ CheckpointResourceClient <- R6::R6Class("CheckpointResourceClient",
     #' @description Acquire and verify a registered descriptor.
     #' @param resource A custodian-registered resource descriptor.
     initialize = function(resource) {
-      .require_checkpoint_policy("resource")
+      .require_checkpoint_ingress_policy("resource")
       if (!inherits(resource, "resource") ||
           !.is_checkpoint_resource_format(resource$format) ||
           !is.character(resource$url) || length(resource$url) != 1L ||
@@ -319,6 +339,7 @@ CheckpointResourceClient <- R6::R6Class("CheckpointResourceClient",
         stop("Checkpoint resource acquisition or verification failed; reassign the registered resource.",
              call. = FALSE)
       })
+      .checkpoint_snapshot_policy(private$snapshot, "resource")
       # Do not keep transport URL, credentials or the original descriptor.
       super$initialize(resourcer::newResource(name = "checkpoint", url = "",
         format = resource$format))
@@ -368,7 +389,7 @@ CheckpointResourceClient <- R6::R6Class("CheckpointResourceClient",
 #' @export
 flowerCheckpointInitDS <- function(resource_symbol) {
   .dsflower_require_literal_arguments()
-  .require_checkpoint_policy("resource")
+  .require_checkpoint_ingress_policy("resource")
   owner_env <- parent.frame()
   if (!.checkpoint_symbol(resource_symbol) ||
       !exists(resource_symbol, owner_env, inherits = FALSE)) {
@@ -382,6 +403,7 @@ flowerCheckpointInitDS <- function(resource_symbol) {
   snapshot <- client$getSnapshot()
   verified <- .checkpoint_verify("verify", snapshot$snapshot_directory,
                                   snapshot$provenance$manifest_sha256)
+  .checkpoint_snapshot_policy(verified, "resource")
   .checkpoint_reference(verified, owner_env)
 }
 
@@ -391,12 +413,12 @@ flowerCheckpointInitDS <- function(resource_symbol) {
 #' @export
 flowerCheckpointStatusDS <- function(handle_symbol) {
   .dsflower_require_literal_arguments()
-  policy <- .require_checkpoint_policy("resource")
+  .require_checkpoint_ingress_policy("resource")
   snapshot <- .checkpoint_resolve(handle_symbol, parent.frame())
   verified <- .checkpoint_verify("verify", snapshot$snapshot_directory,
                                   snapshot$provenance$manifest_sha256)
   result <- .checkpoint_public_summary(verified, "resource")
-  result$policy <- policy
+  result$policy <- .checkpoint_snapshot_policy(verified, "resource")
   result
 }
 
@@ -421,7 +443,7 @@ flowerCheckpointUploadDS <- function(action, upload_id = NULL, chunk_b64 = NULL,
       !action %in% c("begin", "chunk", "finish", "abort")) {
     stop("Invalid public checkpoint upload action.", call. = FALSE)
   }
-  if (!identical(action, "abort")) .require_checkpoint_policy("analyst-declared")
+  if (!identical(action, "abort")) .require_checkpoint_ingress_policy("analyst-declared")
   state <- .checkpoint_state(parent.frame(), TRUE)
   for (token in ls(state, all.names = TRUE)) {
     entry <- state[[token]]
@@ -514,6 +536,7 @@ flowerCheckpointUploadDS <- function(action, upload_id = NULL, chunk_b64 = NULL,
   }
   if (!is.null(chunk_b64) || !is.null(index)) stop("Invalid upload finish arguments.", call. = FALSE)
   if (!is.null(entry$snapshot)) {
+    .checkpoint_snapshot_policy(entry$snapshot, "analyst-declared")
     return(list(upload_id = upload_id,
       public_initialisation = .checkpoint_public_summary(entry$snapshot, "analyst-declared")))
   }
@@ -528,6 +551,7 @@ flowerCheckpointUploadDS <- function(action, upload_id = NULL, chunk_b64 = NULL,
   if (!identical(snapshot$provenance$manifest_sha256, entry$manifest_sha256)) {
     stop("Declared checkpoint manifest digest does not match the bundle.", call. = FALSE)
   }
+  .checkpoint_snapshot_policy(snapshot, "analyst-declared")
   entry$snapshot <- snapshot
   entry$work <- NULL
   state[[upload_id]] <- entry

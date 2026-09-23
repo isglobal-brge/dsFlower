@@ -167,7 +167,7 @@ def test_verified_public_payload_initializes_server_and_node_exactly(registry):
 def test_later_round_uses_federated_arrays_and_first_round_refuses_substitution(registry):
     changed = [a + np.float32(.25) for a in registry.arrays]
     cfg = pinned(registry)
-    with pytest.raises(ValueError, match="first global decoder"):
+    with pytest.raises(ValueError, match="admitted checkpoint"):
         client_app._prepare_neural_model(message(changed), registry.context, cfg, {}, pins())
     model, _, _ = client_app._prepare_neural_model(
         message(changed), registry.context, cfg, {}, pins(2))
@@ -308,7 +308,7 @@ def test_public_selection_requires_node_authorization_and_matching_decoder(regis
 def test_checkpoint_fields_cannot_select_another_contract(key):
     context = SimpleNamespace(run_config={key: "public:unapproved"})
     with mock.patch.object(task, "_load_manifest", return_value={}):
-        with pytest.raises(ValueError, match="require the segmentation contract"):
+        with pytest.raises(ValueError, match="require admitted material"):
             task.load_pinned_run_config(context)
 
 

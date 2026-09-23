@@ -104,9 +104,10 @@ derived tensor geometry and totalization. Sticky identity binds distribution,
 dispersion, public time/grid conventions, validity and effective feature/target
 tensors. Only DP parameters and existing availability metadata leave the node;
 no training losses, subject weights, survival predictions or outcome tensors
-are added to the release. Evaluation belongs to channel B on public or
-independently authorized local held-out data. Private validation, holdout, CV
-and private metric-based HPO remain unsupported and fail public preflight.
+are added to the training release. Private validation, holdout and CV add one
+fixed-layout Gaussian release for observed-status Brier and bounded fitted NLL.
+Concordance stays on public/authorized local splits and private HPO remains
+unsupported. [The validation design](DESIGN_VALIDATION_CV.md) derives sensitivities.
 
 ### HookApp
 
@@ -222,8 +223,10 @@ accepted model nor metrics.
 This release implements atomic holdout for tabular declarative neural/native-tree
 models and native dsFlower vision models with their exact extractor profile.
 HookApp backends fail explicitly before private preparation and are not
-advertised as holdout-capable. K-fold cross-validation remains tabular-only for
-neural models and native-tree binary classification or bounded regression.
+advertised as holdout-capable. K-fold cross-validation supports tabular neural
+models (including survival), patient segmentation and native-tree binary
+classification or bounded regression. Ordinary image classification CV remains
+unsupported. Both admitted public starts apply independently to every fold.
 Extending the same engine-agnostic resampling contract to another backend
 requires a reviewed backend-specific training/evaluation adapter; accepting a
 contract without executing both sides is forbidden.
@@ -234,7 +237,9 @@ The experimental `pytorch_resnet18_segmentation` contract uses the neural
 mechanism with a mandatory custodian-selected patient privacy unit. It is
 implemented but not promoted (`vetted = FALSE`): the packaged v5 public-data
 benchmark evidence remains subject to reviewer acceptance. Private validation,
-atomic holdout, CV and HPO are outside this contract and fail public preflight.
+atomic holdout and CV use bounded patient intersection/prediction/reference
+statistics for pooled foreground Dice; private HPO remains unsupported. See
+[the metric and initialisation contract](DESIGN_VALIDATION_CV.md).
 
 The frozen `resnet18_layer2_128_v1` encoder resides outside the released module.
 It runs under `eval()` and `no_grad()` with fixed pretrained BatchNorm statistics.

@@ -43,7 +43,8 @@
     return(run_config)
   }
   origin <- if (startsWith(init, "client:")) "analyst-declared" else "resource"
-  policy <- .require_checkpoint_policy(origin)
+  contract <- if (.segmentationRequested(run_config)) .CHECKPOINT_CONTRACT else "declarative_neural"
+  policy <- .require_checkpoint_policy(origin, contract)
   if (identical(origin, "resource")) {
     snapshot <- .checkpoint_resolve(substring(init, 10L), owner_env)
   } else {
@@ -59,6 +60,10 @@
   verified <- .checkpoint_verify("verify", snapshot$snapshot_directory,
     snapshot$provenance$manifest_sha256, .checkpoint_decoder_spec(run_config))
   summary <- .checkpoint_public_summary(verified, origin)
+  if (!.segmentationRequested(run_config) &&
+      !identical(summary$provenance$manifest$role, "tabular_model")) {
+    stop("Public checkpoint does not match the declarative tabular contract.", call. = FALSE)
+  }
   run_config[["segmentation-decoder-init"]] <- if (identical(origin, "resource")) "resource" else "client"
   run_config[["public-initialisation-origin"]] <- origin
   run_config[["public-initialisation-manifest-sha256"]] <- summary$manifest_sha256
@@ -80,20 +85,19 @@
                                          owner_env = parent.frame()) {
   fields <- intersect(names(run_config), .segmentationConfigFields())
   if (!.segmentationRequested(run_config)) {
-    if (length(fields)) {
+    if (length(setdiff(fields, "segmentation-decoder-init"))) {
       stop("Segmentation fields require the segmentation contract.", call. = FALSE)
     }
     return(run_config)
   }
-  if (!identical(track, "neural") ||
+  if (!track %in% c("neural", "validation") ||
       !identical(run_config[["data_type"]], "image") ||
       !identical(run_config[["loss-name"]], "segmentation_bce_dice")) {
-    stop("Segmentation requires neural image training with segmentation_bce_dice.",
+    stop("Segmentation requires neural image training or validation with segmentation_bce_dice.",
          call. = FALSE)
   }
-  if (any(grepl("^(validation-|resampling-|holdout-|cv-|hpo-)",
-                names(run_config)))) {
-    stop("Private segmentation validation, holdout, CV and HPO are unsupported.",
+  if (any(grepl("^hpo-", names(run_config)))) {
+    stop("Private segmentation HPO is unsupported.",
          call. = FALSE)
   }
   unit <- .resolvePrivacyUnitPolicy(unit_policy)
@@ -162,10 +166,14 @@
     stop("Segmentation metadata roles must use distinct columns.", call. = FALSE)
   }
   if (length(intersect(names(run_config), c(
-      "feature-bounds", "target-bounds", "target-levels", "num-labels")))) {
+      "feature-bounds", "target-bounds", "target-levels"))) ||
+      (!is.null(run_config[["num-labels"]]) &&
+       !identical(as.numeric(run_config[["num-labels"]]), 2))) {
     stop("Segmentation does not accept scalar target or tabular feature contracts.",
          call. = FALSE)
   }
+  # Pin the otherwise unused compatibility count for CV recipe equality.
+  run_config[["num-labels"]] <- 2L
   .normalizeSegmentationDecoderInit(run_config, owner_env)
 }
 

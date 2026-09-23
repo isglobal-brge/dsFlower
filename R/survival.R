@@ -17,15 +17,10 @@
   survival <- identical(requested, "survival") ||
     isTRUE(loss %in% .SURVIVAL_LOSSES) || !is.null(supplied)
   if (!survival) return(run_config)
-  if (!identical(track, "neural") || !isTRUE(loss %in% .SURVIVAL_LOSSES)) {
-    stop("Survival requires the trusted neural survival loss contract; private ",
-         "validation and other tracks are unsupported.", call. = FALSE)
+  if (!track %in% c("neural", "validation") || !isTRUE(loss %in% .SURVIVAL_LOSSES)) {
+    stop("Survival requires the trusted neural survival loss contract.", call. = FALSE)
   }
   run_config[["loss-name"]] <- loss
-  if (any(grepl("^(validation-|resampling-|holdout-|cv-)", names(run_config)))) {
-    stop("Survival private validation, holdout and CV are unsupported.",
-         call. = FALSE)
-  }
   if (!identical(run_config[["data_type"]] %||% "tabular", "tabular")) {
     stop("Survival requires tabular baseline covariates.", call. = FALSE)
   }

@@ -50,19 +50,18 @@ test_that("segmentation authority rejects hostile pins and scalar target roles",
                "require the segmentation contract")
 })
 
-test_that("new-task private evaluation rejects before private staging", {
+test_that("incomplete segmentation evaluation contracts reject before private staging", {
   local_segmentation_roots()
   config <- segmentation_config()
   for (key in c("validation-bins", "resampling-method", "holdout-validation-bins",
                 "cv-folds")) {
     bad <- config
     bad[[key]] <- 3L
-    expect_error(dsFlower:::.addDpConfigToRunConfig(bad),
-                 "Private segmentation validation, holdout, CV and HPO")
+    expect_error(dsFlower:::.addDpConfigToRunConfig(bad))
   }
   config[["dp-track"]] <- "validation"
   config[["validation-task"]] <- "segmentation"
-  expect_error(dsFlower:::.addDpConfigToRunConfig(config), "neural image training")
+  expect_error(dsFlower:::.addDpConfigToRunConfig(config), "validation-model-track")
 })
 
 test_that("direct segmentation retains source census and custodian mask roots", {

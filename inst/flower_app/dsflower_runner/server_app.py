@@ -126,8 +126,8 @@ def _build_initial_model(cfg):
                                            num_labels=num_labels, **spatial)
     if not isinstance(model, torch.nn.Module):
         raise ValueError("build_from_spec must return a torch.nn.Module")
-    if loss_name == "segmentation_bce_dice":
-        from . import segmentation_checkpoints
+    from . import segmentation_checkpoints
+    if segmentation_checkpoints.checkpoint_id(cfg) is not None:
         from .params import set_torch_params
         arrays = segmentation_checkpoints.server_initialization(cfg)
         if arrays is not None:
@@ -698,17 +698,20 @@ def _save_cross_validation(cfg, layout, metrics, folds):
         "binary": "accuracy", "multiclass": "accuracy",
         "ordinal": "accuracy", "multilabel": "macro_f1",
         "regression": "mae", "count": "mae",
+        "segmentation": "foreground_dice", "survival": "negative_log_likelihood",
     }[layout["task"]]
     primary = metrics.get(required_metric) if isinstance(metrics, dict) else None
     primary_is_number = (isinstance(primary, (int, float, np.number))
                          and not isinstance(primary, (bool, np.bool_)))
     primary_is_plausible = (
         (primary is None and layout["task"] in (
-            "multiclass", "ordinal", "multilabel"))
+            "multiclass", "ordinal", "multilabel", "survival"))
         or (primary_is_number and math.isfinite(float(primary))
             and float(primary) >= 0.0
             and (layout["task"] in ("regression", "count")
                  or float(primary) <= 1.0)))
+    if layout["task"] == "survival" and primary_is_number:
+        primary_is_plausible = math.isfinite(float(primary)) and abs(float(primary)) <= layout["nll_bound"]
     if (not isinstance(metrics, dict) or required_metric not in metrics
             or not primary_is_plausible
             or _contains_forbidden_cv_key(metrics)):
@@ -741,9 +744,10 @@ def _save_cross_validation(cfg, layout, metrics, folds):
 
 
 def _run_cross_validation(grid, cfg, track):
-    if track != "neural" or str(cfg.get("data-kind", "")).lower() != "tabular":
+    if track != "neural" or (str(cfg.get("data-kind", "")).lower() != "tabular"
+                               and cfg.get("loss-name") != "segmentation_bce_dice"):
         raise RuntimeError(
-            "cross-validation is implemented only for tabular neural runs")
+            "cross-validation requires tabular neural or trusted segmentation runs")
     folds = int(cfg.get("cv-folds", 0))
     if not 2 <= folds <= 10:
         raise RuntimeError("cross-validation folds must be in [2, 10]")
@@ -881,6 +885,7 @@ def _save_holdout(cfg, metrics):
         "binary": "accuracy", "multiclass": "accuracy",
         "ordinal": "accuracy", "multilabel": "macro_f1",
         "regression": "mae", "count": "mae",
+        "segmentation": "foreground_dice", "survival": "negative_log_likelihood",
     }[layout["task"]]
     if (not isinstance(metrics, dict) or required_metric not in metrics
             or any(key in metrics for key in (

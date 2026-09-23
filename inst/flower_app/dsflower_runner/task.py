@@ -254,7 +254,7 @@ def _survival_public_contract(manifest):
     loss_name = manifest.get("loss-name")
     config = survival.config_from_run(manifest, loss_name)
     if (manifest.get("task-type") != "survival"
-            or manifest.get("dp-track") != "neural"
+            or manifest.get("dp-track") not in ("neural", "validation")
             or manifest.get("dp-unit") != "patient"
             or manifest.get("patient-id-canonicalization") != "trim-utf8-v2"
             or manifest.get("data_type") != "tabular"):
@@ -266,9 +266,11 @@ def _survival_public_contract(manifest):
         {"survival-config-b64": manifest.get("survival-config-b64")}, loss_name)
     if encoded != config:
         raise ValueError("survival manifest configuration pins disagree")
-    if any(str(key).startswith(("resampling-", "cv-", "validation-", "holdout-"))
-           for key in manifest):
-        raise ValueError("survival private validation/resampling is unsupported")
+    from . import resampling
+    if any(str(key).startswith("cv-") for key in manifest):
+        resampling.cross_validation_contract_from_manifest(manifest)
+    if any(str(key).startswith(("holdout-", "resampling-")) for key in manifest):
+        resampling.contract_from_manifest(manifest)
     targets = manifest.get("target_column")
     features = manifest.get("feature_columns")
     patient = manifest.get("patient_column")
@@ -283,7 +285,7 @@ def _survival_public_contract(manifest):
     return config
 
 
-def load_survival_data(context=None):
+def load_survival_data(context=None, *, metric_targets=False):
     """Verify M source rows/N subjects and their server-staged subject tensors.
 
     Duplicate subject rows and invalid private outcomes are zero contributions;
@@ -293,11 +295,6 @@ def load_survival_data(context=None):
     manifest = _load_manifest(context)
     config = _survival_public_contract(manifest)
     directory = _get_manifest_dir(context)
-    source = _read_staged_frame(os.path.join(directory, manifest["data_file"]), manifest)
-    ids = _load_patient_ids(source, manifest)
-    assert_pinned_unit_count(context, len(source), ids, manifest=manifest)
-    if len(source) != manifest.get("n_samples"):
-        raise RuntimeError("survival source census changed after staging")
     features = manifest["feature_columns"]
     target_cols = list(survival.TARGET_COLUMNS)
     hazard = manifest["loss-name"] == "discrete_hazard_nll"
@@ -315,6 +312,11 @@ def load_survival_data(context=None):
     if (not isinstance(relative,str) or not relative or relative != os.path.basename(relative)
             or relative in (".","..") or "\\" in relative):
         raise ValueError("survival artifact path must be a staging basename")
+    source = _read_staged_frame(os.path.join(directory, manifest["data_file"]), manifest)
+    ids = _load_patient_ids(source, manifest)
+    assert_pinned_unit_count(context, len(source), ids, manifest=manifest)
+    if len(source) != manifest.get("n_samples"):
+        raise RuntimeError("survival source census changed after staging")
     artifact = _read_staged_frame(os.path.join(directory,relative),
                                   {**manifest,"data_format":"csv"})
     if (list(artifact.columns) != [manifest["patient_column"]]+features+target_cols
@@ -338,6 +340,7 @@ def load_survival_data(context=None):
         expected_x[i] = source_x[row]
         expected_y[i] = [max(config["t_min"],min(time,config["horizon"])),
                          event if time <= config["horizon"] else 0.,1.]
+    metric_y = expected_y.copy()
     train_y = expected_y
     if hazard:
         train_y = survival.period_targets(*expected_y.T,config)
@@ -348,7 +351,10 @@ def load_survival_data(context=None):
             or not np.allclose(actual_x,expected_x,rtol=2e-7,atol=1e-8)
             or not np.allclose(actual_y,expected_y,rtol=2e-7,atol=1e-8)):
         raise RuntimeError("survival artifact values do not match the staged source contract")
-    return expected_x,train_y.astype(np.float32),np.asarray(unique),len(source)
+    y = metric_y if metric_targets else train_y
+    # Public horizon comparisons and interval packing must retain the exact
+    # staged time: rounding to float32 can move an event across a boundary.
+    return expected_x,y.astype(np.float64 if metric_targets else np.float32),np.asarray(unique),len(source)
 
 
 def load_native_tree_data(context=None, *, manifest=None):
@@ -959,7 +965,11 @@ def load_pinned_run_config(context=None):
         for key in segmentation.PIN_KEYS:
             if key not in cfg or cfg[key] != manifest[key]:
                 raise ValueError("Flower segmentation config does not match manifest pin")
-        from . import segmentation_checkpoints as checkpoints
+    from . import segmentation_checkpoints as checkpoints
+    if (manifest.get("loss-name") == "segmentation_bce_dice"
+            or checkpoints.INIT_KEY in manifest or checkpoints.INIT_KEY in cfg):
+        if manifest.get("dp-track") not in ("neural", "validation"):
+            raise ValueError("public checkpoint requires a trusted neural contract")
         if any(key in source for source in (manifest, cfg) for key in (
                 "segmentation-public-manifest-sha256", "segmentation-public-checkpoint-sha256",
                 "segmentation-public-provenance")):
@@ -980,9 +990,14 @@ def load_pinned_run_config(context=None):
         if selected is None:
             cfg.pop(checkpoints.INIT_KEY, None)
     elif any(str(key).startswith(("segmentation-public-", "public-initialisation-"))
-             or key == "segmentation-decoder-init" for source in (manifest, cfg) for key in source
+             for source in (manifest, cfg) for key in source
              if key != "public-initialisation-policy"):
-        raise ValueError("public decoder checkpoint fields require the segmentation contract")
+        raise ValueError("public checkpoint fields require admitted material")
+    for key in ("validation-survival-horizons", "validation-survival-nll-bound"):
+        if key in cfg or key in manifest:
+            if (manifest.get("task-type") != "survival" or key not in manifest
+                    or cfg.get(key) != manifest[key]):
+                raise ValueError("survival validation metric pin differs from manifest")
     if manifest.get("cv-contract-sha256") is not None:
         _validate_cv_execution_config(manifest, cfg)
     if str(manifest.get("dp-track", "")).lower() == "egress":
@@ -1156,6 +1171,11 @@ def load_pinned_run_config(context=None):
         raise ValueError(
             "Flower config requests cross-validation without a manifest contract")
     if str(manifest.get("dp-track", "")).lower() == "validation":
+        if manifest.get("task-type") == "survival":
+            _survival_public_contract(manifest)
+            for key in ("survival-config-b64",):
+                if key not in manifest or cfg.get(key) != manifest[key]:
+                    raise ValueError("survival validation config differs from manifest")
         required = [
             "validation-model-track", "validation-task", "validation-bins",
             "validation-contract-sha256",
@@ -1173,6 +1193,8 @@ def load_pinned_run_config(context=None):
             )
             data_type = manifest.get("data_type")
             if data_type == "image":
+                if checkpoints.checkpoint_id(manifest) is not None:
+                    image_fields = image_fields[:3]
                 required.extend(image_fields)
                 if ("data-kind" not in cfg
                         or type(cfg["data-kind"]) is not str
@@ -1245,6 +1267,7 @@ def load_pinned_run_config(context=None):
         "task-type", "app-params-b64", "app-params-sha256",
         "target-bounds", "target-levels", "validation-model-track",
         "validation-task", "validation-bins", "validation-contract-sha256",
+        "validation-survival-horizons", "validation-survival-nll-bound",
         "data-kind",
         "validation-native-tree-request-b64",
         "validation-native-tree-request-sha256",

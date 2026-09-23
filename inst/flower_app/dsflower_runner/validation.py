@@ -43,7 +43,8 @@ def _integer(value, name, lower, upper):
     return int(number)
 
 
-def validation_layout(task, *, n_classes=2, n_labels=2, bins=32):
+def validation_layout(task, *, n_classes=2, n_labels=2, bins=32,
+                      horizons=None, nll_bound=20.0):
     task = str(task).lower()
     bins = _integer(bins, "validation bins", 4, _MAX_BINS)
     if task == "classification":
@@ -68,6 +69,21 @@ def validation_layout(task, *, n_classes=2, n_labels=2, bins=32):
         return {"task": task, "size": 5, "sensitivity": 2.0}
     if task == "count":
         return {"task": task, "size": 6, "sensitivity": math.sqrt(5.0)}
+    if task == "segmentation":
+        return {"task": task, "size": 4, "max_pixels": 128 * 128,
+                "sensitivity": math.sqrt(3.0)}
+    if task == "survival":
+        if (not isinstance(horizons, (list, tuple)) or not 1 <= len(horizons) <= 64
+                or any(type(t) not in (int, float) or not math.isfinite(t)
+                       or not 0 < t <= 1e6 for t in horizons)
+                or any(a >= b for a, b in zip(horizons, horizons[1:]))):
+            raise ValueError("survival validation horizons must be ordered public times")
+        if (type(nll_bound) not in (int, float) or not math.isfinite(nll_bound)
+                or not 0 < nll_bound <= 1000):
+            raise ValueError("survival validation NLL bound must be positive and finite")
+        size = 2 + 2 * len(horizons)
+        return {"task": task, "size": size, "horizons": list(map(float, horizons)),
+                "nll_bound": float(nll_bound), "sensitivity": math.sqrt(size)}
     raise ValueError("unsupported validation task %r" % task)
 
 
@@ -91,8 +107,13 @@ def _effective_validation_layout(layout):
         effective = validation_layout(
             "multilabel", n_labels=layout.get("labels"),
             bins=layout.get("bins"))
-    elif task in ("regression", "count"):
+    elif task in ("regression", "count", "segmentation"):
         effective = validation_layout(task)
+        if task == "segmentation" and layout.get("max_pixels") != effective["max_pixels"]:
+            raise ValueError("invalid segmentation pixel bound")
+    elif task == "survival":
+        effective = validation_layout(task, horizons=layout.get("horizons"),
+                                      nll_bound=layout.get("nll_bound"))
     else:
         raise ValueError("invalid validation layout")
     try:
@@ -175,10 +196,14 @@ def layout_from_config(cfg):
         raise ValueError("validation configuration must be an object")
     task = str(cfg.get("validation-task", "")).lower()
     loss = str(cfg.get("loss-name", "")).lower()
-    if (loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
-            or str(cfg.get("task-type", "")).lower() == "survival"
-            or str(cfg.get("validation-task", "")).lower() == "survival"):
-        raise ValueError("survival private validation/resampling is unsupported")
+    if task == "segmentation":
+        from . import segmentation
+        segmentation.validate_config(cfg)
+        return validation_layout(task)
+    if task == "survival":
+        return _survival_layout_from_config(cfg)
+    if loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll", "segmentation_bce_dice"):
+        raise ValueError("validation task does not match the trusted loss")
     bins = cfg.get("validation-bins", 32)
     if loss == "bce_logits" and task != "binary":
         raise ValueError("bce_logits validation is binary only")
@@ -212,10 +237,12 @@ def holdout_layout_from_config(cfg):
     if not isinstance(cfg, dict):
         raise ValueError("holdout configuration must be an object")
     loss = str(cfg.get("loss-name", "")).lower()
-    if (loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
-            or str(cfg.get("task-type", "")).lower() == "survival"
-            or str(cfg.get("validation-task", "")).lower() == "survival"):
-        raise ValueError("survival private validation/resampling is unsupported")
+    if loss == "segmentation_bce_dice":
+        from . import segmentation
+        segmentation.validate_config(cfg)
+        return validation_layout("segmentation")
+    if loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
+        return _survival_layout_from_config(cfg)
     task = str(cfg.get("task-type", "")).lower()
     bins = cfg.get("holdout-validation-bins", 32)
     if loss == "bce_logits":
@@ -239,10 +266,29 @@ def holdout_layout_from_config(cfg):
     raise ValueError("loss/task has no trusted holdout validation semantics")
 
 
+def _survival_layout_from_config(cfg):
+    from . import survival
+    config = survival.config_from_run(cfg, cfg.get("loss-name"))
+    horizons = cfg.get("validation-survival-horizons", [config["horizon"]])
+    if isinstance(horizons, str):
+        if len(horizons) > 4096:
+            raise ValueError("survival validation horizons are oversized")
+        horizons = json.loads(horizons)
+    layout = validation_layout("survival", horizons=horizons,
+                               nll_bound=cfg.get("validation-survival-nll-bound", 20.0))
+    if layout["horizons"][0] < config["t_min"] or layout["horizons"][-1] > config["horizon"]:
+        raise ValueError("survival validation horizon exceeds fitted parametrisation")
+    return layout
+
+
 def cross_validation_layout_from_config(cfg):
     """Fixed full-metric layout for one pooled OOF release."""
     if not isinstance(cfg, dict):
         raise ValueError("cross-validation configuration must be an object")
+    if cfg.get("loss-name") == "segmentation_bce_dice":
+        # Segmentation has no histogram bins; a holdout alias would advertise
+        # a second partition contract to its public preflight.
+        return holdout_layout_from_config(cfg)
     nested = dict(cfg)
     nested["holdout-validation-bins"] = cfg.get("cv-validation-bins", 32)
     if "target-bounds" not in nested and (
@@ -326,7 +372,9 @@ def neural_predictions(model, X, loss_name):
             return logits.squeeze(-1)
         if loss in ("poisson_nll", "negbin_nll", "gamma_nll"):
             return torch.exp(logits.squeeze(-1))
-        if loss == "multilabel_bce":
+        if loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
+            return logits
+        if loss in ("multilabel_bce", "segmentation_bce_dice"):
             return torch.sigmoid(logits)
         if loss == "ordinal":
             cumulative = torch.cummin(torch.sigmoid(logits), dim=-1).values
@@ -474,12 +522,19 @@ def _bounded_public_arrays(arrays, *, max_elements=None):
 def public_model_arrays(cfg):
     """Load the researcher-side public model which the ServerApp will send."""
     _model_track(cfg)
+    from . import segmentation_checkpoints
+    if segmentation_checkpoints.checkpoint_id(cfg) is not None:
+        return _bounded_public_arrays(segmentation_checkpoints.server_initialization(cfg))
     path = _public_model_path(cfg)
     from . import model_spec
     from .params import get_torch_params
 
     image = cfg.get("data-kind") == "image"
-    if image:
+    if image and cfg.get("loss-name") == "segmentation_bce_dice":
+        from . import segmentation
+        segmentation.validate_config(cfg)
+        input_dim = segmentation.FEATURE_DIM
+    elif image:
         _backbone, _image_size, input_dim = _vision_geometry_from_config(cfg)
     else:
         if any(key in cfg for key in (
@@ -497,7 +552,8 @@ def public_model_arrays(cfg):
     labels = int(cfg.get("num-labels", 2))
     model = model_spec.build_from_spec(
         spec, in_dim=input_dim, out_dim=output_dim, num_labels=labels,
-        output_limit=model_spec.output_limit_for_loss(loss))
+        output_limit=model_spec.output_limit_for_loss(loss),
+        **({"output_shape": (1, 128, 128)} if loss == "segmentation_bce_dice" else {}))
     state = _load_public_state(path, cfg, image=image)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
@@ -534,6 +590,14 @@ def _node_input_dim(context, cfg=None):
     from . import task as task_module
     manifest = task_module._load_manifest(context)
     if manifest.get("data_type") == "image":
+        if cfg is not None and cfg.get("loss-name") == "segmentation_bce_dice":
+            from . import segmentation, segmentation_checkpoints
+            segmentation.validate_config(cfg)
+            if manifest.get("dp-unit") != "patient":
+                raise ValueError("segmentation validation requires patient privacy")
+            if segmentation_checkpoints.checkpoint_id(cfg) is None:
+                _vision_artifact_pins(cfg)
+            return segmentation.FEATURE_DIM
         if cfg is None:
             raise ValueError("vision validation configuration is missing")
         _vision_artifact_pins(cfg)
@@ -603,60 +667,92 @@ def _apply_feature_bounds(X, cfg):
 def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
                              on_private_start=None):
     """Validate public inputs, then read private data and emit one DP vector."""
-    from . import seeding, task as task_module
+    from . import seeding, task as task_module, segmentation_checkpoints
     from .params import get_torch_params, load_user_model, set_torch_params
 
-    del round_index  # Operational coordinates are not validation reroll axes.
-
+    del round_index
     layout = layout_from_config(cfg)
     _model_track(cfg)
     input_dim = _node_input_dim(context, cfg)
-    if not isinstance(public_arrays, (list, tuple)) or not public_arrays:
-        raise ValueError("validation needs public model arrays")
-
-    # Everything through model construction/decoding is public and occurs
-    # before load_data opens the staged private frame.
+    arrays = _bounded_public_arrays(public_arrays)
+    manifest = task_module._load_manifest(context)
+    checkpoint, summary = segmentation_checkpoints.verify_node_checkpoint(cfg, manifest)
+    if checkpoint is not None:
+        assert_checkpoint_arrays(arrays, checkpoint, summary)
     loss = str(cfg.get("loss-name", "")).lower()
     model = load_user_model(cfg, input_dim, loss)
-    set_torch_params(model, list(public_arrays))
-    selection = seeding.request_selection(task_module._load_manifest(context))
-
+    set_torch_params(model, arrays)
+    selection = seeding.request_selection(manifest)
     image = cfg.get("data-kind") == "image"
-    if image:
+    segment = loss == "segmentation_bce_dice"
+    survival = layout["task"] == "survival"
+    if segment:
+        from . import segmentation
+        encoder, device = segmentation.prepare_encoder(cfg)
+    elif image:
         from . import vision
         encoder, image_size, is_3d, device = vision.prepare_backbone(
             cfg.get("backbone"), cfg.get("vision-extractor-profile"),
             cfg.get("num-features"), cfg.get("image-size"))
     else:
-        empty_public_shape = np.empty((0, input_dim), dtype=np.float64)
-        _apply_feature_bounds(empty_public_shape, cfg)
-
+        _apply_feature_bounds(np.empty((0, input_dim), dtype=np.float64), cfg)
     if on_private_start is not None:
         on_private_start()
-    if image:
-        paths, y, unit_ids = task_module.load_image_collection(
-            context, allow_empty=True)
+    if segment:
+        X_model, y, unit_ids, _ = segmentation.load_subject_tensors(context, cfg, encoder, device)
+    elif survival:
+        X, y, unit_ids, _ = task_module.load_survival_data(context, metric_targets=True)
+        X_model = _apply_feature_bounds(X, cfg)
+        X_model[y[:, -1] == 0] = 0.0
+    elif image:
+        paths, y, unit_ids = task_module.load_image_collection(context, allow_empty=True)
         task_module.assert_pinned_unit_count(context, len(y), unit_ids)
-        if paths:
-            features = vision.extract_features_from_paths(
-                encoder, paths, image_size, is_3d, device=device)
-        else:
-            features = np.empty((0, input_dim), dtype=np.float32)
+        features = (vision.extract_features_from_paths(encoder, paths, image_size, is_3d, device=device)
+                    if paths else np.empty((0, input_dim), dtype=np.float32))
         X_model = _totalize_vision_features(features, len(y), input_dim)
     else:
-        X, y, unit_ids = task_module.load_data(
-            context, include_unit_ids=True)
+        X, y, unit_ids = task_module.load_data(context, include_unit_ids=True)
         task_module.assert_pinned_unit_count(context, len(y), unit_ids)
         X_model = _apply_feature_bounds(X, cfg)
-    predictions = neural_predictions(model, X_model, cfg.get("loss-name"))
+    predictions = metric_predictions(model, X_model, y, cfg, layout)
     target_bounds = (target_bounds_from_config(cfg)
                      if layout["task"] in ("regression", "count") else None)
     released, _sigma = private_validation_vector(
-        y, predictions, layout, epsilon=pcfg["epsilon"],
-        delta=pcfg["delta"], target_bounds=target_bounds, num_releases=1,
-        unit_ids=unit_ids, request_selection=selection,
-        public_arrays=get_torch_params(model))
+        y, predictions, layout, epsilon=pcfg["epsilon"], delta=pcfg["delta"],
+        target_bounds=target_bounds, num_releases=1, unit_ids=unit_ids,
+        request_selection=selection, public_arrays=get_torch_params(model))
     return [released.astype(np.float64)]
+
+
+def assert_checkpoint_arrays(arrays, checkpoint, summary):
+    """Bind the actual public predictor to all admitted ordered tensor digests."""
+    declared = summary["tensor_schema"]
+    if (len(arrays) != len(checkpoint) or len(arrays) != len(declared) or any(
+            list(a.shape) != item["shape"] or str(a.dtype) != item["dtype"]
+            or hashlib.sha256(a.tobytes(order="C")).hexdigest() != item["sha256"]
+            or a.tobytes(order="C") != b.tobytes(order="C")
+            for a, b, item in zip(arrays, checkpoint, declared))):
+        raise ValueError("public model differs from its admitted checkpoint")
+
+
+def metric_predictions(model, X, y, cfg, layout):
+    predictions = neural_predictions(model, X, cfg.get("loss-name"))
+    if layout["task"] != "survival":
+        return predictions
+    from . import survival
+    import torch
+    config = survival.config_from_run(cfg, cfg.get("loss-name"))
+    curves = survival.survival_predictions(predictions, config, layout["horizons"])["survival"]
+    targets = np.asarray(y, dtype=np.float64)
+    loss_targets = (survival.period_targets(*targets.T, config)
+                    if cfg["loss-name"] == "discrete_hazard_nll" else targets)
+    loss = survival.loss_factory(cfg["loss-name"], cfg)
+    # The training likelihood is a mean. One subject per call exposes exactly
+    # its decomposable fitted loss, including the hazard interval normalization.
+    nll = np.asarray([float(loss(torch.as_tensor(predictions[i:i+1]),
+                               torch.as_tensor(loss_targets[i:i+1])))
+                      for i in range(len(targets))], dtype=np.float64)
+    return np.column_stack((nll, curves))
 
 
 def _finite_array(value, name):
@@ -757,6 +853,37 @@ def _numeric_contributions(y, predictions, layout, target_bounds):
     return np.column_stack(cols)
 
 
+def _segmentation_contributions(target, scores, layout):
+    n = len(target)
+    if scores.shape != (n, 1, 128, 128) or target.shape not in (
+            (n, 1, 128, 128), (n, 2, 128, 128)):
+        raise ValueError("segmentation validation requires pinned patient mask geometry")
+    truth = target[:, :1] >= .5
+    pred = scores >= .5
+    valid = (target[:, 1, 0, 0] == 1 if target.shape[1] == 2 else np.ones(n, dtype=bool))
+    scale = float(layout["max_pixels"])
+    return np.column_stack((np.ones(n),
+        valid * (pred & truth).sum(axis=(1, 2, 3)) / scale,
+        valid * pred.sum(axis=(1, 2, 3)) / scale,
+        valid * truth.sum(axis=(1, 2, 3)) / scale))
+
+
+def _survival_contributions(target, scores, layout):
+    h = len(layout["horizons"])
+    if target.shape != (len(target), 3) or scores.shape != (len(target), h + 1):
+        raise ValueError("survival validation requires time/event/valid and fixed predictions")
+    time, event, validity = target.T
+    valid = ((validity == 1) & (time > 0) & np.isin(event, (0, 1)))
+    horizons = np.asarray(layout["horizons"])
+    eligible = valid[:, None] & ((time[:, None] >= horizons) |
+                                ((event[:, None] == 1) & (time[:, None] <= horizons)))
+    alive = ~((event[:, None] == 1) & (time[:, None] <= horizons))
+    error = (np.clip(scores[:, 1:], 0, 1) - alive) ** 2
+    bound = layout["nll_bound"]
+    nll = (np.clip(scores[:, 0], -bound, bound) + bound) / (2 * bound)
+    return np.column_stack((valid, valid * nll, eligible * error, eligible)).astype(np.float64)
+
+
 def validation_contributions(y, predictions, layout, *, target_bounds=None):
     if not isinstance(layout, dict) or int(layout.get("size", 0)) > _MAX_VECTOR:
         raise ValueError("invalid validation layout")
@@ -769,6 +896,10 @@ def validation_contributions(y, predictions, layout, *, target_bounds=None):
         out = _classification_contributions(target, scores, layout)
     elif task == "multilabel":
         out = _multilabel_contributions(target, scores, layout)
+    elif task == "segmentation":
+        out = _segmentation_contributions(target, scores, layout)
+    elif task == "survival":
+        out = _survival_contributions(target, scores, layout)
     else:
         out = _numeric_contributions(target, scores, layout, target_bounds)
     if out.shape != (target.shape[0], int(layout["size"])):
@@ -983,6 +1114,10 @@ def _summed_validation_contributions(y, predictions, layout, *,
                 np.bincount(index, minlength=stride)[:stride]
                 if inverse is None else _patient_histogram_sum(
                     inverse, counts, index, stride))
+    elif task in ("segmentation", "survival"):
+        contribution = (_segmentation_contributions(target, scores, layout)
+                        if task == "segmentation" else _survival_contributions(target, scores, layout))
+        total[:] = _stable_numeric_sum(contribution, inverse, counts)
     elif task in ("regression", "count"):
         contribution = _numeric_contributions(
             target, scores, layout, target_bounds)
@@ -1239,6 +1374,23 @@ def validation_metrics(released, layout, *, target_bounds=None):
                               if valid_auc else None),
             "macro_f1": (_unit_interval(np.mean(valid_f1))
                          if valid_f1 else None)})
+    if task == "segmentation":
+        n, intersection, predicted, reference = _nonnegative_metric_cells(value)
+        intersection, predicted, reference = np.minimum([intersection, predicted, reference], n)
+        return {"n": float(n), "foreground_dice": float(np.clip(
+            2.0 * intersection / max(predicted + reference, 1e-12), 0.0, 1.0))}
+    if task == "survival":
+        n = max(float(value[0]), 0.0)
+        h = len(layout["horizons"])
+        nll = min(n, max(0.0, float(value[1])))
+        eligible = np.clip(value[2+h:], 0.0, n)
+        errors = np.clip(value[2:2+h], 0.0, eligible)
+        return {"n": n, "negative_log_likelihood": (
+            None if n <= 0 else (2.0 * (nll / n) - 1.0) * layout["nll_bound"]),
+            "brier": {"horizons": layout["horizons"],
+                      "scores": [_safe_ratio(a, b) for a, b in zip(errors, eligible)],
+                      "eligible_n": eligible.tolist()},
+            "brier_method": "observed-status"}
     n = max(float(value[0]), 0.0)
     # Each remaining numeric coordinate is the sum of per-unit contributions
     # already bounded to [0, 1]. Project noisy pooled coordinates back onto that

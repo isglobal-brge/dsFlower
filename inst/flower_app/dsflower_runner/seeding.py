@@ -191,6 +191,7 @@ _REQUEST_SELECTION_KEYS = frozenset({
     "public-initialisation-origin", "public-initialisation-encoder-sha256",
     "public-initialisation-identity-version",
     "validation-model-track", "validation-task", "validation-bins",
+    "validation-survival-horizons", "validation-survival-nll-bound",
     "validation-contract-sha256", "validation-artifact-format",
     "validation-artifact-sha256", "validation-profile-sha256",
     "validation-public-schema-sha256",
@@ -367,7 +368,7 @@ def _update_array(hasher, label, value):
     canonical_dtype = array.dtype.newbyteorder("<")
     canonical = np.ascontiguousarray(array.astype(canonical_dtype, copy=False))
     _frame(hasher, label + "/meta", _array_metadata(canonical))
-    raw = memoryview(canonical).cast("B")
+    raw = memoryview(canonical.reshape(-1)).cast("B")
     _frame_header(hasher, label + "/bytes", len(raw))
     if canonical.dtype.kind != "f":
         for start in range(0, len(raw), _HASH_CHUNK_BYTES):

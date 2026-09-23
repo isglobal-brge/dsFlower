@@ -897,6 +897,7 @@
     "validation-artifact-sha256", "validation-artifact-size-bytes",
     "validation-profile-sha256", "validation-profile-size-bytes",
     "validation-public-schema-sha256",
+    "validation-survival-horizons", "validation-survival-nll-bound",
     "resampling-version", "resampling-method", "resampling-assignment",
     "resampling-test-numerator", "resampling-test-denominator",
     "resampling-privacy-unit", "resampling-unit-canonicalization",

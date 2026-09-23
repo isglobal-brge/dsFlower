@@ -73,14 +73,14 @@ test_that("survival public pins are strict and custodian patient units mandatory
   expect_error(dsFlower:::.addDpConfigToRunConfig(wire), "distribution")
 })
 
-test_that("survival excludes private validation, holdout, CV, Cox and mixed roles", {
+test_that("survival rejects incomplete evaluation contracts, Cox and mixed roles", {
   .survival_patient_options()
   for (field in c("resampling-version", "cv-version", "validation-task")) {
     wire <- .survival_wire_fixture()
     wire[[field]] <- 1L
-    expect_error(dsFlower:::.addDpConfigToRunConfig(wire), "unsupported")
+    expect_error(dsFlower:::.addDpConfigToRunConfig(wire))
   }
-  for (track in c("validation", "egress", "native_tree")) {
+  for (track in c("egress", "native_tree")) {
     wire <- .survival_wire_fixture()
     wire[["dp-track"]] <- track
     expect_error(dsFlower:::.addDpConfigToRunConfig(wire), "trusted neural")

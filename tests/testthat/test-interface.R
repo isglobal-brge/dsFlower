@@ -1502,7 +1502,7 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
     c("bce_logits", "cross_entropy", "mse", "poisson_nll",
       "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
       "huber", "quantile", "aft_weibull_nll", "aft_lognormal_nll",
-      "discrete_hazard_nll")
+      "discrete_hazard_nll", "segmentation_bce_dice")
   )
   expect_false("tree_objectives" %in% names(caps))
   expect_identical(caps$native_tree$contract,
@@ -1524,7 +1524,7 @@ test_that("flowerGetCapabilitiesDS returns expected structure", {
   expect_true(caps$resampling$cross_validation$available)
   expect_identical(caps$resampling$cross_validation$tracks,
                    c("neural", "native_tree"))
-  expect_identical(caps$resampling$cross_validation$data_kinds, "tabular")
+  expect_identical(caps$resampling$cross_validation$data_kinds, c("tabular", "image"))
   expect_identical(caps$resampling$cross_validation$folds, c(2L, 10L))
   expect_true(caps$resampling$cross_validation$pooled_only)
   expect_true("max_rounds" %in% names(caps))

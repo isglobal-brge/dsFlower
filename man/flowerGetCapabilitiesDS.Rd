@@ -25,6 +25,6 @@ runner vocabulary, and disclosure settings. The response is independent of
 cohort contents, handle state, and other sessions, and does not disclose
 filesystem paths. Native-tree and association availability are probed only
 when explicitly requested. Resampling advertises atomic holdout for tabular
-neural/native-tree runs and native dsFlower neural vision; cross-validation
-remains tabular for the neural and native-tree tracks.
+neural/native-tree runs and trusted neural images. Cross-validation supports
+tabular models and segmentation images, including patient-level survival metrics.
 }

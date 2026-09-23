@@ -515,8 +515,9 @@ flowerInitDS <- function(data_symbol) {
 }
 
 .normalizeValidationConfig <- function(run_config, track) {
-  fields <- names(run_config)[startsWith(tolower(names(run_config)),
-                                          "validation-")]
+  fields <- setdiff(names(run_config)[startsWith(tolower(names(run_config)),
+                                          "validation-")],
+                    c("validation-survival-horizons", "validation-survival-nll-bound"))
   if (!identical(track, "validation")) {
     present_vision <- intersect(.VISION_EXTRACTOR_FIELDS, names(run_config))
     if (length(fields)) {
@@ -566,7 +567,7 @@ flowerInitDS <- function(data_symbol) {
   }
   if (length(task) != 1L || is.na(task) ||
       !task %in% c("binary", "multiclass", "ordinal", "multilabel",
-                   "regression", "count")) {
+                   "regression", "count", "segmentation", "survival")) {
     stop("validation-task is unsupported.", call. = FALSE)
   }
   if (length(bins) != 1L || !is.finite(bins) || bins != floor(bins) ||
@@ -619,7 +620,9 @@ flowerInitDS <- function(data_symbol) {
     ordinal = "ordinal", multilabel_bce = "multilabel",
     mse = "regression", huber = "regression", quantile = "regression",
     gamma_nll = "regression",
-    poisson_nll = "count", negbin_nll = "count", "")
+    poisson_nll = "count", negbin_nll = "count",
+    segmentation_bce_dice = "segmentation", aft_weibull_nll = "survival",
+    aft_lognormal_nll = "survival", discrete_hazard_nll = "survival", "")
   if (!nzchar(expected_task) || !identical(task, expected_task)) {
     stop("validation-task disagrees with the pinned model loss.",
          call. = FALSE)
@@ -642,13 +645,16 @@ flowerInitDS <- function(data_symbol) {
            "'native_tree'.", call. = FALSE)
     }
     if (identical(data_type, "image")) {
-      if (!identical(task, if (n_classes == 2L) "binary" else "multiclass") ||
-          !identical(loss, "cross_entropy") || n_labels != 2L) {
+      segmentation <- identical(task, "segmentation")
+      checkpoint <- !is.null(run_config[["public-initialisation-manifest-sha256"]])
+      if (!segmentation && (!identical(task, if (n_classes == 2L) "binary" else "multiclass") ||
+          !identical(loss, "cross_entropy") || n_labels != 2L)) {
         stop("Vision validation supports cross_entropy binary/multiclass ",
              "classification only.", call. = FALSE)
       }
       if (!identical(sort(present_vision), sort(vision_fields)) ||
-          !identical(sort(present_artifact), sort(artifact_fields))) {
+          (!checkpoint && !identical(sort(present_artifact), sort(artifact_fields))) ||
+          (checkpoint && length(present_artifact))) {
         stop("Vision validation requires the exact backbone, image-size, ",
              "extractor-profile and artifact pin set.", call. = FALSE)
       }
@@ -659,8 +665,8 @@ flowerInitDS <- function(data_symbol) {
       }
       levels <- unlist(run_config[["target-levels"]] %||% NULL,
                        use.names = FALSE)
-      if (length(levels) != n_classes || anyNA(levels) ||
-          anyDuplicated(levels)) {
+      if (!segmentation && (length(levels) != n_classes || anyNA(levels) ||
+          anyDuplicated(levels))) {
         stop("Vision validation requires exactly one public target level per class.",
              call. = FALSE)
       }
@@ -669,13 +675,13 @@ flowerInitDS <- function(data_symbol) {
       artifact_hash <- run_config[["validation-artifact-sha256"]]
       artifact_size <- suppressWarnings(as.numeric(unlist(
         run_config[["validation-artifact-size-bytes"]], use.names = FALSE)))
-      if (!identical(run_config[["validation-artifact-format"]],
+      if (!checkpoint && (!identical(run_config[["validation-artifact-format"]],
                      .VISION_VALIDATION_ARTIFACT_FORMAT) ||
           !is.character(artifact_hash) || length(artifact_hash) != 1L ||
           is.na(artifact_hash) || !grepl("^[0-9a-f]{64}$", artifact_hash) ||
           length(artifact_size) != 1L || !is.finite(artifact_size) ||
           artifact_size != floor(artifact_size) || artifact_size < 1 ||
-          artifact_size > .VISION_VALIDATION_ARTIFACT_MAX_BYTES) {
+          artifact_size > .VISION_VALIDATION_ARTIFACT_MAX_BYTES)) {
         stop("Vision validation artifact pins are outside their public contract.",
              call. = FALSE)
       }
@@ -685,7 +691,7 @@ flowerInitDS <- function(data_symbol) {
         stop("Vision validation requires one declarative model spec.",
              call. = FALSE)
       }
-      run_config[["validation-artifact-size-bytes"]] <-
+      if (!checkpoint) run_config[["validation-artifact-size-bytes"]] <-
         as.integer(artifact_size)
     } else if (length(present_vision) || length(present_artifact)) {
       stop("Vision-only validation pins require data_type='image'.",
@@ -949,6 +955,8 @@ flowerInitDS <- function(data_symbol) {
     payload$public_schema_sha256 <-
       run_config[["validation-public-schema-sha256"]]
   }
+  extension <- .validationCvContractExtension(run_config)
+  if (length(extension)) payload$validation_cv <- extension
   canonical <- as.character(jsonlite::toJSON(
     payload, auto_unbox = TRUE, null = "null", na = "null",
     digits = NA, always_decimal = TRUE, pretty = FALSE))
@@ -988,7 +996,7 @@ flowerInitDS <- function(data_symbol) {
   }
   if (identical(track, "validation")) {
     validation_task <- run_config[["validation-task"]]
-    inferred <- if (validation_task %in% c("regression", "count")) {
+    inferred <- if (validation_task %in% c("regression", "count", "survival", "segmentation")) {
       validation_task
     } else "classification"
   } else if (identical(track, "neural")) {
@@ -1267,6 +1275,8 @@ flowerInitDS <- function(data_symbol) {
   run_config <- .normalizeRunRounds(run_config)
   initialisation_policy <- .public_initialisation_policy(if (.segmentationRequested(run_config)) {
     .CHECKPOINT_CONTRACT
+  } else if (!is.null(run_config[["segmentation-decoder-init"]])) {
+    "declarative_neural"
   } else NULL)
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
@@ -1280,11 +1290,20 @@ flowerInitDS <- function(data_symbol) {
   run_config[["dp-track"]] <- track
   run_config <- .normalizeSurvivalConfig(run_config, track, unit_policy)
   run_config <- .normalizeSegmentationConfig(run_config, track, unit_policy, owner_env)
+  if (!.segmentationRequested(run_config) &&
+      !is.null(run_config[["segmentation-decoder-init"]])) {
+    if (!track %in% c("neural", "validation") ||
+        !identical(run_config[["data_type"]] %||% "tabular", "tabular")) {
+      stop("Public checkpoint initialisation requires a trusted neural contract.", call. = FALSE)
+    }
+    run_config <- .normalizeSegmentationDecoderInit(run_config, owner_env)
+  }
+  run_config <- .normalizePrivateMetricConfig(run_config)
   run_config <- .normalizeAssociationConfig(run_config, track, unit_policy)
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
   run_config <- .normalizeResamplingConfig(run_config, track, unit_policy)
-  run_config <- .normalizeCrossValidationConfig(run_config, track)
+  run_config <- .normalizeCrossValidationConfig(run_config, track, unit_policy)
   run_config[["public-initialisation-policy"]] <- initialisation_policy
   run_config <- .normalizePinnedTaskType(run_config, track)
   run_config <- .normalizeHookAppParams(run_config, track)
@@ -1483,6 +1502,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     target_column, feature_columns, run_config)
   target_column <- columns$target_column
   feature_columns <- columns$feature_columns
+  .validatePreparedPublicCheckpoint(run_config, feature_columns, target_column)
   .validateSurvivalColumns(run_config, target_column, feature_columns,
                            imaging_unit_policy)
   .validateSegmentationColumns(
@@ -2093,8 +2113,8 @@ flowerPingDS <- function() {
 #' cohort contents, handle state, and other sessions, and does not disclose
 #' filesystem paths. Native-tree and association availability are probed only
 #' when explicitly requested. Resampling advertises atomic holdout for tabular
-#' neural/native-tree runs and native dsFlower neural vision; cross-validation
-#' remains tabular for the neural and native-tree tracks.
+#' neural/native-tree runs and trusted neural images. Cross-validation supports
+#' tabular models and segmentation images, including patient-level survival metrics.
 #'
 #' @param native_tree_probe Exactly \code{"none"} (the default), \code{"all"},
 #'   or one implemented native-tree engine name. This controls an operational
@@ -2196,8 +2216,8 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
 #'
 #' DataSHIELD AGGREGATE method. Returns the current status of the handle
 #' including whether data is prepared, a SuperNode is ensured, and the
-#' server-authored privacy unit effective for this handle. Prepared public
-#' segmentation runs additionally return verified public identity and provenance.
+#' server-authored privacy unit effective for this handle. Prepared
+#' public-initialised runs additionally return verified public identity and provenance.
 #' Checkpoint bytes and storage locations are never returned.
 #'
 #' @param handle_symbol Character; symbol of the handle.

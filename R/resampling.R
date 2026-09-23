@@ -191,7 +191,7 @@
   )
 }
 
-.normalizeCrossValidationConfig <- function(run_config, track) {
+.normalizeCrossValidationConfig <- function(run_config, track, unit_policy = NULL) {
   names_lower <- tolower(names(run_config) %||% character())
   present <- names(run_config)[
     startsWith(names_lower, "cv-") | startsWith(names_lower, "cv_")]
@@ -210,8 +210,11 @@
   }
   requested_type <- tolower(as.character(unlist(
     run_config[["data_type"]] %||% "tabular", use.names = FALSE)))
-  if (length(requested_type) != 1L || !identical(requested_type, "tabular")) {
-    stop("Cross-validation currently supports tabular data only.",
+  if (length(requested_type) != 1L ||
+      !requested_type %in% c("tabular", "image") ||
+      (identical(requested_type, "image") &&
+       (!identical(track, "neural") || !.segmentationRequested(run_config)))) {
+    stop("Cross-validation supports tabular data and trusted segmentation images only.",
          call. = FALSE)
   }
   bins <- suppressWarnings(as.numeric(unlist(
@@ -221,7 +224,7 @@
     stop("cv-validation-bins must be an integer in [4, 512].",
          call. = FALSE)
   }
-  policy <- .dpUnitPolicy()
+  policy <- .resolvePrivacyUnitPolicy(unit_policy)
   contract <- .crossValidationContract(
     run_config[["cv-folds"]], policy$dp_unit)
   supplied <- list(
@@ -386,7 +389,8 @@
   allowed_losses <- c(
     "bce_logits", "cross_entropy", "mse", "poisson_nll",
     "multilabel_bce", "hinge", "negbin_nll", "gamma_nll", "huber",
-    "quantile", "ordinal")
+    "quantile", "ordinal", "segmentation_bce_dice", "aft_weibull_nll",
+    "aft_lognormal_nll", "discrete_hazard_nll")
   if (!loss %in% allowed_losses) {
     stop("Cross-validation loss is unsupported.", call. = FALSE)
   }
@@ -524,7 +528,9 @@
     feature_columns, use.names = FALSE)))
   targets <- enc2utf8(as.character(unlist(
     target_column, use.names = FALSE)))
-  if (!length(features) || anyNA(features) || any(!nzchar(features)) ||
+  image <- identical(run_config[["data_type"]], "image") ||
+    !is.null(run_config[["backbone"]])
+  if ((!image && !length(features)) || anyNA(features) || any(!nzchar(features)) ||
       anyDuplicated(features) || !length(targets) || anyNA(targets) ||
       any(!nzchar(targets)) || anyDuplicated(targets)) {
     stop("Cross-validation requires ordered unique public columns.",
@@ -532,7 +538,7 @@
   }
   n_features <- .cv_job_scalar(
     run_config[["num-features"]], "num-features", "integer", 1, 65536)
-  if (!identical(n_features, as.integer(length(features)))) {
+  if (!image && !identical(n_features, as.integer(length(features)))) {
     stop("Cross-validation feature count differs from its ordered schema.",
          call. = FALSE)
   }
@@ -587,7 +593,7 @@
   }
   task <- tolower(.cv_job_scalar(
     run_config[["task-type"]], "task-type", "character"))
-  if (!task %in% c("classification", "regression", "count")) {
+  if (!task %in% c("classification", "regression", "count", "segmentation", "survival")) {
     stop("Cross-validation task is unsupported.", call. = FALSE)
   }
   folds <- .cv_job_scalar(
@@ -718,12 +724,14 @@
       num_classes = .cv_job_scalar(
         run_config[["num-classes"]], "num-classes", "integer", 2, 1024),
       num_labels = .cv_job_scalar(
-        run_config[["num-labels"]], "num-labels", "integer", 2, 1024),
+        run_config[["num-labels"]] %||% 2L, "num-labels", "integer", 2, 1024),
       local_epochs = .cv_job_scalar(
         run_config[["local-epochs"]], "local-epochs", "integer", 1, 1000),
       batch_size = .cv_job_scalar(
         run_config[["batch-size"]], "batch-size", "integer", 1, 65536)),
     training = .cv_job_training(run_config))
+  extension <- .validationCvContractExtension(run_config)
+  if (length(extension)) payload$validation_cv <- extension
   if (payload$privacy$clipping_norm <= 0) {
     stop("privacy clipping norm is outside its public contract.",
          call. = FALSE)

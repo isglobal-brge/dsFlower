@@ -328,22 +328,18 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
         int(pins["round_index"]))
     seeding.seed_torch(seeding.sub_seed(public_master, "init"))
     checkpoint_arrays = None
-    if pins["loss_name"] == "segmentation_bce_dice":
-        from . import segmentation, segmentation_checkpoints
+    from . import segmentation_checkpoints
+    if (pins["loss_name"] == "segmentation_bce_dice"
+            or segmentation_checkpoints.checkpoint_id(cfg) is not None):
         checkpoint_arrays, checkpoint_summary = segmentation_checkpoints.verify_node_checkpoint(
             cfg, task_module._load_manifest(context))
-        if checkpoint_arrays is not None:
+        if checkpoint_arrays is not None and pins["loss_name"] == "segmentation_bce_dice":
+            from . import segmentation
             segmentation.verified_encoder_bytes(cfg)
     model = load_user_model(cfg, input_dim, pins["loss_name"])
     initial_arrays = _validate_public_neural_arrays(msg.content["arrays"], model)
     if checkpoint_arrays is not None and int(pins["round_index"]) == 1:
-        declared = checkpoint_summary["tensor_schema"]
-        if (len(initial_arrays) != len(declared) or any(
-                list(a.shape) != record["shape"] or str(a.dtype) != record["dtype"]
-                or hashlib.sha256(a.tobytes(order="C")).hexdigest() != record["sha256"]
-                or a.tobytes(order="C") != b.tobytes(order="C")
-                for a, b, record in zip(initial_arrays, checkpoint_arrays, declared))):
-            raise ValueError("first global decoder differs from the public checkpoint")
+        validation.assert_checkpoint_arrays(initial_arrays, checkpoint_arrays, checkpoint_summary)
         set_torch_params(model, checkpoint_arrays)
     return model, input_dim, manifest_image
 
@@ -355,6 +351,8 @@ def _prepare_neural_evaluation_model(msg, context, cfg, pins):
     if manifest_image != cfg_image:
         raise RuntimeError("cross-validation data-kind does not match its manifest")
     input_dim = _neural_input_dim(context, cfg, manifest_image)
+    from . import segmentation_checkpoints
+    segmentation_checkpoints.verify_node_checkpoint(cfg, task_module._load_manifest(context))
     # Initial values are overwritten by the complete public ArrayRecord. A fixed
     # public seed keeps construction deterministic without making accumulation a
     # privacy-randomness operation.
@@ -705,7 +703,7 @@ def _apply_feature_bounds(X, cfg):
 def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
                   cv_fold=None, on_private_start=None):
     if pins.get("loss_name") == "segmentation_bce_dice":
-        return _train_segmentation(context, cfg, pcfg, pins, model,
+        return _train_segmentation(context, cfg, pcfg, pins, model, cv_fold=cv_fold,
                                    on_private_start=on_private_start)
     n_classes = int(pins["n_classes"])
     has_holdout = cfg.get("resampling-contract-sha256") is not None
@@ -728,8 +726,8 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
                 "resampling requires a positive pinned privacy-unit count")
 
     survival_run = pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
-    if survival_run and (has_holdout or has_cv or manifest_image):
-        raise ValueError("survival private validation/resampling and image inputs are unsupported")
+    if survival_run and manifest_image:
+        raise ValueError("survival image inputs are unsupported")
     if survival_run:
         values, y, groups, n_staged = task_module.load_survival_data(context)
         if values.ndim != 2 or int(values.shape[1]) != int(input_dim):
@@ -819,32 +817,51 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         geometry_n_units=geometry_n_units, **fit_options)
 
 
-def _train_segmentation(context, cfg, pcfg, pins, model, on_private_start=None):
+def _train_segmentation(context, cfg, pcfg, pins, model, cv_fold=None,
+                         on_private_start=None):
     from . import segmentation
     segmentation.validate_config(cfg)
     manifest = task_module._load_manifest(context)
     if manifest.get("dp-unit") != "patient":
         raise ValueError("segmentation requires custodian patient privacy")
+    has_holdout = cfg.get("resampling-contract-sha256") is not None
+    has_cv = cfg.get("cv-contract-sha256") is not None
+    if has_holdout and has_cv:
+        raise ValueError("holdout and cross-validation cannot be combined")
+    if has_cv != (cv_fold is not None):
+        raise ValueError("cross-validation fold coordinate is unavailable")
+    geometry = (task_module.pinned_unit_count_from_manifest(manifest)
+                if has_holdout or has_cv else None)
+    if geometry is not None and geometry < 1:
+        raise ValueError("resampling requires a positive pinned privacy-unit count")
     encoder, device = segmentation.prepare_encoder(cfg)
     if on_private_start is not None:
         on_private_start()
-    X, y, subjects, n_staged = segmentation.load_subject_tensors(
-        context, cfg, encoder, device)
-    # The encoder is never passed to the optimizer or the release module.
+    X, y, subjects, n_staged = segmentation.load_subject_tensors(context, cfg, encoder, device)
     del encoder
+    if has_holdout:
+        X, y, subjects = _holdout_partition(context, X, y, subjects, subset="train")
+    elif has_cv:
+        X, y, subjects = _cross_validation_partition(context, X, y, subjects,
+                                                       fold=cv_fold, subset="train")
     X = _totalize_private_features(X)
     effective = dp_harness.effective_dpsgd_mechanism(
         epsilon=pcfg["epsilon"], delta=pcfg["delta"],
-        clipping_norm=pcfg["clipping_norm"], n_samples=len(subjects),
+        clipping_norm=pcfg["clipping_norm"], n_samples=(len(subjects) if geometry is None else geometry),
         batch_size=int(pins["batch_size"]), local_epochs=int(pins["local_epochs"]),
         num_rounds=int(pins["num_rounds"]))
     effective["privacy_unit"] = "patient"
-    seed_config, _ = _neural_seed_contract(cfg, pins, pcfg, manifest=manifest)
+    seed_config, _ = _neural_seed_contract(cfg, pins, pcfg, geometry_n_units=geometry, manifest=manifest)
     master = seeding.master_seed(
         "neural-dpsgd/v1", seed_config, effective, int(pins["round_index"]),
         public_arrays=get_torch_params(model), private_arrays=(X, y))
+    empty = len(y) == 0
+    if empty:
+        X = np.zeros((1, segmentation.FEATURE_DIM), dtype=np.float32)
+        y = np.zeros((1, 2, 128, 128), dtype=np.float32)
     return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master,
-                   noise_multiplier=effective["noise_multiplier"])
+                   noise_multiplier=effective["noise_multiplier"], geometry_n_units=geometry,
+                   **({"public_zero_gradient": True} if empty else {}))
 
 
 def _holdout_partition(context, X, y, unit_ids, *, subset):
@@ -1004,27 +1021,46 @@ def _forget_cv_sufficient(context):
     context.state.pop(_CV_OOF_TOTAL_KEY, None)
 
 
-def _cross_validation_neural_accumulate(context, cfg, pins, model,
-                                        input_dim, fold):
-    """Retain the raw vector and public model seed digest only in node RAM."""
-    if is_image_run(context):
-        raise RuntimeError("cross-validation supports tabular neural data only")
-    X, y, unit_ids = load_data(context, include_unit_ids=True)
+def _evaluation_inputs(context, cfg, input_dim, on_private_start=None):
+    """Resolve public encoders before loading the fixed private metric inputs."""
+    loss = cfg.get("loss-name")
+    if loss == "segmentation_bce_dice":
+        from . import segmentation
+        encoder, device = segmentation.prepare_encoder(cfg)
+        if on_private_start is not None:
+            on_private_start()
+        X, y, ids, _ = segmentation.load_subject_tensors(context, cfg, encoder, device)
+        return X, y, ids
+    if on_private_start is not None:
+        on_private_start()
+    if loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
+        X, y, ids, _ = task_module.load_survival_data(context, metric_targets=True)
+    else:
+        X, y, ids = load_data(context, include_unit_ids=True)
     if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
-        raise RuntimeError("staged feature width changed before CV evaluation")
-    task_module.assert_pinned_unit_count(
-        context, len(y), patient_ids=unit_ids)
+        raise RuntimeError("staged feature width changed before evaluation")
+    task_module.assert_pinned_unit_count(context, len(y), patient_ids=ids)
+    X = _apply_feature_bounds(X, cfg)
+    if loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
+        X[y[:, -1] == 0] = 0.0
+    return X, y, ids
+
+
+def _cross_validation_neural_accumulate(context, cfg, pins, model,
+                                        input_dim, fold, on_private_start=None):
+    """Retain the raw vector and public model seed digest only in node RAM."""
+    if is_image_run(context) and pins["loss_name"] != "segmentation_bce_dice":
+        raise RuntimeError("cross-validation image contract is unsupported")
+    layout = validation.cross_validation_layout_from_config(cfg)
+    X, y, unit_ids = _evaluation_inputs(context, cfg, input_dim, on_private_start)
     X, y, unit_ids = _cross_validation_partition(
         context, X, y, unit_ids, fold=int(fold), subset="test")
-    X = _apply_feature_bounds(X, cfg)
-    layout = validation.cross_validation_layout_from_config(cfg)
-    predictions = validation.neural_predictions(model, X, pins["loss_name"])
+    predictions = validation.metric_predictions(model, X, y, cfg, layout)
     bounds = (validation.cross_validation_target_bounds_from_config(cfg)
               if layout["task"] in ("regression", "count") else None)
     raw = validation.validation_sufficient_vector(
         y, predictions, layout, target_bounds=bounds, unit_ids=unit_ids)
-    _store_cv_sufficient(context, int(fold), raw, layout,
-                         public_arrays=get_torch_params(model))
+    _store_cv_sufficient(context, int(fold), raw, layout, public_arrays=get_torch_params(model))
     return [np.zeros(1, dtype=np.float64)]
 
 
@@ -1047,8 +1083,12 @@ def _cross_validation_release(context, cfg, pcfg):
 def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim,
                             on_private_start=None):
     """Evaluate the final public aggregate on test units and release one vector."""
-    manifest_image = is_image_run(context)
-    if manifest_image:
+    layout = validation.holdout_layout_from_config(cfg)
+    special = pins["loss_name"] in ("segmentation_bce_dice", "aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
+    manifest_image = is_image_run(context) and not special
+    if special:
+        values, y, unit_ids = _evaluation_inputs(context, cfg, input_dim, on_private_start)
+    elif manifest_image:
         from . import vision
         encoder, image_size, is_3d, device = vision.prepare_backbone(
             cfg.get("backbone", cfg.get("model", "resnet18")),
@@ -1073,9 +1113,8 @@ def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim,
              if len(y) == 0 else vision.extract_features_from_paths(
                  encoder, list(values), image_size, is_3d, device=device))
     else:
-        X = _apply_feature_bounds(values, cfg)
-    layout = validation.holdout_layout_from_config(cfg)
-    predictions = validation.neural_predictions(model, X, pins["loss_name"])
+        X = values if special else _apply_feature_bounds(values, cfg)
+    predictions = validation.metric_predictions(model, X, y, cfg, layout)
     bounds = (validation.holdout_target_bounds_from_config(cfg)
               if layout["task"] in ("regression", "count") else None)
     privacy_unit = cfg.get("resampling-privacy-unit")
@@ -1224,12 +1263,9 @@ def train(msg: Message, context: Context) -> Message:
             pins["operation"] = "cv-accumulate"
             model, input_dim, manifest_image = _prepare_neural_evaluation_model(
                 msg, context, cfg, pins)
-            if manifest_image:
-                raise RuntimeError(
-                    "cross-validation supports tabular neural data only")
-            mark_private_started()
             new_arrays = _cross_validation_neural_accumulate(
-                context, cfg, pins, model, input_dim, int(claim["fold"]))
+                context, cfg, pins, model, input_dim, int(claim["fold"]),
+                on_private_start=mark_private_started)
         elif operation == "holdout-evaluate":
             if track != "neural":
                 raise RuntimeError("holdout evaluation requires the neural track")
@@ -1238,8 +1274,8 @@ def train(msg: Message, context: Context) -> Message:
                 raise RuntimeError(
                     "neural calibration horizon does not match release guard")
             pins["round_index"] = int(pins["num_rounds"])
-            model, input_dim, manifest_image = _prepare_neural_model(
-                msg, context, cfg, pcfg, pins)
+            model, input_dim, manifest_image = _prepare_neural_evaluation_model(
+                msg, context, cfg, pins)
             new_arrays = _holdout_neural_release(
                 context, cfg, pcfg, pins, model, input_dim,
                 on_private_start=mark_private_started)
@@ -1346,11 +1382,11 @@ def train(msg: Message, context: Context) -> Message:
                          if operation == "cv-train" else None),
                 on_private_start=(mark_private_started
                                   if manifest_image else None))
-            if pins["loss_name"] == "segmentation_bce_dice":
-                from . import segmentation_checkpoints
+            from . import segmentation_checkpoints
+            if segmentation_checkpoints.checkpoint_id(cfg) is not None:
                 segmentation_checkpoints.record_release(
                     context, task_module._load_manifest(context),
-                    int(pins["round_index"]), new_arrays)
+                    int(pins["round_index"]), new_arrays, fold=pins.get("fold_index"))
 
         hook_status = True if track == "egress" else None
         if _reply_cache_allowed(claim):

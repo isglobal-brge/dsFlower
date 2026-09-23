@@ -58,9 +58,16 @@ def validate_config(cfg):
         raise ValueError("segmentation requires alpha 0.5 or 1 and smoothing 1")
     if cfg.get("mask-vocabulary") not in ("0,1", "0,255"):
         raise ValueError("segmentation requires a declared binary mask vocabulary")
-    if any(str(key).startswith(("validation-", "holdout-", "resampling-", "cv-", "hpo-"))
-           for key in cfg):
-        raise ValueError("segmentation private validation, holdout and CV are unsupported")
+    from . import resampling
+    partition_cfg = dict({"dp-unit": "patient", "patient-id-canonicalization": "trim-utf8-v2"}, **cfg)
+    if any(str(key).startswith("cv-") for key in cfg):
+        resampling.cross_validation_contract_from_manifest(partition_cfg)
+    if any(str(key).startswith(("holdout-", "resampling-")) for key in cfg):
+        resampling.contract_from_manifest(partition_cfg)
+    if any(str(key).startswith("validation-") for key in cfg) and cfg.get("validation-task") != "segmentation":
+        raise ValueError("segmentation validation requires its fixed task layout")
+    if any(str(key).startswith("hpo-") for key in cfg):
+        raise ValueError("segmentation private HPO is unsupported")
 
 
 def decoder_spec(variant="current"):

@@ -131,14 +131,14 @@ def _decode_arrays(payload, manifest):
             or len(payload) != checkpoint["size_bytes"]
             or hashlib.sha256(payload).hexdigest() != _sha(checkpoint["sha256"])):
         raise ValueError("public checkpoint file digest or size mismatch")
-    shapes = _tensor_shapes(manifest["decoder"])
+    shapes = _manifest_tensor_shapes(manifest)
     tensors = manifest["tensors"]
     if not isinstance(tensors, list) or len(tensors) != len(shapes):
         raise ValueError("public checkpoint tensor roster mismatch")
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         entries = archive.infolist()
         expected_names = [str(i) + ".npy" for i in range(len(shapes))]
-        if sorted(item.filename for item in entries) != expected_names:
+        if sorted(item.filename for item in entries) != sorted(expected_names):
             raise ValueError("public checkpoint NPZ tensor roster mismatch")
         for item in entries:
             index = int(item.filename[:-4])
@@ -203,7 +203,167 @@ def _clean_spec(spec):
     return clean
 
 
+def _manifest_tensor_shapes(manifest):
+    if manifest.get("role") != "tabular_model":
+        return _tensor_shapes(manifest["decoder"])
+    from . import model_spec
+    cfg = manifest["model_config"]
+    loss = cfg["loss-name"]
+    model = model_spec.build_from_spec(
+        manifest["model_spec"], cfg["num-features"],
+        model_spec.output_width(loss, cfg), num_labels=cfg["num-labels"],
+        output_limit=model_spec.output_limit_for_loss(loss))
+    return [tuple(value.shape) for value in model.state_dict().values()]
+
+
+_TABULAR_LOSS_PARAMETERS = {
+    "negbin_nll": ("nb-dispersion", 1.0, 1e-6, 1e12),
+    "gamma_nll": ("gamma-shape", 1.0, 1e-6, 1e12),
+    "huber": ("huber-delta", 1.0, 1e-6, 1e6),
+    "quantile": ("quantile-level", 0.5, 0.0, 1.0),
+}
+
+
+def _effective_tabular_model_config(config):
+    """Canonical trusted loss constants; omitted and explicit defaults agree."""
+    effective = dict(config)
+    parameter = _TABULAR_LOSS_PARAMETERS.get(config.get("loss-name"))
+    if parameter is not None:
+        key, default, lower, upper = parameter
+        value = config.get(key, default)
+        if (type(value) not in (int, float) or not np.isfinite(value)
+                or not lower <= value <= upper
+                or (key == "quantile-level" and value in (lower, upper))):
+            raise ValueError("public checkpoint loss parameter is invalid: " + key)
+        effective[key] = float(value)
+    return effective
+
+
+def _validate_tabular_manifest(manifest, requested_spec=None):
+    required = {"schema_version", "checkpoint_id", "model_id", "role",
+                "model_spec", "model_spec_sha256", "model_config", "feature_contract",
+                "dataset", "licence", "checkpoint", "tensors", "evidence",
+                "pretraining_protocol_sha256", "creation"}
+    if (set(manifest) != required or manifest["schema_version"] != SCHEMA
+            or manifest["model_id"] != "declarative_neural"
+            or not isinstance(manifest["checkpoint_id"], str)
+            or not 0 < len(manifest["checkpoint_id"]) <= 128):
+        raise ValueError("public checkpoint manifest violates the tabular contract")
+    spec = manifest["model_spec"]
+    if (not isinstance(spec, dict)
+            or manifest["model_spec_sha256"] != hashlib.sha256(_canonical(spec)).hexdigest()
+            or (requested_spec is not None and spec != requested_spec)):
+        raise ValueError("public checkpoint does not match the requested model spec")
+    cfg = manifest["model_config"]
+    required_cfg = {"loss-name", "num-features", "num-classes", "num-labels"}
+    survival_losses = {"aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"}
+    losses = {"bce_logits", "cross_entropy", "hinge", "ordinal", "multilabel_bce",
+              "mse", "huber", "quantile", "poisson_nll", "negbin_nll", "gamma_nll"}
+    if isinstance(cfg, dict) and cfg.get("loss-name") in survival_losses:
+        required_cfg.add("survival-config-b64")
+    parameter = _TABULAR_LOSS_PARAMETERS.get(cfg.get("loss-name")) if isinstance(cfg, dict) else None
+    allowed_cfg = required_cfg | ({parameter[0]} if parameter is not None else set())
+    if (not isinstance(cfg, dict) or not required_cfg <= set(cfg) <= allowed_cfg
+            or cfg["loss-name"] not in losses | survival_losses
+            or any(type(cfg[key]) is not int or not 1 <= cfg[key] <= 65536
+                   for key in ("num-features", "num-classes", "num-labels"))
+            or not 2 <= cfg["num-classes"] <= 1024
+            or not 2 <= cfg["num-labels"] <= 1024):
+        raise ValueError("public checkpoint model geometry is invalid")
+    _effective_tabular_model_config(cfg)
+    if cfg["loss-name"] in survival_losses:
+        from . import survival
+        encoded = cfg["survival-config-b64"]
+        if not isinstance(encoded, str) or len(encoded) > 65536:
+            raise ValueError("public checkpoint survival configuration is invalid")
+        decoded = _json(base64.b64decode(encoded, validate=True))
+        survival.validate_survival_config(decoded, cfg["loss-name"])
+    if cfg["loss-name"] in {"bce_logits", "multilabel_bce", *survival_losses} and cfg["num-classes"] != 2:
+        raise ValueError("public checkpoint binary/survival class geometry is invalid")
+    feature = manifest["feature_contract"]
+    if (not isinstance(feature, dict) or set(feature) != {
+            "features", "feature_lower", "feature_upper", "target_levels", "target_bounds"}
+            or not isinstance(feature["features"], list)
+            or len(feature["features"]) != cfg["num-features"]
+            or any(not isinstance(v, str) or not v for v in feature["features"])
+            or len(set(feature["features"])) != cfg["num-features"]):
+        raise ValueError("public checkpoint feature contract is invalid")
+    lower, upper = feature["feature_lower"], feature["feature_upper"]
+    if lower is not None or upper is not None:
+        if (not isinstance(lower, list) or not isinstance(upper, list)
+                or len(lower) != cfg["num-features"] or len(upper) != len(lower)
+                or any(type(v) not in (int, float) or not np.isfinite(v) for v in lower + upper)
+                or any(a >= b for a, b in zip(lower, upper))):
+            raise ValueError("public checkpoint feature bounds are invalid")
+    levels, bounds = feature["target_levels"], feature["target_bounds"]
+    if levels is not None and (not isinstance(levels, list) or len(levels) < 2
+            or any(type(v) not in (str, int, float, bool) for v in levels)
+            or len({_canonical(v) for v in levels}) != len(levels)):
+        raise ValueError("public checkpoint target levels are invalid")
+    if bounds is not None and (not isinstance(bounds, dict) or set(bounds) != {"lower", "upper"}
+            or any(type(v) not in (int, float) or not np.isfinite(v) for v in bounds.values())
+            or bounds["lower"] >= bounds["upper"]):
+        raise ValueError("public checkpoint target bounds are invalid")
+    creation = manifest["creation"]
+    if (not isinstance(creation, dict) or set(creation) != {"created_at", "creator"}
+            or any(not isinstance(v, str) or not v.strip() or len(v) > 256 for v in creation.values())
+            or any(not isinstance(manifest[k], dict) or not manifest[k] for k in ("dataset", "licence"))):
+        raise ValueError("public checkpoint provenance is invalid")
+    checkpoint = _record(manifest["checkpoint"], _MAX_FILE)
+    if checkpoint["file"] != "checkpoint.npz":
+        raise ValueError("public checkpoint filename is invalid")
+    evidence = manifest["evidence"]
+    if not isinstance(evidence, dict) or set(evidence) != _EVIDENCE:
+        raise ValueError("public checkpoint evidence roster mismatch")
+    records = [checkpoint, *[_record(r, _MAX_FILE) for r in evidence.values()]]
+    if (manifest["pretraining_protocol_sha256"] != evidence["protocol"]["sha256"]
+            or len({"manifest.json", *(r["file"] for r in records)}) != 1 + len(records)):
+        raise ValueError("public checkpoint evidence identity mismatch")
+    shapes = _manifest_tensor_shapes(manifest)
+    tensors = manifest["tensors"]
+    if not isinstance(tensors, list) or len(tensors) != len(shapes):
+        raise ValueError("public checkpoint tensor roster mismatch")
+    for i, (tensor, shape) in enumerate(zip(tensors, shapes)):
+        if (not isinstance(tensor, dict) or set(tensor) != {"name", "shape", "dtype", "sha256"}
+                or tensor["name"] != str(i) or tensor["dtype"] != "float32"
+                or not isinstance(tensor["shape"], list)
+                or any(type(dim) is not int for dim in tensor["shape"])
+                or tuple(tensor["shape"]) != shape):
+            raise ValueError("public checkpoint tensor contract mismatch")
+        _sha(tensor["sha256"])
+    return records
+
+
+def verify_model_config(manifest, config, node_manifest=None):
+    """Bind generic public tensors to the trusted loss and feature geometry."""
+    if manifest.get("role") == "tabular_model":
+        effective = _effective_tabular_model_config(manifest["model_config"])
+        supplied = _effective_tabular_model_config(config)
+        for key, value in effective.items():
+            if key == "survival-config-b64":
+                from . import survival
+                same = survival.config_from_run(config, config["loss-name"]) == survival.config_from_run(
+                    manifest["model_config"], config["loss-name"])
+            else:
+                same = supplied.get(key) == value
+            if not same:
+                raise ValueError("public checkpoint model contract mismatch: " + key)
+        if node_manifest is not None:
+            schema = manifest["feature_contract"]
+            bounds = node_manifest.get("feature-bounds") or {}
+            levels = node_manifest.get("target-levels")
+            if isinstance(levels, dict):
+                levels = levels.get("values")
+            checks = {"features": node_manifest.get("feature_columns"),
+                      "feature_lower": bounds.get("lower"), "feature_upper": bounds.get("upper"),
+                      "target_levels": levels, "target_bounds": node_manifest.get("target-bounds")}
+            if any(schema[key] != value for key, value in checks.items()):
+                raise ValueError("public checkpoint feature/target contract mismatch")
+
+
 def _validate_manifest(manifest, decoder_spec=None):
+    if manifest.get("role") == "tabular_model":
+        return _validate_tabular_manifest(manifest, decoder_spec)
     from . import segmentation
     required = {"schema_version", "checkpoint_id", "model_id", "decoder",
                 "feature_contract", "encoder_sha256", "dataset", "licence",
@@ -247,7 +407,7 @@ def _validate_manifest(manifest, decoder_spec=None):
     if len(names) != len(set(names)):
         raise ValueError("public checkpoint artifact filenames must be distinct")
     # Check tensor headers here, before NPZ/tensor parsing.
-    shapes = _tensor_shapes(manifest["decoder"])
+    shapes = _manifest_tensor_shapes(manifest)
     tensors = manifest["tensors"]
     if not isinstance(tensors, list) or len(tensors) != len(shapes):
         raise ValueError("public checkpoint tensor roster mismatch")
@@ -267,7 +427,15 @@ def canonical_manifest_sha256(manifest):
     scientific = copy.deepcopy(manifest)
     scientific.pop("creation")
     scientific.pop("checkpoint_id")
-    for record in (scientific["checkpoint"], scientific["encoder"],
+    if scientific.get("role") == "tabular_model":
+        scientific["model_config"] = _effective_tabular_model_config(scientific["model_config"])
+    if scientific.get("role") == "tabular_model" and "survival-config-b64" in scientific["model_config"]:
+        from . import survival
+        config = scientific["model_config"]
+        config["survival-config"] = survival.config_from_run(config, config["loss-name"])
+        config.pop("survival-config-b64")
+    for record in (scientific["checkpoint"],
+                   *([scientific["encoder"]] if "encoder" in scientific else []),
                    *scientific["evidence"].values()):
         record.pop("file")
     return hashlib.sha256(_canonical({"identity_version": IDENTITY_VERSION,
@@ -279,7 +447,7 @@ def _summary(manifest):
             "provenance": {"manifest_sha256": canonical_manifest_sha256(manifest),
                            "manifest": manifest},
             "checkpoint_sha256": manifest["checkpoint"]["sha256"],
-            "encoder_sha256": manifest["encoder_sha256"],
+            "encoder_sha256": manifest.get("encoder_sha256", hashlib.sha256(b"").hexdigest()),
             "tensor_schema": copy.deepcopy(manifest["tensors"])}
 
 
@@ -288,8 +456,10 @@ def _verify_evidence(manifest, contents):
     original = _json(contents[evidence["original_manifest"]["file"]])
     if (original.get("checkpoint_sha256") != manifest["checkpoint"]["sha256"]
             or original.get("tensor_sha256") != [item["sha256"] for item in manifest["tensors"]]
-            or original.get("encoder_sha256") != manifest["encoder_sha256"]
-            or original.get("decoder") != manifest["decoder"]
+            or original.get("encoder_sha256") != manifest.get("encoder_sha256")
+            or original.get("decoder") != manifest.get("decoder")
+            or (manifest.get("role") == "tabular_model" and
+                original.get("model_spec_sha256") != manifest["model_spec_sha256"])
             or original.get("privacy") != "public_nonprivate"):
         raise ValueError("public checkpoint pretraining evidence disagrees with manifest")
     for key in ("protocol", "provenance", "audit"):
@@ -497,6 +667,7 @@ def server_initialization(config):
         raise ValueError("public initialization payload fields are invalid")
     manifest = payload["provenance"]["manifest"]
     _validate_manifest(manifest, model_spec.read_spec(config))
+    verify_model_config(manifest, config)
     if any(payload[key] != value for key, value in _summary(manifest).items()):
         raise ValueError("public initialization payload identity mismatch")
     return _decode_arrays(base64.b64decode(payload["local_arrays_b64"], validate=True), manifest)
@@ -526,6 +697,7 @@ def verify_node_checkpoint(config, manifest):
     contents, _ = _read_contents(directory, protected=True,
                                  decoder_spec=model_spec.read_spec(config))
     arrays, summary = _verify_contents(contents, model_spec.read_spec(config))
+    verify_model_config(summary["provenance"]["manifest"], config, manifest)
     if (summary["provenance"]["manifest_sha256"] != manifest[MANIFEST_KEY]
             or summary["checkpoint_sha256"] != manifest[CHECKPOINT_KEY]
             or summary["encoder_sha256"] != manifest[ENCODER_KEY]
@@ -535,7 +707,7 @@ def verify_node_checkpoint(config, manifest):
     return arrays, summary
 
 
-def record_release(context, manifest, round_index, arrays):
+def record_release(context, manifest, round_index, arrays, fold=None):
     if checkpoint_id(manifest) is None:
         return
     from . import task
@@ -550,14 +722,19 @@ def record_release(context, manifest, round_index, arrays):
               "released_tensors": [
                   {"shape": list(a.shape), "dtype": str(a.dtype),
                    "sha256": hashlib.sha256(a.tobytes(order="C")).hexdigest()} for a in arrays]}
+    if fold is not None:
+        if type(fold) is not int or not 1 <= fold <= 10:
+            raise ValueError("public checkpoint release fold is invalid")
+        record["fold"] = fold
+    filename = ("segmentation-public-init-release-fold-%02d-%06d.json" % (fold, round_index)
+                if fold is not None else "segmentation-public-init-release-%06d.json" % round_index)
     fd, temporary = tempfile.mkstemp(prefix=".segmentation-release-", dir=directory)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(_canonical(record))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, os.path.join(
-            directory, "segmentation-public-init-release-%06d.json" % round_index))
+        os.replace(temporary, os.path.join(directory, filename))
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

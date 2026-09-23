@@ -1,5 +1,12 @@
 # Public initialisation in 0.7.0
 
+Version 0.7.0 also admits a trusted declarative tabular bundle profile and reuses
+both public routes for CV and atomic holdout. Analyst bundles can be validated as
+fixed models. See [private validation and CV](PRIVATE_VALIDATION_CV.md) for exact
+calls, the tabular profile and segmentation/survival metric layouts. The optional
+`dsflower.public_initialisation.declarative_neural` policy override governs the
+tabular profile; segmentation retains its existing contract override.
+
 `client:<local-bundle>` supports research iteration with declared public material.
 `resource:<handle-symbol>` supports curated institutional checkpoints, large
 artifacts and nodes that admit no analyst-supplied material. Both routes use the

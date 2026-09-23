@@ -1,5 +1,18 @@
 # dsFlower 0.7.0
 
+* Accept analyst-declared checkpoint bundles as fixed private-validation models,
+  including trusted declarative tabular and segmentation profiles. Verify complete
+  manifests, tensor digests and geometry before private access, bind model identity
+  into the release, and enforce the custodian's public-initialisation policy.
+* Start atomic holdout and every CV fold from either admitted public route, with
+  first-round tensor checks and fold-bound release identity. Checkpoint choice
+  does not change the private HMAC partition or the 80/20 job budget split.
+* Add patient-level private foreground Dice and survival observed-status Brier at
+  public horizons plus symmetrically clipped fitted NLL to validation, holdout and
+  CV. Each node emits one fixed Gaussian-noised vector; concordance remains a
+  public-split metric. Document layouts, sensitivities and exact analyst calls in
+  `PRIVATE_VALIDATION_CV.md` and `DESIGN_VALIDATION_CV.md`.
+
 * Replace the 0.6.0 file registry with digest-bound analyst-declared public bundles
   and custodian-registered checkpoint resources. Declared material supports research
   iteration; resources support institutional curation, large artifacts and nodes
@@ -7,7 +20,7 @@
 * Add session-bound checkpoint admission and `dsflower.public_initialisation`
   policy (`analyst_or_resource`, `resource_only`, `none`, with per-contract
   overrides). Resources pin the archive SHA-256 in their format descriptor; complete
-  bundles include the frozen encoder and all provenance evidence.
+  segmentation bundles include the frozen encoder and all provenance evidence.
 * Snapshot and verify before private staging, reverify before private access, and
   check first-round tensors. Bind versioned canonical content identity and origin;
   resource aliases and repacking do not alter scientific identity. Node status no

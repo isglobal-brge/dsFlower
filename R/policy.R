@@ -25,7 +25,7 @@
     "bce_logits", "cross_entropy", "mse", "poisson_nll",
     "multilabel_bce", "hinge", "ordinal", "negbin_nll", "gamma_nll",
     "huber", "quantile", "aft_weibull_nll", "aft_lognormal_nll",
-    "discrete_hazard_nll"
+    "discrete_hazard_nll", "segmentation_bce_dice"
   ),
   aggregation_strategies = c(
     "fedavg", "fedadam", "fedadagrad", "fedyogi", "fedavgm"
@@ -40,7 +40,7 @@
     cross_validation = list(
       available = TRUE,
       tracks = c("neural", "native_tree"),
-      data_kinds = "tabular",
+      data_kinds = c("tabular", "image"),
       folds = c(2L, 10L),
       assignment = "hmac-sha256-score-v1",
       pooled_only = TRUE)
