@@ -1,5 +1,8 @@
 # dsFlower 0.6.0
 
+This release combines request-selection identity v2, the durable gated-Hook
+release cache and custodian-approved public segmentation initialisation.
+
 * Add a durable node-owned release cache for gated HookApps. Identical requests
   replay the exact released arrays and constant metrics even for nondeterministic
   applications. Cache keys are domain-separated from the v2 semantic identity,
@@ -13,6 +16,17 @@
   with protected ownership and permissions. Declarative mechanisms, privacy
   calibration and the existing minimum-duration Hook envelope are unchanged;
   this release does not introduce a fixed-duration deadline.
+
+* Admit public segmentation decoder initialisation through a custodian-owned
+  checkpoint registry and manifest-hash allowlist. The node verifies checkpoint,
+  tensor, evidence and frozen encoder digests before private staging, binds the
+  public identity into request/seed contracts, and records provenance in the run
+  manifest and release record. BUSI v5 epochs60 manifests, original evidence and
+  a fetch-and-verify installation procedure are included; the three original
+  checkpoint binaries still require retrieval from the stopped evaluation host.
+  Installation and use require no campaign tooling. Random initialisation remains
+  the default; the DP contract, accountant, clipping, sampler and training path
+  are unchanged.
 
 # dsFlower 0.5.2
 

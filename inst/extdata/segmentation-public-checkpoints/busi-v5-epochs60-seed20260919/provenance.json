@@ -1,0 +1,17 @@
+{
+  "dataset": "BUSI",
+  "release": "Kaggle mirror version 1, 2021-03-14",
+  "dataset_url": "https://www.kaggle.com/datasets/aryashah2k/breast-ultrasound-images-dataset",
+  "download_url": "https://www.kaggle.com/api/v1/datasets/download/aryashah2k/breast-ultrasound-images-dataset?datasetVersionNumber=1",
+  "sha256": "7fffc86a517934da55021f66641d81383058d26a30adb0ffab3780ca7e52d57d",
+  "licence": "CC0 1.0 (mirror declaration; not an assertion about original rights)",
+  "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt",
+  "licence_sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+  "metadata_url": "https://www.kaggle.com/api/v1/datasets/list?search=breast-ultrasound-images-dataset",
+  "metadata_sha256": "be8bd03602e74ccd95bd86b87f607362e41f6778f4c9d92063d3497e76b82468",
+  "attribution": "Al-Dhabyani W, Gomaa M, Khaled H, Fahmy A. Dataset of breast ultrasound images. Data in Brief. 2020;28:104863. DOI: 10.1016/j.dib.2019.104863. Mirror: Arya Shah, Kaggle, version 1 (2021-03-14).",
+  "original_url": "https://scholar.cu.edu.eg/?q=afahmy/pages/dataset",
+  "publisher_md5": null,
+  "privacy": "Public nonprivate pretraining only; no patient-level split or privacy claim on BUSI.",
+  "retrieved": "2026-09-19"
+}

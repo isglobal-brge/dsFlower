@@ -28,6 +28,17 @@ noise remains bound to the validated clipped update through `bind_seed`.
 Pooled CV release keys also bind the ordered public fold-model digests retained
 in existing node RAM; private statistic hashes do not enter this public block.
 
+Public segmentation initialization additionally binds `segmentation-decoder-init`,
+`segmentation-public-manifest-sha256` and `segmentation-public-checkpoint-sha256`
+in both the neural config and request selection. These are admitted and pinned
+by the node; the manifest hash binds the complete provenance. The existing
+encoder and patient-image-selection pins retain their meanings. Explicit
+`random` is canonicalized to the omitted default. Registry paths and the public
+checkpoint transport payload do not enter the seed contract.
+As with every runner update, the source-bound execution fingerprint changes;
+this preserves the default mechanism and request contract, not an older
+runner's exact deterministic realization.
+
 Identical selections and identical effective inputs replay byte-identically
 within the same node-key/runtime domain. Declarative tracks recompute their
 deterministic releases; every admitted HookApp uses a durable release cache,

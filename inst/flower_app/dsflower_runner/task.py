@@ -952,6 +952,27 @@ def load_pinned_run_config(context=None):
         for key in segmentation.PIN_KEYS:
             if key not in cfg or cfg[key] != manifest[key]:
                 raise ValueError("Flower segmentation config does not match manifest pin")
+        from . import segmentation_checkpoints as checkpoints
+        # Public status transport only initializes the researcher-side strategy.
+        # It can never authorize/replace a node checkpoint or select DP seeds.
+        cfg.pop(checkpoints.TRANSPORT_KEY, None)
+        selected = checkpoints.checkpoint_id(manifest)
+        if checkpoints.checkpoint_id(cfg) != selected:
+            raise ValueError("Flower public checkpoint selection differs from node manifest")
+        for key in checkpoints.NODE_KEYS:
+            if key in cfg:
+                raise ValueError("Flower config cannot supply node-owned checkpoint provenance")
+            if selected is not None and key not in manifest:
+                raise ValueError("public checkpoint requires node-owned provenance pins")
+            if selected is None and key in manifest:
+                raise ValueError("random decoder cannot carry public checkpoint provenance")
+        if selected is None:
+            cfg.pop(checkpoints.INIT_KEY, None)
+    elif any(key in manifest or key in cfg for key in (
+            "segmentation-decoder-init", "segmentation-public-manifest-sha256",
+            "segmentation-public-checkpoint-sha256", "segmentation-public-provenance",
+            "segmentation-public-initialization-b64")):
+        raise ValueError("public decoder checkpoint fields require the segmentation contract")
     if manifest.get("cv-contract-sha256") is not None:
         _validate_cv_execution_config(manifest, cfg)
     if str(manifest.get("dp-track", "")).lower() == "egress":
@@ -1201,6 +1222,8 @@ def load_pinned_run_config(context=None):
         "segmentation-alpha", "segmentation-smooth", "mask-vocabulary",
         "segmentation-selection", "segmentation-preprocessing",
         "segmentation-checkpoint-sha256", "segmentation-output-shape",
+        "segmentation-decoder-init", "segmentation-public-manifest-sha256",
+        "segmentation-public-checkpoint-sha256", "segmentation-public-provenance",
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "survival-config", "survival-config-b64",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",

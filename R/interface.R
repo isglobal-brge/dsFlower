@@ -1262,6 +1262,7 @@ flowerInitDS <- function(data_symbol) {
 
 .addDpConfigToRunConfig <- function(run_config, unit_policy = NULL) {
   run_config <- .validate_client_run_config(run_config)
+  attr(run_config, "segmentation_public_initialization") <- NULL
   run_config <- .normalizeRunRounds(run_config)
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
@@ -1445,6 +1446,9 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     NULL
   }
   run_config <- .addDpConfigToRunConfig(run_config, imaging_unit_policy)
+  public_initialization <- attr(run_config, "segmentation_public_initialization",
+                                exact = TRUE)
+  attr(run_config, "segmentation_public_initialization") <- NULL
   if (isTRUE(imaging_backed) && !.segmentationRequested(run_config)) {
     .validateImagingTargetLevels(handle$descriptor, run_config)
   }
@@ -1703,6 +1707,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       handle$target_column   <- target_column
       handle$feature_columns <- feature_columns
       handle$prepared        <- TRUE
+      handle$segmentation_public_initialization <- public_initialization
       if (!is.null(previous_run_token) &&
           !identical(previous_run_token, run_token)) {
         .cleanupStaging(previous_run_token)
@@ -1745,6 +1750,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     handle$target_column   <- target_column
     handle$feature_columns <- feature_columns
     handle$prepared        <- TRUE
+    handle$segmentation_public_initialization <- public_initialization
 
     if (!is.null(previous_run_token) &&
         !identical(previous_run_token, run_token)) {
@@ -1987,6 +1993,7 @@ flowerCleanupRunDS <- function(handle_symbol) {
   handle$target_column   <- NULL
   handle$feature_columns <- NULL
   handle$prepared        <- FALSE
+  handle$segmentation_public_initialization <- NULL
   handle$node_ensured    <- FALSE
 
   .storeHandle(handle_symbol, handle)
@@ -2183,7 +2190,9 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
 #'
 #' DataSHIELD AGGREGATE method. Returns the current status of the handle
 #' including whether data is prepared, a SuperNode is ensured, and the
-#' server-authored privacy unit effective for this handle.
+#' server-authored privacy unit effective for this handle. Prepared public
+#' segmentation runs additionally return the verified public checkpoint and its
+#' provenance so the coordinator can initialise its aggregation strategy.
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @return Named list with status information.
@@ -2206,7 +2215,7 @@ flowerStatusDS <- function(handle_symbol) {
     supernode_running <- !is.null(entry)
   }
 
-  list(
+  status <- list(
     prepared           = handle$prepared,
     node_ensured       = handle$node_ensured,
     supernode_running  = supernode_running,
@@ -2216,6 +2225,10 @@ flowerStatusDS <- function(handle_symbol) {
     feature_columns    = handle$feature_columns,
     privacy_unit       = unit_policy$dp_unit
   )
+  if (isTRUE(handle$prepared) && !is.null(handle$segmentation_public_initialization)) {
+    status$segmentation_public_initialization <- handle$segmentation_public_initialization
+  }
+  status
 }
 
 #' Query the server-owned stateless privacy policy

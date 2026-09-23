@@ -1,0 +1,128 @@
+{
+  "checkpoint": {
+    "file": "checkpoint.npz",
+    "sha256": "b49b39a40ac00287ba5292f053aafff4c8ef042d09ac9c3a51d88ef2d94e07ed",
+    "size_bytes": 39510
+  },
+  "checkpoint_id": "busi-v5-epochs60-seed20260920",
+  "dataset": {
+    "attribution": "Al-Dhabyani W, Gomaa M, Khaled H, Fahmy A. Dataset of breast ultrasound images. Data in Brief. 2020;28:104863. DOI: 10.1016/j.dib.2019.104863. Mirror: Arya Shah, Kaggle, version 1 (2021-03-14).",
+    "dataset": "BUSI",
+    "dataset_url": "https://www.kaggle.com/datasets/aryashah2k/breast-ultrasound-images-dataset",
+    "download_url": "https://www.kaggle.com/api/v1/datasets/download/aryashah2k/breast-ultrasound-images-dataset?datasetVersionNumber=1",
+    "licence": "CC0 1.0 (mirror declaration; not an assertion about original rights)",
+    "licence_sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+    "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt",
+    "metadata_sha256": "be8bd03602e74ccd95bd86b87f607362e41f6778f4c9d92063d3497e76b82468",
+    "metadata_url": "https://www.kaggle.com/api/v1/datasets/list?search=breast-ultrasound-images-dataset",
+    "original_url": "https://scholar.cu.edu.eg/?q=afahmy/pages/dataset",
+    "privacy": "Public nonprivate pretraining only; no patient-level split or privacy claim on BUSI.",
+    "publisher_md5": null,
+    "release": "Kaggle mirror version 1, 2021-03-14",
+    "retrieved": "2026-09-19",
+    "sha256": "7fffc86a517934da55021f66641d81383058d26a30adb0ffab3780ca7e52d57d"
+  },
+  "decoder": "narrow",
+  "encoder_sha256": "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec",
+  "evidence": {
+    "audit": {
+      "file": "audit.json",
+      "sha256": "d59334151e074de56afaaec81e92930ddaad8371f7f2665577096ce4ff7d9d57",
+      "size_bytes": 427487
+    },
+    "licence": {
+      "file": "licence.txt",
+      "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+      "size_bytes": 7048
+    },
+    "mirror_metadata": {
+      "file": "mirror-metadata.json",
+      "sha256": "be8bd03602e74ccd95bd86b87f607362e41f6778f4c9d92063d3497e76b82468",
+      "size_bytes": 67100
+    },
+    "original_manifest": {
+      "file": "original-manifest.json",
+      "sha256": "3f3e9d6ceca5dda443c8e0f52d882f5d23b041685eff4b954bbd95449a9523db",
+      "size_bytes": 1420
+    },
+    "protocol": {
+      "file": "protocol.md",
+      "sha256": "28a713f8ffe6f7bb7b74e7d59d13d1be265d5738b43503c60e6581a67e0c5820",
+      "size_bytes": 11554
+    },
+    "provenance": {
+      "file": "provenance.json",
+      "sha256": "0e3dd39468fdfe562b54b412284eb7315e612ba2f579b566ec49495bfe3bc51d",
+      "size_bytes": 1279
+    }
+  },
+  "feature_contract": "resnet18_layer2_128_v1",
+  "licence": {
+    "attribution": "Al-Dhabyani W, Gomaa M, Khaled H, Fahmy A. Dataset of breast ultrasound images. Data in Brief. 2020;28:104863. DOI: 10.1016/j.dib.2019.104863. Mirror: Arya Shah, Kaggle, version 1 (2021-03-14).",
+    "declaration": "CC0 1.0 (mirror declaration; not an assertion about original rights)",
+    "name": "CC0 1.0",
+    "scope": "Kaggle mirror declaration; not an assertion about original rights",
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt"
+  },
+  "model_id": "pytorch_resnet18_segmentation",
+  "schema_version": "dsflower-segmentation-public-checkpoint/v1",
+  "tensors": [
+    {
+      "dtype": "float32",
+      "name": "0",
+      "sha256": "a35c40fed8524bbf1eb3501fe1f8fb5031e931f1bbc59ec90e14417579d4ebf5",
+      "shape": [
+        8,
+        128,
+        3,
+        3
+      ]
+    },
+    {
+      "dtype": "float32",
+      "name": "1",
+      "sha256": "18dab6f1d852107637f6617ce37b1871d523dfbb206f53f20580c1527dcb7bd2",
+      "shape": [
+        8
+      ]
+    },
+    {
+      "dtype": "float32",
+      "name": "2",
+      "sha256": "9e325067225a66fe4d66cb2c525f6b3739a628b60a4463b42676ae6be4a7b3ca",
+      "shape": [
+        4,
+        8,
+        3,
+        3
+      ]
+    },
+    {
+      "dtype": "float32",
+      "name": "3",
+      "sha256": "3e983f9c033cf42c00e9964a325edaeee201a11843003e2c0d758f7d2e77942a",
+      "shape": [
+        4
+      ]
+    },
+    {
+      "dtype": "float32",
+      "name": "4",
+      "sha256": "08956a3db1a369b04abf1f10e3718ae7e3a80950b0f10694f4f0e0c488ae0cfe",
+      "shape": [
+        1,
+        4,
+        1,
+        1
+      ]
+    },
+    {
+      "dtype": "float32",
+      "name": "5",
+      "sha256": "0a4d1482d0b9c4d6a0dd7f9c0e5b1921cb2a40ff47d502afba2361363e7cda8a",
+      "shape": [
+        1
+      ]
+    }
+  ]
+}

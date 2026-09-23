@@ -85,8 +85,9 @@ def _save_portable_arrays(results_dir, arrays, round_number):
 
 def _build_initial_model(cfg):
     """Seed the global model's array SHAPES from the researcher's declarative spec
-    (DATA, node-built by model_spec). Researcher-side + untrusted: random init only;
-    the nodes rebuild from the same spec and enforce all DP + hardening. No
+    (DATA, node-built by model_spec). Random initialization is the default; public
+    segmentation uses the node-verified checkpoint relayed through status. The
+    nodes independently rebuild/verify and enforce all DP + hardening. No
     researcher code is imported here."""
     try:
         import model_spec
@@ -125,6 +126,12 @@ def _build_initial_model(cfg):
                                            num_labels=num_labels, **spatial)
     if not isinstance(model, torch.nn.Module):
         raise ValueError("build_from_spec must return a torch.nn.Module")
+    if loss_name == "segmentation_bce_dice":
+        from . import segmentation_checkpoints
+        from .params import set_torch_params
+        arrays = segmentation_checkpoints.server_initialization(cfg)
+        if arrays is not None:
+            set_torch_params(model, arrays)
     return model
 
 

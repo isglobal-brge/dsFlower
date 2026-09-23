@@ -15,5 +15,7 @@ Named list with status information.
 \description{
 DataSHIELD AGGREGATE method. Returns the current status of the handle
 including whether data is prepared, a SuperNode is ensured, and the
-server-authored privacy unit effective for this handle.
+server-authored privacy unit effective for this handle. Prepared public
+segmentation runs additionally return the verified public checkpoint and its
+provenance so the coordinator can initialise its aggregation strategy.
 }

@@ -329,3 +329,240 @@ test_that("direct prepare uses image routing only for the segmentation contract"
                                  config), "mask_data_root")
   expect_identical(dsFlower:::.getHandle("segmentation_direct")$run_token, prior_token)
 })
+
+segmentation_public_provenance <- function(id = "busi-test") {
+  bytes <- charToRaw("verified public decoder bytes")
+  list(manifest_sha256 = strrep("a", 64L), manifest = list(
+    checkpoint_id = id, checkpoint = list(
+      sha256 = digest::digest(bytes, algo = "sha256", serialize = FALSE),
+      size_bytes = length(bytes)),
+    dataset = list(name = "public BUSI fixture", publisher_md5 = NULL,
+                   training_loss = 0.12345678901234566),
+    licence = list(declaration = "CC0-1.0", scope = "public mirror declaration")))
+}
+
+segmentation_public_payload <- function(id = "busi-test") {
+  list(provenance = segmentation_public_provenance(id),
+       checkpoint_base64 = gsub("[\r\n]", "", jsonlite::base64_enc(
+         charToRaw("verified public decoder bytes"))))
+}
+
+segmentation_public_config <- function() {
+  config <- segmentation_config()
+  config[["segmentation-decoder-init"]] <- "public:busi-test"
+  config[["model-spec-b64"]] <- gsub("[\r\n]", "", jsonlite::base64_enc(
+    charToRaw('{"kind":"sequential","layers":[]}')))
+  config
+}
+
+test_that("public decoder admission requires a custodian manifest allowlist", {
+  local_segmentation_roots()
+  config <- segmentation_public_config()
+  calls <- 0L
+  local_mocked_bindings(.verifySegmentationPublicCheckpoint = function(
+      run_config, checkpoint_id, manifest_sha256) {
+    calls <<- calls + 1L
+    expect_identical(checkpoint_id, "busi-test")
+    expect_identical(manifest_sha256, strrep("a", 64L))
+    segmentation_public_payload(checkpoint_id)
+  }, .package = "dsFlower")
+  withr::local_options(list(dsflower.segmentation_public_checkpoints = character()))
+  expect_error(dsFlower:::.addDpConfigToRunConfig(config), "not allowlisted")
+  expect_identical(calls, 0L)
+  withr::local_options(list(dsflower.segmentation_public_checkpoints =
+    c("busi-test" = strrep("a", 64L))))
+  actual <- dsFlower:::.addDpConfigToRunConfig(config)
+  expect_identical(calls, 1L)
+  expect_identical(actual[["segmentation-public-manifest-sha256"]], strrep("a", 64L))
+  expect_identical(actual[["segmentation-public-checkpoint-sha256"]],
+                   segmentation_public_provenance()$manifest$checkpoint$sha256)
+  expect_identical(actual[["segmentation-public-provenance"]],
+                   segmentation_public_provenance())
+  for (key in dsFlower:::.segmentationPublicCheckpointFields()) {
+    forged <- config
+    forged[[key]] <- actual[[key]]
+    expect_error(dsFlower:::.addDpConfigToRunConfig(forged), "server-owned")
+  }
+  config[["segmentation-public-initialization-b64"]] <- "forged"
+  expect_error(dsFlower:::.addDpConfigToRunConfig(config), "unsupported")
+})
+
+test_that("decoder IDs and custodian checkpoint policies fail closed", {
+  local_segmentation_roots()
+  config <- segmentation_public_config()
+  local_mocked_bindings(.verifySegmentationPublicCheckpoint = function(...) {
+    stop("must not reach verifier")
+  }, .package = "dsFlower")
+  invalid <- list("", "PUBLIC:busi-test", "public:../file", "public:/file",
+                  "public:https://example.org/file", "public:", NA_character_,
+                  "public:busi-test\n", "public:busi-test\r\n",
+                  c("random", "public:busi-test"), 1, list("random"))
+  for (value in invalid) {
+    bad <- config
+    bad[["segmentation-decoder-init"]] <- value
+    expect_error(dsFlower:::.addDpConfigToRunConfig(bad), "decoder_init")
+  }
+  invalid_policies <- list(NULL, list("busi-test" = strrep("a", 64L)),
+    strrep("a", 64L), c("../busi-test" = strrep("a", 64L)),
+    c("busi-test" = "bad-hash"), c("busi-test" = NA_character_),
+    c("busi-test\n" = strrep("a", 64L)),
+    c("busi-test" = paste0(strrep("a", 64L), "\n")),
+    stats::setNames(rep(strrep("a", 64L), 2), rep("busi-test", 2)))
+  for (policy in invalid_policies) {
+    withr::with_options(list(dsflower.segmentation_public_checkpoints = policy), {
+      expect_error(dsFlower:::.addDpConfigToRunConfig(config),
+                   if (is.null(policy)) "not allowlisted" else "named character vector")
+    })
+  }
+})
+
+test_that("random decoder default preserves the existing admission contract", {
+  local_segmentation_roots()
+  local_mocked_bindings(.verifySegmentationPublicCheckpoint = function(...) {
+    stop("random must not read public checkpoint files")
+  }, .package = "dsFlower")
+  config <- segmentation_config()
+  before <- dsFlower:::.addDpConfigToRunConfig(config)
+  config[["segmentation-decoder-init"]] <- "random"
+  attr(config, "segmentation_public_initialization") <- list(untrusted = "value")
+  withr::local_options(list(dsflower.segmentation_public_checkpoints = "malformed"))
+  expect_identical(dsFlower:::.addDpConfigToRunConfig(config), before)
+  expect_length(intersect(names(before), c("segmentation-decoder-init",
+    dsFlower:::.segmentationPublicCheckpointFields())), 0L)
+})
+
+test_that("public checkpoint failures occur before private staging and run creation", {
+  local_segmentation_roots()
+  withr::local_options(list(dsflower.segmentation_public_checkpoints =
+    c("busi-test" = strrep("a", 64L))))
+  local_mocked_bindings(
+    .verifySegmentationPublicCheckpoint = function(...) {
+      stop("Public segmentation checkpoint verification failed before private staging.")
+    },
+    .generate_run_token = function(...) stop("private boundary reached"),
+    .stage_image_manifest = function(...) stop("private boundary reached"),
+    .package = "dsFlower")
+  dsFlower:::.setHandle("segmentation_public_failure",
+                        mock_handle(table_data = segmentation_table()))
+  withr::defer(dsFlower:::.removeHandle("segmentation_public_failure"))
+  config <- segmentation_public_config()
+  expect_error(flowerPrepareRunDS("segmentation_public_failure", "mask_path", NULL,
+                                 config),
+               "verification failed before private staging")
+  expect_null(dsFlower:::.getHandle("segmentation_public_failure")$run_token)
+})
+
+test_that("trusted public verification validates subprocess evidence and spec syntax", {
+  roots <- local_segmentation_roots()
+  config <- segmentation_public_config()
+  verify <- function(config, result) {
+    dsFlower:::.verifySegmentationPublicCheckpoint(
+      config, "busi-test", strrep("a", 64L), registry_root = roots$root,
+      runner_dir = roots$root, runtime = list(python = "trusted-python", venv_path = "trusted"),
+      run_probe = function(command, args, env, error_on_status, timeout) {
+        expect_identical(command, "trusted-python")
+        expect_identical(args[1:2], c("-I", "-c"))
+        expect_match(args[[3]], "initialization_payload", fixed = TRUE)
+        expect_match(args[[3]], "prepare_encoder(cfg)", fixed = TRUE)
+        expect_identical(args[[5]], roots$root)
+        result
+      })
+  }
+  payload <- segmentation_public_payload()
+  result <- list(status = 0L, stdout = as.character(jsonlite::toJSON(
+    payload, auto_unbox = TRUE, null = "null", digits = I(17))))
+  expect_identical(verify(config, result), payload)
+  expect_error(verify(config, list(status = 1L, stdout = "digest mismatch")),
+               "verification failed before private staging")
+  for (stdout in c("{}", "not JSON", gsub(strrep("a", 64L), strrep("c", 64L),
+                                          result$stdout, fixed = TRUE))) {
+    expect_error(verify(config, list(status = 0L, stdout = stdout)), "verification failed")
+  }
+  for (spec in list(NULL, "not-base64", strrep("a", 16385L))) {
+    bad <- config
+    bad[["model-spec-b64"]] <- spec
+    expect_error(verify(bad, result), "decoder spec")
+  }
+  payload$checkpoint_base64 <- jsonlite::base64_enc(charToRaw("altered checkpoint"))
+  expect_error(verify(config, list(status = 0L, stdout = as.character(jsonlite::toJSON(
+    payload, auto_unbox = TRUE)))), "transport verification")
+})
+
+test_that("public decoder provenance is stored in the prepared run manifest", {
+  roots <- local_segmentation_roots()
+  withr::local_envvar(c(
+    DSFLOWER_NODE_SECRET_FILE = file.path(roots$root, "node-secret"),
+    DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET = "1"))
+  withr::local_options(list(dsflower.segmentation_public_checkpoints =
+    c("busi-test" = strrep("a", 64L))))
+  local_mocked_bindings(.verifySegmentationPublicCheckpoint = function(...) {
+    segmentation_public_payload()
+  }, .package = "dsFlower")
+  dsFlower:::.setHandle("segmentation_public_manifest",
+                        mock_handle(table_data = segmentation_table()))
+  withr::defer(dsFlower:::.removeHandle("segmentation_public_manifest"))
+  config <- segmentation_public_config()
+  flowerPrepareRunDS("segmentation_public_manifest", "mask_path", NULL,
+                     config)
+  handle <- dsFlower:::.getHandle("segmentation_public_manifest")
+  withr::defer(dsFlower:::.cleanupStaging(handle$run_token))
+  manifest <- jsonlite::fromJSON(file.path(handle$staging_dir, "manifest.json"),
+                                simplifyVector = FALSE)
+  expect_identical(manifest[["segmentation-decoder-init"]], "public:busi-test")
+  expect_identical(manifest[["segmentation-public-provenance"]],
+                   segmentation_public_provenance())
+  expect_match(paste(readLines(file.path(handle$staging_dir, "manifest.json")),
+                     collapse = "\n"), '"publisher_md5": null', fixed = TRUE)
+  expect_identical(manifest[["segmentation-public-manifest-sha256"]], strrep("a", 64L))
+  expect_identical(manifest[["segmentation-public-checkpoint-sha256"]],
+                   segmentation_public_provenance()$manifest$checkpoint$sha256)
+  expect_equal(manifest[["privacy-epsilon"]], 1)
+  expect_equal(manifest[["privacy-clipping_norm"]], 1)
+  expect_null(manifest$segmentation_public_initialization)
+  expect_identical(flowerStatusDS("segmentation_public_manifest")$segmentation_public_initialization,
+                   segmentation_public_payload())
+  flowerCleanupRunDS("segmentation_public_manifest")
+  expect_null(flowerStatusDS("segmentation_public_manifest")$segmentation_public_initialization)
+  config <- segmentation_config()
+  flowerPrepareRunDS("segmentation_public_manifest", "mask_path", NULL, config)
+  handle <- dsFlower:::.getHandle("segmentation_public_manifest")
+  withr::defer(dsFlower:::.cleanupStaging(handle$run_token))
+  expect_null(flowerStatusDS("segmentation_public_manifest")$segmentation_public_initialization)
+})
+
+test_that("public preflight and trusted runner resolve the same encoder cache", {
+  python <- unname(Sys.which("python3"))
+  skip_if(!nzchar(python), "Python interpreter is unavailable")
+  roots <- local_segmentation_roots()
+  runtime <- list(python = python, venv_path = dirname(dirname(python)))
+  withr::local_envvar(c(TORCH_HOME = file.path(roots$root, "foreign-torch"),
+                        PYTHONPATH = file.path(roots$root, "foreign-python"),
+                        XDG_CACHE_HOME = file.path(roots$root, "public-cache")))
+  local_mocked_bindings(
+    .privacy_runtime_bootstrap = function() list(secret_path = "public-test-key"),
+    .validate_node_secret = function(path) path, .package = "dsFlower")
+  launch_env <- dsFlower:::.build_clean_python_env(runtime$venv_path, roots$root)
+  probe <- paste(
+    "import json, os",
+    "root = os.path.expanduser(os.getenv('TORCH_HOME', os.path.join(os.getenv('XDG_CACHE_HOME', '~/.cache'), 'torch')))",
+    "print(json.dumps({'hub': os.path.join(root, 'hub'), 'home': os.path.expanduser('~'), 'TORCH_HOME': os.getenv('TORCH_HOME')}))",
+    sep = "\n")
+  launch_cache <- processx::run(python, c("-I", "-c", probe), env = launch_env)$stdout
+  payload <- segmentation_public_payload()
+  actual <- dsFlower:::.verifySegmentationPublicCheckpoint(
+    segmentation_public_config(), "busi-test", strrep("a", 64L),
+    registry_root = roots$root, runner_dir = roots$root, runtime = runtime,
+    run_probe = function(command, args, env, error_on_status, timeout) {
+      expect_false("current" %in% env)
+      expect_false(any(c("HOME", "USERPROFILE", "TORCH_HOME", "PYTHONPATH") %in% names(env)))
+      expect_identical(env, launch_env[names(env)])
+      preflight_cache <- processx::run(command, c("-I", "-c", probe), env = env)$stdout
+      expect_identical(preflight_cache, launch_cache)
+      cache <- jsonlite::fromJSON(preflight_cache)
+      expect_null(cache$TORCH_HOME)
+      expect_identical(cache$hub, file.path(Sys.getenv("XDG_CACHE_HOME"), "torch", "hub"))
+      list(status = 0L, stdout = as.character(jsonlite::toJSON(
+        payload, auto_unbox = TRUE, null = "null", digits = I(17))))
+    })
+  expect_identical(actual, payload)
+})
