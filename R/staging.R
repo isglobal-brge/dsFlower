@@ -865,7 +865,8 @@
     "privacy-egress_file_mb", "privacy-egress_processes",
     "privacy-hook_enabled", "user-module", "app-params-sha256",
     "association-contract", "association-privacy-unit",
-    "association-unit-semantics", "survival-config"
+    "association-unit-semantics", "survival-config",
+    .segmentationPublicCheckpointFields()
   )
 }
 

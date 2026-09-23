@@ -185,6 +185,8 @@ _REQUEST_SELECTION_KEYS = frozenset({
     "segmentation-alpha", "segmentation-smooth", "segmentation-selection",
     "segmentation-preprocessing", "segmentation-checkpoint-sha256",
     "segmentation-output-shape",
+    "segmentation-decoder-init", "segmentation-public-manifest-sha256",
+    "segmentation-public-checkpoint-sha256",
     "validation-model-track", "validation-task", "validation-bins",
     "validation-contract-sha256", "validation-artifact-format",
     "validation-artifact-sha256", "validation-profile-sha256",
@@ -216,6 +218,8 @@ def request_selection(manifest):
     engine schema/parameters, and callers bind validated release coordinates.
     """
     selection = select_config(manifest, _REQUEST_SELECTION_KEYS)
+    if selection.get("segmentation-decoder-init") == "random":
+        selection.pop("segmentation-decoder-init")
     if manifest.get("task-type") == "survival":
         # Accepted wire aliases do not affect survival execution.
         selection.pop("target-bounds", None)

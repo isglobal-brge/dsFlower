@@ -1,5 +1,12 @@
 # dsFlower 0.5.2
 
+* Admit public segmentation decoder initialisation through a custodian-owned
+  checkpoint registry and manifest-hash allowlist. The node verifies checkpoint,
+  tensor, evidence and frozen encoder digests before private staging, binds the
+  public identity into request/seed contracts, and records provenance in the run
+  manifest and release record. The bundled BUSI v5 epochs60 narrow decoders can be
+  installed without campaign tooling. Random initialisation remains the default;
+  the DP contract, accountant, clipping, sampler and training path are unchanged.
 * Correct deterministic release identity to include server-authored request
   selections, including source operands, ordered columns, public vocabularies, imaging roles and
   resampling contracts. The semantic randomness contract is now v2. Identical

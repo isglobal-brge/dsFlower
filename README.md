@@ -329,6 +329,40 @@ The mask-path column is the target. Authorized dsImaging image bundles can use
 their declared `mask_root` asset and retain their existing patient roster checks.
 Neither route accepts an analyst-supplied filesystem root.
 
+The registry parameter `decoder_init` defaults to `"random"`. A custodian can
+enable `"public:<checkpoint-id>"` by installing a checkpoint in the protected
+node registry and allowlisting its exact manifest SHA-256. The
+[BUSI v5 public checkpoint bundle](inst/extdata/segmentation-public-checkpoints/README.md)
+contains the three epochs60 narrow decoders and the administrator installation
+procedure. For example, after installing a chosen bundle entry:
+
+```r
+options(dsflower.segmentation_public_checkpoints = c(
+  "busi-v5-epochs60-seed20260919" = "<installed manifest SHA-256>"))
+```
+
+The analyst then selects `decoder = "narrow"` and
+`decoder_init = "public:busi-v5-epochs60-seed20260919"` in the registered model's
+parameters. The installed registry lives at
+`dirname(node_secret_path)/segmentation-public-checkpoints/<checkpoint-id>/`;
+the node-secret environment override applies as usual. No runtime download or
+campaign hook is needed. The manifest declares dataset provenance, licence and
+its scope, protocol/evidence digests, frozen encoder identity, checkpoint hash
+and every tensor hash. The node verifies the protected files and all digests
+before private staging and repeats verification before training. Missing,
+unlisted, altered or architecture-incompatible checkpoints fail closed.
+
+Prepared node status supplies only the verified public checkpoint and provenance
+to initialise the coordinator's aggregation strategy from the same weights.
+The first round starts from the verified public decoder; later rounds continue
+the incoming federated decoder. The checkpoint identity enters request selection
+and the neural seed contract. The run manifest and protected release record carry
+the verified provenance. Private budget adapts this public decoder using the
+existing DP contract, accountant, clipping, sampler and training loop. Public
+initialisation preserves the registry's experimental status and does not extend
+the dataset mirror's licence declaration. Omitted or explicit `"random"` retains
+the existing random-initialisation contract.
+
 Private validation, holdout, CV and HPO reject during public preflight. Dice and
 IoU, including empty/foreground strata, are available only for public or
 authorized local evaluation at threshold 0.5; both-empty Dice is 1. Local
@@ -354,6 +388,7 @@ controls remain normal DataSHIELD profile options.
 | `patient_column` | unset | Required explicit stable identifier when `dp_unit="patient"`; never auto-detected. |
 | `image_data_root` | unset | Custodian image root for direct segmentation metadata; declared paths must remain within it. |
 | `mask_data_root` | unset | Custodian PNG-mask root for direct segmentation metadata; declared paths must remain within it. |
+| `segmentation_public_checkpoints` | empty | Named checkpoint-ID to manifest-SHA-256 allowlist for installed public segmentation decoders; omitted IDs are refused. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |
 | `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated 256-bit node key; `DSFLOWER_NODE_SECRET_FILE` takes precedence when a deployment selects a service or secret-manager path. |
 | `app_spool_root` | `/var/lib/dsflower/appstore` | Private, persistent, service-owned upload spool; ephemeral and symlink paths are rejected. |

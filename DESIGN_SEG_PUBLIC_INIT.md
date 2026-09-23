@@ -50,6 +50,10 @@ the node's request selection and neural seed contract. Omitted/default random
 selection is normalised away to preserve the existing default semantic contract.
 The checkpoint ID and content hashes distinguish public initialisers, even when
 their tensor values happen to coincide. Operational paths never select seeds.
+The existing execution fingerprint hashes runner source, so installing this
+updated runner changes its deterministic streams, including random-init runs.
+Backward compatibility means the default request/selection contract and training
+mechanism stay unchanged, not that an older runner's exact noise is reproduced.
 
 After admission, the existing node status response carries the verified public
 NPZ bytes and provenance (never private data or trained weights). The client

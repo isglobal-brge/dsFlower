@@ -33,6 +33,8 @@ def configure_runtime():
 
 def validate_config(cfg):
     """Public-only admission; called before resolving any private path."""
+    from .segmentation_checkpoints import checkpoint_id
+    checkpoint_id(cfg)
     if "data_type" in cfg:
         if "data-kind" in cfg and cfg["data-kind"] != cfg["data_type"]:
             raise ValueError("segmentation data kind conflicts with manifest")
@@ -119,13 +121,9 @@ def loss_factory(cfg):
     return loss
 
 
-def prepare_encoder(cfg):
-    """Verify checkpoint and frozen spatial geometry before private reads."""
-    from torchvision.models import resnet18, ResNet18_Weights
-    from .vision import pick_device
-
-    validate_config(cfg)
-    configure_runtime()
+def verified_encoder_bytes():
+    """Read the pinned public encoder, without loading unverified weights."""
+    from torchvision.models import ResNet18_Weights
     weights = ResNet18_Weights.IMAGENET1K_V1
     path = os.path.join(torch.hub.get_dir(), "checkpoints",
                         os.path.basename(weights.url))
@@ -138,6 +136,17 @@ def prepare_encoder(cfg):
     if (len(checkpoint) != 46_830_571
             or hashlib.sha256(checkpoint).hexdigest() != CHECKPOINT_SHA256):
         raise ValueError("segmentation pretrained checkpoint digest mismatch")
+    return checkpoint
+
+
+def prepare_encoder(cfg):
+    """Verify checkpoint and frozen spatial geometry before private reads."""
+    from torchvision.models import resnet18
+    from .vision import pick_device
+
+    validate_config(cfg)
+    configure_runtime()
+    checkpoint = verified_encoder_bytes()
     # Consume exactly the verified bytes. Asking torchvision to load weights
     # here would reopen its cache (or fetch again) after the hash check.
     state = torch.load(io.BytesIO(checkpoint), map_location="cpu", weights_only=True)

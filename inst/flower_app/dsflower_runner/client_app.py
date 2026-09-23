@@ -62,6 +62,8 @@ _NEURAL_SEED_CONFIG_KEYS = frozenset({
     "segmentation-alpha", "segmentation-smooth", "segmentation-selection",
     "segmentation-preprocessing", "segmentation-checkpoint-sha256",
     "segmentation-output-shape",
+    "segmentation-decoder-init", "segmentation-public-manifest-sha256",
+    "segmentation-public-checkpoint-sha256",
 })
 _NEURAL_PUBLIC_INIT_POLICY_HASH = hashlib.sha256(
     b"dsflower/neural-public-init-policy/v1").hexdigest()
@@ -81,6 +83,8 @@ def _reply_cache_allowed(claim):
 def _neural_seed_contract(cfg, pins, _pcfg, geometry_n_units=None, *, manifest):
     """Exact public inputs which can affect trusted neural execution."""
     run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
+    if run.get("segmentation-decoder-init") == "random":
+        run.pop("segmentation-decoder-init")
     if pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         from . import survival
         # These accepted wire aliases have no effect on survival execution.
@@ -321,8 +325,20 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
         {"policy_hash": _NEURAL_PUBLIC_INIT_POLICY_HASH},
         int(pins["round_index"]))
     seeding.seed_torch(seeding.sub_seed(public_master, "init"))
+    checkpoint_arrays = None
+    if pins["loss_name"] == "segmentation_bce_dice":
+        from . import segmentation, segmentation_checkpoints
+        checkpoint_arrays, _ = segmentation_checkpoints.verify_node_checkpoint(
+            cfg, task_module._load_manifest(context))
+        if checkpoint_arrays is not None:
+            segmentation.verified_encoder_bytes()
     model = load_user_model(cfg, input_dim, pins["loss_name"])
-    _validate_public_neural_arrays(msg.content["arrays"], model)
+    initial_arrays = _validate_public_neural_arrays(msg.content["arrays"], model)
+    if checkpoint_arrays is not None and int(pins["round_index"]) == 1:
+        if any(a.tobytes(order="C") != b.tobytes(order="C")
+               for a, b in zip(initial_arrays, checkpoint_arrays)):
+            raise ValueError("first global decoder differs from the public checkpoint")
+        set_torch_params(model, checkpoint_arrays)
     return model, input_dim, manifest_image
 
 
@@ -1302,6 +1318,11 @@ def train(msg: Message, context: Context) -> Message:
                          if operation == "cv-train" else None),
                 on_private_start=(mark_private_started
                                   if manifest_image else None))
+            if pins["loss_name"] == "segmentation_bce_dice":
+                from . import segmentation_checkpoints
+                segmentation_checkpoints.record_release(
+                    context, task_module._load_manifest(context),
+                    int(pins["round_index"]), new_arrays)
 
         hook_status = True if track == "egress" else None
         if _reply_cache_allowed(claim):
