@@ -87,13 +87,13 @@ class JointGaussianReleaseTests(unittest.TestCase):
     def test_numeric_profile_known_answer_for_supported_matrix(self):
         expected = {
             ("darwin", "arm64", "2.4.6"):
-                "be65850d33e5a992f54e3a003be63c6315558b001bc1028088649a19cb4e0610",
+                "f74ae8755633fa5139f9a23ac8a4b573a472fbacbf65ba4fddb81749bbbfbf62",
             ("darwin", "x86_64", "2.4.6"):
-                "31efb146d544fc01556ae140510578c716e7b6c9ab10a7e047c51e382b678bf3",
+                "e17344046bc8080601b41b15ceb820005e00e78aee5ac16bb03c98deadc76051",
             ("linux", "x86_64", "2.4.6"):
-                "cdc473e7ec8b242e451b4a52398d01884178ff8ecbafb731fa98b113864ebe27",
+                "aedc807f04db85228317651cde5e8d67e9684d074864e83b1c153fa77937d67b",
             ("windows", "amd64", "2.4.6"):
-                "6b5b0b77bafeca529f7b60ff960d0a9284f21bd8c6dbdfac10d904de088476b2",
+                "158a2d2375c02349ed8b14a490880609f71e16548912172c235f5b4d52086df7",
         }
         profile = tree_release.numeric_execution_profile()
         key = (profile["system"], profile["machine"], profile["numpy"])

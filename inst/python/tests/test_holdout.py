@@ -207,9 +207,16 @@ class NeuralHoldoutTests(unittest.TestCase):
         self.assertIsNone(train[2])
 
         model = object()
+        public_arrays = [np.zeros((1, 2), dtype=np.float32)]
+        manifest = {"target_column": "outcome", "feature_columns": ["a", "b"],
+                    "patient_column": "patient", "dp-unit": "patient"}
         captured = {}
         with (mock.patch.object(
                   client_app, "load_data", return_value=(X, y, patient_ids)),
+              mock.patch.object(client_app.task_module, "_load_manifest",
+                                return_value=manifest),
+              mock.patch.object(client_app, "get_torch_params",
+                                return_value=public_arrays),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
               mock.patch.object(client_app, "_apply_feature_bounds",
                                 side_effect=lambda values, ignored: values),
@@ -224,6 +231,8 @@ class NeuralHoldoutTests(unittest.TestCase):
                   validation, "private_validation_vector",
                   side_effect=lambda yy, predictions, layout, **kwargs:
                   (captured.update(y=yy.copy(), predictions=predictions.copy(),
+                                   request_selection=kwargs["request_selection"],
+                                   public_arrays=kwargs["public_arrays"],
                                    include_zero_neighbor=kwargs.get(
                                        "include_zero_neighbor"))
                    or (np.ones(layout["size"]), 1.0)))):
@@ -234,6 +243,9 @@ class NeuralHoldoutTests(unittest.TestCase):
         np.testing.assert_array_equal(captured["y"], y[mask])
         self.assertEqual(len(captured["predictions"]), int(mask.sum()))
         self.assertIs(captured["include_zero_neighbor"], True)
+        self.assertEqual(captured["request_selection"],
+                         client_app.seeding.request_selection(manifest))
+        self.assertIs(captured["public_arrays"], public_arrays)
         self.assertEqual(len(released), 1)
 
     def test_empty_train_and_test_sides_are_shape_preserving(self):
@@ -372,9 +384,18 @@ class NeuralHoldoutTests(unittest.TestCase):
                     "num-features": 2, "image-size": 32,
                 }
                 callback = mock.Mock()
+                manifest = {
+                    "target_column": "outcome",
+                    "dp-unit": "patient" if groups is not None else "row",
+                }
+                model = torch.nn.Linear(2, 2)
+                public_arrays = client_app.get_torch_params(model)
                 with (mock.patch.object(
                           client_app, "is_image_run",
                           return_value=manifest_image),
+                      mock.patch.object(
+                          client_app.task_module, "_load_manifest",
+                          return_value=manifest),
                       mock.patch.object(
                           client_app, "load_data", return_value=(X, y, groups)),
                       mock.patch.object(
@@ -402,7 +423,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                     arrays = client_app._holdout_neural_release(
                         None, cfg, {"epsilon": 0.4, "delta": 2e-6},
                         {"loss_name": "cross_entropy"},
-                        torch.nn.Linear(2, 2), input_dim=2,
+                        model, input_dim=2,
                         on_private_start=callback)
 
                 self.assertEqual(len(arrays), 1)
@@ -411,6 +432,12 @@ class NeuralHoldoutTests(unittest.TestCase):
                 self.assertEqual(release.call_count, 1)
                 self.assertEqual(release.call_args.args[0].shape, (0,))
                 self.assertEqual(release.call_args.args[1].shape, (0, 2))
+                self.assertEqual(
+                    release.call_args.kwargs["request_selection"],
+                    client_app.seeding.request_selection(manifest))
+                for expected, actual in zip(
+                        public_arrays, release.call_args.kwargs["public_arrays"]):
+                    np.testing.assert_array_equal(expected, actual)
                 extract.assert_not_called()
                 callback.assert_called_once_with()
 
@@ -526,7 +553,7 @@ class NeuralHoldoutTests(unittest.TestCase):
         self.assertEqual(captured["n_staged"], len(y))
         self.assertEqual(captured["geometry_n_units"], len(y))
         seed_contract.assert_called_once_with(
-            cfg, pins, pcfg, geometry_n_units=len(y))
+            cfg, pins, pcfg, geometry_n_units=len(y), manifest={"n_units": 6})
 
     def test_patient_replacement_keeps_fixed_dp_sampling_geometry(self):
         import torch
@@ -709,6 +736,9 @@ class NeuralHoldoutTests(unittest.TestCase):
             "num-features": 2, "image-size": 32,
         }
         pins = {"loss_name": "cross_entropy"}
+        manifest = {"data_type": "image", "target_column": "outcome",
+                    "image_asset": "scans", "image_path_col": "path"}
+        public_arrays = [np.zeros((2, 2), dtype=np.float32)]
 
         for is_3d, groups, mask in cases:
             with self.subTest(is_3d=is_3d, unit="patient" if groups is not None else "row"):
@@ -734,10 +764,16 @@ class NeuralHoldoutTests(unittest.TestCase):
                     captured["target"] = target.copy()
                     captured["predictions"] = predictions.copy()
                     captured["unit_ids"] = kwargs.get("unit_ids")
+                    captured["request_selection"] = kwargs["request_selection"]
+                    captured["public_arrays"] = kwargs["public_arrays"]
                     return np.ones(layout["size"]), 1.0
 
                 with (mock.patch.object(client_app, "is_image_run",
                                         return_value=True),
+                      mock.patch.object(client_app.task_module, "_load_manifest",
+                                        return_value=manifest),
+                      mock.patch.object(client_app, "get_torch_params",
+                                        return_value=public_arrays),
                       mock.patch.object(vision, "prepare_backbone",
                                         side_effect=prepare),
                       mock.patch.object(client_app, "load_image_collection",
@@ -766,6 +802,9 @@ class NeuralHoldoutTests(unittest.TestCase):
                 np.testing.assert_array_equal(captured["paths"], paths[mask])
                 np.testing.assert_array_equal(captured["target"], y[mask])
                 self.assertEqual(captured["is_3d"], is_3d)
+                self.assertEqual(captured["request_selection"],
+                                 client_app.seeding.request_selection(manifest))
+                self.assertIs(captured["public_arrays"], public_arrays)
                 if groups is None:
                     self.assertIsNone(captured["unit_ids"])
                 else:

@@ -350,7 +350,7 @@ def _sanitize_cfg(cfg):
 
 
 def hook_master_seed(module_name, global_arrays, X, y, cfg, pcfg,
-                     unit_ids=None):
+                     unit_ids=None, *, request_selection=None):
     """Bind Hook randomness to its exact effective inputs, without persistence."""
     if not isinstance(module_name, str) or not module_name:
         raise RuntimeError("Hook semantic module identity is invalid")
@@ -365,7 +365,9 @@ def hook_master_seed(module_name, global_arrays, X, y, cfg, pcfg,
                  else "hook-output-perturbation/v1")
     return seeding.master_seed(
         mechanism,
-        {"module": module_name, "hook": clean_cfg},
+        {"module": module_name, "hook": clean_cfg,
+         "module-sha256": _pinned_user_package(module_name, return_digest=True),
+         "request-selection": request_selection or {}},
         seeding.select_config(pcfg, _HOOK_SEED_PRIVACY_KEYS),
         int(clean_cfg["round_index"]),
         public_arrays=old,
@@ -373,7 +375,8 @@ def hook_master_seed(module_name, global_arrays, X, y, cfg, pcfg,
         unit_ids=canonical_units)
 
 
-def hook_execution_seed(module_name, global_arrays, cfg, pcfg):
+def hook_execution_seed(module_name, global_arrays, cfg, pcfg, *,
+                        request_selection=None):
     """Public-only seed for S&A partitions and child training randomness.
 
     A neighbouring private record must not reshuffle unaffected S&A blocks or
@@ -388,7 +391,9 @@ def hook_execution_seed(module_name, global_arrays, cfg, pcfg):
                  else "hook-output-execution/v1")
     return seeding.master_seed(
         mechanism,
-        {"module": module_name, "hook": clean_cfg},
+        {"module": module_name, "hook": clean_cfg,
+         "module-sha256": _pinned_user_package(module_name, return_digest=True),
+         "request-selection": request_selection or {}},
         seeding.select_config(pcfg, _HOOK_SEED_PRIVACY_KEYS),
         int(clean_cfg["round_index"]),
         public_arrays=_as_f64_list(global_arrays))
@@ -420,7 +425,7 @@ def _code_dirs():
     return out
 
 
-def _pinned_user_package(module_name):
+def _pinned_user_package(module_name, *, return_digest=False):
     """Re-hash the exact node-installed package immediately before execution."""
     if not module_name or not module_name.replace("_", "a").isalnum() or not (
             module_name[0].isalpha() or module_name[0] == "_"):
@@ -466,7 +471,7 @@ def _pinned_user_package(module_name):
         digest.update(b"\x00")
     if not hmac.compare_digest(digest.hexdigest(), expected):
         raise RuntimeError("node-installed hook package changed after verification")
-    return init_file
+    return digest.hexdigest() if return_digest else init_file
 
 
 def _bwrap_mount(path, td):

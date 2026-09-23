@@ -281,7 +281,7 @@ def test_semantic_identity_binds_every_effective_pin_and_tensor_not_paths():
     cfg, pins = config(), {"batch_size": 16, "round_index": 1}
     x, y = np.zeros((2, seg.FEATURE_DIM), np.float32), targets(2).numpy()
     def digest(c, xx=x, yy=y):
-        selected, _ = client_app._neural_seed_contract(c, pins, {})
+        selected, _ = client_app._neural_seed_contract(c, pins, {}, manifest={})
         return seeding._semantic_digest("seg-test", selected, {"policy_hash": "1" * 64}, 1,
                                         private_arrays=(xx, yy), execution_fingerprint={})
     original = digest(cfg)

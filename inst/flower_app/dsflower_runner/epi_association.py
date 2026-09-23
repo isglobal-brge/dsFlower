@@ -233,13 +233,14 @@ def _canonical_sufficient_vector(value):
 
 
 def private_association_vector(
-        sufficient, *, privacy_unit, epsilon, delta):
+        sufficient, *, privacy_unit, epsilon, delta, request_selection=None):
     """Apply the sole sticky joint Gaussian release for one node."""
     raw = _canonical_sufficient_vector(sufficient)
     released, sigma = tree_release.joint_gaussian_release(
         raw, mechanism=MECHANISM, layout=association_layout(privacy_unit),
         epsilon=epsilon, delta=delta, sensitivity=SENSITIVITY,
-        num_releases=1, execution_fingerprint=EXECUTION_PROFILE)
+        num_releases=1, execution_fingerprint=EXECUTION_PROFILE,
+        request_selection=request_selection)
     vector = np.ascontiguousarray(released, dtype=np.float64).reshape(9)
     if not bool(np.all(np.isfinite(vector))):
         raise RuntimeError("private association release is non-finite")

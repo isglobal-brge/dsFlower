@@ -349,7 +349,7 @@ class SeedDerivationTest(unittest.TestCase):
                 unit_ids=["p1"])
         self.assertEqual(
             digest.hex(),
-            "92ff80aa5026b03062a7885021760409183dc3f436f7fca9a2e464b1779d34d0")
+            "2ab19ab5725886734be51654bb1fc0908ae74a9b67f63ff60065bc1039752c07")
 
     def test_stream_is_reproducible_but_domain_separated(self):
         cfg, privacy = self._contract()

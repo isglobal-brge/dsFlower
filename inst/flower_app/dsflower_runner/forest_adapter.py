@@ -196,13 +196,14 @@ def _policy_hash(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _topology(profile, features):
+def _topology(profile, features, *, request_selection=None):
     config = {
         "cut_counts": [len(value) for value in profile["public_cuts"]],
         "depth": profile["max_depth"],
         "engine": "extra_trees",
         "features": features,
         "trees": profile["n_estimators"],
+        "request-selection": request_selection or {},
     }
     policy = {
         "mechanism": "public-random-topology",
@@ -391,14 +392,17 @@ def _validate_prepared(prepared):
     return canonical, profile
 
 
-def prepare_extra_trees_training(manifest, features, target, *, unit_ids=None):
+def prepare_extra_trees_training(manifest, features, target, *, unit_ids=None,
+                                 request_selection=None):
     """Prepare the sole private sufficient vector and sticky release key."""
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_extra_trees_profile(canonical)
     materialized = materialize_forest_units(
         canonical, features, target, unit_ids=unit_ids)
     topology = _topology(
-        profile, len(canonical["public_schema"]["features"]))
+        profile, len(canonical["public_schema"]["features"]),
+        request_selection=tree_release.request_selection(
+            canonical, request_selection))
     stats = _sufficient_vector(materialized, topology, canonical, profile)
     stats.setflags(write=False)
     return PreparedExtraTreesTraining(
@@ -420,7 +424,7 @@ def _sanitizer_arguments(canonical, profile):
     }
 
 
-def train_extra_trees(prepared):
+def train_extra_trees(prepared, *, request_selection=None):
     """Consume one prepared request and return only sanitized model bytes."""
     canonical, profile = _validate_prepared(prepared)
     object.__setattr__(prepared, "_used", True)
@@ -432,7 +436,9 @@ def train_extra_trees(prepared):
             epsilon=canonical["privacy"]["epsilon"],
             delta=canonical["privacy"]["delta"],
             sensitivity=profile["sensitivity"], num_releases=1,
-            execution_fingerprint=EXECUTION_PROFILE)
+            execution_fingerprint=EXECUTION_PROFILE,
+            request_selection=tree_release.request_selection(
+                canonical, request_selection))
         if sigma != profile["sigma"]:
             raise RuntimeError("ExtraTrees accountant and release sigma differ")
         trees = []

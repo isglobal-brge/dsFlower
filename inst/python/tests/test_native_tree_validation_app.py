@@ -281,7 +281,7 @@ class NativeTreeValidationClientTests(unittest.TestCase):
             self.assertEqual(dict(reply.content["metrics"]), {
                 "available": 1, "num-examples": 1})
 
-    def test_contract_spelling_and_row_order_are_not_noise_reroll_axes(self):
+    def test_request_contract_separates_noise_and_row_order_replays(self):
         with tempfile.TemporaryDirectory() as root, \
                 tempfile.TemporaryDirectory() as results_dir:
             _request, artifact, _profile_bytes, pins = _write_contract(
@@ -303,6 +303,7 @@ class NativeTreeValidationClientTests(unittest.TestCase):
                 frame = pd.read_csv(os.path.join(root, "train.csv"))
                 frame.iloc[::-1].to_csv(
                     os.path.join(root, "train.csv"), index=False)
+                np.testing.assert_array_equal(first, release())
                 manifest_path = os.path.join(root, "manifest.json")
                 with open(manifest_path, encoding="utf-8") as handle:
                     manifest = json.load(handle)
@@ -312,7 +313,7 @@ class NativeTreeValidationClientTests(unittest.TestCase):
                 cfg["validation-contract-sha256"] = "d" * 64
                 context.run_config = cfg
                 second = release()
-            np.testing.assert_array_equal(first, second)
+            self.assertFalse(np.array_equal(first, second))
 
     def test_regression_target_bounds_come_from_the_node_manifest(self):
         with tempfile.TemporaryDirectory() as root, \

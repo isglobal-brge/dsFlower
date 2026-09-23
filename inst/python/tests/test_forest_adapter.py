@@ -290,7 +290,7 @@ class ExtraTreesStickyTests(unittest.TestCase):
         self.assertNotEqual(
             nominal_model["public_schema_sha256"],
             original_model["public_schema_sha256"])
-        self.assertEqual(nominal_model["trees"], original_model["trees"])
+        self.assertNotEqual(nominal_model["trees"], original_model["trees"])
 
     def test_patient_materialization_is_order_invariant_and_one_record_per_unit(self):
         manifest = _manifest(trees=6, depth=2, unit="patient")

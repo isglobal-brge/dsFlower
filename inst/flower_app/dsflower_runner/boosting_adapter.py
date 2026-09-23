@@ -309,7 +309,8 @@ def _topology_hash(value):
 
 
 def _release_histogram(raw, canonical, profile, *, release_index,
-                       tree_index, stage_index, topology, selected_features):
+                       tree_index, stage_index, topology, selected_features,
+                       request_selection=None):
     layout = {
         "engine": profile["engine"],
         "feature_indices": list(selected_features),
@@ -330,6 +331,8 @@ def _release_histogram(raw, canonical, profile, *, release_index,
         sensitivity=profile["sensitivity"],
         num_releases=profile["num_releases"],
         execution_fingerprint=profile["execution_profile"],
+        request_selection=tree_release.request_selection(
+            canonical, request_selection),
     )[0]
 
 
@@ -390,7 +393,7 @@ def _go_right(bins, feature, cut, default_left):
 
 
 def _train_lightgbm_tree(materialized, canonical, profile, prediction,
-                         tree_index, release_offset):
+                         tree_index, release_offset, request_selection=None):
     q_gradient, q_hessian = _gradients(
         prediction, materialized.target, canonical["task"],
         profile["gradient_clip"], profile["hessian_clip"])
@@ -427,7 +430,8 @@ def _train_lightgbm_tree(materialized, canonical, profile, prediction,
             raw, canonical, profile,
             release_index=release_index,
             tree_index=tree_index, stage_index=stage, topology=topology,
-            selected_features=selected_features)
+            selected_features=selected_features,
+            request_selection=request_selection)
         best = None
         best_stats = None
         for node in active:
@@ -504,7 +508,7 @@ def _train_lightgbm_tree(materialized, canonical, profile, prediction,
 
 
 def _train_catboost_tree(materialized, canonical, profile, prediction,
-                         tree_index, release_offset):
+                         tree_index, release_offset, request_selection=None):
     q_gradient, q_hessian = _gradients(
         prediction, materialized.target, canonical["task"],
         profile["gradient_clip"], profile["hessian_clip"])
@@ -523,7 +527,8 @@ def _train_catboost_tree(materialized, canonical, profile, prediction,
             release_index=release_index,
             tree_index=tree_index, stage_index=level,
             topology={"splits": splits},
-            selected_features=selected_features)
+            selected_features=selected_features,
+            request_selection=request_selection)
         active_leaves = 1 << level
         best = None
         best_stats = None
@@ -601,7 +606,7 @@ def prepare_boosting_training(manifest, features, target, *, unit_ids=None):
     return PreparedBoostingTraining(canonical, profile, materialized)
 
 
-def train_boosting(prepared):
+def train_boosting(prepared, *, request_selection=None):
     """Consume a fixed transcript and return only a safe canonical projection."""
     if type(prepared) is not PreparedBoostingTraining or prepared._used:
         raise ValueError("boosting request was not prepared by dsFlower")
@@ -617,12 +622,12 @@ def train_boosting(prepared):
         if profile["engine"] == "lightgbm":
             tree, update = _train_lightgbm_tree(
                 materialized, canonical, profile, prediction, tree_index,
-                release_offset)
+                release_offset, request_selection=request_selection)
             release_offset += profile["num_leaves"] - 1
         else:
             tree, update = _train_catboost_tree(
                 materialized, canonical, profile, prediction, tree_index,
-                release_offset)
+                release_offset, request_selection=request_selection)
             release_offset += profile["max_depth"]
         trees.append(tree)
         prediction += update

@@ -16,6 +16,28 @@ _RELEASE_DOMAIN = "tree-joint-gaussian/v1"
 _NUMERIC_CONTRACT = "dsflower-tree-gaussian-numeric-v1"
 
 
+def request_selection(canonical, selection=None, *, parameters=None):
+    """Bind native schema and unit selections, plus the node request pins.
+
+    The canonical backend manifest is trusted and validated by each adapter.
+    Scope labels and operational resource ceilings do not select computation.
+    """
+    return {
+        "node": {} if selection is None else selection,
+        "native-tree": {
+            "engine": canonical["engine"],
+            "mode": canonical["mode"],
+            "task": canonical["task"],
+            "public-schema-sha256": canonical["public_schema"]["sha256"],
+            "parameters-sha256": _policy_hash(
+                canonical["engine_params"] if parameters is None else parameters),
+            "unit-policy": seeding.select_config(canonical["privacy"], (
+                "unit", "adjacency", "unit_canonicalization",
+                "contribution_strategy", "max_rows_per_unit")),
+        },
+    }
+
+
 def _canonical_vector(value):
     array = np.asarray(value)
     if array.dtype.hasobject or array.dtype.kind not in "iuf" or \
@@ -52,7 +74,7 @@ def numeric_execution_profile():
 
 def joint_gaussian_release(
         value, *, mechanism, layout, epsilon, delta, sensitivity,
-        num_releases, execution_fingerprint):
+        num_releases, execution_fingerprint, request_selection=None):
     """Release one fixed-layout sufficient vector with semantic sticky noise.
 
     ``num_releases`` is the fixed transcript count accounted by the caller's
@@ -93,7 +115,8 @@ def joint_gaussian_release(
         "numeric": numeric_execution_profile(),
     }
     master = bytearray(seeding.master_seed(
-        mechanism, {"layout": layout}, privacy, 1,
+        mechanism, {"layout": layout,
+                    "request-selection": request_selection or {}}, privacy, 1,
         private_arrays=(canonical,),
         execution_fingerprint=execution))
     subkey = None
@@ -113,4 +136,5 @@ def joint_gaussian_release(
     return released, float(sigma)
 
 
-__all__ = ["joint_gaussian_release", "numeric_execution_profile"]
+__all__ = ["joint_gaussian_release", "numeric_execution_profile",
+           "request_selection"]

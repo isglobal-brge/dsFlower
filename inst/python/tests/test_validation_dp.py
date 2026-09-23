@@ -17,8 +17,8 @@ RUNNER_ROOT = os.path.abspath(os.path.join(
 if RUNNER_ROOT not in sys.path:
     sys.path.insert(0, RUNNER_ROOT)
 
-from dsflower_runner import (client_app, dp_harness, params, server_app, task,
-                             validation, vision)  # noqa: E402
+from dsflower_runner import (client_app, dp_harness, params, seeding, server_app,
+                             task, validation, vision)  # noqa: E402
 from flwr.common import (ArrayRecord, ConfigRecord, Message, MetricRecord,
                          RecordDict)  # noqa: E402
 
@@ -171,6 +171,74 @@ class ValidationReleaseTests(unittest.TestCase):
         self.assertFalse(np.array_equal(
             one, validation.validation_contributions(
                 kwargs["y"], kwargs["predictions"], layout).sum(axis=0)))
+
+    def test_request_selection_and_public_model_bind_identical_statistics(self):
+        layout = validation.validation_layout("classification", bins=8)
+        y = np.asarray([0, 1, 1])
+        predictions = np.asarray([0.1, 0.7, 0.9])
+        raw = validation.validation_sufficient_vector(y, predictions, layout)
+        manifest = {
+            "target_column": "outcome", "feature_columns": ["a", "b"],
+            "patient_column": "patient", "dp-unit": "patient",
+        }
+        arrays = [np.zeros((1, 2), dtype=np.float32)]
+        selection = seeding.request_selection(manifest)
+        base_key = validation._validation_noise_key(
+            raw, layout, 1.0, request_selection=selection,
+            public_arrays=arrays)
+        base, sigma = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5,
+            request_selection=selection, public_arrays=arrays)
+        replay, replay_sigma = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5,
+            request_selection=seeding.request_selection(dict(manifest)),
+            public_arrays=[arrays[0].copy()])
+        self.assertEqual(base.tobytes(), replay.tobytes())
+        self.assertEqual(sigma, replay_sigma)
+        alternatives = (
+            {"target_column": "duplicate_outcome"},
+            {"feature_columns": ["duplicate_a", "b"]},
+            {"feature_columns": ["b", "a"]},
+            {"patient_column": "duplicate_patient"},
+            {"dp-unit": "row"},
+        )
+        for changed in alternatives:
+            with self.subTest(changed=changed):
+                selected = seeding.request_selection({**manifest, **changed})
+                self.assertNotEqual(base_key, validation._validation_noise_key(
+                    raw, layout, 1.0, request_selection=selected,
+                    public_arrays=arrays))
+                released, changed_sigma = validation.private_validation_vector(
+                    y, predictions, layout, epsilon=1.0, delta=1e-5,
+                    request_selection=selected, public_arrays=arrays)
+                self.assertFalse(np.array_equal(base, released))
+                self.assertEqual(sigma, changed_sigma)
+        self.assertNotEqual(base_key, validation._validation_noise_key(
+            raw, layout, 1.0, request_selection=selection,
+            public_arrays=[np.ones((1, 2), dtype=np.float32)]))
+
+    def test_numeric_bounds_separate_equal_normalized_statistics(self):
+        layout = validation.validation_layout("regression")
+        y = np.asarray([0.0, 0.0])
+        predictions = np.asarray([0.0, 0.0])
+        first_raw = validation.validation_sufficient_vector(
+            y, predictions, layout, target_bounds=(0.0, 1.0))
+        second_raw = validation.validation_sufficient_vector(
+            y, predictions, layout, target_bounds=(0.0, 2.0))
+        np.testing.assert_array_equal(first_raw, second_raw)
+        base, sigma = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5,
+            target_bounds=(0.0, 1.0))
+        replay, replay_sigma = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5,
+            target_bounds={"lower": 0.0, "upper": 1.0})
+        changed, changed_sigma = validation.private_validation_vector(
+            y, predictions, layout, epsilon=1.0, delta=1e-5,
+            target_bounds=(0.0, 2.0))
+        self.assertEqual(base.tobytes(), replay.tobytes())
+        self.assertFalse(np.array_equal(base, changed))
+        self.assertEqual(sigma, replay_sigma)
+        self.assertEqual(sigma, changed_sigma)
 
     def test_row_permutation_and_patient_relabel_keep_release_and_key(self):
         layout = validation.validation_layout("classification", bins=8)
@@ -801,6 +869,66 @@ class ValidationInferenceTests(unittest.TestCase):
                                       dtype=np.float32), "bce_logits"),
                 validation.validation_layout("classification", bins=8)).sum(axis=0)
             self.assertFalse(np.array_equal(released[0], raw))
+
+    def test_node_validation_binds_selected_columns_and_equal_prediction_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "data.csv"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("a,b,outcome,duplicate_outcome\n"
+                             "0,0,0,0\n0,0,1,1\n")
+            manifest = {
+                "data_file": "data.csv", "data_format": "csv",
+                "data_type": "tabular", "target_column": "outcome",
+                "feature_columns": ["a", "b"], "dp-unit": "row",
+                "patient_column": None, "n_units": 2,
+                "task-type": "classification", "loss-name": "bce_logits",
+                "num-classes": 2, "num-labels": 2,
+            }
+            cfg = {
+                "validation-model-track": "neural",
+                "validation-task": "binary", "validation-bins": 8,
+                "num-features": 2, "num-classes": 2, "num-labels": 2,
+                "loss-name": "bce_logits",
+                "model-spec-b64": base64.b64encode(json.dumps({
+                    "kind": "sequential", "layers": [
+                        {"op": "linear", "out": "@out"}]
+                }).encode("utf-8")).decode("ascii"),
+            }
+            model = params.load_user_model(cfg, 2, "bce_logits")
+            arrays = [np.zeros_like(value)
+                      for value in params.get_torch_params(model)]
+            context = type("Context", (), {
+                "node_config": {"manifest-dir": directory}})()
+
+            def release(selected, model_arrays):
+                with open(os.path.join(directory, "manifest.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump(selected, handle)
+                return validation.private_model_validation(
+                    context, cfg, {"epsilon": 1.0, "delta": 1e-5},
+                    1, model_arrays)[0]
+
+            with mock.patch.object(
+                    seeding, "_node_secret", return_value=b"s" * 32):
+                baseline = release(manifest, arrays)
+                replay = release(dict(manifest), arrays)
+                target_changed = release(
+                    {**manifest, "target_column": "duplicate_outcome"}, arrays)
+                order_changed = release(
+                    {**manifest, "feature_columns": ["b", "a"]}, arrays)
+                changed_arrays = [value.copy() for value in arrays]
+                changed_arrays[0][:] = 1.0
+                model_changed = release(manifest, changed_arrays)
+            self.assertEqual(baseline.tobytes(), replay.tobytes())
+            for changed in (target_changed, order_changed, model_changed):
+                self.assertFalse(np.array_equal(baseline, changed))
+            params.set_torch_params(model, arrays)
+            first_predictions = validation.neural_predictions(
+                model, np.zeros((2, 2), dtype=np.float32), "bce_logits")
+            params.set_torch_params(model, changed_arrays)
+            second_predictions = validation.neural_predictions(
+                model, np.zeros((2, 2), dtype=np.float32), "bce_logits")
+            np.testing.assert_array_equal(first_predictions, second_predictions)
 
     def test_node_vision_validation_preflights_then_releases_2d_and_3d(self):
         import torch

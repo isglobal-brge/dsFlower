@@ -16,7 +16,7 @@ FLOWER_APP = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "..", "..", "flower_app")
 sys.path.insert(0, FLOWER_APP)
 
-from dsflower_runner import epi_association
+from dsflower_runner import epi_association, seeding
 
 
 class AssociationSufficientVectorTests(unittest.TestCase):
@@ -144,13 +144,14 @@ class AssociationSufficientVectorTests(unittest.TestCase):
 
 class AssociationReleaseTests(unittest.TestCase):
     @staticmethod
-    def _release(vector, *, unit="row", secret=None):
+    def _release(vector, *, unit="row", secret=None, request_selection=None):
         secret = bytes(range(32)) if secret is None else secret
         with mock.patch(
                 "dsflower_runner.seeding._node_secret",
                 return_value=secret):
             return epi_association.private_association_vector(
-                vector, privacy_unit=unit, epsilon=1.0, delta=1.0e-6)
+                vector, privacy_unit=unit, epsilon=1.0, delta=1.0e-6,
+                request_selection=request_selection)
 
     def test_effective_vector_replay_is_byte_exact(self):
         first_raw = epi_association.association_sufficient_vector(
@@ -179,6 +180,29 @@ class AssociationReleaseTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first - raw, data_changed - changed))
         self.assertFalse(np.array_equal(first, secret_changed))
         self.assertFalse(np.array_equal(first, unit_changed))
+
+    def test_equal_statistics_with_distinct_selections_use_distinct_noise(self):
+        raw = np.asarray([2, 1, 0, 3, 4, 0, 0, 0, 1], dtype=np.float64)
+        manifest = {
+            "target_column": "outcome", "feature_columns": ["exposure"],
+            "patient_column": "patient", "dp-unit": "patient",
+        }
+        selection = seeding.request_selection(manifest)
+        baseline, sigma = self._release(raw, request_selection=selection)
+        replay, replay_sigma = self._release(
+            raw.copy(), request_selection=seeding.request_selection(dict(manifest)))
+        self.assertEqual(baseline.tobytes(), replay.tobytes())
+        self.assertEqual(sigma, replay_sigma)
+        for changed in (
+                {"target_column": "duplicate_outcome"},
+                {"feature_columns": ["duplicate_exposure"]},
+                {"patient_column": "duplicate_patient"}):
+            with self.subTest(changed=changed):
+                released, changed_sigma = self._release(
+                    raw, request_selection=seeding.request_selection(
+                        {**manifest, **changed}))
+                self.assertFalse(np.array_equal(baseline, released))
+                self.assertEqual(sigma, changed_sigma)
 
     def test_empty_cohort_still_reaches_the_gaussian_mechanism(self):
         released, sigma = self._release(np.zeros(9, dtype=np.float64))

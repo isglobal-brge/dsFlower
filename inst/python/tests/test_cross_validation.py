@@ -337,7 +337,7 @@ class CvClientTests(unittest.TestCase):
         self.assertEqual(captured["geometry_n_units"], len(y))
         seed_contract.assert_called_once_with(
             {"cv-contract-sha256": "a" * 64},
-            pins, pcfg, geometry_n_units=len(y))
+            pins, pcfg, geometry_n_units=len(y), manifest={"n_units": 9})
 
     def test_empty_cv_train_side_runs_the_pinned_noise_schedule(self):
         import torch
@@ -471,9 +471,12 @@ class CvClientTests(unittest.TestCase):
               mock.patch.object(validation, "neural_predictions",
                                 side_effect=lambda model, values, loss:
                                 np.full(len(values), 0.75)),
+              mock.patch.object(client_app, "get_torch_params",
+                                return_value=[np.zeros((1, 2))]),
               mock.patch.object(client_app, "_store_cv_sufficient",
-                                side_effect=lambda context, fold, raw, layout:
-                                captured.update(fold=fold, raw=raw.copy())),
+                                side_effect=lambda context, fold, raw, layout,
+                                **kwargs: captured.update(
+                                    fold=fold, raw=raw.copy(), **kwargs)),
               mock.patch.object(validation, "private_sufficient_vector",
                                 side_effect=AssertionError("release called")),
               mock.patch.object(client_app.seeding, "master_seed",
@@ -482,6 +485,8 @@ class CvClientTests(unittest.TestCase):
                 None, cfg, {"loss_name": "bce_logits"}, object(), 2, 2)
         self.assertEqual(captured["fold"], 2)
         self.assertEqual(captured["raw"].shape, (8,))
+        np.testing.assert_array_equal(
+            captured["public_arrays"][0], np.zeros((1, 2)))
         np.testing.assert_array_equal(ack[0], np.zeros(1))
 
     def test_empty_oof_fold_accumulates_a_zero_vector_without_release(self):
@@ -501,7 +506,8 @@ class CvClientTests(unittest.TestCase):
                   client_app.resampling, "cross_validation_folds_from_context",
                   return_value=np.ones(len(y), dtype=np.int64)),
               mock.patch.object(client_app, "_store_cv_sufficient",
-                                side_effect=lambda context, fold, raw, layout:
+                                side_effect=lambda context, fold, raw, layout,
+                                **kwargs:
                                 captured.update(raw=raw.copy())),
               mock.patch.object(validation, "private_sufficient_vector",
                                 side_effect=AssertionError("release called"))):
@@ -574,6 +580,84 @@ class CvClientTests(unittest.TestCase):
             self.assertNotIn(client_app._CV_OOF_TOTAL_KEY, context.state)
             with self.assertRaisesRegex(RuntimeError, "incomplete"):
                 client_app._load_complete_cv_sufficient(context, layout)
+
+    def test_oof_seed_binds_ordered_public_models_with_identical_statistics(self):
+        contract = resampling.cross_validation_contract(3, "row")
+        manifest = {
+            "dp-unit": "row", "patient_column": None,
+            "cv-job-sha256": "e" * 64,
+            **resampling.cross_validation_manifest_fields(contract),
+        }
+        cfg = {"loss-name": "bce_logits", "task-type": "classification",
+               "num-classes": 2, "cv-validation-bins": 4}
+        layout = validation.cross_validation_layout_from_config(cfg)
+        raw = np.ones(layout["size"], dtype=np.float64)
+        models = [np.full((1, 2), value, dtype=np.float32)
+                  for value in (1.0, 2.0, 3.0)]
+        keys = []
+        master_seed = client_app.seeding.master_seed
+
+        def capture_key(*args, **kwargs):
+            key = master_seed(*args, **kwargs)
+            keys.append(key)
+            return key
+
+        def release(public_models):
+            context = SimpleNamespace(state=RecordDict())
+            for fold, arrays in enumerate(public_models, 1):
+                client_app._store_cv_sufficient(
+                    context, fold, raw, layout, public_arrays=[arrays])
+            np.testing.assert_array_equal(
+                client_app._load_complete_cv_sufficient(context, layout), 3 * raw)
+            return client_app._cross_validation_release(
+                context, cfg, {"epsilon": 1.0, "delta": 1e-6})[0]
+
+        with (mock.patch.object(task, "_load_manifest", return_value=manifest),
+              mock.patch.object(client_app.seeding, "_node_secret",
+                                return_value=b"s" * 32),
+              mock.patch.object(client_app.seeding, "master_seed",
+                                side_effect=capture_key)):
+            baseline = release(models)
+            replay = release([value.astype(">f4") for value in models])
+            changed = release([np.zeros_like(models[0]), *models[1:]])
+            reordered = release(list(reversed(models)))
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], keys[2])
+        self.assertNotEqual(keys[0], keys[3])
+        self.assertEqual(baseline.tobytes(), replay.tobytes())
+        self.assertFalse(np.array_equal(baseline, changed))
+        self.assertFalse(np.array_equal(baseline, reordered))
+
+    def test_oof_model_seed_metadata_rejects_changed_replay_and_invalid_digests(self):
+        contract = resampling.cross_validation_contract(3, "row")
+        manifest = {
+            "dp-unit": "row", "patient_column": None,
+            "cv-job-sha256": "e" * 64,
+            **resampling.cross_validation_manifest_fields(contract),
+        }
+        layout = validation.validation_layout("classification", bins=4)
+        raw = np.ones(layout["size"], dtype=np.float64)
+        context = SimpleNamespace(state=RecordDict())
+        arrays = [np.zeros((1, 2), dtype=np.float32)]
+        with mock.patch.object(task, "_load_manifest", return_value=manifest):
+            client_app._store_cv_sufficient(
+                context, 1, raw, layout, public_arrays=arrays)
+            client_app._store_cv_sufficient(
+                context, 1, raw, layout, public_arrays=[arrays[0].copy()])
+            with self.assertRaisesRegex(RuntimeError, "replay changed"):
+                client_app._store_cv_sufficient(
+                    context, 1, raw, layout,
+                    public_arrays=[np.ones_like(arrays[0])])
+            for invalid in ("a" * 64, [], ["g" * 64], ["a" * 64] * 2):
+                with self.subTest(invalid=invalid):
+                    state = context.state.copy()
+                    meta = dict(state[client_app._CV_OOF_META_KEY])
+                    meta["model-digests"] = invalid
+                    state[client_app._CV_OOF_META_KEY] = ConfigRecord(meta)
+                    with self.assertRaisesRegex(RuntimeError, "metadata is invalid"):
+                        client_app._store_cv_sufficient(
+                            SimpleNamespace(state=state), 2, raw, layout,
+                            public_arrays=arrays)
 
     def test_context_state_rejects_order_and_tampering_and_abort_purges(self):
         with tempfile.TemporaryDirectory() as root:

@@ -167,6 +167,39 @@ class AssociationClientTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "uploaded code"):
                 client_app._assert_association_process_isolated()
 
+    def test_node_manifest_selectors_separate_identical_private_columns(self):
+        frame = pd.DataFrame({
+            "outcome": [0, 1, 1, 0], "duplicate_outcome": [0, 1, 1, 0],
+            "exposure": [0, 0, 1, 1], "duplicate_exposure": [0, 0, 1, 1],
+        })
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as results_dir:
+            manifest = _write_node(root, frame)
+            cfg = _config(results_dir)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": root}, run_config=cfg)
+            message = server_app._request_messages((1,), cfg)[0]
+
+            def release(selected):
+                with open(os.path.join(root, "manifest.json"), "w",
+                          encoding="utf-8") as handle:
+                    json.dump(selected, handle)
+                reply = client_app.train(message, context)
+                self.assertEqual(reply.content["metrics"]["available"], 1)
+                return reply.content["arrays"].to_numpy_ndarrays()[0]
+
+            with mock.patch.object(
+                    seeding, "_node_secret", return_value=b"s" * 32):
+                baseline = release(manifest)
+                replay = release(dict(manifest))
+                target_changed = release(
+                    {**manifest, "target_column": "duplicate_outcome"})
+                exposure_changed = release(
+                    {**manifest, "feature_columns": ["duplicate_exposure"]})
+            self.assertEqual(baseline.tobytes(), replay.tobytes())
+            self.assertFalse(np.array_equal(baseline, target_changed))
+            self.assertFalse(np.array_equal(baseline, exposure_changed))
+
 
 class AssociationServerTests(unittest.TestCase):
     def test_complete_release_is_pooled_only_and_reply_order_stable(self):

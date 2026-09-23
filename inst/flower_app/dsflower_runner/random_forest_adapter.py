@@ -251,13 +251,14 @@ def _sample_without_replacement(rng, population, count):
     return result
 
 
-def _public_schedule(profile, features):
+def _public_schedule(profile, features, *, request_selection=None):
     config = {
         "cut_counts": [len(value) for value in profile["public_cuts"]],
         "depth": profile["max_depth"],
         "features": features,
         "max_features": profile["max_features"],
         "trees": profile["n_estimators"],
+        "request-selection": request_selection or {},
     }
     policy = {
         "candidate_schedule": forest_accounting.RANDOM_FOREST_CANDIDATE_PROFILE,
@@ -429,14 +430,16 @@ def _validate_prepared(prepared):
 
 
 def prepare_random_forest_training(
-        manifest, features, target, *, unit_ids=None):
+        manifest, features, target, *, unit_ids=None, request_selection=None):
     """Freeze the bounded units and public-PRF schedule for one transcript."""
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_random_forest_profile(canonical)
     materialized = materialize_random_forest_units(
         canonical, features, target, unit_ids=unit_ids)
     candidates, assignment_key = _public_schedule(
-        profile, len(canonical["public_schema"]["features"]))
+        profile, len(canonical["public_schema"]["features"]),
+        request_selection=tree_release.request_selection(
+            canonical, request_selection))
     try:
         assignments = _tree_assignments(
             materialized._binned_features, materialized._target_units,
@@ -634,7 +637,7 @@ def _sanitizer_arguments(canonical, profile):
     }
 
 
-def train_random_forest(prepared):
+def train_random_forest(prepared, *, request_selection=None):
     """Consume one prepared request and return only canonical model bytes."""
     canonical, profile = _validate_prepared(prepared)
     object.__setattr__(prepared, "_used", True)
@@ -665,7 +668,9 @@ def train_random_forest(prepared):
                 delta=canonical["privacy"]["delta"],
                 sensitivity=profile["split_sensitivity"],
                 num_releases=profile["num_releases"],
-                execution_fingerprint=EXECUTION_PROFILE)
+                execution_fingerprint=EXECUTION_PROFILE,
+                request_selection=tree_release.request_selection(
+                    canonical, request_selection))
             if sigma != profile["split_sigma"]:
                 raise RuntimeError("Random Forest accountant and split sigma differ")
             features, cuts, defaults = _choose_splits(
@@ -690,7 +695,9 @@ def train_random_forest(prepared):
             delta=canonical["privacy"]["delta"],
             sensitivity=profile["leaf_sensitivity"],
             num_releases=profile["num_releases"],
-            execution_fingerprint=EXECUTION_PROFILE)
+            execution_fingerprint=EXECUTION_PROFILE,
+            request_selection=tree_release.request_selection(
+                canonical, request_selection))
         if sigma != profile["leaf_sigma"]:
             raise RuntimeError("Random Forest accountant and leaf sigma differ")
         if canonical["task"] == "binary_classification":

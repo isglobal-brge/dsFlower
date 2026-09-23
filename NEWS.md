@@ -1,3 +1,14 @@
+# dsFlower 0.5.2
+
+* Correct deterministic release identity to include server-authored request
+  selections, including source operands, ordered columns, public vocabularies, imaging roles and
+  resampling contracts. The semantic randomness contract is now v2. Identical
+  requests and data still replay; distinct selections receive separate keys even
+  when their private tensors or sufficient statistics are identical.
+* Noise distribution, calibration and training paths are unchanged. Evidence
+  produced under earlier runners remains valid as measurements of the same
+  mechanism; exact noise realizations change under the corrected identity.
+
 # dsFlower 0.5.1
 
 * Recognize PyTorch's generated non-scriptable RemoteModule as installed runtime

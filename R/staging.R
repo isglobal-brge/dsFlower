@@ -684,7 +684,7 @@
     "survival_file", "survival_schema", "survival_shape",
     "survival_feature_columns", "survival_target_columns",
     "target-preencoded", "association-preencoded",
-    "group_column", "dataset_id", "source_kind", "assets", "data_type",
+    "group_column", "dataset_id", "source_kind", "request-source", "assets", "data_type",
     "drop_missing"
   )
 }
@@ -997,6 +997,20 @@
     stop("Could not atomically update the run manifest.", call. = FALSE)
   }
   invisible(manifest_path)
+}
+
+# Bind only the trusted source selection used to derive release keys. A fresh
+# Flower handle or run token for the same data operand is still a sticky retry.
+.pin_request_source <- function(staging_dir, handle, descriptor = NULL) {
+  source <- list(source = handle$source, data_symbol = handle$data_symbol)
+  if (!is.null(descriptor)) {
+    source$dataset_id <- descriptor$dataset_id
+    source$source_kind <- descriptor$source_kind
+  }
+  manifest_path <- file.path(staging_dir, "manifest.json")
+  manifest <- jsonlite::fromJSON(manifest_path, simplifyVector = FALSE)
+  manifest[["request-source"]] <- source
+  .write_manifest_atomic(manifest, manifest_path)
 }
 
 #' Bind the stateless privacy contract to a prepared manifest

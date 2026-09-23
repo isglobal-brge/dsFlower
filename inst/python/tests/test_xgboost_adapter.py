@@ -541,7 +541,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
             "public_schema"]["sha256"]
         renamed_prepared = self._prepare(manifest=renamed_levels)
         self.assertEqual(first.profile, renamed_prepared.profile)
-        self.assertEqual(first._noise_key, renamed_prepared._noise_key)
+        self.assertNotEqual(first._noise_key, renamed_prepared._noise_key)
 
         wider_features = copy.deepcopy(_manifest())
         wider_features["public_schema"]["lower"][0] = -1.0
@@ -559,7 +559,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
             "public_schema"]["sha256"]
         self.assertNotEqual(
             first.profile, self._prepare(manifest=wider_features).profile)
-        self.assertEqual(
+        self.assertNotEqual(
             first._noise_key,
             self._prepare(manifest=wider_features)._noise_key)
 
@@ -583,7 +583,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
         self.assertEqual(
             regression_first.profile["base_score"],
             regression_wider.profile["base_score"])
-        self.assertEqual(
+        self.assertNotEqual(
             regression_first._noise_key, regression_wider._noise_key)
 
         same_native = _manifest()

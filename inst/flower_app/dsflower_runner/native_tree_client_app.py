@@ -37,7 +37,7 @@ from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 
 from . import (native_tree_engine, native_tree_request, release_guard,
-               resampling, task, validation, xgboost_adapter, xgboost_bundle)
+               resampling, seeding, task, validation, xgboost_adapter, xgboost_bundle)
 
 
 app = ClientApp()
@@ -647,6 +647,18 @@ def _replay_cv_reply(context, claim, msg):
     return _reply(msg, value.tobytes(), True)
 
 
+def _request_selection(manifest, operation, fold=None, request=None):
+    selection = seeding.request_selection(manifest)
+    selection["release-coordinate"] = {"operation": operation, "fold": fold}
+    if request is not None:
+        selection["native-tree-request"] = {
+            **seeding.select_config(request, ("engine", "mode", "task")),
+            "parameters": request["parameters"],
+            "public-schema-sha256": request["public_schema"]["sha256"],
+        }
+    return selection
+
+
 def _evaluate_holdout(msg, context, request, node_manifest, privacy):
     config = _exact_message_config(msg)
     layout = _holdout_layout(request, config)
@@ -682,19 +694,24 @@ def _evaluate_holdout(msg, context, request, node_manifest, privacy):
         "lower": request["public_schema"]["target"]["lower"],
         "upper": request["public_schema"]["target"]["upper"],
     })
+    selection = _request_selection(
+        node_manifest, "holdout-evaluate", request=request)
+    public_arrays = (np.frombuffer(artifact, dtype=np.uint8),)
     if target.shape[0] == 0:
         released, _sigma = validation.private_sufficient_vector(
             np.zeros(int(layout["size"]), dtype=np.float64), layout,
             epsilon=privacy["epsilon"], delta=privacy["delta"],
             num_releases=1,
-            include_zero_neighbor=privacy["unit"] == "patient")
+            include_zero_neighbor=privacy["unit"] == "patient",
+            request_selection=selection, public_arrays=public_arrays)
     else:
         predictions = np.asarray(model.predict(features), dtype=np.float64)
         released, _sigma = validation.private_validation_vector(
             target, predictions, layout, epsilon=privacy["epsilon"],
             delta=privacy["delta"], target_bounds=bounds,
             num_releases=1, unit_ids=unit_ids,
-            include_zero_neighbor=privacy["unit"] == "patient")
+            include_zero_neighbor=privacy["unit"] == "patient",
+            request_selection=selection, public_arrays=public_arrays)
     _cache_vector(context, claim, released)
     return _vector_reply(msg, released)
 
@@ -773,9 +790,17 @@ def _cross_validation_release(msg, context, request, privacy, claim):
     config = _exact_message_config(msg)
     layout = _cv_layout(request, config)
     raw = _complete_cv_total(context, request, layout)
+    manifest = task._load_manifest(context)
+    selection = _request_selection(
+        manifest, "cv-release", int(claim["fold"]), request=request)
+    meta = _holdout_state(context)[_CV_OOF_META]
+    selection["fold-artifact-sha256"] = [
+        meta["fold-%d-artifact-sha256" % fold]
+        for fold in range(1, int(manifest["cv-folds"]) + 1)]
     released, _sigma = validation.private_sufficient_vector(
         raw, layout, epsilon=privacy["epsilon"], delta=privacy["delta"],
-        num_releases=1, include_zero_neighbor=False)
+        num_releases=1, include_zero_neighbor=False,
+        request_selection=selection)
     _forget_cv_state(context)
     _cache_cv_reply(context, claim, released)
     return _vector_reply(msg, released)
@@ -831,17 +856,21 @@ def train(msg: Message, context: Context) -> Message:
             **{key: privacy[key] for key in (
                 "epsilon", "delta", "unit", "unit_canonicalization",
                 "gradient_clip")})
+        selection = _request_selection(
+            node_manifest, operation,
+            int(claim["fold"]) if operation == "cv-train" else None)
         if engine == "xgboost":
             # Preserve the verified native-bundle path byte-for-byte in scope.
             prepared = xgboost_adapter.prepare_xgboost_training(
                 manifest, features, target, native_bundle=_NATIVE_BUNDLE,
-                unit_ids=unit_ids)
+                unit_ids=unit_ids, request_selection=selection)
             native_artifact = xgboost_adapter.train_xgboost_native(prepared)
             artifact, _digest = xgboost_adapter.sanitize_xgboost_artifact(
                 manifest, native_artifact)
         else:
             artifact = native_tree_engine.train_model(
-                manifest, features, target, unit_ids=unit_ids)
+                manifest, features, target, unit_ids=unit_ids,
+                request_selection=selection)
         if node_manifest.get("resampling-contract-sha256") is not None:
             _mark_training_complete(
                 context, request, node_manifest, artifact)

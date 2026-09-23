@@ -319,12 +319,12 @@ class NeuralSemanticConfigTests(unittest.TestCase):
 
         direct, _ = client_app._neural_seed_contract(
             {"feature-bounds": bounds, "feature-bounds-b64": "ignored-one"},
-            pins, privacy)
+            pins, privacy, manifest={})
         changed_alias, _ = client_app._neural_seed_contract(
             {"feature-bounds": bounds, "feature-bounds-b64": "ignored-two"},
-            pins, privacy)
+            pins, privacy, manifest={})
         encoded_only, _ = client_app._neural_seed_contract(
-            {"feature-bounds-b64": encoded}, pins, privacy)
+            {"feature-bounds-b64": encoded}, pins, privacy, manifest={})
 
         self.assertEqual(direct, changed_alias)
         self.assertEqual(direct, encoded_only)
@@ -334,23 +334,23 @@ class NeuralSemanticConfigTests(unittest.TestCase):
         privacy = {"policy_hash": "1" * 64}
         first = client_app._neural_seed_contract(
             {"backbone": "resnet18", "model": "ignored-one"},
-            pins, privacy)
+            pins, privacy, manifest={})
         second = client_app._neural_seed_contract(
             {"backbone": "resnet18", "model": "ignored-two"},
-            pins, privacy)
+            pins, privacy, manifest={})
         self.assertEqual(first, second)
 
-    def test_vision_extractor_profile_is_not_a_nominal_seed_axis(self):
+    def test_untrusted_vision_profile_is_not_a_manifest_seed_axis(self):
         pins = {"optimizer": "sgd"}
         privacy = {"policy_hash": "1" * 64}
         first = client_app._neural_seed_contract({
             "backbone": "resnet18",
             "vision-extractor-profile": "extractor-v1",
-        }, pins, privacy)
+        }, pins, privacy, manifest={})
         second = client_app._neural_seed_contract({
             "backbone": "resnet18",
             "vision-extractor-profile": "extractor-v2",
-        }, pins, privacy)
+        }, pins, privacy, manifest={})
         self.assertEqual(first, second)
 
     def test_training_vision_width_must_match_the_canonical_backbone(self):
@@ -480,12 +480,12 @@ class NeuralSemanticConfigTests(unittest.TestCase):
         public = (np.asarray([0.25, -0.5], dtype=np.float32),)
         private = (np.asarray([[1.0, 2.0]], dtype=np.float32),)
 
-        plain, _ = client_app._neural_seed_contract(cfg, pins, privacy)
+        plain, _ = client_app._neural_seed_contract(cfg, pins, privacy, manifest={})
         self.assertNotIn("resampling-geometry-n-units", plain)
 
         def derive(geometry):
             config, _ = client_app._neural_seed_contract(
-                cfg, pins, privacy, geometry_n_units=geometry)
+                cfg, pins, privacy, geometry_n_units=geometry, manifest={})
             return seeding.master_seed(
                 "neural-dpsgd/v1", config, {"policy_hash": "1" * 64}, 1,
                 public_arrays=public, private_arrays=private,
@@ -1192,7 +1192,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         pins = {"round_index": 1, "loss_name": "mse"}
         original_contract = client_app._neural_seed_contract
 
-        with (mock.patch.object(client_app, "is_image_run", return_value=False),
+        with (mock.patch.object(client_app.task_module, "_load_manifest", return_value={}),
+              mock.patch.object(client_app, "is_image_run", return_value=False),
               mock.patch.object(client_app, "_neural_input_dim", return_value=2),
               mock.patch.object(client_app, "_neural_seed_contract",
                                 wraps=original_contract) as seed_contract,
@@ -1207,7 +1208,7 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         self.assertIs(prepared, model)
         self.assertEqual(input_dim, 2)
         self.assertFalse(manifest_image)
-        seed_contract.assert_called_once_with(cfg, pins, {})
+        seed_contract.assert_called_once_with(cfg, pins, {}, manifest={})
         self.assertEqual(master_seed.call_args.args[2], {
             "policy_hash": client_app._NEURAL_PUBLIC_INIT_POLICY_HASH,
         })
@@ -1320,6 +1321,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         }
         with (mock.patch.object(
                   client_app, "load_data", return_value=(X, y, None)),
+              mock.patch.object(client_app.task_module, "_load_manifest",
+                                return_value={"target_column": "outcome"}),
               mock.patch.object(client_app.task_module,
                                 "assert_pinned_unit_count"),
               mock.patch.object(
@@ -1344,6 +1347,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
             epsilon=1.0, delta=1e-5, clipping_norm=1.0,
             n_samples=2, batch_size=2, local_epochs=1, num_rounds=1)
         self.assertEqual(master_seed.call_args.args[0], "neural-dpsgd/v1")
+        self.assertEqual(master_seed.call_args.args[1]["request-selection"],
+                         seeding.request_selection({"target_column": "outcome"}))
         self.assertEqual(master_seed.call_args.args[2], {
             **effective, "privacy_unit": "row",
         })
@@ -1820,6 +1825,7 @@ class HookAppPublicConfigTests(unittest.TestCase):
                   np.zeros((2, 3), dtype=np.float32),
                   np.zeros(2, dtype=np.float32), None)),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
+              mock.patch.object(client_app.task_module, "_load_manifest", return_value={}),
               mock.patch.object(tier2_lib, "hook_master_seed",
                                 return_value=b"m" * 32),
               mock.patch.object(tier2_lib, "hook_execution_seed",

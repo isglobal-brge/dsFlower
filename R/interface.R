@@ -1641,6 +1641,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
       }
       staging_dir <- .stageFromDescriptor(
         desc, run_token, target_column, feature_columns, run_config)
+      .pin_request_source(staging_dir, handle, desc)
 
       # Read the server-authored structural counts from the staged manifest.
       manifest_path <- file.path(staging_dir, "manifest.json")
@@ -1727,6 +1728,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
     } else {
       .stageData(data, run_token, target_column, feature_columns, run_config)
     }
+    .pin_request_source(staging_dir, handle)
 
     staged_manifest <- jsonlite::fromJSON(
       file.path(staging_dir, "manifest.json"), simplifyVector = TRUE)

@@ -172,6 +172,71 @@ def select_config(config, keys):
     return {key: config[key] for key in sorted(set(keys)) if key in config}
 
 
+_REQUEST_SELECTION_KEYS = frozenset({
+    "request-source", "dataset_id", "source_kind",
+    "data_type", "dp-track", "task-type", "target_column", "feature_columns",
+    "patient_column", "dp-unit", "patient-id-canonicalization",
+    "target-levels", "target-bounds", "feature-bounds",
+    "target-preencoded", "association-preencoded",
+    "model-spec-b64", "loss-name", "num-features", "num-classes", "num-labels",
+    "backbone", "image-size", "vision-extractor-profile", "survival-config",
+    "image_asset", "image_path_col", "mask_asset", "mask_path_col",
+    "sample_id_col", "subject_id_col", "mask_empty_col", "mask-vocabulary",
+    "segmentation-alpha", "segmentation-smooth", "segmentation-selection",
+    "segmentation-preprocessing", "segmentation-checkpoint-sha256",
+    "segmentation-output-shape",
+    "validation-model-track", "validation-task", "validation-bins",
+    "validation-contract-sha256", "validation-artifact-format",
+    "validation-artifact-sha256", "validation-profile-sha256",
+    "validation-public-schema-sha256",
+    "association-contract", "association-contract-sha256",
+    "association-job-sha256", "association-n-nodes",
+    "association-privacy-unit", "association-unit-semantics",
+    "resampling-version", "resampling-method", "resampling-assignment",
+    "resampling-test-numerator", "resampling-test-denominator",
+    "resampling-privacy-unit", "resampling-unit-canonicalization",
+    "resampling-contract-sha256", "holdout-validation-bins",
+    "cv-version", "cv-method", "cv-assignment", "cv-folds",
+    "cv-privacy-unit", "cv-unit-canonicalization", "cv-contract-sha256",
+    "cv-validation-bins", "cv-n-nodes", "cv-job-sha256",
+    "strategy", "strategy-eta", "strategy-eta-l", "strategy-beta-1",
+    "strategy-beta-2", "strategy-tau", "strategy-server-learning-rate",
+    "strategy-server-momentum",
+})
+
+
+def request_selection(manifest):
+    """Public request identity from the node-authored staging manifest only.
+
+    Column and vocabulary lists retain their order. Never accept a selection
+    blob from Flower config: identical tensors do not identify which columns
+    the analyst requested. Asset aliases/column roles are semantic; relocated
+    asset roots and staging files are not. Counts and private assignments stay
+    out of this public block. Native adapters additionally bind their validated
+    engine schema/parameters, and callers bind validated release coordinates.
+    """
+    selection = select_config(manifest, _REQUEST_SELECTION_KEYS)
+    if manifest.get("task-type") == "survival":
+        # Accepted wire aliases do not affect survival execution.
+        selection.pop("target-bounds", None)
+    if manifest.get("data_type") == "image":
+        assets = manifest.get("assets", {})
+        names = {manifest.get("image_asset", "images")}
+        if manifest.get("loss-name") == "segmentation_bce_dice":
+            names.add(manifest.get("mask_asset", "masks"))
+        selection["assets"] = {
+            name: select_config(assets.get(name, {}), {"type", "kind", "path_col"})
+            for name in sorted(names)
+        }
+    # The trusted manifest is JSON. Hash its selected JSON directly so large
+    # ordered column lists/model specs do not consume the outer config's item
+    # and byte budgets a second time. Sorting object keys preserves list order.
+    encoded = json.dumps(
+        selection, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return {"manifest-sha256": hashlib.sha256(encoded).hexdigest()}
+
+
 @lru_cache(maxsize=1)
 def _runtime_fingerprint():
     """Public execution facts that can change deterministic model arithmetic."""
@@ -359,7 +424,7 @@ def _semantic_digest(mechanism, config, privacy, round_index,
         raise RuntimeError("semantic privacy policy hash is missing or invalid")
 
     digest = hashlib.sha256()
-    _frame(digest, "contract", b"dsflower-semantic-randomness-v1")
+    _frame(digest, "contract", b"dsflower-semantic-randomness-v2")
     _frame(digest, "mechanism", mechanism.encode("utf-8"))
     runtime = (_runtime_fingerprint() if execution_fingerprint is None
                else execution_fingerprint)

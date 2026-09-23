@@ -38,7 +38,7 @@ from flwr.clientapp import ClientApp
 from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 
-from . import epi_association, task
+from . import epi_association, seeding, task
 
 
 app = ClientApp()
@@ -158,7 +158,8 @@ def train(msg: Message, context: Context) -> Message:
             privacy_unit=cfg["association-privacy-unit"], unit_ids=unit_ids)
         released, sigma = epi_association.private_association_vector(
             sufficient, privacy_unit=cfg["association-privacy-unit"],
-            epsilon=privacy["epsilon"], delta=privacy["delta"])
+            epsilon=privacy["epsilon"], delta=privacy["delta"],
+            request_selection=seeding.request_selection(node_manifest))
         if not math.isfinite(sigma) or sigma <= 0.0:
             raise RuntimeError("association noise scale is invalid")
         return _reply(msg, released, sigma, True)

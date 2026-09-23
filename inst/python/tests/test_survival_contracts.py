@@ -361,8 +361,8 @@ class SurvivalRunnerTests(unittest.TestCase):
         cfg=self.task.load_pinned_run_config(self.context)
         self.assertEqual(model_spec.output_width("discrete_hazard_nll",cfg),3)
         self.assertEqual(client_app._prep_target(np.zeros((7,7)),pins["loss_name"],2).shape,(7,7))
-        first,_=client_app._neural_seed_contract(cfg,pins,{})
-        second,_=client_app._neural_seed_contract(wire(config(edges=[0.,4.,10.,20.])),pins,{})
+        first,_=client_app._neural_seed_contract(cfg,pins,{},manifest=self.manifest)
+        second,_=client_app._neural_seed_contract(wire(config(edges=[0.,4.,10.,20.])),pins,{},manifest=self.manifest)
         self.assertNotEqual(first,second)
         cfg.update({"num-features":2,"model-spec-b64":base64.b64encode(
             json.dumps({"layers":[{"op":"linear","out":"@out"}]}).encode()).decode()})
@@ -413,9 +413,9 @@ class SurvivalRunnerTests(unittest.TestCase):
     def test_irrelevant_class_pins_are_canonical_and_cannot_rekey(self):
         from dsflower_runner import client_app
         pins=self.task.load_run_pins(self.context)
-        base,_=client_app._neural_seed_contract(wire(self.cfg),pins,{})
+        base,_=client_app._neural_seed_contract(wire(self.cfg),pins,{},manifest=self.manifest)
         explicit={**wire(self.cfg),"num-classes":2,"num-labels":2}
-        self.assertEqual(base,client_app._neural_seed_contract(explicit,pins,{})[0])
+        self.assertEqual(base,client_app._neural_seed_contract(explicit,pins,{},manifest=self.manifest)[0])
         for key in ("num-classes","num-labels"):
             self.context.run_config={**wire(self.cfg),key:3}
             with self.assertRaises(ValueError):self.task.load_pinned_run_config(self.context)
@@ -441,7 +441,7 @@ class SurvivalRunnerTests(unittest.TestCase):
         x,y,ids,m=self.task.load_survival_data(self.context)
         privacy={"policy_hash":"f"*64}
         def digest(cfg=wire(self.cfg),target=y,features=x,pinned=pins):
-            semantic,_=client_app._neural_seed_contract(cfg,pinned,{})
+            semantic,_=client_app._neural_seed_contract(cfg,pinned,{},manifest=self.manifest)
             return seeding._semantic_digest("survival-test",semantic,privacy,1,
                     private_arrays=(features,target),execution_fingerprint={})
         baseline=digest()
@@ -471,7 +471,7 @@ class SurvivalRunnerTests(unittest.TestCase):
             def digest(extra):
                 self.context.run_config={**wire(self.cfg),**extra}
                 cfg=self.task.load_pinned_run_config(self.context)
-                semantic,_=client_app._neural_seed_contract(cfg,pins,{})
+                semantic,_=client_app._neural_seed_contract(cfg,pins,{},manifest=self.manifest)
                 return seeding._semantic_digest("survival-wire-test",semantic,
                     {"policy_hash":"f"*64},1,execution_fingerprint={})
             baseline=digest({})
@@ -481,7 +481,7 @@ class SurvivalRunnerTests(unittest.TestCase):
         # Existing contracts retain their prior handling of these public keys.
         for extra in extras:
             semantic,_=client_app._neural_seed_contract(
-                {"loss-name":"mse",**extra},{"loss_name":"mse"},{})
+                {"loss-name":"mse",**extra},{"loss_name":"mse"},{},manifest={})
             for key,value in extra.items():self.assertEqual(semantic["run"][key],value)
 
     def test_sticky_repeated_released_arrays_and_effective_changes(self):

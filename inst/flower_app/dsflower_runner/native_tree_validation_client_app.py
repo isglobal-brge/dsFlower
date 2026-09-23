@@ -37,7 +37,7 @@ from flwr.clientapp import ClientApp
 from flwr.common import (ArrayRecord, ConfigRecord, Context, Message,
                          MetricRecord, RecordDict)
 
-from . import native_tree_engine, native_tree_request, task, validation
+from . import native_tree_engine, native_tree_request, seeding, task, validation
 
 
 app = ClientApp()
@@ -254,7 +254,8 @@ def train(msg: Message, context: Context) -> Message:
         released, _sigma = validation.private_validation_vector(
             target, predictions, layout, epsilon=pcfg["epsilon"],
             delta=pcfg["delta"], target_bounds=target_bounds,
-            num_releases=1, unit_ids=unit_ids)
+            num_releases=1, unit_ids=unit_ids,
+            request_selection=seeding.request_selection(node_manifest))
         return _reply(msg, released.astype(np.float64), True)
     except Exception:
         # Never expose paths, parser diagnostics, private counts or exceptions.

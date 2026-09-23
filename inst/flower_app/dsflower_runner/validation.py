@@ -140,8 +140,9 @@ def _canonical_sufficient_vector(value, layout):
     return canonical
 
 
-def _validation_noise_key(raw, layout, sigma):
-    """Bind sticky validation noise only to the effective DP release."""
+def _validation_noise_key(raw, layout, sigma, *, request_selection=None,
+                          public_arrays=()):
+    """Bind sticky validation noise to the request and effective DP release."""
     from . import seeding
 
     effective = _effective_validation_layout(layout)
@@ -160,7 +161,9 @@ def _validation_noise_key(raw, layout, sigma):
     privacy = dict(semantics)
     privacy["policy_hash"] = hashlib.sha256(encoded).hexdigest()
     master = seeding.master_seed(
-        _VALIDATION_MECHANISM, {"layout": effective}, privacy, 1,
+        _VALIDATION_MECHANISM,
+        {"layout": effective, "request-selection": request_selection},
+        privacy, 1, public_arrays=public_arrays,
         private_arrays=(canonical,),
         execution_fingerprint=_VALIDATION_FINGERPRINT)
     return seeding.sub_seed(master, "validation-noise/v2")
@@ -600,8 +603,8 @@ def _apply_feature_bounds(X, cfg):
 def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
                              on_private_start=None):
     """Validate public inputs, then read private data and emit one DP vector."""
-    from . import task as task_module
-    from .params import load_user_model, set_torch_params
+    from . import seeding, task as task_module
+    from .params import get_torch_params, load_user_model, set_torch_params
 
     del round_index  # Operational coordinates are not validation reroll axes.
 
@@ -616,6 +619,7 @@ def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
     loss = str(cfg.get("loss-name", "")).lower()
     model = load_user_model(cfg, input_dim, loss)
     set_torch_params(model, list(public_arrays))
+    selection = seeding.request_selection(task_module._load_manifest(context))
 
     image = cfg.get("data-kind") == "image"
     if image:
@@ -650,7 +654,8 @@ def private_model_validation(context, cfg, pcfg, round_index, public_arrays,
     released, _sigma = private_validation_vector(
         y, predictions, layout, epsilon=pcfg["epsilon"],
         delta=pcfg["delta"], target_bounds=target_bounds, num_releases=1,
-        unit_ids=unit_ids)
+        unit_ids=unit_ids, request_selection=selection,
+        public_arrays=get_torch_params(model))
     return [released.astype(np.float64)]
 
 
@@ -1001,7 +1006,8 @@ def validation_sufficient_vector(y, predictions, layout, *,
 
 def private_sufficient_vector(raw, layout, *, epsilon, delta,
                               num_releases=1,
-                              include_zero_neighbor=False):
+                              include_zero_neighbor=False,
+                              request_selection=None, public_arrays=()):
     """Apply the one semantic-sticky Gaussian release to a sufficient vector."""
     from . import dp_harness, seeding
 
@@ -1011,7 +1017,9 @@ def private_sufficient_vector(raw, layout, *, epsilon, delta,
         effective, include_zero_neighbor=include_zero_neighbor)
     sigma = dp_harness.compute_output_sigma(
         epsilon, delta, sensitivity, num_releases=num_releases)
-    rng = seeding.np_rng(_validation_noise_key(raw, effective, sigma))
+    rng = seeding.np_rng(_validation_noise_key(
+        raw, effective, sigma, request_selection=request_selection,
+        public_arrays=public_arrays))
     noise = np.asarray(rng.normal(0.0, sigma, size=raw.shape), dtype=np.float64)
     released = raw + noise
     if released.shape != raw.shape or not bool(np.all(np.isfinite(released))):
@@ -1021,15 +1029,23 @@ def private_sufficient_vector(raw, layout, *, epsilon, delta,
 
 def private_validation_vector(y, predictions, layout, *, epsilon, delta,
                               target_bounds=None, num_releases=1,
-                              unit_ids=None, include_zero_neighbor=False):
+                              unit_ids=None, include_zero_neighbor=False,
+                              request_selection=None, public_arrays=()):
     """Release one semantic-sticky Gaussian sum with its exact DP bound."""
     raw = validation_sufficient_vector(
         y, predictions, layout, target_bounds=target_bounds,
         unit_ids=unit_ids)
+    selection = request_selection
+    if layout["task"] in ("regression", "count"):
+        bounds = (target_bounds if isinstance(target_bounds, dict) else
+                  {"lower": target_bounds[0], "upper": target_bounds[1]})
+        selection = {"request": request_selection,
+                     "target-bounds": _target_bounds(bounds)}
     return private_sufficient_vector(
         raw, layout, epsilon=epsilon, delta=delta,
         num_releases=num_releases,
-        include_zero_neighbor=include_zero_neighbor)
+        include_zero_neighbor=include_zero_neighbor,
+        request_selection=selection, public_arrays=public_arrays)
 
 
 def _safe_ratio(a, b):

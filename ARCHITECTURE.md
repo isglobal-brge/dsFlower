@@ -322,13 +322,34 @@ initialization/dropout is data-independent and uses a separate HMAC-derived seed
 through the framework PRNG; it is not a DP-noise source. No privacy-critical
 stream is reused. The canonical identity includes the effective configuration,
 per-training policy, round, incoming public arrays, transformed or patient-pooled
-private tensors and a runtime fingerprint. Operational paths, tokens, message
+private tensors and a runtime fingerprint. The `dsflower-semantic-randomness-v2`
+contract also binds a public request-selection block derived from the node's
+server-authored manifest: target columns (including ordered survival time/event
+roles), ordered feature columns, patient column and unit policy, public target
+vocabularies/bounds, imaging asset aliases and path/id/mask column roles, and
+holdout/CV geometry and assignment contracts. Native engines bind their validated
+schema, engine parameters and contribution policy, including the active CV fold;
+validation and association bind their public request contracts even when their
+private sufficient statistics coincide. Hook keys bind the verified uploaded
+package contents as well as manifest selections and the validated update.
+The server preserves selected source operands and descriptor identities in
+protected `request-source` manifest metadata. Canonical selection/schema digests
+keep large public column lists within the outer key encoder's limits. Pooled CV
+also binds the ordered public fold-model digests held in existing node RAM.
+The node never accepts an analyst-authored request-selection blob. Operational paths, tokens, message
 IDs and timestamps are excluded, and the private digest remains node-local.
 
 A single fixed noise vector for all distinct queries is unsafe because correlated
 answers can cancel it. Sticky noise only solves repeated identical queries. In
 dsFlower, equivalent canonical identities reuse one deterministic noise stream,
 while distinct semantic identities receive domain-separated keys.
+In particular, selecting different private columns cannot reuse a key merely
+because their contents happen to match. Request-selection changes affect key
+derivation only: noise distribution, calibration, accounting, clipping,
+partition-assignment algorithms and training paths are unchanged. Earlier-runner
+evidence remains valid as measurements of the same mechanism, although v2 draws
+different deterministic noise realizations. See the runner's
+[`SEEDING.md`](inst/flower_app/dsflower_runner/SEEDING.md) for the identity boundary.
 
 Trusted built-in tracks request strict deterministic Torch kernels. HookApps are
 seeded for Python, NumPy and Torch and bind final noise to the validated clipped

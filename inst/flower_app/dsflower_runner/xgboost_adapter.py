@@ -19,7 +19,7 @@ import math
 import numpy as np
 
 from . import native_tree_contract as tree_contract
-from . import seeding, xgboost_accounting, xgboost_bundle, xgboost_native
+from . import seeding, tree_release, xgboost_accounting, xgboost_bundle, xgboost_native
 from .xgboost_sanitizer import sanitize_xgboost_json
 
 
@@ -631,7 +631,7 @@ def _native_parameters(canonical, profile):
 
 
 def prepare_xgboost_training(manifest, features, target, *, native_bundle,
-                             unit_ids=None):
+                             unit_ids=None, request_selection=None):
     """Prepare one complete T-tree training and its private-bound sticky key."""
     if not xgboost_bundle.is_verified_bundle(native_bundle):
         raise ValueError("verified native XGBoost bundle is required")
@@ -645,9 +645,8 @@ def prepare_xgboost_training(manifest, features, target, *, native_bundle,
     # canonical private tensors below bind the complete model input directly.
     # One native invocation trains all T trees, so the sole outer runner round
     # coordinate is fixed to one; T and depth remain inside the semantic config.
-    # Admission bounds are deliberately absent: once the effective records pass
-    # them, widening a bound without changing bins, targets or base_score must
-    # not create a fresh noise stream.
+    # Public schema selections remain distinct even when their bounded private
+    # records happen to coincide.
     semantic_config = {
         "contract_version": canonical["contract_version"],
         "engine": "xgboost",
@@ -661,6 +660,9 @@ def prepare_xgboost_training(manifest, features, target, *, native_bundle,
                 "public_cuts", "reg_alpha", "reg_lambda")
         },
     }
+    semantic_config["request-selection"] = tree_release.request_selection(
+        canonical, request_selection,
+        parameters=semantic_config["native_profile"])
     source_privacy = canonical["privacy"]
     privacy_policy = {
         "mechanism": MECHANISM_PROFILE,

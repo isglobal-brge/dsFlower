@@ -302,7 +302,7 @@ class RandomForestTranscriptTests(unittest.TestCase):
         np.testing.assert_array_equal(
             first, _train(wider, self.X, self.y))
 
-    def test_schema_names_ids_and_scope_are_not_reroll_axes(self):
+    def test_schema_selections_separate_noise_but_ids_and_scope_do_not(self):
         manifest = _manifest(trees=6, depth=2, max_features=2, unit="patient")
         X = np.asarray([
             [-1.4, -0.9, -0.4], [-1.2, -0.7, -0.2],
@@ -310,6 +310,13 @@ class RandomForestTranscriptTests(unittest.TestCase):
         ])
         y = np.asarray([0.0, 0.0, 1.0, 1.0])
         first = json.loads(_train(manifest, X, y, ["a", "a", "b", "b"]))
+
+        scope = copy.deepcopy(manifest)
+        scope["data_scope"]["snapshot_hash"] = "c" * 64
+        scope["data_scope"]["cohort_hash"] = "d" * 64
+        replay = json.loads(_train(
+            scope, X, y, ["renamed-1", "renamed-1", "renamed-2", "renamed-2"]))
+        self.assertEqual(first, replay)
 
         nominal = copy.deepcopy(manifest)
         nominal["public_schema"]["features"] = ["u", "v", "w"]
@@ -322,7 +329,7 @@ class RandomForestTranscriptTests(unittest.TestCase):
                             "renamed-2", "renamed-2"]))
         self.assertNotEqual(
             first["public_schema_sha256"], replay["public_schema_sha256"])
-        self.assertEqual(first["trees"], replay["trees"])
+        self.assertNotEqual(first["trees"], replay["trees"])
 
     def test_duplicate_assignment_is_content_addressed_not_occurrence_rank(self):
         manifest = _manifest(trees=11, depth=2, max_features=2)
