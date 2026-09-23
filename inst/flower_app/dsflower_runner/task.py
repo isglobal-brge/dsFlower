@@ -927,6 +927,13 @@ def load_pinned_run_config(context=None):
     """Overlay every node-pinned declarative field onto Flower run_config."""
     manifest = _load_manifest(context)
     cfg = _run_config(context)
+    for key in cfg:
+        normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+        normalized = normalized.lower().replace("-", "_").replace(".", "_")
+        if (normalized == "public_initialisation_policy"
+                or normalized == "dsflower_public_initialisation"
+                or normalized.startswith("dsflower_public_initialisation_")):
+            raise ValueError("public initialisation policy is administrator-only")
     # Cache storage belongs to the administrator's launch environment, never
     # the analyst's Flower configuration or manifest overrides.
     for source in (manifest, cfg):
@@ -953,8 +960,12 @@ def load_pinned_run_config(context=None):
             if key not in cfg or cfg[key] != manifest[key]:
                 raise ValueError("Flower segmentation config does not match manifest pin")
         from . import segmentation_checkpoints as checkpoints
-        # Public status transport only initializes the researcher-side strategy.
-        # It can never authorize/replace a node checkpoint or select DP seeds.
+        if any(key in source for source in (manifest, cfg) for key in (
+                "segmentation-public-manifest-sha256", "segmentation-public-checkpoint-sha256",
+                "segmentation-public-provenance")):
+            raise ValueError("legacy registry public checkpoint pins are retired")
+        # The independently supplied local payload initializes the coordinator;
+        # it never authorizes a node or replaces its protected snapshot.
         cfg.pop(checkpoints.TRANSPORT_KEY, None)
         selected = checkpoints.checkpoint_id(manifest)
         if checkpoints.checkpoint_id(cfg) != selected:
@@ -964,14 +975,13 @@ def load_pinned_run_config(context=None):
                 raise ValueError("Flower config cannot supply node-owned checkpoint provenance")
             if selected is not None and key not in manifest:
                 raise ValueError("public checkpoint requires node-owned provenance pins")
-            if selected is None and key in manifest:
+            if selected is None and key in manifest and key != checkpoints.POLICY_KEY:
                 raise ValueError("random decoder cannot carry public checkpoint provenance")
         if selected is None:
             cfg.pop(checkpoints.INIT_KEY, None)
-    elif any(key in manifest or key in cfg for key in (
-            "segmentation-decoder-init", "segmentation-public-manifest-sha256",
-            "segmentation-public-checkpoint-sha256", "segmentation-public-provenance",
-            "segmentation-public-initialization-b64")):
+    elif any(str(key).startswith(("segmentation-public-", "public-initialisation-"))
+             or key == "segmentation-decoder-init" for source in (manifest, cfg) for key in source
+             if key != "public-initialisation-policy"):
         raise ValueError("public decoder checkpoint fields require the segmentation contract")
     if manifest.get("cv-contract-sha256") is not None:
         _validate_cv_execution_config(manifest, cfg)
@@ -1222,8 +1232,11 @@ def load_pinned_run_config(context=None):
         "segmentation-alpha", "segmentation-smooth", "mask-vocabulary",
         "segmentation-selection", "segmentation-preprocessing",
         "segmentation-checkpoint-sha256", "segmentation-output-shape",
-        "segmentation-decoder-init", "segmentation-public-manifest-sha256",
-        "segmentation-public-checkpoint-sha256", "segmentation-public-provenance",
+        "segmentation-decoder-init",
+        "public-initialisation-manifest-sha256", "public-initialisation-checkpoint-sha256",
+        "public-initialisation-provenance", "public-initialisation-origin",
+        "public-initialisation-directory", "public-initialisation-policy",
+        "public-initialisation-encoder-sha256", "public-initialisation-identity-version",
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "survival-config", "survival-config-b64",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",

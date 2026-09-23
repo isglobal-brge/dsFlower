@@ -84,6 +84,9 @@ as_flower_dataset.data.frame <- function(x, dataset_id = NULL, ...) {
 #'
 #' @export
 as_flower_dataset.ResourceClient <- function(x, ...) {
+  if (inherits(x, "CheckpointResourceClient")) {
+    stop("Checkpoint resources require flowerCheckpointInitDS().", call. = FALSE)
+  }
   # S3 normally dispatches this subclass to the more specific method below,
   # but keep this check for callers that invoke the method directly.
   if (inherits(x, "ImagingDatasetResourceClient")) {
@@ -95,6 +98,9 @@ as_flower_dataset.ResourceClient <- function(x, ...) {
   # Class names are not a security boundary: a resolver can return a generic
   # ResourceClient for an imaging+dataset URL.
   resource <- tryCatch(x$getResource(), error = function(e) NULL)
+  if (is.list(resource) && .is_checkpoint_resource_format(resource$format)) {
+    stop("Checkpoint resources require flowerCheckpointInitDS().", call. = FALSE)
+  }
   url <- if (is.list(resource)) resource$url else NULL
   if (!is.character(url) || length(url) != 1L || is.na(url) || !nzchar(url)) {
     stop("ResourceClient does not expose a valid resource URL.", call. = FALSE)

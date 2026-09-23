@@ -378,6 +378,45 @@ def read_image_3d(path, image_size):
 # Frozen backbone + trainable head
 # --------------------------------------------------------------------------- #
 
+# These full byte identities bind the existing ImageNet1K V1 feature contracts.
+# Loading never calls torchvision's URL/cache loader.
+_PRESEEDED_ENCODERS = {
+    "resnet18": ("resnet18-f37072fd.pth", 46_830_571,
+                 "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec"),
+    "resnet50": ("resnet50-0676ba61.pth", 102_530_333,
+                 "0676ba61b6795bbe1773cffd859882e5e297624d384b6993f7c9e683e722fb8a"),
+    "densenet121": ("densenet121-a639ec97.pth", 32_342_954,
+                    "a639ec97d7c33b07ae66f0b5fb7d0192f95a3b11b7576c66c0126c2a727c4395"),
+}
+
+
+def verified_backbone_bytes(backbone):
+    """Read a full-SHA-pinned custodian-preseeded encoder, with no download."""
+    import torch
+    from .segmentation_checkpoints import _read
+    filename, size, digest = _PRESEEDED_ENCODERS[backbone]
+    path = os.path.join(torch.hub.get_dir(), "checkpoints", filename)
+    try:
+        return _read(path, size, digest, size, protected=False)
+    except (OSError, ValueError) as exc:
+        raise ValueError("verified pretrained encoder is unavailable; custodian must pre-seed the pinned file") from exc
+
+
+def _load_verified_backbone(net, backbone, checkpoint):
+    import io
+    import torch
+    state = torch.load(io.BytesIO(checkpoint), map_location="cpu", weights_only=True)
+    if backbone == "densenet121":
+        # The official V1 checkpoint predates PyTorch's ban on dots in module
+        # names. Match torchvision's data-only compatibility translation.
+        pattern = re.compile(r"^(.*denselayer\d+\.(?:norm|relu|conv))\.((?:[12])\.(?:weight|bias|running_mean|running_var))$")
+        for key in list(state):
+            match = pattern.match(key)
+            if match:
+                state[match.group(1) + match.group(2)] = state.pop(key)
+    net.load_state_dict(state, strict=True)
+
+
 def build_backbone(backbone):
     """Build a FROZEN (eval, no-grad) feature extractor. Deterministic weights so
     every node shares the same feature space (FedAvg over heads is then valid)."""
@@ -388,7 +427,7 @@ def build_backbone(backbone):
     if name == "resnet18_layer2":
         raise ValueError("spatial encoder requires the full segmentation contract")
     feat_dim, is3d = _BACKBONES[name]
-    torch.manual_seed(0)  # determinism for any non-pretrained fallback
+    torch.manual_seed(0)  # fixed construction, including the MONAI seed-0 profile
 
     if is3d:
         # MONAI is a required dep for volumetric runs. If it is missing we must NOT
@@ -412,28 +451,19 @@ def build_backbone(backbone):
             net.fc = nn.Identity()
         model = net
     else:
-        # Pin an explicit, version-stable weights enum (not "DEFAULT", which can
-        # change across torchvision releases) so every node extracts in the SAME
-        # feature space. On an air-gapped node without a pre-seeded weights cache,
-        # fail closed: a silent random init would diverge per node and break FedAvg.
         import torchvision.models as tvm
-        try:
-            if name == "resnet18":
-                net = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
-                net.fc = nn.Identity()
-            elif name == "resnet50":
-                net = tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V1)
-                net.fc = nn.Identity()
-            else:
-                net = tvm.densenet121(weights=tvm.DenseNet121_Weights.IMAGENET1K_V1)
-                net.classifier = nn.Identity()
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not load pretrained weights for 2D backbone '{name}'. On an "
-                "air-gapped node, pre-seed the torchvision weights cache (TORCH_HOME) "
-                "so every node shares the SAME frozen feature space; a silent random "
-                f"fallback would make FedAvg over heads invalid. Original error: {e}"
-            ) from e
+        checkpoint = verified_backbone_bytes(name)
+        if name == "resnet18":
+            net = tvm.resnet18(weights=None)
+        elif name == "resnet50":
+            net = tvm.resnet50(weights=None)
+        else:
+            net = tvm.densenet121(weights=None)
+        _load_verified_backbone(net, name, checkpoint)
+        if name.startswith("resnet"):
+            net.fc = nn.Identity()
+        else:
+            net.classifier = nn.Identity()
         model = net
 
     model.eval()

@@ -1260,10 +1260,14 @@ flowerInitDS <- function(data_symbol) {
   value
 }
 
-.addDpConfigToRunConfig <- function(run_config, unit_policy = NULL) {
+.addDpConfigToRunConfig <- function(run_config, unit_policy = NULL,
+                                    owner_env = parent.frame()) {
   run_config <- .validate_client_run_config(run_config)
   attr(run_config, "segmentation_public_initialization") <- NULL
   run_config <- .normalizeRunRounds(run_config)
+  initialisation_policy <- .public_initialisation_policy(if (.segmentationRequested(run_config)) {
+    .CHECKPOINT_CONTRACT
+  } else NULL)
   track <- as.character(unlist(
     run_config[["dp-track"]] %||% "neural", use.names = FALSE))
   if (length(track) != 1L || is.na(track) ||
@@ -1275,12 +1279,13 @@ flowerInitDS <- function(data_symbol) {
   track <- tolower(track)
   run_config[["dp-track"]] <- track
   run_config <- .normalizeSurvivalConfig(run_config, track, unit_policy)
-  run_config <- .normalizeSegmentationConfig(run_config, track, unit_policy)
+  run_config <- .normalizeSegmentationConfig(run_config, track, unit_policy, owner_env)
   run_config <- .normalizeAssociationConfig(run_config, track, unit_policy)
   run_config <- .normalizeValidationConfig(run_config, track)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
   run_config <- .normalizeResamplingConfig(run_config, track, unit_policy)
   run_config <- .normalizeCrossValidationConfig(run_config, track)
+  run_config[["public-initialisation-policy"]] <- initialisation_policy
   run_config <- .normalizePinnedTaskType(run_config, track)
   run_config <- .normalizeHookAppParams(run_config, track)
   run_config <- .normalizePublicFeatureBounds(run_config)
@@ -1445,7 +1450,7 @@ flowerPrepareRunDS <- function(handle_symbol, target_column,
   } else {
     NULL
   }
-  run_config <- .addDpConfigToRunConfig(run_config, imaging_unit_policy)
+  run_config <- .addDpConfigToRunConfig(run_config, imaging_unit_policy, owner_env)
   public_initialization <- attr(run_config, "segmentation_public_initialization",
                                 exact = TRUE)
   attr(run_config, "segmentation_public_initialization") <- NULL
@@ -2166,6 +2171,7 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
     privacy_clipping_norm = .serverDpClippingNorm(),
     privacy_unit        = privacy_policy$dp_unit,
     privacy_patient_column = privacy_policy$patient_column,
+    public_initialisation = .public_initialisation_policy_status(),
     runner_abi          = 3L,
     runner_sha256       = runner_sha256,
     dp_app_schema_versions = 1L,
@@ -2191,8 +2197,8 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
 #' DataSHIELD AGGREGATE method. Returns the current status of the handle
 #' including whether data is prepared, a SuperNode is ensured, and the
 #' server-authored privacy unit effective for this handle. Prepared public
-#' segmentation runs additionally return the verified public checkpoint and its
-#' provenance so the coordinator can initialise its aggregation strategy.
+#' segmentation runs additionally return verified public identity and provenance.
+#' Checkpoint bytes and storage locations are never returned.
 #'
 #' @param handle_symbol Character; symbol of the handle.
 #' @return Named list with status information.
@@ -2223,10 +2229,11 @@ flowerStatusDS <- function(handle_symbol) {
     federation_id      = handle$federation_id,
     target_column      = handle$target_column,
     feature_columns    = handle$feature_columns,
-    privacy_unit       = unit_policy$dp_unit
+    privacy_unit       = unit_policy$dp_unit,
+    public_initialisation_policy = .public_initialisation_policy_status()
   )
   if (isTRUE(handle$prepared) && !is.null(handle$segmentation_public_initialization)) {
-    status$segmentation_public_initialization <- handle$segmentation_public_initialization
+    status$public_initialisation <- handle$segmentation_public_initialization
   }
   status
 }
@@ -2238,7 +2245,9 @@ flowerStatusDS <- function(handle_symbol) {
 #' @export
 flowerPrivacyPolicyDS <- function() {
   .dsflower_require_literal_arguments()
-  .privacy_policy_status()
+  policy <- .privacy_policy_status()
+  policy$public_initialisation <- .public_initialisation_policy_status()
+  policy
 }
 
 #' Check TCP connectivity from this node to a given address

@@ -62,8 +62,10 @@ _NEURAL_SEED_CONFIG_KEYS = frozenset({
     "segmentation-alpha", "segmentation-smooth", "segmentation-selection",
     "segmentation-preprocessing", "segmentation-checkpoint-sha256",
     "segmentation-output-shape",
-    "segmentation-decoder-init", "segmentation-public-manifest-sha256",
-    "segmentation-public-checkpoint-sha256",
+    "segmentation-decoder-init",
+    "public-initialisation-manifest-sha256", "public-initialisation-checkpoint-sha256",
+    "public-initialisation-origin", "public-initialisation-encoder-sha256",
+    "public-initialisation-identity-version",
 })
 _NEURAL_PUBLIC_INIT_POLICY_HASH = hashlib.sha256(
     b"dsflower/neural-public-init-policy/v1").hexdigest()
@@ -328,15 +330,19 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
     checkpoint_arrays = None
     if pins["loss_name"] == "segmentation_bce_dice":
         from . import segmentation, segmentation_checkpoints
-        checkpoint_arrays, _ = segmentation_checkpoints.verify_node_checkpoint(
+        checkpoint_arrays, checkpoint_summary = segmentation_checkpoints.verify_node_checkpoint(
             cfg, task_module._load_manifest(context))
         if checkpoint_arrays is not None:
-            segmentation.verified_encoder_bytes()
+            segmentation.verified_encoder_bytes(cfg)
     model = load_user_model(cfg, input_dim, pins["loss_name"])
     initial_arrays = _validate_public_neural_arrays(msg.content["arrays"], model)
     if checkpoint_arrays is not None and int(pins["round_index"]) == 1:
-        if any(a.tobytes(order="C") != b.tobytes(order="C")
-               for a, b in zip(initial_arrays, checkpoint_arrays)):
+        declared = checkpoint_summary["tensor_schema"]
+        if (len(initial_arrays) != len(declared) or any(
+                list(a.shape) != record["shape"] or str(a.dtype) != record["dtype"]
+                or hashlib.sha256(a.tobytes(order="C")).hexdigest() != record["sha256"]
+                or a.tobytes(order="C") != b.tobytes(order="C")
+                for a, b, record in zip(initial_arrays, checkpoint_arrays, declared))):
             raise ValueError("first global decoder differs from the public checkpoint")
         set_torch_params(model, checkpoint_arrays)
     return model, input_dim, manifest_image

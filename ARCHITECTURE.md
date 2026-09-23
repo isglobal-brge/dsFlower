@@ -265,37 +265,45 @@ node-local. Effective tensors, selection/profile/preprocessing and checkpoint
 pins contribute to sticky semantic identity; path names alone do not identify
 the training data.
 
-The decoder defaults to `decoder_init = "random"`. The optional
-`"public:<checkpoint-id>"` selects an administrator-installed checkpoint whose
-manifest SHA-256 is allowlisted in `dsflower.segmentation_public_checkpoints`.
-The protected registry is fixed beside the node secret, under
-`segmentation-public-checkpoints/<checkpoint-id>/`; analysts can select an ID
-and matching decoder architecture, but cannot supply paths, uploads or pins.
-Before private staging, the node verifies manifest, checkpoint, evidence and
-individual tensor digests and checks the frozen encoder. The runner repeats
-verification before private access. All participating nodes must admit the same
-public identity. The coordinator starts every aggregation strategy from the
-agreed public decoder; the first training round checks those weights, and later
-rounds continue the incoming federated decoder.
+The decoder defaults to `decoder_init = "random"`. Two digest-bound public
+initialisation routes are available in 0.7.0:
 
-The checkpoint ID, manifest digest and checkpoint digest enter the v2 request
-selection and neural seed identity. Verified provenance is retained in the run
-manifest, protected release record and saved client model metadata. Public
-pretraining spends no private budget; adaptation uses the existing accountant,
-clipping, sampler and training loop. Public initialisation does not promote the
-experimental contract. Segmentation uses the declarative mechanism and does not
-use the gated-Hook release cache. The random default retains its contract, while
-the execution fingerprint's updated runner bytes change deterministic streams.
+- `client:<path-to-bundle>` validates researcher-local public material and declares
+  its provenance and digests. This route supports research iteration.
+- `resource:<handle-symbol>` uses a custodian-registered checkpoint resource admitted
+  through `datashield.assign.resource()` and `flowerCheckpointInitDS()`. This route
+  supports curated institutional material, large artifacts, and nodes that admit
+  no analyst-supplied material. The coordinator independently obtains the same
+  public weights through its local `public_checkpoint_file` argument.
 
-The [public checkpoint bundle](inst/extdata/segmentation-public-checkpoints/README.md)
-contains three BUSI v5 epochs60 manifests, evidence and exact recovery/install
-instructions. The original NPZ binaries remain absent pending reviewer recovery
-from the evaluation pod; no synthetic replacements are supplied. The registry
-fails closed until authentic files pass the documented verification.
+The custodian sets `dsflower.public_initialisation` to `analyst_or_resource`
+(default), `resource_only`, or `none`, optionally overridden by
+`dsflower.public_initialisation.pytorch_resnet18_segmentation`. Analysts cannot
+change this policy. The former `public:<id>` selector, registry beside the node
+secret, installer and manifest allowlist no longer authorize initialisation.
+
+Both routes use a complete verified bundle, including the frozen encoder,
+checkpoint, manifest, provenance, licence, protocol and audit evidence. The node
+verifies a protected snapshot before private staging; the trusted runner verifies
+it again before private access and checks the first round's public arrays against
+its admitted tensors. Missing or altered material fails closed. Status returns
+public identity, provenance and geometry; it never exports checkpoint bytes.
+Canonical content identity excludes resource names, session symbols, locations
+and archive packaging, so aliases and repacking do not create another noise draw.
+Run manifests and release records retain the origin and verified digests.
+
+See [public initialisation procedures](PUBLIC_INITIALISATION.md) for exact
+Opal, Armadillo and DSLite commands, bundle requirements and policy configuration.
+The [BUSI reference records](inst/extdata/segmentation-public-checkpoints/README.md)
+retain the original hashes and evidence. The three original decoder binaries are
+still absent; synthetic tests do not establish recovery of those checkpoints.
+Public initialisation does not change the DP accountant, clipping, sampler,
+training algorithm, release cache or identity-v2 machinery. Segmentation remains
+experimental; the mirror's licence declaration retains its original qualification.
 
 Private-data-dependent releases are restricted to DP-trained decoder parameters;
-public reconstruction metadata, verified public initialisation bytes and
-provenance may also be returned. Public or authorized local evaluation uses the
+public reconstruction metadata and verified public provenance may also be returned.
+Checkpoint bytes are never returned by the resource or status interfaces. Public or authorized local evaluation uses the
 canonical output grid, threshold 0.5 and subject-mean Dice/IoU, with foreground
 and empty-mask strata.
 Both-empty Dice is 1 and one-empty Dice is 0; these are not private metric routes.
@@ -360,7 +368,8 @@ server-authored manifest: target columns (including ordered survival time/event
 roles), ordered feature columns, patient column and unit policy, public target
 vocabularies/bounds, imaging asset aliases and path/id/mask column roles, and
 holdout/CV geometry and assignment contracts. Public segmentation initialisation
-also binds the verified checkpoint ID, manifest digest and checkpoint digest.
+also binds its origin and versioned canonical manifest, checkpoint, tensor-contract
+and encoder digests; checkpoint labels are excluded.
 Native engines bind their validated schema, engine parameters and contribution
 policy, including the active CV fold; validation and association bind their
 public request contracts even when their
@@ -538,7 +547,8 @@ session/profile options.
 | `patient_column` | unset | Required explicit stable ID column in patient mode |
 | `image_data_root` | unset | Custodian root for direct segmentation image paths |
 | `mask_data_root` | unset | Custodian root for direct segmentation PNG-mask paths |
-| `segmentation_public_checkpoints` | empty | Named checkpoint-ID to manifest-SHA-256 allowlist for protected, installed public segmentation decoders |
+| `public_initialisation` | `analyst_or_resource` | Custodian admission policy: `analyst_or_resource`, `resource_only`, or `none`; optional per-contract suffix. |
+| `checkpoint_cache_dir` | `checkpoints` under `tools::R_user_dir("dsFlower", "data")` | Protected service-owned cache outside staging, Hook mounts and node-secret storage. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound |
 | `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV takes precedence when it selects another path |
 | `release_cache_dir` | `release-cache` beside the node secret | Persistent gated-Hook release cache, outside private staging and Hook mounts, with protected ownership and permissions |

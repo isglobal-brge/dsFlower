@@ -1,3 +1,23 @@
+# dsFlower 0.7.0
+
+* Replace the 0.6.0 file registry with digest-bound analyst-declared public bundles
+  and custodian-registered checkpoint resources. Declared material supports research
+  iteration; resources support institutional curation, large artifacts and nodes
+  that prohibit analyst-supplied material.
+* Add session-bound checkpoint admission and `dsflower.public_initialisation`
+  policy (`analyst_or_resource`, `resource_only`, `none`, with per-contract
+  overrides). Resources pin the archive SHA-256 in their format descriptor; complete
+  bundles include the frozen encoder and all provenance evidence.
+* Snapshot and verify before private staging, reverify before private access, and
+  check first-round tensors. Bind versioned canonical content identity and origin;
+  resource aliases and repacking do not alter scientific identity. Node status no
+  longer exports checkpoint bytes; the coordinator uses its own public copy.
+* Remove ordinary vision-backbone runtime weight downloads. Load only digest-pinned
+  local encoder bytes with safe loading and `weights=None`; fail closed on absence.
+* Preserve the original BUSI evidence and missing-binary qualification. The DP
+  contract, accountant, clipping, sampler, training, release cache and identity v2
+  remain unchanged. Document Opal, Armadillo and DSLite procedures.
+
 # dsFlower 0.6.0
 
 This release combines request-selection identity v2, the durable gated-Hook

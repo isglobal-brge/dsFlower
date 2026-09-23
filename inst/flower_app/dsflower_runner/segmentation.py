@@ -1,6 +1,5 @@
 """Pinned binary image/subject contract. Only decoder parameters are released."""
 
-import hashlib
 import io
 import os
 import unicodedata
@@ -121,22 +120,16 @@ def loss_factory(cfg):
     return loss
 
 
-def verified_encoder_bytes():
-    """Read the pinned public encoder, without loading unverified weights."""
-    from torchvision.models import ResNet18_Weights
-    weights = ResNet18_Weights.IMAGENET1K_V1
-    path = os.path.join(torch.hub.get_dir(), "checkpoints",
-                        os.path.basename(weights.url))
-    # The custodian must pre-seed the exact public checkpoint. No implicit fetch
-    # during a private release, and no random fallback.
-    if not os.path.isfile(path):
-        raise ValueError("segmentation pretrained checkpoint is unavailable")
-    with open(path, "rb") as handle:
-        checkpoint = handle.read(46_830_571 + 1)
-    if (len(checkpoint) != 46_830_571
-            or hashlib.sha256(checkpoint).hexdigest() != CHECKPOINT_SHA256):
-        raise ValueError("segmentation pretrained checkpoint digest mismatch")
-    return checkpoint
+def verified_encoder_bytes(cfg=None):
+    """Consume admitted encoder bytes, or the fixed custodian-preseeded default."""
+    from . import segmentation_checkpoints as checkpoints
+    if cfg and checkpoints.checkpoint_id(cfg) is not None:
+        path = os.path.join(cfg[checkpoints.DIRECTORY_KEY], "encoder.pth")
+        return checkpoints._read(path, 46_830_571, CHECKPOINT_SHA256, 46_830_571)
+    # Random decoder runs retain the custodian-preseeded pinned encoder route.
+    # This is not a fallback for a selected public initialisation bundle.
+    from .vision import verified_backbone_bytes
+    return verified_backbone_bytes("resnet18")
 
 
 def prepare_encoder(cfg):
@@ -146,7 +139,7 @@ def prepare_encoder(cfg):
 
     validate_config(cfg)
     configure_runtime()
-    checkpoint = verified_encoder_bytes()
+    checkpoint = verified_encoder_bytes(cfg)
     # Consume exactly the verified bytes. Asking torchvision to load weights
     # here would reopen its cache (or fetch again) after the hash check.
     state = torch.load(io.BytesIO(checkpoint), map_location="cpu", weights_only=True)

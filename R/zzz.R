@@ -24,7 +24,7 @@
     state <- get(binding, envir = owner_env, inherits = FALSE)
     valid <- is.environment(state) &&
       identical(state$marker, .dsflower_session_state_marker) &&
-      is.environment(state$handles) &&
+      is.environment(state$handles) && is.environment(state$checkpoints) &&
       bindingIsLocked(binding, owner_env) && environmentIsLocked(state)
     if (!isTRUE(valid)) {
       stop("Flower private session state is unavailable.", call. = FALSE)
@@ -36,6 +36,12 @@
   state <- new.env(parent = emptyenv())
   state$marker <- .dsflower_session_state_marker
   state$handles <- new.env(parent = emptyenv())
+  state$checkpoints <- new.env(parent = emptyenv())
+  reg.finalizer(state$checkpoints, function(entries) {
+    for (entry in as.list(entries)) {
+      if (!is.null(entry$work)) unlink(entry$work, recursive = TRUE)
+    }
+  }, onexit = TRUE)
   lockEnvironment(state, bindings = TRUE)
   assign(binding, state, envir = owner_env)
   lockBinding(binding, owner_env)
@@ -527,6 +533,10 @@
 #' @param pkgname Package name.
 #' @keywords internal
 .onLoad <- function(libname, pkgname) {
+  if (length(resourcer::getResourceResolvers())) {
+    resourcer::unregisterResourceResolver("CheckpointResourceResolver")
+  }
+  resourcer::registerResourceResolver(CheckpointResourceResolver$new())
   # Ensure venv root directory exists.
   # configure creates it during install_github (as root).
   # This fallback handles API installs where configure doesn't run.

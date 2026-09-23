@@ -28,13 +28,19 @@ noise remains bound to the validated clipped update through `bind_seed`.
 Pooled CV release keys also bind the ordered public fold-model digests retained
 in existing node RAM; private statistic hashes do not enter this public block.
 
-Public segmentation initialization additionally binds `segmentation-decoder-init`,
-`segmentation-public-manifest-sha256` and `segmentation-public-checkpoint-sha256`
-in both the neural config and request selection. These are admitted and pinned
-by the node; the manifest hash binds the complete provenance. The existing
-encoder and patient-image-selection pins retain their meanings. Explicit
-`random` is canonicalized to the omitted default. Registry paths and the public
-checkpoint transport payload do not enter the seed contract.
+Public initialisation binds canonical `segmentation-decoder-init` (`client` or
+`resource`) and the node-authored `public-initialisation-` manifest/checkpoint/
+encoder SHA-256, origin and identity-version fields in both neural configuration
+and request selection. Canonicalisation is explicitly versioned as
+`dsflower-public-initialisation-identity/v1`: scientific manifest/evidence,
+checkpoint bytes, tensor schema/hashes and encoder identity are bound. Resource
+names, session symbols, cache paths, archive transport SHA/ZIP packaging, artifact
+filenames and administrative labels/timestamps are excluded. Repacking and aliases
+therefore do not change the noise draw. The first incoming `public_arrays` remain
+independently bound and must match the admitted tensors exactly on round one.
+The existing encoder and patient-image-selection pins retain their meanings.
+Explicit `random` is canonicalized to the omitted default. Coordinator transport
+bytes and the custodian policy value do not become independent noise axes.
 As with every runner update, the source-bound execution fingerprint changes;
 this preserves the default mechanism and request contract, not an older
 runner's exact deterministic realization.

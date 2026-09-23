@@ -1,5 +1,8 @@
 # Public decoder initialisation for segmentation
 
+Historical 0.6.0 design, superseded by [the 0.7.0 routes](DESIGN_PUBLIC_INIT.md).
+The registry, installer and node byte-export path described below are retired.
+
 Task: `FLOWER_SEGINIT_2026-09-23`. Design written before implementation.
 
 The registry entry `pytorch_resnet18_segmentation` gains `decoder_init`, with

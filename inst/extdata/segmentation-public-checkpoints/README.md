@@ -1,13 +1,13 @@
 # Public BUSI decoder checkpoint bundle
 
-This directory supplies the registry manifests, policy pins and original public
+This directory preserves historical manifests, manifest pins and original public
 evidence for the three narrow-decoder checkpoints used by the v5 segmentation
 evaluation after 60 public BUSI epochs.
-The registry IDs are `busi-v5-epochs60-seed20260919`,
+The historical checkpoint IDs are `busi-v5-epochs60-seed20260919`,
 `busi-v5-epochs60-seed20260920`, and `busi-v5-epochs60-seed20260921`.
 Each decoder has 9,521 float32 parameters in six tensors. The checkpoint files
-contain decoder weights only; the frozen ImageNet ResNet-18 encoder remains the
-existing node-installed, hash-pinned checkpoint.
+contain decoder weights only. A complete 0.7.0 bundle must also include the
+exact frozen ImageNet ResNet-18 encoder as `encoder.pth`.
 
 **Availability:** the three original `checkpoint.npz` files are not included in
 this checkout. Their sole confirmed source is the original evaluation host,
@@ -16,7 +16,7 @@ URL has been established. The omission is an access limitation, not a package
 size limitation: each file is expected to be 39,510 bytes. The fetch-and-verify
 procedure below requires access to that archive (or an exact preserved copy).
 It has not been completed against the original binaries in this checkout.
-The registry fails closed until those files are installed; these manifests do
+Both initialisation routes fail closed without complete verified bundles; these manifests do
 not by themselves provide usable public initialisation.
 
 ## Provenance and scope
@@ -38,90 +38,53 @@ retained; cross-dataset near-duplicate screening was not claimed.
 `protocol.md` is the unchanged v5 preregistration, SHA-256
 `28a713f8ffe6f7bb7b74e7d59d13d1be265d5738b43503c60e6581a67e0c5820`.
 Its historical statements about campaign-only loading and non-redistribution
-describe that evaluation; this bundle implements the subsequently requested
-node-registry route. `original-manifest.json` preserves the original checkpoint,
+describe that evaluation; neither the retired 0.6.0 registry nor the new product
+routes change that history. `original-manifest.json` preserves the original checkpoint,
 tensor, encoder, protocol, dataset, provenance and public-audit hashes.
 `audit.json` preserves the original public input census and mask-normalisation
-records. The new `manifest.json` binds those evidence bytes and the checkpoint
-to one registry ID. Its SHA-256 appears in the bundle's `allowlist.json`.
+records. The preserved 0.6.0 `manifest.json` binds those evidence bytes and the
+checkpoint. Its historical SHA-256 appears in `allowlist.json`.
 
 Public pretraining spent no private budget. A dsFlower run spends its unchanged
 DP budget adapting the public decoder. Selecting a checkpoint does not promote
 the contract to `vetted = TRUE`, establish new utility, or change the accountant,
 clipping, sampler, loss, frozen encoder, or training schedule.
 
-## Administrator installation
+## Build a complete 0.7.0 bundle, then declare or register it
 
-Install dsFlower **0.6.0** from the reviewed source. Run the installer as the
-node service account, after retrieving all three original NPZ files into
-`$HOME/dsflower-public-checkpoints/epochs60` with their original
-`seed20260919.npz`, `seed20260920.npz` and `seed20260921.npz` names.
-The node's existing protected state, Python runtime and frozen encoder must
-already be set up. Use the same `DSFLOWER_NODE_SECRET_FILE` setting as the
-running node if it overrides the package default. The registry location is
-fixed beside that secret; it is never supplied by an analyst.
+These are historical 0.6.0 reference manifests and evidence, preserved byte-for-byte.
+They are not a runtime registry or an admission allowlist in 0.7.0. The old installer
+and `public:<id>` selector have been removed. `allowlist.json` preserves historical
+manifest pins only; no current node policy reads it.
 
-From this release checkout, the exact verification and installation command is:
+After recovering each original, copy it byte-for-byte to its reference directory's
+`checkpoint.npz`. Supply the original pinned ResNet-18 encoder file as well:
+46,830,571 bytes, SHA-256
+`f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec`.
+From the dsFlower source checkout, use the trusted runtime:
 
 ```sh
-Rscript --vanilla \
-  "$HOME/Documents/GitHub/dsflower-fix/dsFlower/tools/install-segmentation-public-checkpoints.R" \
-  "$HOME/dsflower-public-checkpoints/epochs60"
+/path/to/trusted/python tools/build-public-initialisation-bundle.py \
+  inst/extdata/segmentation-public-checkpoints/busi-v5-epochs60-seed20260919 \
+  /custodian/public/resnet18-f37072fd.pth \
+  /custodian/approved/busi_bundle.zip --creator 'Institution model custodian'
 ```
 
-Use the corresponding absolute source-checkout path when installing on another
-node. The helper requires the installed package version to be 0.6.0 and installs
-all three IDs. It verifies the package's manifest pins, original file sizes and
-SHA-256 values, evidence files, individual tensors and frozen encoder before
-publishing entries in the protected node registry. Existing entries are never
-overwritten. It reads public artifacts only; it neither downloads files nor
-opens private data.
+The helper creates a new versioned envelope while preserving checkpoint, tensor,
+encoder and evidence hashes. It reads the original manifest without changing it.
+The resulting closed ZIP includes `encoder.pth`, `checkpoint.npz`, a new
+`manifest.json` and all six evidence artifacts. The canonical identity is independent
+of ZIP packaging, labels and creation timestamps. Bundle construction grants no
+server permission.
 
-The helper prints an `options(dsflower.segmentation_public_checkpoints = ...)`
-statement after successful installation. Persist only the IDs that this
-custodian admits in the node's startup configuration. Installing the files does
-not itself enable policy, and shell-process options cannot configure a running
-node. No manifest or allowlist pin needs to change when the original bytes are
-recovered.
-
-On POSIX the protected state, registry and checkpoint directories must be owned
-by root or the node account and must not be writable by group or others. Files
-must be regular files with the same ownership/write protections. Links and
-reparse points are rejected. Run the helper as the node service account so it
-can validate the existing secret and own the installed `0600` files. Apply the
-node's existing private-directory ACL policy on Windows. Treat `allowlist.json` as part of the reviewed package;
-changing a manifest requires a deliberate update of its custodian pin.
-
-Installation alone does not admit a checkpoint. The policy defaults to an
-empty named character vector. Enabling one ID does not enable the other two.
-Runtime admission verifies the manifest, every installed evidence file, NPZ,
-each tensor and the frozen encoder before private staging. The runner repeats
-verification before using private inputs. It never downloads public artifacts
-or silently falls back to random initialisation.
-
-## Selecting the route
-
-An analyst selects an admitted checkpoint in the ordinary contract constructor:
-
-```r
-model <- dsFlowerClient::ds.flower.model.pytorch_resnet18_segmentation(
-  decoder = "narrow",
-  decoder_init = "public:busi-v5-epochs60-seed20260919"
-)
-```
-
-The default remains `decoder_init = "random"`. A public checkpoint must match
-the independently selected decoder architecture. Unknown, uninstalled,
-unallowlisted or mismatching IDs fail before private access. At round one the
-trusted node installs the verified public decoder weights; subsequent rounds
-continue from the incoming federated weights under the same pinned identity.
-Verified public bytes and provenance are returned through node status so that
-the client also initialises its Flower strategy from the same checkpoint;
-the participating nodes must agree on that provenance. This hand-off happens
-automatically in the ordinary client submission path. The request/seed contract,
-run manifest, protected node release record and saved client release metadata
-retain the registry ID, manifest and checkpoint hashes and the provenance
-block. The trusted node independently verifies its installed copy.
+For institutional admission, register the bundle with format
+`dsflower-checkpoint-v1:<archive-SHA256>` through native Opal/Armadillo/DSLite resource
+administration. The analyst assigns it, calls `flowerCheckpointInitDS()`, and selects
+`decoder_init="resource:CKPT"`. The analyst independently supplies a matching local
+`public_checkpoint_file` for the coordinator; nodes never export checkpoint bytes.
+For declared research material use `decoder_init="client:<local-bundle>"`, subject
+to the custodian's `dsflower.public_initialisation` policy. Exact commands and cache
+requirements are in [the public initialisation guide](../../../PUBLIC_INITIALISATION.md).
 
 ## Recovery of the original archive bytes
 
@@ -148,10 +111,9 @@ for seed in 20260919 20260920 20260921; do
 done
 ```
 
-Alternatively, copy those same files from a preserved local archive and pass
-that absolute directory as the installer's sole argument. The helper copies
-each verified original to its ID's `checkpoint.npz` and requires these exact
-SHA-256 values:
+Alternatively, recover those same files from a preserved local archive. Copy each
+original to its reference directory's `checkpoint.npz`. Verification requires these
+exact SHA-256 values:
 
 | Seed | Checkpoint SHA-256 |
 | --- | --- |
@@ -166,14 +128,14 @@ with numeric keys `0` to `5`. The v5 runtime records NumPy 2.4.6. Serialising
 the recorded six float32 shapes with that version gives 38,084 tensor bytes,
 768 NPY header bytes, 330 ZIP local-header bytes, 306 central-directory bytes
 and 22 end-record bytes: 39,510 bytes irrespective of tensor values. The
-installation still requires the original checkpoint SHA-256, every tensor
+bundle builder still requires the original checkpoint SHA-256, every tensor
 digest and this expected size; it does not accept synthetic arrays. If a
 restored artifact contradicts any pin, stop and reconcile the original
-evidence instead of changing the allowlist or bypassing validation.
+evidence instead of changing the recorded pins or bypassing validation.
 
 The six tensor hashes must also match the preserved original manifest. Do not
 retrain substitutes or regenerate NPZ containers and present them as the same
-checkpoint bytes. Neither training nor campaign tooling is needed to install
+checkpoint bytes. Neither training nor campaign tooling is needed to build
 or use the bundle.
 
 ## Reserved source-bundle locations
@@ -192,6 +154,5 @@ These are reserved filenames, not placeholder binary files. The manifests,
 allowlist and original evidence are already present and must remain unchanged.
 Copy each original `seed<seed>.npz` byte-for-byte to its matching
 `checkpoint.npz`; do not recompress or reserialise it. Packaging these bytes and
-verifying their original hashes remain outstanding until recovery. Installing
-the protected node registry with the command above does not modify this source
-checkout or add recovered binaries to Git.
+verifying their original hashes remain outstanding until recovery. The bundle
+helper does not modify the reference evidence or add recovered binaries to Git.

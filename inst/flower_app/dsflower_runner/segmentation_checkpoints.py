@@ -1,9 +1,11 @@
-"""Custodian-installed, provenance-bound public segmentation decoders.
+"""Digest-bound public initialisation bundles; no resource-byte status export.
 
-This module reads public artifacts only. Admission also runs it before R stages
-private metadata. A checkpoint is never fetched or deserialized with pickle.
+The R service admits a verified protected snapshot before staging. The trusted
+runner repeats admission before opening private data. Only the local coordinator
+helper returns decoder bytes, from the analyst's independently supplied file.
 """
 
+import argparse
 import base64
 import copy
 import hashlib
@@ -12,36 +14,44 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
+import struct
 import tempfile
 import zipfile
 
 import numpy as np
 
-SCHEMA = "dsflower-segmentation-public-checkpoint/v1"
+SCHEMA = "dsflower-public-initialisation-bundle/v1"
+IDENTITY_VERSION = "dsflower-public-initialisation-identity/v1"
 INIT_KEY = "segmentation-decoder-init"
-MANIFEST_KEY = "segmentation-public-manifest-sha256"
-CHECKPOINT_KEY = "segmentation-public-checkpoint-sha256"
-PROVENANCE_KEY = "segmentation-public-provenance"
+MANIFEST_KEY = "public-initialisation-manifest-sha256"
+CHECKPOINT_KEY = "public-initialisation-checkpoint-sha256"
+PROVENANCE_KEY = "public-initialisation-provenance"
+ORIGIN_KEY = "public-initialisation-origin"
+DIRECTORY_KEY = "public-initialisation-directory"
+POLICY_KEY = "public-initialisation-policy"
 TRANSPORT_KEY = "segmentation-public-initialization-b64"
-IDENTITY_KEYS = (INIT_KEY, MANIFEST_KEY, CHECKPOINT_KEY)
-NODE_KEYS = (MANIFEST_KEY, CHECKPOINT_KEY, PROVENANCE_KEY)
-_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+IDENTITY_KEYS = (MANIFEST_KEY, CHECKPOINT_KEY, ORIGIN_KEY)
+ENCODER_KEY = "public-initialisation-encoder-sha256"
+VERSION_KEY = "public-initialisation-identity-version"
+NODE_KEYS = (MANIFEST_KEY, CHECKPOINT_KEY, PROVENANCE_KEY, ORIGIN_KEY, DIRECTORY_KEY, POLICY_KEY, ENCODER_KEY, VERSION_KEY)
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-_EVIDENCE = {"original_manifest", "protocol", "provenance", "audit", "licence",
-             "mirror_metadata"}
+_EVIDENCE = {"original_manifest", "protocol", "provenance", "audit", "licence", "mirror_metadata"}
 _MAX_FILE = 2 * 1024 * 1024
+_MAX_BUNDLE = 64 * 1024 * 1024
+_ENCODER_SIZE = 46_830_571
 
 
 def checkpoint_id(config):
+    """Return a canonical origin; paths/session selectors are consumed by R."""
     value = config.get(INIT_KEY, "random")
     if value == "random":
         return None
-    if (not isinstance(value, str) or not value.startswith("public:")
-            or _ID.fullmatch(value[7:]) is None):
-        raise ValueError("segmentation decoder_init must be random or public:<checkpoint-id>")
-    return value[7:]
+    if type(value) is not str or value not in ("client", "resource"):
+        raise ValueError("segmentation decoder_init must be random, client or resource after admission")
+    return value
 
 
 def _sha(value):
@@ -55,13 +65,18 @@ def _protected(path, directory=False):
     # This does not load or enable a native tree runtime.
     from .xgboost_bundle import _secure_metadata, BundleVerificationError
     try:
-        return _secure_metadata(Path(path), directory=directory)
+        metadata = _secure_metadata(Path(path), directory=directory)
+        if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != (0o700 if directory else 0o600):
+            raise ValueError("public checkpoint snapshot permissions must be 0700/0600")
+        return metadata
     except BundleVerificationError as exc:
         raise ValueError("public checkpoint paths must be regular, custodian-owned and protected") from exc
 
 
-def _read(path, limit, expected_sha=None, expected_size=None):
-    before = _protected(path)
+def _read(path, limit, expected_sha=None, expected_size=None, protected=True):
+    before = _protected(path) if protected else os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("public checkpoint source must be a regular file")
     if before.st_size < 1 or before.st_size > limit:
         raise ValueError("public checkpoint file exceeds its size bound")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
@@ -72,8 +87,8 @@ def _read(path, limit, expected_sha=None, expected_size=None):
                 or not stat.S_ISREG(after.st_mode)):
             raise ValueError("public checkpoint file changed while opening")
         data = handle.read(limit + 1)
-    final = _protected(path)
-    if (before.st_dev, before.st_ino) != (final.st_dev, final.st_ino):
+    final = _protected(path) if protected else os.lstat(path)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns):
         raise ValueError("public checkpoint file changed while reading")
     if len(data) > limit or (expected_size is not None and len(data) != expected_size):
         raise ValueError("public checkpoint file size mismatch")
@@ -97,18 +112,6 @@ def _json(data):
         raise ValueError("public checkpoint JSON must be an object")
     json.dumps(value, allow_nan=False)  # also rejects finite-syntax overflow
     return value
-
-
-def _artifact(directory, record):
-    if (not isinstance(record, dict)
-            or set(record) != {"file", "sha256", "size_bytes"}
-            or not isinstance(record["file"], str)
-            or _FILE.fullmatch(record["file"]) is None
-            or type(record["size_bytes"]) is not int
-            or not 0 < record["size_bytes"] <= _MAX_FILE):
-        raise ValueError("public checkpoint artifact record is invalid")
-    return _read(directory / record["file"], _MAX_FILE,
-                 record["sha256"], record["size_bytes"])
 
 
 def _tensor_shapes(decoder):
@@ -178,55 +181,113 @@ def _decode_arrays(payload, manifest):
     return arrays
 
 
-def verify_checkpoint(registry_root, checkpoint_id, manifest_sha256, decoder_spec=None):
-    """Return verified arrays and provenance, using only bounded public bytes."""
-    from . import segmentation
+def _canonical(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
 
-    if not isinstance(checkpoint_id, str) or _ID.fullmatch(checkpoint_id) is None:
-        raise ValueError("invalid public checkpoint id")
-    root = Path(registry_root)
-    if not root.is_absolute() or root.name != "segmentation-public-checkpoints":
-        raise ValueError("public checkpoint registry must be under protected node state")
-    # R canonicalises the secret's parent. Reject links throughout the registry
-    # itself; the parent is the existing protected node-state trust root.
-    _protected(root.parent, directory=True)
-    _protected(root, directory=True)
-    directory = root / checkpoint_id
-    _protected(directory, directory=True)
-    manifest = _json(_read(directory / "manifest.json", 65536, manifest_sha256))
+
+def _record(record, limit):
+    if (not isinstance(record, dict) or set(record) != {"file", "sha256", "size_bytes"}
+            or not isinstance(record["file"], str) or _FILE.fullmatch(record["file"]) is None
+            or type(record["size_bytes"]) is not int or not 0 < record["size_bytes"] <= limit):
+        raise ValueError("public checkpoint artifact record is invalid")
+    _sha(record["sha256"])
+    return record
+
+
+def _clean_spec(spec):
+    clean = copy.deepcopy(spec)
+    for layer in clean.get("layers", []):
+        if layer.get("op") == "upsample" and layer.get("mode") == "nearest":
+            layer.pop("mode")
+    return clean
+
+
+def _validate_manifest(manifest, decoder_spec=None):
+    from . import segmentation
     required = {"schema_version", "checkpoint_id", "model_id", "decoder",
                 "feature_contract", "encoder_sha256", "dataset", "licence",
-                "checkpoint", "tensors", "evidence"}
+                "checkpoint", "tensors", "evidence", "role", "encoder",
+                "decoder_spec_sha256", "pretraining_protocol_sha256", "creation"}
     if (set(manifest) != required or manifest["schema_version"] != SCHEMA
-            or manifest["checkpoint_id"] != checkpoint_id
             or manifest["model_id"] != "pytorch_resnet18_segmentation"
+            or manifest["role"] != "segmentation_decoder"
             or manifest["feature_contract"] != segmentation.PROFILE
-            or manifest["encoder_sha256"] != segmentation.CHECKPOINT_SHA256):
+            or manifest["encoder_sha256"] != segmentation.CHECKPOINT_SHA256
+            or not isinstance(manifest["checkpoint_id"], str)
+            or not 0 < len(manifest["checkpoint_id"]) <= 128):
         raise ValueError("public checkpoint manifest violates the segmentation contract")
+    creation = manifest["creation"]
+    if (not isinstance(creation, dict) or set(creation) != {"created_at", "creator"}
+            or any(not isinstance(v, str) or not v.strip() or len(v) > 256
+                   for v in creation.values())):
+        raise ValueError("public checkpoint creation metadata is invalid")
+    expected_spec = segmentation.decoder_spec(manifest["decoder"])
+    if (manifest["decoder_spec_sha256"] != hashlib.sha256(_canonical(expected_spec)).hexdigest()
+            or (decoder_spec is not None and _clean_spec(decoder_spec) != expected_spec)):
+        raise ValueError("public checkpoint does not match the requested decoder")
     for key in ("dataset", "licence"):
         if not isinstance(manifest[key], dict) or not manifest[key]:
             raise ValueError("public checkpoint requires dataset provenance and licence")
-    if decoder_spec is not None:
-        clean = copy.deepcopy(decoder_spec)
-        for layer in clean.get("layers", []):
-            if layer.get("op") == "upsample" and layer.get("mode") == "nearest":
-                layer.pop("mode")
-        if clean != segmentation.decoder_spec(manifest["decoder"]):
-            raise ValueError("public checkpoint does not match the requested decoder")
-    tensors = manifest["tensors"]
+    checkpoint = _record(manifest["checkpoint"], _MAX_FILE)
+    encoder = _record(manifest["encoder"], _MAX_BUNDLE)
+    if (checkpoint["file"] != "checkpoint.npz" or encoder["file"] != "encoder.pth"
+            or encoder["sha256"] != segmentation.CHECKPOINT_SHA256
+            or encoder["size_bytes"] != _ENCODER_SIZE):
+        raise ValueError("public checkpoint frozen encoder contract mismatch")
     evidence = manifest["evidence"]
     if not isinstance(evidence, dict) or set(evidence) != _EVIDENCE:
         raise ValueError("public checkpoint evidence roster mismatch")
-    files = [manifest["checkpoint"]["file"], "manifest.json"]
-    verified = {}
-    for key, record in evidence.items():
-        verified[key] = _artifact(directory, record)
-        files.append(record["file"])
-    if len(files) != len(set(files)):
+    for record in evidence.values():
+        _record(record, _MAX_FILE)
+    if manifest["pretraining_protocol_sha256"] != evidence["protocol"]["sha256"]:
+        raise ValueError("public checkpoint pretraining protocol digest mismatch")
+    records = [checkpoint, encoder, *evidence.values()]
+    names = ["manifest.json", *(record["file"] for record in records)]
+    if len(names) != len(set(names)):
         raise ValueError("public checkpoint artifact filenames must be distinct")
-    original = _json(verified["original_manifest"])
+    # Check tensor headers here, before NPZ/tensor parsing.
+    shapes = _tensor_shapes(manifest["decoder"])
+    tensors = manifest["tensors"]
+    if not isinstance(tensors, list) or len(tensors) != len(shapes):
+        raise ValueError("public checkpoint tensor roster mismatch")
+    for i, (tensor, shape) in enumerate(zip(tensors, shapes)):
+        if (not isinstance(tensor, dict) or set(tensor) != {"name", "shape", "dtype", "sha256"}
+                or tensor["name"] != str(i) or tensor["dtype"] != "float32"
+                or not isinstance(tensor["shape"], list)
+                or any(type(dim) is not int for dim in tensor["shape"])
+                or tuple(tensor["shape"]) != shape):
+            raise ValueError("public checkpoint tensor contract mismatch")
+        _sha(tensor["sha256"])
+    return records
+
+
+def canonical_manifest_sha256(manifest):
+    """Versioned scientific identity, independent of resource/ZIP/name metadata."""
+    scientific = copy.deepcopy(manifest)
+    scientific.pop("creation")
+    scientific.pop("checkpoint_id")
+    for record in (scientific["checkpoint"], scientific["encoder"],
+                   *scientific["evidence"].values()):
+        record.pop("file")
+    return hashlib.sha256(_canonical({"identity_version": IDENTITY_VERSION,
+                                      "manifest": scientific})).hexdigest()
+
+
+def _summary(manifest):
+    return {"identity_version": IDENTITY_VERSION,
+            "provenance": {"manifest_sha256": canonical_manifest_sha256(manifest),
+                           "manifest": manifest},
+            "checkpoint_sha256": manifest["checkpoint"]["sha256"],
+            "encoder_sha256": manifest["encoder_sha256"],
+            "tensor_schema": copy.deepcopy(manifest["tensors"])}
+
+
+def _verify_evidence(manifest, contents):
+    evidence = manifest["evidence"]
+    original = _json(contents[evidence["original_manifest"]["file"]])
     if (original.get("checkpoint_sha256") != manifest["checkpoint"]["sha256"]
-            or original.get("tensor_sha256") != [item["sha256"] for item in tensors]
+            or original.get("tensor_sha256") != [item["sha256"] for item in manifest["tensors"]]
             or original.get("encoder_sha256") != manifest["encoder_sha256"]
             or original.get("decoder") != manifest["decoder"]
             or original.get("privacy") != "public_nonprivate"):
@@ -234,7 +295,7 @@ def verify_checkpoint(registry_root, checkpoint_id, manifest_sha256, decoder_spe
     for key in ("protocol", "provenance", "audit"):
         if original.get(key + "_sha256") != evidence[key]["sha256"]:
             raise ValueError("public checkpoint pretraining evidence digest mismatch")
-    provenance = _json(verified["provenance"])
+    provenance = _json(contents[evidence["provenance"]["file"]])
     _sha(provenance.get("sha256"))
     for key in ("dataset", "release", "dataset_url", "licence", "attribution"):
         if not isinstance(provenance.get(key), str) or not provenance[key].strip():
@@ -248,24 +309,180 @@ def verify_checkpoint(registry_root, checkpoint_id, manifest_sha256, decoder_spe
             or not isinstance(manifest["licence"].get("scope"), str)
             or not manifest["licence"]["scope"].strip()):
         raise ValueError("public checkpoint dataset or licence provenance mismatch")
-    payload = _artifact(directory, manifest["checkpoint"])
-    arrays = _decode_arrays(payload, manifest)
-    return arrays, {"manifest_sha256": manifest_sha256, "manifest": manifest}
 
 
-def initialization_payload(registry_root, checkpoint_id, manifest_sha256, decoder_spec=None):
-    """Public-only status payload for the ordinary researcher-side ServerApp."""
-    _, provenance = verify_checkpoint(
-        registry_root, checkpoint_id, manifest_sha256, decoder_spec)
-    payload = _artifact(Path(registry_root) / checkpoint_id,
-                        provenance["manifest"]["checkpoint"])
-    return {"provenance": provenance,
-            "checkpoint_base64": base64.b64encode(payload).decode("ascii")}
+def _verify_contents(contents, decoder_spec=None):
+    manifest = _json(contents["manifest.json"])
+    records = _validate_manifest(manifest, decoder_spec)
+    if set(contents) != {"manifest.json", *(r["file"] for r in records)}:
+        raise ValueError("public checkpoint bundle roster is not closed")
+    for record in records:
+        data = contents[record["file"]]
+        if (len(data) != record["size_bytes"] or
+                hashlib.sha256(data).hexdigest() != record["sha256"]):
+            raise ValueError("public checkpoint artifact digest or size mismatch")
+    _verify_evidence(manifest, contents)
+    arrays = _decode_arrays(contents[manifest["checkpoint"]["file"]], manifest)
+    return arrays, _summary(manifest)
+
+
+def _read_contents(path, *, protected=False, decoder_spec=None, expected_bundle_sha256=None):
+    path = Path(path)
+    if path.is_dir():
+        if expected_bundle_sha256 is not None:
+            raise ValueError("registered public checkpoint resources require a ZIP archive")
+        if protected:
+            _protected(path, directory=True)
+        elif path.is_symlink():
+            raise ValueError("public checkpoint source cannot be a symlink")
+        manifest_bytes = _read(path / "manifest.json", 65536, protected=protected)
+        manifest = _json(manifest_bytes)
+        records = _validate_manifest(manifest, decoder_spec)
+        if set(p.name for p in path.iterdir()) != {"manifest.json", *(r["file"] for r in records)}:
+            raise ValueError("public checkpoint bundle roster is not closed")
+        contents = {"manifest.json": manifest_bytes}
+        for record in records:
+            contents[record["file"]] = _read(path / record["file"], record["size_bytes"],
+                                            record["sha256"], record["size_bytes"], protected)
+        return contents, None
+    payload = _read(path, _MAX_BUNDLE, protected=protected)
+    digest = hashlib.sha256(payload).hexdigest()
+    if expected_bundle_sha256 is not None and digest != _sha(expected_bundle_sha256):
+        raise ValueError("public checkpoint registered bundle digest mismatch")
+    # Bound the central directory before ZipFile allocates its entry objects.
+    # Small checkpoint bundles never need ZIP64 or multi-disk containers.
+    eocd = payload.rfind(b"PK\x05\x06", max(0, len(payload) - 65557))
+    if eocd < 0 or len(payload) - eocd < 22:
+        raise ValueError("public checkpoint archive footer is invalid")
+    _, disk, directory_disk, disk_count, total_count, directory_size, directory_offset, comment_size = struct.unpack(
+        "<4s4H2LH", payload[eocd:eocd + 22])
+    if (disk or directory_disk or disk_count != total_count or not 1 <= total_count <= 16
+            or directory_size > 16384 or directory_offset + directory_size != eocd
+            or eocd + 22 + comment_size != len(payload)
+            or payload[:4] != b"PK\x03\x04"):
+        raise ValueError("public checkpoint archive directory bounds are invalid")
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        entries = archive.infolist()
+        if len(entries) != total_count or not 1 <= len(entries) <= 16 or sum(e.file_size for e in entries) > _MAX_BUNDLE:
+            raise ValueError("public checkpoint archive exceeds decompression bounds")
+        names = [e.filename for e in entries]
+        if len(set(names)) != len(names) or "manifest.json" not in names:
+            raise ValueError("public checkpoint archive roster is invalid")
+        for entry in entries:
+            mode = entry.external_attr >> 16
+            if (not _FILE.fullmatch(entry.filename) or entry.is_dir()
+                    or (stat.S_IFMT(mode) not in (0, stat.S_IFREG))
+                    or entry.flag_bits & 1
+                    or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                    or not 0 < entry.file_size <= _MAX_BUNDLE
+                    or entry.file_size > max(4096, entry.compress_size * 512)):
+                raise ValueError("public checkpoint archive entry is unsafe or exceeds bounds")
+        manifest_entry = archive.getinfo("manifest.json")
+        if manifest_entry.file_size > 65536:
+            raise ValueError("public checkpoint manifest exceeds size bound")
+        manifest_bytes = archive.read(manifest_entry)
+        records = _validate_manifest(_json(manifest_bytes), decoder_spec)
+        expected = {r["file"]: r for r in records}
+        if set(names) != {"manifest.json", *expected}:
+            raise ValueError("public checkpoint archive roster is not closed")
+        # Complete member size/roster validation precedes any tensor parsing.
+        for name, record in expected.items():
+            if archive.getinfo(name).file_size != record["size_bytes"]:
+                raise ValueError("public checkpoint archive artifact size mismatch")
+        contents = {"manifest.json": manifest_bytes}
+        for name in expected:
+            contents[name] = archive.read(name)
+    return contents, digest
+
+
+def inspect_bundle(path, decoder_spec=None):
+    contents, _ = _read_contents(path, decoder_spec=decoder_spec)
+    return _verify_contents(contents, decoder_spec)[1]
+
+
+def pack_bundle(directory, output_file):
+    contents, _ = _read_contents(directory)
+    _verify_contents(contents)
+    with zipfile.ZipFile(output_file, "x", compression=zipfile.ZIP_STORED) as archive:
+        for name in sorted(contents):
+            archive.writestr(name, contents[name])
+    return inspect_bundle(output_file)
+
+
+def admit_bundle(path, cache_root, expected_bundle_sha256=None, decoder_spec=None):
+    """Verify all public bytes, then atomically publish a private snapshot."""
+    contents, archive_digest = _read_contents(path, decoder_spec=decoder_spec,
+                                               expected_bundle_sha256=expected_bundle_sha256)
+    _, summary = _verify_contents(contents, decoder_spec)
+    root = Path(cache_root)
+    if not root.is_absolute():
+        raise ValueError("public checkpoint protected cache must be absolute")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _protected(root, directory=True)
+    # Storage identity need not be the scientific/noise identity.
+    storage_digest = archive_digest or hashlib.sha256(_canonical(summary)).hexdigest()
+    destination = root / storage_digest
+    if not destination.exists():
+        temporary = Path(tempfile.mkdtemp(prefix=".admitting-", dir=root))
+        try:
+            for name, data in contents.items():
+                fd = os.open(temporary / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as output:
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+            try:
+                os.rename(temporary, destination)
+            except OSError:
+                if not destination.exists():
+                    raise
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+    result = verify_snapshot(destination, summary["provenance"]["manifest_sha256"], decoder_spec)
+    result["bundle_sha256"] = archive_digest
+    return result
+
+
+def verify_snapshot(snapshot_directory, manifest_sha256, decoder_spec=None):
+    path = Path(snapshot_directory)
+    if not path.is_absolute():
+        raise ValueError("public checkpoint snapshot must be absolute")
+    _protected(path.parent, directory=True)
+    contents, _ = _read_contents(path, protected=True, decoder_spec=decoder_spec)
+    _, summary = _verify_contents(contents, decoder_spec)
+    if summary["provenance"]["manifest_sha256"] != _sha(manifest_sha256):
+        raise ValueError("public checkpoint canonical manifest digest mismatch")
+    return dict(summary, snapshot_directory=str(path))
+
+
+def coordinator_payload(checkpoint_file, summary, decoder_spec=None):
+    """LOCAL analyst file only. This helper must never back node status."""
+    manifest = summary["provenance"]["manifest"]
+    _validate_manifest(manifest, decoder_spec)
+    expected = _summary(manifest)
+    if any(summary.get(key) != value for key, value in expected.items()):
+        raise ValueError("public checkpoint summary identity mismatch")
+    if Path(checkpoint_file).is_dir() or Path(checkpoint_file).suffix.lower() == ".zip":
+        local = client_payload(checkpoint_file, decoder_spec)
+        if local["provenance"]["manifest_sha256"] != expected["provenance"]["manifest_sha256"]:
+            raise ValueError("local coordinator bundle differs from node-admitted identity")
+        return dict(expected, local_arrays_b64=local["local_arrays_b64"])
+    payload = _read(Path(checkpoint_file), _MAX_FILE, manifest["checkpoint"]["sha256"],
+                    manifest["checkpoint"]["size_bytes"], protected=False)
+    _decode_arrays(payload, manifest)
+    return dict(expected, local_arrays_b64=base64.b64encode(payload).decode("ascii"))
+
+
+def client_payload(path, decoder_spec=None):
+    """Produce coordinator arrays from an independently supplied LOCAL bundle."""
+    contents, _ = _read_contents(path, decoder_spec=decoder_spec)
+    _, summary = _verify_contents(contents, decoder_spec)
+    return dict(summary, local_arrays_b64=base64.b64encode(contents["checkpoint.npz"]).decode("ascii"))
 
 
 def server_initialization(config):
-    """Verify a public status payload; it grants no node-side authorization."""
-    from . import model_spec, segmentation
+    from . import model_spec
     selected = checkpoint_id(config)
     encoded = config.get(TRANSPORT_KEY)
     if selected is None:
@@ -273,74 +490,70 @@ def server_initialization(config):
             raise ValueError("random decoder cannot carry public initialization bytes")
         return None
     if not isinstance(encoded, str) or len(encoded) > 4 * _MAX_FILE:
-        raise ValueError("public decoder requires a bounded node status payload")
-    status = _json(base64.b64decode(encoded, validate=True))
-    if set(status) != {"provenance", "checkpoint_base64"}:
+        raise ValueError("public decoder requires a bounded local coordinator payload")
+    payload = _json(base64.b64decode(encoded, validate=True))
+    expected_keys = set(_summary(payload["provenance"]["manifest"])) | {"local_arrays_b64"}
+    if set(payload) != expected_keys:
         raise ValueError("public initialization payload fields are invalid")
-    provenance = status["provenance"]
-    if not isinstance(provenance, dict) or set(provenance) != {"manifest_sha256", "manifest"}:
-        raise ValueError("public initialization provenance is invalid")
-    _sha(provenance["manifest_sha256"])
-    manifest = provenance["manifest"]
-    if (manifest.get("schema_version") != SCHEMA
-            or manifest.get("checkpoint_id") != selected
-            or manifest.get("model_id") != "pytorch_resnet18_segmentation"
-            or manifest.get("feature_contract") != segmentation.PROFILE
-            or manifest.get("encoder_sha256") != segmentation.CHECKPOINT_SHA256):
-        raise ValueError("public initialization payload violates segmentation contract")
-    spec = model_spec.read_spec(config)
-    for layer in spec.get("layers", []):
-        if layer.get("op") == "upsample" and layer.get("mode") == "nearest":
-            layer.pop("mode")
-    if spec != segmentation.decoder_spec(manifest["decoder"]):
-        raise ValueError("public checkpoint does not match the requested decoder")
-    return _decode_arrays(base64.b64decode(status["checkpoint_base64"], validate=True), manifest)
+    manifest = payload["provenance"]["manifest"]
+    _validate_manifest(manifest, model_spec.read_spec(config))
+    if any(payload[key] != value for key, value in _summary(manifest).items()):
+        raise ValueError("public initialization payload identity mismatch")
+    return _decode_arrays(base64.b64decode(payload["local_arrays_b64"], validate=True), manifest)
 
 
 def verify_node_checkpoint(config, manifest):
-    """Resolve exclusively from the node secret's parent and node-authored pins."""
     from . import model_spec
     selected = checkpoint_id(manifest)
     if checkpoint_id(config) != selected:
         raise ValueError("Flower public checkpoint selection differs from node manifest")
     if selected is None:
-        if any(key in manifest or key in config for key in NODE_KEYS):
+        if any(key in manifest or key in config for key in NODE_KEYS if key != POLICY_KEY):
             raise ValueError("random decoder cannot carry public checkpoint provenance")
         return None, None
     for key in NODE_KEYS:
         if key not in manifest or config.get(key) != manifest[key]:
             raise ValueError("public checkpoint requires node-owned provenance pins")
-    secret = os.environ.get("DSFLOWER_NODE_SECRET_FILE", "")
-    if not secret or not os.path.isabs(secret):
-        raise ValueError("public checkpoint registry has no protected node state")
-    arrays, provenance = verify_checkpoint(
-        Path(secret).parent / "segmentation-public-checkpoints", selected,
-        manifest[MANIFEST_KEY], model_spec.read_spec(config))
-    if (provenance != manifest[PROVENANCE_KEY]
-            or provenance["manifest"]["checkpoint"]["sha256"] != manifest[CHECKPOINT_KEY]):
+    origin = "analyst-declared" if selected == "client" else "resource"
+    policy = manifest[POLICY_KEY]
+    if (manifest[ORIGIN_KEY] != origin or policy not in ("analyst_or_resource", "resource_only")
+            or (selected == "client" and policy != "analyst_or_resource")):
+        raise ValueError("public checkpoint origin violates node policy")
+    directory = Path(manifest[DIRECTORY_KEY])
+    if not directory.is_absolute():
+        raise ValueError("public checkpoint snapshot must be absolute")
+    _protected(directory.parent, directory=True)
+    contents, _ = _read_contents(directory, protected=True,
+                                 decoder_spec=model_spec.read_spec(config))
+    arrays, summary = _verify_contents(contents, model_spec.read_spec(config))
+    if (summary["provenance"]["manifest_sha256"] != manifest[MANIFEST_KEY]
+            or summary["checkpoint_sha256"] != manifest[CHECKPOINT_KEY]
+            or summary["encoder_sha256"] != manifest[ENCODER_KEY]
+            or summary["identity_version"] != manifest[VERSION_KEY]
+            or summary != manifest[PROVENANCE_KEY]):
         raise ValueError("public checkpoint provenance differs from node manifest")
-    return arrays, provenance
+    return arrays, summary
 
 
 def record_release(context, manifest, round_index, arrays):
-    """Store public provenance with the successful DP release, never private data."""
     if checkpoint_id(manifest) is None:
         return
     from . import task
     directory = task._get_manifest_dir(context)
-    record = {"schema_version": "dsflower-segmentation-public-release/v1",
+    initialisation = ("analyst-declared" if manifest[ORIGIN_KEY] == "analyst-declared"
+                      else "resource:" + manifest[MANIFEST_KEY])
+    record = {"schema_version": "dsflower-public-initialisation-release/v1",
               "run_token": manifest["run_token"], "round": int(round_index),
-              "decoder_init": manifest[INIT_KEY],
+              "initialisation": initialisation,
+              "public_initialisation_policy": manifest[POLICY_KEY],
               "public_initialisation": manifest[PROVENANCE_KEY],
               "released_tensors": [
                   {"shape": list(a.shape), "dtype": str(a.dtype),
-                   "sha256": hashlib.sha256(a.tobytes(order="C")).hexdigest()}
-                  for a in arrays]}
-    payload = json.dumps(record, sort_keys=True, allow_nan=False).encode("utf-8")
+                   "sha256": hashlib.sha256(a.tobytes(order="C")).hexdigest()} for a in arrays]}
     fd, temporary = tempfile.mkstemp(prefix=".segmentation-release-", dir=directory)
     try:
         with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
+            handle.write(_canonical(record))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, os.path.join(
@@ -348,3 +561,31 @@ def record_release(context, manifest, round_index, arrays):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("operation", choices=("inspect", "local", "admit", "verify", "pack"))
+    parser.add_argument("path")
+    parser.add_argument("destination", nargs="?")
+    parser.add_argument("--expected-sha256")
+    parser.add_argument("--manifest-sha256")
+    parser.add_argument("--decoder-spec-b64")
+    args = parser.parse_args()
+    spec = (_json(base64.b64decode(args.decoder_spec_b64, validate=True))
+            if args.decoder_spec_b64 else None)
+    if args.operation == "inspect":
+        result = inspect_bundle(args.path, spec)
+    elif args.operation == "local":
+        result = client_payload(args.path, spec)
+    elif args.operation == "admit":
+        result = admit_bundle(args.path, args.destination, args.expected_sha256, spec)
+    elif args.operation == "verify":
+        result = verify_snapshot(args.path, args.manifest_sha256, spec)
+    else:
+        result = pack_bundle(args.path, args.destination)
+    print(json.dumps(result, allow_nan=False, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

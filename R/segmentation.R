@@ -21,156 +21,63 @@
 }
 
 .segmentationPublicCheckpointFields <- function() {
-  c("segmentation-public-manifest-sha256", "segmentation-public-checkpoint-sha256",
-    "segmentation-public-provenance")
+  c("public-initialisation-origin", "public-initialisation-manifest-sha256",
+    "public-initialisation-checkpoint-sha256", "public-initialisation-provenance",
+    "public-initialisation-directory", "public-initialisation-policy",
+    "public-initialisation-encoder-sha256", "public-initialisation-identity-version",
+    "initialisation", "segmentation-public-manifest-sha256",
+    "segmentation-public-checkpoint-sha256", "segmentation-public-provenance")
 }
 
-# This is custodian policy, never analyst-supplied run configuration. Pinning the
-# manifest also pins its licence/protocol/evidence and exact tensor inventory.
-.segmentationPublicCheckpointPolicy <- function() {
-  policy <- .dsf_option("segmentation_public_checkpoints", character())
-  if (!is.character(policy) || (length(policy) &&
-      (is.null(names(policy)) || anyNA(names(policy)) ||
-       anyDuplicated(names(policy)) ||
-       any(!grepl("\\A[a-z0-9][a-z0-9._-]{0,63}\\z", names(policy), perl = TRUE)) ||
-       anyNA(policy) || any(!grepl("\\A[0-9a-f]{64}\\z", policy, perl = TRUE))))) {
-    stop("dsflower.segmentation_public_checkpoints must be a named character ",
-         "vector of checkpoint IDs and manifest SHA-256 values.", call. = FALSE)
-  }
-  policy
-}
-
-# Run the installed verifier in the trusted runtime, before resolving private
-# descriptors or staging metadata. The runner repeats verification at execution.
-.verifySegmentationPublicCheckpoint <- function(
-    run_config, checkpoint_id, manifest_sha256,
-    registry_root = file.path(dirname(.node_secret_path()),
-                              "segmentation-public-checkpoints"),
-    runtime = .resolve_framework_runtime("pytorch"),
-    runner_dir = system.file("flower_app", "dsflower_runner", package = "dsFlower"),
-    run_probe = processx::run) {
-  spec_b64 <- run_config[["model-spec-b64"]]
-  if (!is.character(spec_b64) || length(spec_b64) != 1L || is.na(spec_b64) ||
-      !nzchar(spec_b64) || nchar(spec_b64, type = "bytes") > 16384L) {
-    stop("Public segmentation initialisation requires a bounded decoder spec.",
-         call. = FALSE)
-  }
-  decoded <- tryCatch(jsonlite::base64_dec(spec_b64), error = function(e) NULL)
-  canonical <- if (is.null(decoded)) NULL else
-    gsub("[\r\n]", "", jsonlite::base64_enc(decoded))
-  spec <- tryCatch(jsonlite::fromJSON(rawToChar(decoded), simplifyVector = FALSE),
-                   error = function(e) NULL)
-  if (!identical(canonical, spec_b64) || !is.list(spec) || is.null(names(spec))) {
-    stop("Public segmentation initialisation requires a canonical decoder spec.",
-         call. = FALSE)
-  }
-  cfg <- run_config
-  cfg[["task-type"]] <- "segmentation"
-  code <- paste(
-    "import json, sys",
-    "sys.path.insert(0, sys.argv[1])",
-    "from dsflower_runner.segmentation_checkpoints import initialization_payload",
-    "from dsflower_runner.segmentation import prepare_encoder, validate_decoder_spec",
-    "cfg = json.loads(sys.argv[5])",
-    "spec = json.loads(sys.argv[6])",
-    "validate_decoder_spec(spec)",
-    "payload = initialization_payload(sys.argv[2], sys.argv[3], sys.argv[4], decoder_spec=spec)",
-    "prepare_encoder(cfg)",
-    "sys.stdout.write(json.dumps(payload, allow_nan=False))", sep = "\n")
-  result <- tryCatch({
-    if (!nzchar(runner_dir) || !dir.exists(runner_dir)) stop("missing runner")
-    # Match the trusted launch whitelist without creating staging or node state.
-    # In particular TORCH_HOME/HOME must not select a different encoder cache.
-    inherited_names <- c(
-      "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
-      "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
-      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-      "http_proxy", "https_proxy", "no_proxy",
-      "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES",
-      "NVIDIA_DRIVER_CAPABILITIES", "ROCR_VISIBLE_DEVICES", "XDG_CACHE_HOME")
-    inherited <- Sys.getenv(inherited_names, unset = NA_character_)
-    inherited <- inherited[!is.na(inherited)]
-    venv_bin <- file.path(runtime$venv_path,
-                         if (.Platform$OS.type == "windows") "Scripts" else "bin")
-    env <- c(inherited, LD_LIBRARY_PATH = "", DYLD_LIBRARY_PATH = "",
-             PYTHONHOME = "", PYTHONNOUSERSITE = "1", PYTHONHASHSEED = "0",
-             CUBLAS_WORKSPACE_CONFIG = ":4096:8", VIRTUAL_ENV = runtime$venv_path,
-             PATH = paste0(venv_bin, .Platform$path.sep, Sys.getenv("PATH", "")))
-    run_probe(command = runtime$python,
-      args = c("-I", "-c", code, dirname(runner_dir), registry_root,
-               checkpoint_id, manifest_sha256,
-               as.character(jsonlite::toJSON(cfg, auto_unbox = TRUE, null = "null")),
-               as.character(jsonlite::toJSON(spec, auto_unbox = TRUE, null = "null"))),
-      env = env, error_on_status = FALSE, timeout = 120)
-  }, error = function(e) NULL)
-  payload <- if (is.list(result) && identical(as.integer(result$status), 0L) &&
-      is.character(result$stdout) && length(result$stdout) == 1L &&
-      !is.na(result$stdout) && nchar(result$stdout, type = "bytes") <= 2 * 1024^2) {
-    tryCatch(jsonlite::fromJSON(result$stdout, simplifyVector = FALSE),
-             error = function(e) NULL)
-  } else NULL
-  provenance <- if (is.list(payload)) payload$provenance else NULL
-  manifest <- if (is.list(provenance)) provenance$manifest else NULL
-  checkpoint_hash <- if (is.list(manifest) && is.list(manifest$checkpoint))
-    manifest$checkpoint$sha256 else NULL
-  if (!is.list(provenance) ||
-      !identical(provenance$manifest_sha256, manifest_sha256) ||
-      !is.list(manifest) || !identical(manifest$checkpoint_id, checkpoint_id) ||
-      !is.character(checkpoint_hash) || length(checkpoint_hash) != 1L ||
-      is.na(checkpoint_hash) ||
-      !grepl("\\A[0-9a-f]{64}\\z", checkpoint_hash, perl = TRUE)) {
-    stop("Public segmentation checkpoint verification failed before private staging.",
-         call. = FALSE)
-  }
-  bytes <- tryCatch(jsonlite::base64_dec(payload$checkpoint_base64),
-                     error = function(e) NULL)
-  canonical <- if (is.null(bytes)) NULL else
-    gsub("[\r\n]", "", jsonlite::base64_enc(bytes))
-  if (!is.character(payload$checkpoint_base64) ||
-      length(payload$checkpoint_base64) != 1L ||
-      !identical(canonical, payload$checkpoint_base64) || !length(bytes) ||
-      !identical(as.numeric(length(bytes)), as.numeric(manifest$checkpoint$size_bytes)) ||
-      !identical(digest::digest(bytes, algo = "sha256", serialize = FALSE),
-                 checkpoint_hash)) {
-    stop("Public segmentation checkpoint transport verification failed.", call. = FALSE)
-  }
-  payload
-}
-
-.normalizeSegmentationDecoderInit <- function(run_config) {
+.normalizeSegmentationDecoderInit <- function(run_config, owner_env = parent.frame()) {
   init <- run_config[["segmentation-decoder-init"]] %||% "random"
   if (!is.character(init) || length(init) != 1L || is.na(init) ||
       !(identical(init, "random") ||
-        grepl("\\Apublic:[a-z0-9][a-z0-9._-]{0,63}\\z", init, perl = TRUE))) {
-    stop("Segmentation decoder_init must be 'random' or 'public:<checkpoint-id>'.",
-         call. = FALSE)
+        grepl("\\Aclient:cku_[0-9a-f]{32}\\z", init, perl = TRUE) ||
+        grepl("\\Aresource:[A-Za-z][A-Za-z0-9_.]{0,127}\\z", init, perl = TRUE))) {
+    stop("Segmentation decoder_init requires 'random', an admitted client upload, ",
+         "or 'resource:<handle-symbol>'.", call. = FALSE)
   }
   if (identical(init, "random")) {
-    # Keep the pre-existing random request and seed contract byte-for-byte.
     run_config[["segmentation-decoder-init"]] <- NULL
     return(run_config)
   }
-  checkpoint_id <- substring(init, 8L)
-  policy <- .segmentationPublicCheckpointPolicy()
-  if (!checkpoint_id %in% names(policy)) {
-    stop("Public segmentation checkpoint is not allowlisted by the custodian.",
-         call. = FALSE)
+  origin <- if (startsWith(init, "client:")) "analyst-declared" else "resource"
+  policy <- .require_checkpoint_policy(origin)
+  if (identical(origin, "resource")) {
+    snapshot <- .checkpoint_resolve(substring(init, 10L), owner_env)
+  } else {
+    state <- .checkpoint_state(owner_env)
+    entry <- if (is.environment(state)) state[[substring(init, 8L)]] else NULL
+    if (!is.list(entry) || !identical(entry$origin, "analyst-declared") ||
+        is.null(entry$snapshot) ||
+        difftime(Sys.time(), entry$created, units = "secs") > 3600) {
+      stop("Public initialisation requires a completed same-session upload.", call. = FALSE)
+    }
+    snapshot <- entry$snapshot
   }
-  manifest_sha256 <- unname(policy[[checkpoint_id]])
-  payload <- .verifySegmentationPublicCheckpoint(
-    run_config, checkpoint_id, manifest_sha256)
-  provenance <- payload$provenance
-  run_config[["segmentation-public-manifest-sha256"]] <- manifest_sha256
-  run_config[["segmentation-public-checkpoint-sha256"]] <-
-    provenance$manifest$checkpoint$sha256
-  run_config[["segmentation-public-provenance"]] <- provenance
-  # Public bytes are returned through status for coordinator initialisation,
-  # never written into the training manifest or derived from private arrays.
-  attr(run_config, "segmentation_public_initialization") <- payload
+  verified <- .checkpoint_verify("verify", snapshot$snapshot_directory,
+    snapshot$provenance$manifest_sha256, .checkpoint_decoder_spec(run_config))
+  summary <- .checkpoint_public_summary(verified, origin)
+  run_config[["segmentation-decoder-init"]] <- if (identical(origin, "resource")) "resource" else "client"
+  run_config[["public-initialisation-origin"]] <- origin
+  run_config[["public-initialisation-manifest-sha256"]] <- summary$manifest_sha256
+  run_config[["public-initialisation-checkpoint-sha256"]] <- summary$checkpoint_sha256
+  run_config[["public-initialisation-encoder-sha256"]] <- summary$encoder_sha256
+  run_config[["public-initialisation-identity-version"]] <- summary$identity_version
+  run_config[["public-initialisation-provenance"]] <- summary[c("provenance",
+    "checkpoint_sha256", "encoder_sha256", "tensor_schema", "identity_version")]
+  run_config[["public-initialisation-directory"]] <- verified$snapshot_directory
+  run_config[["public-initialisation-policy"]] <- policy
+  run_config[["initialisation"]] <- if (identical(origin, "resource")) {
+    paste0("resource:", summary$manifest_sha256)
+  } else "analyst-declared"
+  attr(run_config, "segmentation_public_initialization") <- summary
   run_config
 }
 
-.normalizeSegmentationConfig <- function(run_config, track, unit_policy = NULL) {
+.normalizeSegmentationConfig <- function(run_config, track, unit_policy = NULL,
+                                         owner_env = parent.frame()) {
   fields <- intersect(names(run_config), .segmentationConfigFields())
   if (!.segmentationRequested(run_config)) {
     if (length(fields)) {
@@ -259,7 +166,7 @@
     stop("Segmentation does not accept scalar target or tabular feature contracts.",
          call. = FALSE)
   }
-  .normalizeSegmentationDecoderInit(run_config)
+  .normalizeSegmentationDecoderInit(run_config, owner_env)
 }
 
 .validateSegmentationColumns <- function(run_config, target_column,

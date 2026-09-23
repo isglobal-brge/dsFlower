@@ -47,8 +47,8 @@ def public_config():
 def registry(tmp_path, monkeypatch):
     state = tmp_path / "protected"
     state.mkdir(mode=0o700)
-    root = state / "segmentation-public-checkpoints"
-    directory = root / "synthetic-v1"
+    root = state / "checkpoint-cache"
+    directory = tmp_path / "synthetic-v1"
     directory.mkdir(parents=True, mode=0o700)
     shapes = [(8, 128, 3, 3), (8,), (4, 8, 3, 3), (4,), (1, 4, 1, 1), (1,)]
     arrays = [np.full(shape, (i + 1) / 100., np.float32)
@@ -61,6 +61,10 @@ def registry(tmp_path, monkeypatch):
         return {"file": name, "size_bytes": len(data), "sha256": sha(data)}
 
     checkpoint = artifact("checkpoint.npz", stream.getvalue())
+    encoder_bytes = b"synthetic frozen encoder"
+    monkeypatch.setattr(checkpoints, "_ENCODER_SIZE", len(encoder_bytes))
+    monkeypatch.setattr(seg, "CHECKPOINT_SHA256", sha(encoder_bytes))
+    encoder = artifact("encoder.pth", encoder_bytes)
     evidence = {key: artifact(key + ".txt", ("public fixture " + key).encode())
                 for key in ("protocol", "audit", "licence", "mirror_metadata")}
     dataset = {"dataset": "synthetic", "release": "v1", "sha256": "a" * 64,
@@ -82,17 +86,31 @@ def registry(tmp_path, monkeypatch):
                 "feature_contract": seg.PROFILE, "encoder_sha256": seg.CHECKPOINT_SHA256,
                 "dataset": dataset, "licence": {"declaration": dataset["licence"],
                                                  "scope": "synthetic tests only"},
-                "checkpoint": checkpoint, "evidence": evidence,
+                "checkpoint": checkpoint, "evidence": evidence, "encoder": encoder,
+                "role": "segmentation_decoder",
+                "decoder_spec_sha256": sha(checkpoints._canonical(seg.decoder_spec("narrow"))),
+                "pretraining_protocol_sha256": evidence["protocol"]["sha256"],
+                "creation": {"creator": "dsFlower synthetic tests", "created_at": "2026-09-23"},
                 "tensors": [{"name": str(i), "shape": list(a.shape), "dtype": "float32",
                              "sha256": sha(a.tobytes())} for i, a in enumerate(arrays)]}
     wire = json.dumps(manifest).encode()
     (directory / "manifest.json").write_bytes(wire)
-    provenance = {"manifest_sha256": sha(wire), "manifest": manifest}
-    cfg = dict(public_config(), **{checkpoints.INIT_KEY: "public:" + directory.name})
+    admitted = checkpoints.admit_bundle(directory, root)
+    local_directory = directory
+    directory = Path(admitted.pop("snapshot_directory"))
+    admitted.pop("bundle_sha256")
+    summary = admitted
+    provenance = summary["provenance"]
+    cfg = dict(public_config(), **{checkpoints.INIT_KEY: "client"})
     node = dict(cfg, data_type="image", **{
         "run_token": "run_" + "a" * 32, "dp-unit": "patient", "dp-track": "neural",
-        checkpoints.MANIFEST_KEY: sha(wire), checkpoints.CHECKPOINT_KEY: checkpoint["sha256"],
-        checkpoints.PROVENANCE_KEY: provenance})
+        checkpoints.MANIFEST_KEY: provenance["manifest_sha256"],
+        checkpoints.CHECKPOINT_KEY: checkpoint["sha256"],
+        checkpoints.PROVENANCE_KEY: summary,
+        checkpoints.ORIGIN_KEY: "analyst-declared", checkpoints.POLICY_KEY: "analyst_or_resource",
+        checkpoints.DIRECTORY_KEY: str(directory),
+        checkpoints.ENCODER_KEY: manifest["encoder_sha256"],
+        checkpoints.VERSION_KEY: checkpoints.IDENTITY_VERSION})
     run = tmp_path / "run"
     run.mkdir()
     (run / "manifest.json").write_text(json.dumps(node))
@@ -100,16 +118,18 @@ def registry(tmp_path, monkeypatch):
                               state=RecordDict())
     monkeypatch.setenv("DSFLOWER_NODE_SECRET_FILE", str(state / "noise_root"))
     monkeypatch.setattr(seeding, "_node_secret", lambda: b"s" * 32)
-    monkeypatch.setattr(seg, "verified_encoder_bytes", lambda: b"synthetic encoder")
+    monkeypatch.setattr(seg, "verified_encoder_bytes", lambda cfg=None: b"synthetic encoder")
     return SimpleNamespace(root=root, directory=directory, manifest=manifest,
-                           provenance=provenance, arrays=arrays, cfg=cfg,
+                           provenance=provenance, summary=summary, local_directory=local_directory, arrays=arrays, cfg=cfg,
                            node=node, context=context, run=run)
 
 
 def verify(fixture):
-    return checkpoints.verify_checkpoint(fixture.root, "synthetic-v1",
-                                         fixture.provenance["manifest_sha256"],
+    result = checkpoints.verify_snapshot(fixture.directory, fixture.provenance["manifest_sha256"],
                                          seg.decoder_spec("narrow"))
+    result.pop("snapshot_directory")
+    return checkpoints._decode_arrays((fixture.directory / "checkpoint.npz").read_bytes(),
+                                     result["provenance"]["manifest"]), result
 
 
 def message(arrays):
@@ -128,9 +148,8 @@ def pins(round_index=1):
 
 def test_verified_public_payload_initializes_server_and_node_exactly(registry):
     arrays, provenance = verify(registry)
-    assert provenance == registry.provenance
-    payload = checkpoints.initialization_payload(registry.root, "synthetic-v1",
-                                                 provenance["manifest_sha256"])
+    assert provenance == registry.summary
+    payload = checkpoints.client_payload(registry.local_directory)
     cfg = dict(registry.cfg, **{checkpoints.TRANSPORT_KEY:
                base64.b64encode(json.dumps(payload).encode()).decode()})
     model = server_app._build_initial_model(cfg)
@@ -167,8 +186,8 @@ def test_encoder_mismatch_refused_before_decoder_weights_are_loaded(registry):
 
 @pytest.mark.parametrize("name", ["manifest.json", "checkpoint.npz", "original.json",
                                    "protocol.txt", "provenance.json", "audit.txt",
-                                   "licence.txt", "mirror_metadata.txt"])
-def test_every_installed_digest_fails_before_private_training(registry, name):
+                                   "licence.txt", "mirror_metadata.txt", "encoder.pth"])
+def test_every_snapshot_digest_fails_before_private_training(registry, name):
     path = registry.directory / name
     path.write_bytes(path.read_bytes() + b"corrupt")
     claim = {"status": "new", "message_id": "test", "release_index": 1,
@@ -188,7 +207,7 @@ def test_every_installed_digest_fails_before_private_training(registry, name):
 def repin(fixture):
     wire = json.dumps(fixture.manifest).encode()
     (fixture.directory / "manifest.json").write_bytes(wire)
-    fixture.provenance["manifest_sha256"] = sha(wire)
+    fixture.provenance["manifest_sha256"] = checkpoints.canonical_manifest_sha256(fixture.manifest)
 
 
 @pytest.mark.parametrize("index", range(6))
@@ -247,7 +266,7 @@ def test_bad_public_tensor_envelopes_are_rejected(registry, mutation):
 
 
 @pytest.mark.parametrize("key,value", [
-    (checkpoints.INIT_KEY, "public:another"),
+    (checkpoints.INIT_KEY, "resource"),
     (checkpoints.MANIFEST_KEY, "a" * 64),
     (checkpoints.CHECKPOINT_KEY, "b" * 64),
     (checkpoints.PROVENANCE_KEY, {})])
@@ -261,7 +280,7 @@ def test_untrusted_config_cannot_override_node_admission(registry, key, value):
 @pytest.mark.parametrize("key", ["release-cache-dir", "release_cache_bytes", "releaseCacheSize",
                                  "deadline", "gatedDeadline"])
 def test_public_segmentation_rejects_administrator_only_cache_controls(registry, source, key):
-    assert pinned(registry)[checkpoints.INIT_KEY] == "public:synthetic-v1"
+    assert pinned(registry)[checkpoints.INIT_KEY] == "client"
     node = dict(registry.node)
     if source == "config":
         registry.context.run_config = dict(registry.cfg, **{key: "analyst"})
@@ -280,7 +299,7 @@ def test_public_selection_requires_node_authorization_and_matching_decoder(regis
             with pytest.raises(ValueError, match="node-owned"):
                 pinned(registry)
     with pytest.raises(ValueError, match="requested decoder"):
-        checkpoints.verify_checkpoint(registry.root, "synthetic-v1",
+        checkpoints.verify_snapshot(registry.directory,
                                       registry.provenance["manifest_sha256"], seg.decoder_spec())
 
 
@@ -311,17 +330,17 @@ def test_every_public_identity_changes_semantic_seed_and_replays(registry, key):
                                    private_arrays=(np.zeros((1, 2), np.float32),),
                                    execution_fingerprint={})
     before = derive(cfg, registry.node)
-    value = "public:another" if key == checkpoints.INIT_KEY else "f" * 64
+    value = "resource" if key == checkpoints.ORIGIN_KEY else "f" * 64
     assert before != derive(dict(cfg, **{key: value}), dict(registry.node, **{key: value}))
     assert before == derive(copy.deepcopy(cfg), copy.deepcopy(registry.node))
 
 
-def test_random_default_has_unchanged_selection_seed_and_no_registry_reads():
+def test_random_default_has_unchanged_selection_seed_and_no_snapshot_reads():
     cfg = public_config()
     selected, _ = client_app._neural_seed_contract(cfg, pins(), {}, manifest=cfg)
     explicit = dict(cfg, **{checkpoints.INIT_KEY: "random"})
     assert selected == client_app._neural_seed_contract(explicit, pins(), {}, manifest=explicit)[0]
-    with mock.patch.object(checkpoints, "verify_checkpoint", side_effect=AssertionError("registry read")):
+    with mock.patch.object(checkpoints, "verify_snapshot", side_effect=AssertionError("snapshot read")):
         assert checkpoints.verify_node_checkpoint(cfg, cfg) == (None, None)
         assert checkpoints.server_initialization(cfg) is None
     torch.manual_seed(193)
@@ -343,12 +362,18 @@ def test_successful_release_records_exact_provenance_and_released_tensors(regist
     assert not reply.content["metrics"].get("public-preflight-unavailable", 0)
     record = json.loads((registry.run / "segmentation-public-init-release-000001.json").read_text())
     assert record["public_initialisation"] == registry.node[checkpoints.PROVENANCE_KEY]
-    assert record["decoder_init"] == registry.cfg[checkpoints.INIT_KEY]
+    assert record["initialisation"] == "analyst-declared"
+    assert record["public_initialisation_policy"] == "analyst_or_resource"
     assert record["round"] == 1
     assert [item["sha256"] for item in record["released_tensors"]] == [sha(a.tobytes()) for a in released]
 
 
-def test_public_decoder_runs_two_real_dp_rounds_with_unchanged_budget(registry):
+@pytest.mark.parametrize("route", ["client", "resource"])
+def test_public_decoder_runs_two_real_dp_rounds_with_unchanged_budget(registry, route):
+    registry.cfg[checkpoints.INIT_KEY] = route
+    registry.node[checkpoints.INIT_KEY] = route
+    registry.node[checkpoints.ORIGIN_KEY] = "analyst-declared" if route == "client" else "resource"
+    registry.node[checkpoints.POLICY_KEY] = "analyst_or_resource" if route == "client" else "resource_only"
     registry.node.update({"batch-size": 2, "local-epochs": 1, "num-server-rounds": 2,
                           "learning-rate": .01, "n_samples": 2})
     (registry.run / "manifest.json").write_text(json.dumps(registry.node))
@@ -376,7 +401,7 @@ def test_public_decoder_runs_two_real_dp_rounds_with_unchanged_budget(registry):
             arrays = reply.content["arrays"].to_numpy_ndarrays()
             record = json.loads((registry.run / (
                 "segmentation-public-init-release-%06d.json" % rnd)).read_text())
-            assert record["public_initialisation"] == registry.provenance
+            assert record["public_initialisation"] == registry.summary
     cache.assert_not_called()
     assert all(not np.array_equal(a, b) for a, b in zip(initial, arrays))
     assert mechanism.call_count == 2
@@ -387,7 +412,7 @@ def test_public_decoder_runs_two_real_dp_rounds_with_unchanged_budget(registry):
 
 
 @pytest.mark.parametrize("kind", ["file", "directory", "writable"])
-def test_registry_refuses_replaceable_paths(registry, kind):
+def test_snapshot_refuses_replaceable_paths(registry, kind):
     if kind == "writable":
         if os.name == "nt":
             pytest.skip("POSIX mode check")
@@ -398,7 +423,7 @@ def test_registry_refuses_replaceable_paths(registry, kind):
         target = path.with_name(path.name + ".original")
         path.rename(target)
         path.symlink_to(target, target_is_directory=(kind == "directory"))
-    with pytest.raises(ValueError, match="protected"):
+    with pytest.raises(ValueError, match="protected|roster"):
         verify(registry)
 
 
@@ -406,3 +431,152 @@ def test_registry_refuses_replaceable_paths(registry, kind):
 def test_manifest_rejects_ambiguous_or_nonfinite_json(value):
     with pytest.raises(ValueError):
         checkpoints._json(value)
+
+
+def test_archive_snapshot_has_no_bytes_in_public_summary_and_private_modes(registry, tmp_path):
+    archive = tmp_path / "public.zip"
+    packed = checkpoints.pack_bundle(registry.local_directory, archive)
+    admitted = checkpoints.admit_bundle(archive, tmp_path / "resource-cache", sha(archive.read_bytes()))
+    snapshot = Path(admitted.pop("snapshot_directory"))
+    admitted.pop("bundle_sha256")
+    assert admitted == packed == registry.summary
+    assert not any("base64" in key or "b64" in key for key in admitted)
+    assert "local_arrays_b64" not in json.dumps(admitted)
+    if os.name == "posix":
+        assert snapshot.stat().st_mode & 0o777 == 0o700
+        assert all(p.stat().st_mode & 0o777 == 0o600 for p in snapshot.iterdir())
+    # The original local file is no authority after resource snapshotting.
+    archive.write_bytes(b"changed source")
+    verified = checkpoints.verify_snapshot(snapshot, registry.provenance["manifest_sha256"])
+    assert verified["provenance"] == registry.provenance
+
+
+def test_archive_pin_checked_before_manifest_or_tensor_parsing(registry, tmp_path):
+    archive = tmp_path / "bad.zip"
+    archive.write_bytes(b"not even a zip")
+    with mock.patch.object(checkpoints, "_json", side_effect=AssertionError("parsed")), \
+            mock.patch.object(np, "load", side_effect=AssertionError("parsed tensors")):
+        with pytest.raises(ValueError, match="registered bundle digest"):
+            checkpoints.admit_bundle(archive, tmp_path / "cache", "0" * 64)
+
+
+@pytest.mark.parametrize("attack", ["traversal", "absolute", "symlink", "directory", "duplicate", "extra", "oversize", "size", "compression"])
+def test_archive_attacks_are_rejected_before_numpy(registry, tmp_path, attack):
+    archive = tmp_path / "bad.zip"
+    with zipfile.ZipFile(archive, "w") as target:
+        for path in registry.local_directory.iterdir():
+            if attack == "size" and path.name == "encoder.pth":
+                target.writestr(path.name, path.read_bytes() + b"changed")
+            else:
+                target.writestr(path.name, path.read_bytes())
+        if attack == "traversal":
+            target.writestr("../outside", b"bad")
+        elif attack == "absolute":
+            target.writestr("/outside", b"bad")
+        elif attack == "symlink":
+            info = zipfile.ZipInfo("link")
+            info.external_attr = (0o120777 << 16)
+            target.writestr(info, b"encoder.pth")
+        elif attack == "directory":
+            target.writestr("nested/", b"")
+        elif attack == "duplicate":
+            target.writestr("manifest.json", b"{}")
+        elif attack == "extra":
+            target.writestr("unlisted.txt", b"extra")
+        elif attack == "oversize":
+            target.writestr("manifest.json", b"x" * 65537)
+        elif attack == "compression":
+            target.writestr("bomb.txt", b"0" * 1000000, compress_type=zipfile.ZIP_DEFLATED)
+    with mock.patch.object(np, "load", side_effect=AssertionError("parsed tensors")):
+        with pytest.raises(ValueError, match="archive|manifest|roster"):
+            checkpoints.inspect_bundle(archive)
+
+
+def test_repack_alias_and_administrative_metadata_do_not_change_noise_identity(registry, tmp_path):
+    first = tmp_path / "first.zip"
+    second = tmp_path / "second.zip"
+    checkpoints.pack_bundle(registry.local_directory, first)
+    manifest = json.loads((registry.local_directory / "manifest.json").read_bytes())
+    manifest["checkpoint_id"] = "custodian-alias"
+    manifest["creation"] = {"creator": "another packager", "created_at": "2027-01-01"}
+    (registry.local_directory / "manifest.json").write_text(json.dumps(manifest, indent=4))
+    with zipfile.ZipFile(second, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in reversed(list(registry.local_directory.iterdir())):
+            archive.writestr(path.name, path.read_bytes())
+    a = checkpoints.inspect_bundle(first)
+    b = checkpoints.inspect_bundle(second)
+    assert sha(first.read_bytes()) != sha(second.read_bytes())
+    assert a["provenance"]["manifest_sha256"] == b["provenance"]["manifest_sha256"]
+    alias = dict(registry.node)
+    alias[checkpoints.PROVENANCE_KEY] = b
+    alias[checkpoints.DIRECTORY_KEY] = "/another/private/cache"
+    alias["resource_name"] = "PublicModels.alias"
+    alias["resource_symbol"] = "OTHER_HANDLE"
+    alias["bundle_sha256"] = sha(second.read_bytes())
+    assert seeding.request_selection(alias) == seeding.request_selection(registry.node)
+    changed = dict(registry.node, **{checkpoints.MANIFEST_KEY: "b" * 64})
+    assert seeding.request_selection(changed) != seeding.request_selection(registry.node)
+
+
+@pytest.mark.parametrize("route,policy", [("client", "resource_only"), ("client", "none"), ("resource", "none")])
+def test_runner_refuses_disallowed_origin_before_model_or_private_access(registry, route, policy):
+    registry.cfg[checkpoints.INIT_KEY] = route
+    registry.node.update({checkpoints.INIT_KEY: route, checkpoints.POLICY_KEY: policy,
+                          checkpoints.ORIGIN_KEY: "analyst-declared" if route == "client" else "resource"})
+    (registry.run / "manifest.json").write_text(json.dumps(registry.node))
+    with mock.patch.object(client_app, "load_user_model") as model, \
+            mock.patch.object(seg, "load_subject_tensors") as private:
+        with pytest.raises(ValueError, match="node policy"):
+            client_app._prepare_neural_model(message(registry.arrays), registry.context,
+                                             pinned(registry), {}, pins())
+    model.assert_not_called()
+    private.assert_not_called()
+
+
+def test_local_coordinator_file_authorizes_nothing_and_must_match_summary(registry, tmp_path):
+    payload = checkpoints.coordinator_payload(registry.local_directory / "checkpoint.npz", registry.summary)
+    assert payload == checkpoints.client_payload(registry.local_directory)
+    wrong = tmp_path / "wrong.npz"
+    wrong.write_bytes(b"other public weights")
+    with pytest.raises(ValueError, match="size|digest"):
+        checkpoints.coordinator_payload(wrong, registry.summary)
+    registry.context.run_config[checkpoints.DIRECTORY_KEY] = str(registry.local_directory)
+    with pytest.raises(ValueError, match="node-owned"):
+        pinned(registry)
+
+
+@pytest.mark.parametrize("key", ["public-initialisation-policy", "public_initialisation_policy",
+                                 "publicInitialisationPolicy", "dsflower.public_initialisation",
+                                 "dsflower.public_initialisation.pytorch_resnet18_segmentation"])
+def test_untrusted_nonsegmentation_config_cannot_set_policy(key):
+    context = SimpleNamespace(run_config={key: "analyst_or_resource"})
+    with mock.patch.object(task, "_load_manifest", return_value={checkpoints.POLICY_KEY: "none"}):
+        with pytest.raises(ValueError, match="administrator-only"):
+            task.load_pinned_run_config(context)
+
+
+def test_nonsegmentation_manifest_may_report_node_owned_policy():
+    context = SimpleNamespace(run_config={})
+    with mock.patch.object(task, "_load_manifest", return_value={checkpoints.POLICY_KEY: "none"}):
+        assert task.load_pinned_run_config(context)[checkpoints.POLICY_KEY] == "none"
+
+
+@pytest.mark.parametrize("mutation", ["entry-count", "directory-size", "trailing", "prefix"])
+def test_archive_directory_bound_checked_before_zipfile_objects(registry, tmp_path, mutation):
+    import struct
+    archive = tmp_path / "archive.zip"
+    checkpoints.pack_bundle(registry.local_directory, archive)
+    payload = bytearray(archive.read_bytes())
+    footer = payload.rfind(b"PK\x05\x06")
+    if mutation == "entry-count":
+        struct.pack_into("<HH", payload, footer + 8, 60000, 60000)
+    elif mutation == "directory-size":
+        struct.pack_into("<I", payload, footer + 12, 20000000)
+    elif mutation == "trailing":
+        payload += b"unlisted trailing artifact"
+    else:
+        payload[:4] = b"evil"
+    archive.write_bytes(payload)
+    with mock.patch.object(zipfile, "ZipFile", side_effect=AssertionError("central directory allocated")):
+        with pytest.raises(ValueError, match="archive"):
+            checkpoints.inspect_bundle(archive)

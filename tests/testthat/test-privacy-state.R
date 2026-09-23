@@ -236,6 +236,6 @@ test_that("public privacy status reports only the per-training contract", {
   expect_named(status, c(
     "accountant", "guarantee_scope", "per_training_epsilon",
     "per_training_delta", "dp_unit", "patient_column",
-    "unit_canonicalization", "adjacency"
+    "unit_canonicalization", "adjacency", "public_initialisation"
   ))
 })
