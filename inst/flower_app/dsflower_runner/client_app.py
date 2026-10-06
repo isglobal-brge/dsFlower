@@ -41,7 +41,7 @@ from .params import get_torch_params, set_torch_params, load_user_model
 # sys.path / PYTHONPATH cannot shadow dp_harness and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import (canonical_units, dp_harness, release_cache, release_guard, resampling, seeding,
+from . import (canonical_units, dp_harness, neighbourhood, release_cache, release_guard, resampling, seeding,
                task as task_module, validation)
 
 
@@ -772,7 +772,9 @@ def _parent_source_binding(context, units, holdout=False):
     assignment = _source_partition(context, units, holdout)
     digest = hashlib.sha256()
     seeding._update_arrays(digest, "assignment", [assignment])
-    value = {"units-sha256": units.multiset_digest, "assignment-sha256": digest.hexdigest()}
+    value = {"units-sha256": units.multiset_digest,
+             "assignment-sha256": digest.hexdigest(),
+             "unit-records": list(units.records)}
     key = "dsflower-resampling-source-v3"
     previous = context.state.get(key)
     if previous is not None and dict(previous) != value:
@@ -904,10 +906,15 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
 
     fit_options = ({"public_zero_gradient": True}
                    if empty_training else {})
-    return _dp_fit(
-        model, fit_X, fit_y, pcfg, pins, n_staged, cfg, master=master,
-        noise_multiplier=effective_privacy["noise_multiplier"],
-        geometry_n_units=geometry_n_units, **fit_options)
+    # Admission and the complete parent/source binding above still run on hits.
+    # Store the post-optimizer/post-FedProx arrays, never an anchor's noise key.
+    with neighbourhood.release(request, units) as slot:
+        if slot.cached is None:
+            slot.commit(binding, _dp_fit(
+                model, fit_X, fit_y, pcfg, pins, n_staged, cfg, master=master,
+                noise_multiplier=effective_privacy["noise_multiplier"],
+                geometry_n_units=geometry_n_units, **fit_options))
+        return slot.cached
 
 
 def _train_segmentation(context, cfg, pcfg, pins, model, cv_fold=None,
@@ -958,9 +965,12 @@ def _train_segmentation(context, cfg, pcfg, pins, model, cv_fold=None,
     if empty:
         X = np.zeros((1, segmentation.FEATURE_DIM), dtype=np.float32)
         y = np.zeros((1, 2, 128, 128), dtype=np.float32)
-    return _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master,
-                   noise_multiplier=effective["noise_multiplier"], geometry_n_units=geometry,
-                   **({"public_zero_gradient": True} if empty else {}))
+    with neighbourhood.release(request, units) as slot:
+        if slot.cached is None:
+            slot.commit(binding, _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master=master,
+                noise_multiplier=effective["noise_multiplier"], geometry_n_units=geometry,
+                **({"public_zero_gradient": True} if empty else {})))
+        return slot.cached
 
 
 def _holdout_partition(context, X, y, unit_ids, *, subset):
@@ -1199,7 +1209,8 @@ def _cross_validation_release(context, cfg, pcfg):
         parent = context.state.get("dsflower-resampling-source-v3")
         if not isinstance(parent, ConfigRecord):
             raise RuntimeError("cross-validation source binding is unavailable")
-        units = SimpleNamespace(multiset_digest=parent["units-sha256"])
+        units = SimpleNamespace(multiset_digest=parent["units-sha256"],
+                                records=tuple(parent["unit-records"]))
         raw = _load_complete_cv_sufficient(context, layout)
         released, _sigma = validation.private_sufficient_vector(raw, layout,
             epsilon=pcfg["epsilon"], delta=pcfg["delta"], num_releases=1,
@@ -1363,6 +1374,10 @@ def train(msg: Message, context: Context) -> Message:
     try:
         claim = release_guard.claim_release(context, msg)  # before any private read
         if claim["status"] == "replay":
+            if claim.get("operation", "train") not in ("cv-accumulate", "cv-abort"):
+                # Transport retries reuse a frozen coordinate. Even this fast
+                # path must not conceal loss/corruption of its durable history.
+                neighbourhood.NeighbourhoodStore.from_env().verify()
             return _replay_reply(context, claim, msg)
 
         cfg = load_pinned_run_config(context)
@@ -1450,13 +1465,6 @@ def train(msg: Message, context: Context) -> Message:
                     msg, new_arrays, hook_executed=False,
                     public_preflight_unavailable=True)
 
-            cache = release_cache.ReleaseCache.from_env(forbidden_dirs=(
-                release_guard._manifest_dir(context),
-                os.environ.get("DSFLOWER_PINNED_APP_DIR", "")))
-            # Reserve the complete public worst case, including later rounds,
-            # before reading or hashing any private data. R reserves at run
-            # admission as well; this boundary revalidates the durable contract.
-            cache.reserve_run(claim["run_fingerprint"], num_rounds)
             hook_public_ready = True
             module_name = str(cfg["user-module"])
             hook_request = tier2_lib.hook_request_identity(module_name, old, public_hook_cfg, pcfg_round,
@@ -1472,27 +1480,50 @@ def train(msg: Message, context: Context) -> Message:
                 master = tier2_lib.hook_master_seed(
                     module_name, old, X, y, public_hook_cfg, pcfg_round,
                     unit_ids=unit_ids, request_identity=hook_request)
-                with cache.release(
-                        claim["run_fingerprint"], claim["coordinate"],
-                        claim["request_id"], release_cache.cache_key(master)) as slot:
-                    if slot.cached is not None:
-                        new_arrays, metrics = slot.cached
+                units = canonical_units.source_units(X, y)
+                binding = seeding.bind_private_data(hook_request, units,
+                    effective_tensors=(X, y), geometry={
+                        "n_staged_rows": len(y), "n_privacy_units": len(units.records),
+                        "block_count": (int(pcfg_round.get("sa_blocks", 8))
+                                        if pcfg_round.get("sample_aggregate", True) else 1)})
+                release_guard.claim_hook_input(
+                    context, claim, release_cache.cache_key(master))
+                with neighbourhood.release(hook_request, units, forbidden_dirs=(
+                        release_guard._manifest_dir(context),
+                        os.environ.get("DSFLOWER_PINNED_APP_DIR", ""))) as anchor:
+                    cache = release_cache.ReleaseCache.from_env(forbidden_dirs=(
+                        release_guard._manifest_dir(context),
+                        os.environ.get("DSFLOWER_PINNED_APP_DIR", "")))
+                    if anchor.cached is not None:
+                        cache.check_run_open(claim["run_fingerprint"])
                     else:
-                        execution_seed = tier2_lib.hook_execution_seed(
-                            module_name, old, public_hook_cfg, pcfg_round,
-                            request_identity=hook_request)
-                        from .strategy import canonical_local_strategy
-                        new_arrays = tier2_lib.gated_local_update(
-                            module_name, old, X, y, public_hook_cfg, pcfg_round,
-                            seed=seeding.sub_seed(master, "noise"),
-                            execution_seed=seeding.sub_seed(
-                                execution_seed, "egress-execution"),
-                            hook_caps=hook_caps, unit_ids=unit_ids,
-                            release_started=hook_started, pad_release=False,
-                            local_strategy=canonical_local_strategy(cfg, "egress"))
-                        metrics = {"num-examples": 1, "hook-executed": 1}
-                        slot.commit(new_arrays, metrics)
-                        new_arrays, metrics = slot.cached
+                        # Only a would-be-fresh anchor needs the legacy Hook
+                        # full-horizon reservation. Exact/near answers never
+                        # consume it or execute the child.
+                        cache.reserve_run(claim["run_fingerprint"], num_rounds)
+                        with cache.release(
+                                claim["run_fingerprint"], claim["coordinate"],
+                                claim["request_id"], release_cache.cache_key(master)) as slot:
+                            if slot.cached is not None:
+                                new_arrays, metrics = slot.cached
+                            else:
+                                execution_seed = tier2_lib.hook_execution_seed(
+                                    module_name, old, public_hook_cfg, pcfg_round,
+                                    request_identity=hook_request)
+                                from .strategy import canonical_local_strategy
+                                new_arrays = tier2_lib.gated_local_update(
+                                    module_name, old, X, y, public_hook_cfg, pcfg_round,
+                                    seed=seeding.sub_seed(master, "noise"),
+                                    execution_seed=seeding.sub_seed(
+                                        execution_seed, "egress-execution"),
+                                    hook_caps=hook_caps, unit_ids=unit_ids,
+                                    release_started=hook_started, pad_release=False,
+                                    local_strategy=canonical_local_strategy(cfg, "egress"))
+                                metrics = {"num-examples": 1, "hook-executed": 1}
+                                slot.commit(new_arrays, metrics)
+                                new_arrays, metrics = slot.cached
+                        anchor.commit(binding, (new_arrays, metrics))
+                    new_arrays, metrics = anchor.cached
             finally:
                 tier2_lib.pad_hook_release(hook_started, pcfg_round)
             # These exact arrays and constant metrics are durable before any

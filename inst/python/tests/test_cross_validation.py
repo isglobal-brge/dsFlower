@@ -641,12 +641,14 @@ class CvClientTests(unittest.TestCase):
         models = [np.full((1, 2), value, dtype=np.float32)
                   for value in (1.0, 2.0, 3.0)]
         keys = []
+        bind_data = client_app.seeding.bind_private_data
         master_seed = client_app.seeding.release_key
 
-        def capture_key(*args, **kwargs):
-            key = master_seed(*args, **kwargs)
-            keys.append(key)
-            return key
+        def capture_binding(*args, **kwargs):
+            # Assert fresh R/B/K identity even when the anchor suppresses noise.
+            binding = bind_data(*args, **kwargs)
+            keys.append(master_seed(args[0], binding))
+            return binding
 
         def release(public_models):
             context = SimpleNamespace(state=RecordDict())
@@ -663,8 +665,8 @@ class CvClientTests(unittest.TestCase):
         with (mock.patch.object(task, "_load_manifest", return_value=manifest),
               mock.patch.object(client_app.seeding, "_node_secret",
                                 return_value=b"s" * 32),
-              mock.patch.object(client_app.seeding, "release_key",
-                                side_effect=capture_key)):
+              mock.patch.object(client_app.seeding, "bind_private_data",
+                                side_effect=capture_binding)):
             baseline = release(models)
             replay = release([value.astype(">f4") for value in models])
             changed = release([np.zeros_like(models[0]), *models[1:]])

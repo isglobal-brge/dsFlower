@@ -205,7 +205,7 @@ def _message_config(msg):
     for key in config:
         normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
         normalized = normalized.lower().replace("-", "_").replace(".", "_")
-        if re.search(r"(^|_)(cache|deadline)($|_)", normalized):
+        if re.search(r"(^|_)(cache|deadline|neighbourhood)($|_)", normalized):
             raise RuntimeError("cache and deadline controls are administrator-only")
     return config
 
@@ -516,3 +516,93 @@ def claim_release(context, msg):
         "run_fingerprint": fixed["run_fingerprint"],
         "coordinate": _claim_key(operation, fold, round_index),
     }
+
+
+def claim_hook_input(context, claim, semantic_key):
+    """Pin one admitted Hook coordinate's input in its private run staging.
+
+    ``semantic_key`` is the domain-separated Hook cache identifier, never a
+    master/noise key. This bounded integrity claim has no payload or anchor
+    reference and consumes no durable Hook-cache or neighbourhood capacity.
+    It keeps the existing same-run mutation guard on exact and near replies.
+    """
+    try:
+        from . import release_cache
+    except ImportError:
+        import release_cache
+    from urllib.parse import quote
+
+    fixed = _fixed_manifest(context)
+    if not fixed["gated"] or not isinstance(claim, dict):
+        raise RuntimeError("Hook input integrity requires an admitted Hook claim")
+    if (not isinstance(semantic_key, str)
+            or _REQUEST_ID_RE.fullmatch(semantic_key) is None
+            or claim.get("run_fingerprint") != fixed["run_fingerprint"]
+            or claim.get("policy_hash") != fixed["policy_hash"]
+            or not isinstance(claim.get("request_id"), str)
+            or _REQUEST_ID_RE.fullmatch(claim["request_id"]) is None):
+        raise RuntimeError("Hook input integrity claim is invalid")
+    coordinate = claim.get("coordinate")
+    if (not isinstance(coordinate, str)
+            or coordinate != _claim_key(claim.get("operation"),
+                _exact_int(claim.get("fold"), "Hook claim fold", 0, fixed["cv_folds"] + 1),
+                _exact_int(claim.get("release_index"), "Hook claim round", 1, fixed["num_rounds"]))):
+        raise RuntimeError("Hook input integrity coordinate is invalid")
+    binding = {
+        "version": _CLAIM_LEDGER_VERSION,
+        "run-fingerprint": fixed["run_fingerprint"],
+        "policy-hash": fixed["policy_hash"],
+    }
+    connection = None
+    try:
+        # claim_release has already durably created the public ledger. Never
+        # fabricate it here, including after staging loss or a path swap.
+        release_cache._safe_directory(os.path.dirname(fixed["ledger_path"]), ())
+        os.close(release_cache._safe_file(fixed["ledger_path"]))
+        journal = fixed["ledger_path"] + "-journal"
+        if os.path.lexists(journal):
+            os.close(release_cache._safe_file(journal))
+        connection = sqlite3.connect("file:" + quote(fixed["ledger_path"]) + "?mode=rw",
+                                     uri=True, timeout=30.0, isolation_level=None)
+        connection.execute("PRAGMA synchronous=EXTRA")
+        connection.execute("PRAGMA fullfsync=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        stored = dict(connection.execute("SELECT ledger_key, ledger_value FROM ledger"))
+        public_claims = {key: value for key, value in stored.items() if key not in binding}
+        if (any(stored.get(key) != value for key, value in binding.items())
+                or len(public_claims) > fixed["max_claims"]
+                or public_claims.get(coordinate) != claim["request_id"]
+                or any(not key.startswith("claim:") or not isinstance(value, str)
+                       or _REQUEST_ID_RE.fullmatch(value) is None
+                       for key, value in public_claims.items())):
+            raise RuntimeError("Hook input integrity requires its durable public claim")
+        connection.execute("CREATE TABLE IF NOT EXISTS hook_inputs ("
+                           "coordinate TEXT PRIMARY KEY, request_id TEXT NOT NULL, "
+                           "semantic_key TEXT NOT NULL) WITHOUT ROWID")
+        rows = connection.execute("SELECT coordinate, request_id, semantic_key FROM hook_inputs").fetchall()
+        if (len(rows) > fixed["max_claims"] or any(
+                public_claims.get(key) != request_id or not isinstance(value, str)
+                or _REQUEST_ID_RE.fullmatch(value) is None
+                for key, request_id, value in rows)):
+            raise RuntimeError("Hook input integrity ledger is invalid")
+        previous = next((value for key, request_id, value in rows if key == coordinate), None)
+        if previous is not None:
+            if previous != semantic_key:
+                raise RuntimeError("committed release coordinate has a different semantic identity")
+        else:
+            if len(rows) >= fixed["max_claims"]:
+                raise RuntimeError("Hook input integrity ledger is exhausted")
+            connection.execute("INSERT INTO hook_inputs VALUES (?, ?, ?)",
+                               (coordinate, claim["request_id"], semantic_key))
+        connection.commit()
+    except (OSError, sqlite3.Error) as exc:
+        if connection is not None:
+            connection.rollback()
+        raise RuntimeError("Hook input integrity could not be claimed") from exc
+    except BaseException:
+        if connection is not None:
+            connection.rollback()
+        raise
+    finally:
+        if connection is not None:
+            connection.close()

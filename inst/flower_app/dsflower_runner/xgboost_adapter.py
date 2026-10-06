@@ -73,16 +73,19 @@ class PreparedXGBoostTraining:
         "_features", "_manifest", "_native_bundle", "_native_bundle_sha256",
         "_native_parameters", "_noise_key", "_num_boost_round", "_profile",
         "_request_sha256", "_sealed", "_target", "invocation_id",
+        "_request_identity", "_data_binding",
     )
 
     def __init__(self, *, manifest, native_parameters, noise_key, materialized,
-                 profile, native_bundle):
+                 profile, native_bundle, request_identity=None, data_binding=None):
         object.__setattr__(self, "_sealed", False)
         self._manifest = copy.deepcopy(manifest)
         self._native_bundle = native_bundle
         self._native_bundle_sha256 = native_bundle.bundle_sha256
         self._native_parameters = copy.deepcopy(native_parameters)
         self._noise_key = noise_key
+        self._request_identity = request_identity
+        self._data_binding = data_binding
         self._features = materialized.features
         self._target = materialized.target
         self.invocation_id = tree_contract.invocation_identity(self._manifest)
@@ -660,6 +663,8 @@ def prepare_xgboost_training(manifest, features, target, *, native_bundle,
         materialized=materialized,
         profile=profile,
         native_bundle=native_bundle,
+        request_identity=identity,
+        data_binding=binding,
     )
 
 

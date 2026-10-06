@@ -268,10 +268,12 @@ class NeighbourhoodStore:
             for forbidden in self._forbidden:
                 if forbidden and os.path.commonpath((pin_path, os.path.realpath(forbidden))) == os.path.realpath(forbidden):
                     raise StateError()
-            established = os.path.lexists(pin_path) or os.path.lexists(directory) or bool(expected_uuid)
+            lock_preexisted = os.path.lexists(self.init_lock)
+            established = (lock_preexisted or os.path.lexists(pin_path)
+                           or os.path.lexists(directory) or bool(expected_uuid))
             with _file_lock(self.init_lock, create=not established):
                 pin_exists, directory_exists = os.path.lexists(pin_path), os.path.lexists(directory)
-                if not pin_exists and not directory_exists and not expected_uuid:
+                if not pin_exists and not directory_exists and not expected_uuid and not lock_preexisted:
                     self._initialize()
                 elif not pin_exists or not directory_exists:
                     raise StateError()

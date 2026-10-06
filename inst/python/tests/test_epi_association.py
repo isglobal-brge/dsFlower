@@ -155,11 +155,26 @@ class AssociationSufficientVectorTests(unittest.TestCase):
 
 class AssociationReleaseTests(unittest.TestCase):
     @staticmethod
-    def _release(vector, *, unit="row", secret=None, request_selection=None):
+    def _release(vector, *, unit="row", secret=None, request_selection=None,
+                 binding_keys=None):
         secret = bytes(range(32)) if secret is None else secret
-        with mock.patch(
-                "dsflower_runner.seeding._node_secret",
-                return_value=secret):
+        # Different mocked secrets represent different nodes, each with retained
+        # state beside its own key. Rotating a key in place must fail closed.
+        node_secret = os.environ["DSFLOWER_NODE_SECRET_FILE"] + "." + secret.hex()
+        if not os.path.exists(node_secret):
+            descriptor = os.open(node_secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                handle.write(secret.hex())
+        from dsflower_runner import seeding
+        original_binding = seeding.bind_private_data
+        def capture_binding(*args, **kwargs):
+            binding = original_binding(*args, **kwargs)
+            if binding_keys is not None:
+                binding_keys.append(seeding.release_key(args[0], binding))
+            return binding
+        with mock.patch.dict(os.environ, {"DSFLOWER_NODE_SECRET_FILE": node_secret}), \
+                mock.patch.object(seeding, "_node_secret", return_value=secret), \
+                mock.patch.object(seeding, "bind_private_data", side_effect=capture_binding):
             from dsflower_runner import canonical_units
             units = canonical_units.source_units(vector)
             if units is None:
@@ -198,8 +213,11 @@ class AssociationReleaseTests(unittest.TestCase):
                 [0, 1, 9], [0, 1, 1], outcome_levels=(0, 1),
                 exposure_levels=(0, 1), privacy_unit=unit, unit_ids=ids)
             self.assertEqual(left.tobytes(), right.tobytes())
-            self.assertNotEqual(self._release(left, unit=unit)[0].tobytes(),
-                                self._release(right, unit=unit)[0].tobytes())
+            keys = []
+            left_release = self._release(left, unit=unit, binding_keys=keys)[0]
+            right_release = self._release(right, unit=unit, binding_keys=keys)[0]
+            self.assertNotEqual(keys[0], keys[1])
+            self.assertEqual(left_release.tobytes(), right_release.tobytes())
 
     def test_data_secret_and_unit_semantics_bind_noise(self):
         raw = np.asarray([2, 1, 0, 3, 4, 0, 0, 0, 1], dtype=np.float64)

@@ -120,10 +120,10 @@
     settings <- .release_cache_settings()
     staging_dir <- .ensureStagingDir(run_token)
     receipt <- file.path(staging_dir, ".release-cache.json")
-    # Register the exact cleanup target before reserve can persist any pins.
+    # Freeze validated custodian settings and the cleanup target. Capacity is
+    # reserved by Python only after the neighbourhood lookup requires a fresh
+    # anchor, so an exact/near replay cannot be refused by this inner cache.
     .write_manifest_atomic(settings, receipt)
-    .release_cache_command("reserve", run_token, settings,
-                           run_config[["num-server-rounds"]])
     invisible(settings)
   }, error = function(e) stop(
     "The durable Hook release cache is unavailable.", call. = FALSE))
@@ -131,7 +131,7 @@
 
 .release_cache_environment <- function(staging_dir) {
   settings <- .release_cache_receipt(staging_dir)
-  # Public reservation can choose a different eligible staging root before the
+  # Receipt preparation can choose a different eligible staging root before the
   # later data-size check. Find its receipt using only the server run token.
   if (is.null(settings) && grepl("^run_[0-9a-f]{32}$", basename(staging_dir))) {
     for (candidate in .expectedStagingDirs(basename(staging_dir))) {

@@ -344,6 +344,17 @@ class NeighbourhoodStoreTests(unittest.TestCase):
                 operation()
         self.assertFalse(os.path.exists(self.store.database))
 
+    def test_retained_initialization_lock_prevents_recreation_after_state_loss(self):
+        import shutil
+        self.answer(range(10))
+        shutil.rmtree(self.store.directory)
+        os.unlink(self.store.pin_path)
+        self.assertTrue(os.path.exists(self.store.init_lock))
+        with self.assertRaises(nbr.StateError):
+            open_store(self.root)
+        self.assertFalse(os.path.exists(self.store.directory))
+        self.assertFalse(os.path.exists(self.store.pin_path))
+
     def test_missing_established_pin_never_recreated(self):
         self.answer(range(10))
         os.unlink(self.store.pin_path)

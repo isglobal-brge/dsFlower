@@ -261,7 +261,7 @@ def private_association_vector(
         sufficient, *, privacy_unit, epsilon, delta, request_selection=None,
         request_identity=None, source_units=None):
     """Apply the sole sticky joint Gaussian release for one node."""
-    from . import canonical_units, seeding
+    from . import canonical_units, neighbourhood, seeding
     units = source_units or canonical_units.source_units(sufficient)
     layout = association_layout(privacy_unit)
     identity = request_identity or seeding.request_identity(
@@ -273,16 +273,20 @@ def private_association_vector(
     binding = seeding.bind_private_data(
         identity, units, effective_tensors=(raw,),
         geometry={"vector_size": 9})
-    released, sigma = tree_release.joint_gaussian_release(
-        raw, mechanism=MECHANISM, layout=association_layout(privacy_unit),
-        epsilon=epsilon, delta=delta, sensitivity=SENSITIVITY,
-        num_releases=1, execution_fingerprint=EXECUTION_PROFILE,
-        request_selection=request_selection, request_identity=identity,
-        data_binding=binding)
-    vector = np.ascontiguousarray(released, dtype=np.float64).reshape(9)
-    if not bool(np.all(np.isfinite(vector))):
-        raise RuntimeError("private association release is non-finite")
-    return vector, float(sigma)
+    with neighbourhood.release(identity, units) as slot:
+        if slot.cached is not None:
+            return slot.cached
+        released, sigma = tree_release.joint_gaussian_release(
+            raw, mechanism=MECHANISM, layout=association_layout(privacy_unit),
+            epsilon=epsilon, delta=delta, sensitivity=SENSITIVITY,
+            num_releases=1, execution_fingerprint=EXECUTION_PROFILE,
+            request_selection=request_selection, request_identity=identity,
+            data_binding=binding)
+        vector = np.ascontiguousarray(released, dtype=np.float64).reshape(9)
+        if not bool(np.all(np.isfinite(vector))):
+            raise RuntimeError("private association release is non-finite")
+        slot.commit(binding, (vector, float(sigma)))
+        return slot.cached
 
 
 def _released_vector(value):

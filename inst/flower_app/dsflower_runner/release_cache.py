@@ -445,39 +445,13 @@ class ReleaseCache:
             finally:
                 slot.active = False
 
-    def claim_neighbourhood_replay(self, run_fingerprint, coordinate, request_id, key):
-        """Retain the existing per-run mutation guard for an outer-store reply.
-
-        This claims a transport coordinate, not an input-to-answer binding:
-        no payload, entry or pin is created. The immutable neighbourhood anchors
-        remain the sole owner of the selected response.
-        """
+    def check_run_open(self, run_fingerprint):
+        """Check administrative closure without charging an outer-store reply."""
         run = _hex(run_fingerprint, "run fingerprint")
-        key = _hex(key, "semantic key")
-        request_id = _hex(request_id, "public request identity")
-        match = _COORDINATE.fullmatch(coordinate) if isinstance(coordinate, str) else None
-        if match is None:
-            raise RuntimeError("invalid gated cache release coordinate")
         with self._transaction() as connection:
-            reserved = connection.execute(
-                "SELECT rounds, entry_bytes, closed FROM runs WHERE run=?", (run,)).fetchone()
-            if reserved is None or reserved[2] or int(match[1]) > reserved[0]:
-                raise RuntimeError("gated cache run is unavailable")
-            previous = connection.execute(
-                "SELECT request_id, entry_key, committed FROM claims WHERE run=? AND coordinate=?",
-                (run, coordinate)).fetchone()
-            if previous is not None:
-                if previous[:2] != (request_id, key):
-                    raise RuntimeError("committed release coordinate has a different semantic identity")
-                if previous[2] != 2:
-                    entry = connection.execute(
-                        "SELECT payload, digest FROM entries WHERE entry_key=?", (key,)).fetchone()
-                    if (entry is None or len(entry[0]) > reserved[1]
-                            or hashlib.sha256(entry[0]).hexdigest() != entry[1]):
-                        raise RuntimeError("claimed release coordinate has no durable exact reply")
-            else:
-                connection.execute("INSERT INTO claims VALUES (?, ?, ?, ?, 2)",
-                                   (run, coordinate, request_id, key))
+            row = connection.execute("SELECT closed FROM runs WHERE run=?", (run,)).fetchone()
+            if row is not None and row[0]:
+                raise RuntimeError("gated cache run is administratively closed")
 
     def close_run(self, run_fingerprint):
         """Authoritatively close after all in-flight releases finish; retain tombstone."""

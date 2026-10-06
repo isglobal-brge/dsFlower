@@ -66,13 +66,13 @@ test_that("declarative admission does not create or inspect cache state", {
       "dp-track" = "egress", "privacy-hook_enabled" = 0)))
 })
 
-test_that("Hook reservation precedes private staging and preserves rollback", {
+test_that("Hook settings validation precedes private staging and preserves rollback", {
   local_release_cache_state()
+  withr::local_options(list(dsflower.release_cache_bytes = 0))
   seen <- character()
   local_mocked_bindings(
     .release_cache_command = function(action, run_token, settings, rounds = NULL) {
       seen <<- c(seen, action)
-      if (identical(action, "reserve")) stop("capacity exhausted")
       invisible(TRUE)
     },
     .stageData = function(...) stop("private staging must not run"))
@@ -83,7 +83,7 @@ test_that("Hook reservation precedes private staging and preserves rollback", {
   expect_error(flowerPrepareRunDS("cache_admission", "target", "feature",
     config),
     "durable Hook release cache is unavailable")
-  expect_identical(seen, c("reserve", "close"))
+  expect_length(seen, 0L)
   expect_length(dsFlower:::.getHandle("cache_admission")$pending_cleanup_tokens, 0L)
 })
 
@@ -105,7 +105,10 @@ test_that("cache receipts preserve settings and require owner-only state", {
   withr::defer(dsFlower:::.cleanupStaging(token))
   receipt <- file.path(staging, ".release-cache.json")
   expect_true(file.exists(receipt))
-  expect_identical(commands[[1L]]$rounds, 3L)
+  # Even a cache that cannot admit a fresh run must not reject a replay here.
+  # The runner reserves only after canonicalization and anchor selection.
+  expect_length(commands, 0L)
+  expect_false(dir.exists(file.path(root, "releases")))
   withr::local_options(list(dsflower.release_cache_dir = file.path(root, "changed"),
                            dsflower.release_cache_bytes = 99))
   env <- dsFlower:::.release_cache_environment(staging)
@@ -125,6 +128,21 @@ test_that("cache receipts preserve settings and require owner-only state", {
   expect_error(dsFlower:::.release_cache_environment(staging), "unsafe")
   unlink(receipt)
   expect_true(file.rename(original, receipt))
+})
+
+test_that("Hook receipt admission never charges a would-be replay", {
+  root <- local_release_cache_state()
+  withr::local_options(list(dsflower.release_cache_bytes = 1))
+  token <- dsFlower:::.generate_run_token()
+  local_mocked_bindings(
+    .release_cache_command = function(...) stop("no reservation before anchor selection"))
+  expect_no_error(dsFlower:::.release_cache_admit(token, list(
+    "dp-track" = "egress", "privacy-hook_enabled" = 1,
+    "num-server-rounds" = 500L)))
+  staging <- dsFlower:::.expectedStagingDirs(token)[[1L]]
+  expect_identical(unname(dsFlower:::.release_cache_environment(staging)[[
+    "DSFLOWER_RELEASE_CACHE_BYTES"]]), "1")
+  expect_false(dir.exists(file.path(root, "releases")))
 })
 
 test_that("authoritative cleanup stops workers before close and keeps failed receipts", {
@@ -148,7 +166,8 @@ test_that("authoritative cleanup stops workers before close and keeps failed rec
   staging <- dsFlower:::.expectedStagingDirs(token)[[1L]]
   expect_error(dsFlower:::.cleanupStaging(token), "closure interrupted")
   expect_true(file.exists(file.path(staging, ".release-cache.json")))
-  expect_true(all(events[seq.int(2L, length(events) - 1L)] == "stop"))
+  expect_gte(length(events), 2L)
+  expect_true(all(head(events, -1L) == "stop"))
   expect_identical(tail(events, 1L), "close")
   fail_close <- FALSE
   expect_true(dsFlower:::.cleanupStaging(token))
