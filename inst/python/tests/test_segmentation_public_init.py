@@ -107,7 +107,7 @@ def registry(tmp_path, monkeypatch):
     node = dict(cfg, data_type="image", **{
         "run_token": "run_" + "a" * 32, "dp-unit": "patient", "dp-track": "neural",
         checkpoints.MANIFEST_KEY: provenance["manifest_sha256"],
-        checkpoints.CHECKPOINT_KEY: checkpoint["sha256"],
+        checkpoints.CHECKPOINT_KEY: summary["checkpoint_sha256"],
         checkpoints.PROVENANCE_KEY: summary,
         checkpoints.ORIGIN_KEY: "analyst-declared", checkpoints.POLICY_KEY: "analyst_or_resource",
         checkpoints.DIRECTORY_KEY: str(directory),
@@ -575,6 +575,107 @@ def test_repack_alias_and_administrative_metadata_do_not_change_noise_identity(r
         return seeding.request_identity("neural-dpsgd/v3", selected, {"epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, 1,
                                         public_arrays=registry.arrays, execution_fingerprint="fixed-test-execution-v3").digest
     assert identity(changed) != identity(registry.node)
+
+
+@pytest.mark.parametrize("change", ["timestamps", "member-order", "evidence-format",
+                                    "tensor", "scientific-metadata"])
+def test_fully_admitted_checkpoint_semantics_bind_content_not_packaging(registry, tmp_path, change):
+    from dsflower_runner import canonical_units, initialisation
+
+    before = checkpoints.inspect_bundle(registry.local_directory)
+    manifest = copy.deepcopy(before["provenance"]["manifest"])
+    path = registry.local_directory
+    original_payload = (path / "checkpoint.npz").read_bytes()
+    stream = io.BytesIO()
+    changed_arrays = [a.copy() for a in registry.arrays]
+    if change == "tensor":
+        changed_arrays[0].flat[0] += np.float32(.125)
+        np.savez(stream, **{str(i): a for i, a in enumerate(changed_arrays)})
+        manifest["tensors"][0]["sha256"] = sha(changed_arrays[0].tobytes())
+    else:
+        with zipfile.ZipFile(io.BytesIO(original_payload)) as source, \
+                zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as target:
+            entries = source.infolist()
+            if change == "member-order":
+                entries.reverse()
+            for entry in entries:
+                if change == "timestamps":
+                    entry.date_time = (2001, 1, 1, 0, 0, 0)
+                target.writestr(entry, source.read(entry.filename))
+
+    def repin_artifact(record, data):
+        (path / record["file"]).write_bytes(data)
+        record.update(size_bytes=len(data), sha256=sha(data))
+
+    repin_artifact(manifest["checkpoint"], stream.getvalue())
+    if change == "scientific-metadata":
+        manifest["dataset"]["release"] = "v2"
+    # JSON formatting and the original evidence's required NPZ reference are
+    # transport changes too; all evidence and content checks still run below.
+    repin_artifact(manifest["evidence"]["provenance"],
+                   json.dumps(manifest["dataset"], indent=4).encode())
+    original = json.loads((path / manifest["evidence"]["original_manifest"]["file"]).read_bytes())
+    original.update(checkpoint_sha256=manifest["checkpoint"]["sha256"],
+                    tensor_sha256=[t["sha256"] for t in manifest["tensors"]],
+                    provenance_sha256=manifest["evidence"]["provenance"]["sha256"])
+    repin_artifact(manifest["evidence"]["original_manifest"],
+                   json.dumps(original, indent=4, sort_keys=True).encode())
+    (path / "manifest.json").write_text(json.dumps(manifest, indent=4))
+    archive = tmp_path / "repacked.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as target:
+        for member in reversed(sorted(path.iterdir())):
+            target.writestr(zipfile.ZipInfo(member.name, date_time=(2002, 1, 1, 0, 0, 0)),
+                            member.read_bytes())
+    after = checkpoints.admit_bundle(archive, tmp_path / "second-cache",
+                                     expected_bundle_sha256=sha(archive.read_bytes()))
+    arrays_before = checkpoints._decode_arrays(original_payload, before["provenance"]["manifest"])
+    arrays_after = checkpoints._decode_arrays(stream.getvalue(), after["provenance"]["manifest"])
+    for expected, actual in zip(changed_arrays, arrays_after):
+        assert expected.dtype == actual.dtype and expected.shape == actual.shape
+        assert expected.tobytes() == actual.tobytes()
+
+    def node(summary):
+        return dict(registry.node, **{
+            checkpoints.MANIFEST_KEY: summary["provenance"]["manifest_sha256"],
+            checkpoints.CHECKPOINT_KEY: summary["checkpoint_sha256"],
+            checkpoints.PROVENANCE_KEY: summary})
+
+    def request(summary, arrays):
+        return seeding.request_identity("neural-dpsgd/v3", {},
+            {"epsilon": 1., "delta": 1e-6, "clipping_norm": 1.},
+            public_arrays=arrays, manifest=node(summary))
+
+    first, second = request(before, arrays_before), request(after, arrays_after)
+    units = canonical_units.canonicalize_arrays(np.zeros((1, 2)), np.zeros(1), secret=b"s" * 32)
+    bindings = [seeding.bind_private_data(r, units,
+        effective_tensors=(np.zeros((1, 2)), np.zeros(1))) for r in (first, second)]
+    assert bindings[0].digest == bindings[1].digest
+    same = change in ("timestamps", "member-order", "evidence-format")
+    assert (first.digest == second.digest) == same
+    assert (seeding.release_key(first, bindings[0]) == seeding.release_key(second, bindings[1])) == same
+    assert (initialisation.initialisation_spec_sha256(node(before)) ==
+            initialisation.initialisation_spec_sha256(node(after))) == same
+    if same:
+        assert before["tensor_schema"] == after["tensor_schema"]
+        assert before["checkpoint_sha256"] == after["checkpoint_sha256"]
+        assert json.loads(first.canonical_json)["public_arrays"] == json.loads(second.canonical_json)["public_arrays"]
+        assert json.loads(first.canonical_json)["initialisation"]["initial_model_sha256"] == \
+            json.loads(second.canonical_json)["initialisation"]["initial_model_sha256"]
+        payload = checkpoints.coordinator_payload(archive, before)
+        cfg = dict(registry.cfg, **{checkpoints.TRANSPORT_KEY:
+                   base64.b64encode(json.dumps(payload).encode()).decode()})
+        for expected, actual in zip(arrays_before, checkpoints.server_initialization(cfg)):
+            assert expected.tobytes() == actual.tobytes()
+    else:
+        # Checkpoint semantics change even if the coordinator supplies unchanged
+        # current arrays, which independently remain bound to the request.
+        assert first.digest != request(after, arrays_before).digest
+        with pytest.raises(ValueError, match="differs from node-admitted identity"):
+            checkpoints.coordinator_payload(archive, before)
+    if change in ("timestamps", "member-order"):
+        assert before["provenance"]["manifest"]["checkpoint"]["sha256"] != manifest["checkpoint"]["sha256"]
+    assert before["provenance"]["manifest"]["evidence"]["original_manifest"]["sha256"] != \
+        manifest["evidence"]["original_manifest"]["sha256"]
 
 
 @pytest.mark.parametrize("route,policy", [("client", "resource_only"), ("client", "none"), ("resource", "none")])

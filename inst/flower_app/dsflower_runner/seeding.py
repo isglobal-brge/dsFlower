@@ -1179,6 +1179,8 @@ def request_identity(mechanism, config, privacy, round_index=1, *, public_arrays
         input_shape=[int(cfg["num-features"])] if cfg.get("num-features") is not None else None,
         output_shape=output_shape,
         loss=loss, loss_parameters=params, engine_contract=engine)
+    # Admission v2 supplies the ordered tensor-content digest here, never the
+    # NPZ transport checksum retained in the verified provenance manifest.
     checkpoint = cfg.get("public-initialisation-checkpoint-sha256")
     init = _object("initialisation", mode=("hook-pinned" if hook else ("public-checkpoint" if checkpoint else ("spec-seeded" if spec else "none"))),
         version="dsflower-public-init-v1", spec_sha256=init_spec_hash,

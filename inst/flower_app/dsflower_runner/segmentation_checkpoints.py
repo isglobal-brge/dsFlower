@@ -23,7 +23,7 @@ import zipfile
 import numpy as np
 
 SCHEMA = "dsflower-public-initialisation-bundle/v1"
-IDENTITY_VERSION = "dsflower-public-initialisation-identity/v1"
+IDENTITY_VERSION = "dsflower-public-initialisation-identity/v2"
 INIT_KEY = "segmentation-decoder-init"
 MANIFEST_KEY = "public-initialisation-manifest-sha256"
 CHECKPOINT_KEY = "public-initialisation-checkpoint-sha256"
@@ -459,34 +459,55 @@ def _validate_manifest(manifest, decoder_spec=None):
     return records
 
 
+def _canonical_tensor_schema(manifest):
+    """Ordered consumed tensors, after admission verifies each content digest."""
+    return [dict(copy.deepcopy(manifest["tensors"][index]), name=str(i))
+            for i, index in enumerate(_manifest_tensor_order(manifest))]
+
+
 def canonical_manifest_sha256(manifest):
-    """Versioned scientific identity, independent of resource/ZIP/name metadata."""
+    """Scientific identity; archive/evidence pins only authorize transport.
+
+    Full admission checks the raw records and evidence links separately. Their
+    byte digests (including JSON serialization and NPZ headers) must not select
+    another noise stream for the same ordered tensors and scientific metadata.
+    """
     scientific = copy.deepcopy(manifest)
-    scientific.pop("creation")
-    scientific.pop("checkpoint_id")
+    for key in ("creation", "checkpoint_id", "checkpoint", "encoder", "evidence",
+                "pretraining_protocol_sha256"):
+        scientific.pop(key, None)
+    for key in ("licence_sha256", "metadata_sha256"):
+        scientific["dataset"].pop(key, None)
+    scientific["tensors"] = _canonical_tensor_schema(manifest)
     if scientific.get("role") == "tabular_model":
+        from . import model_spec
+        cfg = scientific["model_config"]
+        scientific["model_spec"] = model_spec.canonicalize_spec(
+            scientific["model_spec"], cfg["num-features"],
+            model_spec.output_width(cfg["loss-name"], cfg), num_labels=cfg["num-labels"])
+        scientific["model_spec_sha256"] = hashlib.sha256(
+            _canonical(scientific["model_spec"])).hexdigest()
         scientific["model_config"] = _effective_tabular_model_config(scientific["model_config"])
     if scientific.get("role") == "tabular_model" and "survival-config-b64" in scientific["model_config"]:
         from . import survival
         config = scientific["model_config"]
         config["survival-config"] = survival.config_from_run(config, config["loss-name"])
         config.pop("survival-config-b64")
-    for record in (scientific["checkpoint"],
-                   *([scientific["encoder"]] if "encoder" in scientific else []),
-                   *scientific["evidence"].values()):
-        record.pop("file")
     return hashlib.sha256(_canonical({"identity_version": IDENTITY_VERSION,
                                       "manifest": scientific})).hexdigest()
 
 
 def _summary(manifest):
+    tensors = _canonical_tensor_schema(manifest)
     return {"identity_version": IDENTITY_VERSION,
             "provenance": {"manifest_sha256": canonical_manifest_sha256(manifest),
                            "manifest": manifest},
-            "checkpoint_sha256": manifest["checkpoint"]["sha256"],
+            # The raw NPZ SHA remains in provenance.manifest.checkpoint for
+            # integrity; the public pin describes the consumed tensor content.
+            "checkpoint_sha256": hashlib.sha256(_canonical({
+                "identity_version": IDENTITY_VERSION, "tensors": tensors})).hexdigest(),
             "encoder_sha256": manifest.get("encoder_sha256", hashlib.sha256(b"").hexdigest()),
-            "tensor_schema": [dict(copy.deepcopy(manifest["tensors"][index]), name=str(i))
-                              for i, index in enumerate(_manifest_tensor_order(manifest))]}
+            "tensor_schema": tensors}
 
 
 def _verify_evidence(manifest, contents):
@@ -675,7 +696,9 @@ def coordinator_payload(checkpoint_file, summary, decoder_spec=None):
         local = client_payload(checkpoint_file, decoder_spec)
         if local["provenance"]["manifest_sha256"] != expected["provenance"]["manifest_sha256"]:
             raise ValueError("local coordinator bundle differs from node-admitted identity")
-        return dict(expected, local_arrays_b64=local["local_arrays_b64"])
+        # Equal scientific identity permits an independently repacked local
+        # bundle. Its transport manifest must accompany its own NPZ bytes.
+        return local
     payload = _read(Path(checkpoint_file), _MAX_FILE, manifest["checkpoint"]["sha256"],
                     manifest["checkpoint"]["size_bytes"], protected=False)
     _decode_arrays(payload, manifest)

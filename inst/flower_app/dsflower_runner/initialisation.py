@@ -72,8 +72,9 @@ def canonical_initialisation_spec(cfg, *, application_init_contract=None):
                 encoder = vision._PRESEEDED_ENCODERS[backbone][2]
         from . import segmentation_checkpoints as checkpoints
         if checkpoints.checkpoint_id(cfg) is not None:
-            # The admitted manifest/checkpoint identities describe scientific
-            # content, not a local path, resource alias or archive packaging.
+            # Admission v2 pins canonical scientific metadata and the ordered
+            # tensor schema/content. Raw NPZ/evidence hashes stay exclusively
+            # in provenance transport records, outside this initializer seed.
             checkpoint = {
                 "manifest_sha256": cfg.get(checkpoints.MANIFEST_KEY),
                 "checkpoint_sha256": cfg.get(checkpoints.CHECKPOINT_KEY),

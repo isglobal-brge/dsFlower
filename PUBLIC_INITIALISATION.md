@@ -52,6 +52,19 @@ and contract digests, excluding ZIP packaging, resource names, symbols, location
 credentials and administrative creation labels. Repacking identical contents
 therefore does not create a new noise draw.
 
+Checkpoint identity `dsflower-public-initialisation-identity/v2` binds the
+canonical model/decoder and feature contracts, effective model configuration,
+dataset metadata, licence declaration/scope, frozen encoder content and ordered
+tensor shapes, dtypes and content hashes. The summary's `checkpoint_sha256` is
+the ordered tensor identity, not the NPZ file checksum. Dataset licence/mirror
+evidence checksums, all raw evidence records, archive checksums and sizes remain
+transport-integrity pins in the full provenance manifest; they are checked at
+admission but excluded from scientific identity. JSON formatting, NPZ timestamps
+and member order therefore leave both the initializer seed and R/B/K unchanged.
+Changed tensor content or scientific metadata changes R even when incoming
+training arrays are held fixed; initial and incoming array contents also remain
+independently bound.
+
 ## Custodian server configuration
 
 Install dsFlower 0.7.0 on each R server profile and its trusted Python runtime.
