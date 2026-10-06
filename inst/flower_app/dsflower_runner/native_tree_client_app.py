@@ -449,7 +449,7 @@ def _holdout_layout(request, config):
     if request["task"] == "binary":
         return validation.validation_layout(
             "classification", n_classes=2, bins=bins)
-    return validation.validation_layout("regression", bins=bins)
+    return validation.numeric_holdout_layout("regression")
 
 
 def _cache_vector(context, claim, vector):
@@ -763,6 +763,8 @@ def _cv_layout(request, config):
     bins = config["cv-validation-bins"]
     if type(bins) is not int or not 4 <= bins <= 512:
         raise ValueError("native-tree CV bins are invalid")
+    if request["task"] != "binary":
+        return validation.validation_layout("regression", bins=bins)
     return _holdout_layout(request, {"holdout-validation-bins": bins})
 
 

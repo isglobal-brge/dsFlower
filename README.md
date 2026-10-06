@@ -823,3 +823,21 @@ verification scripts and integration harnesses remain available. A real
 federation is verified by a local multi-node integration harness. Use a private
 R library, private working/state directories and one harness session at a time;
 see the client [local integration instructions](https://github.com/isglobal-brge/dsFlowerClient/blob/main/tools/integration/README.md).
+
+### Running the tests locally
+
+The suites run from a source checkout (no hosted CI since 0.7.1). R, with the package and its dependencies installed:
+
+```sh
+R CMD INSTALL .
+Rscript -e 'testthat::test_dir("tests/testthat", package = "dsFlower", load_package = "installed")'
+```
+
+Python suites use the node runtimes (`$DSFLOWER_VENV_ROOT/pytorch` and, for the native tree/XGBoost files,
+`$DSFLOWER_VENV_ROOT/native-tree`). Run each file under `inst/python/tests/` with
+`"$DSFLOWER_VENV_ROOT/pytorch/bin/python" -m pytest inst/python/tests/<file>.py`; the few stand-alone script files are
+run directly with `python inst/python/tests/<file>.py` and report through their exit status. Tests that need a node
+secret use a throwaway one when `DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET=1`; tests that need optional components
+(dsImaging, the curated XGBoost bundle) skip when those are absent. From a dsFlowerClient checkout next to this one,
+`python3 tools/check-runner-sync.py --server ../dsFlower` must print that both runner copies are byte-identical. The
+retained XGBoost release verifier is `native/xgboost/tests/real_runner_e2e.py` (native-tree runtime, bundle configured).

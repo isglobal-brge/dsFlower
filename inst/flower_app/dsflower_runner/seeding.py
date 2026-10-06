@@ -886,6 +886,13 @@ def _validate_nested_request(value):
         elif task == "segmentation": keys |= {"max_pixels"}
         elif task not in ("regression", "count"):
             raise ValueError("invalid validation profile task")
+        if "version" in profile:
+            from . import validation
+            if (task not in ("regression", "count")
+                    or profile != validation.numeric_holdout_layout(task)
+                    or value["evaluation"]["layout_version"] != profile["version"]):
+                raise ValueError("invalid numeric holdout layout version")
+            keys.add("version")
         _exact(profile, keys, "validation profile")
     elif name == "association-vector":
         _exact(profile, ("cells", "contract", "order", "shape", "unit_semantics"), "association profile")
