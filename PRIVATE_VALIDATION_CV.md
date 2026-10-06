@@ -1,4 +1,4 @@
-# Private validation, holdout and cross-validation in 0.7.1
+# Private validation, holdout and cross-validation in 0.7.3
 
 `ds.flower.validate()` accepts a saved dsFlower model or a complete
 `client:<checkpoint-bundle>` supplied by the analyst. Validation returns only
@@ -199,7 +199,7 @@ The [design note](DESIGN_VALIDATION_CV.md) records the privacy reasoning and
 release identity. Synthetic tests establish implementation behavior, not model
 utility or live Opal/Armadillo deployment.
 
-## Content-based assignment and sensitivity in 0.7.1
+## Content-based assignment and sensitivity in 0.7.3
 
 The selected source-unit multiset is canonicalized before pooling, prediction or
 partitioning. Row tokens bind selected content and duplicate occurrence; patient
@@ -207,29 +207,212 @@ tokens retain canonical grouping IDs. Row shuffling, symbol aliases and run toke
 preserve assignments. A changed row can move to another fold; changing selected
 columns can change all row tokens. Model settings and holdout fraction do not
 redraw the score. Default neural starts are specification-seeded and all CV folds
-share the same initial model.
+share the same initial model. These 0.7.1 rules are unchanged.
 
-Holdout can gain or lose the changed unit, including in patient mode. Both empty
-and nonempty releases therefore select the existing absent-unit (zero-neighbour)
-bound, rather than only the replacement diameter. The calibration routine itself
-is unchanged. The bounds are:
+### Numeric holdout layout and exact sensitivity
 
-| Layout | Holdout L2 bound (row or patient) | Pooled OOF L2 bound |
+Version 0.7.3 introduces the explicit numeric holdout layout
+`validation-vector-v4`. It applies to row and patient holdout for bounded
+regression, gamma and count models, including native-tree regression. Normalize
+clipped targets and predictions to `y,p` in `[0,1]`, set `e = |y-p|`, and write
+
+```
+s = (e, e^2, y, y^2)                 regression/gamma/native-tree regression
+s = (e, e^2, y, y^2, deviance/cap)   count
+c = (1, s - 1/4)                    released contribution
+```
+
+The count deviance and its public cap are unchanged. The first coordinate
+remains one per privacy unit. The fixed offset `1/4` is part of the trusted
+layout, with no analyst setting. Each other coordinate now lies in
+`[-1/4, 3/4]`; this translates the original bounded domain and does not loosen
+any bound or change clipping. The zero contribution for a unit outside test, or
+an empty test subset, remains the all-zero vector: no offset is subtracted for
+an absent unit.
+
+Let `d` be the number of coordinates after the count: four for regression and
+five for count. For two present units,
+
+```
+||c(u) - c(v)||_2^2 = ||s(u) - s(v)||_2^2 <= d.
+```
+
+For one present unit versus an absent contribution,
+
+```
+||c(u) - 0||_2^2 <= 1 + d (3/4)^2.
+```
+
+Thus the required sensitivity is `max(sqrt(d), sqrt(1+9d/16)) = sqrt(d)`.
+These are exact uniform bounds for these implemented layouts, including the
+relationships between their coordinates, rather than just unattainable box
+corners. For regression, `(y,p)=(1,0)` has all four statistics equal to one;
+`(y,p)=(0,0)` has all four zero. This attains both the replacement diameter and
+the stated absent radius. For count, the admitted public target bounds `[1,10]`
+make the cap equal to the deviance at `(target,prediction)=(10,1)`. That record
+has all five normalized statistics equal to one, and `(1,1)` has all five zero.
+They attain both bounds. At some particular public count bounds, the coupling
+of deviance to error makes a smaller diameter possible; the fixed layout uses
+the tight bound uniform over all admitted public bounds, with no new
+bound-dependent privacy calibration.
+
+| Numeric holdout layout | 0.7.1 replacement diameter | 0.7.1 absent radius / calibration | 0.7.3 absent radius | 0.7.3 calibration |
+| --- | --- | --- | --- | --- |
+| Regression/gamma | `2` | `sqrt(5)` | `sqrt(13)/2` | `2` |
+| Native-tree regression | `2` | `sqrt(5)` | `sqrt(13)/2` | `2` |
+| Count | `sqrt(5)` | `sqrt(6)` | `sqrt(61)/4` | `sqrt(5)` |
+
+The replacement diameter is unchanged in 0.7.3. For a patient with multiple
+records, use its average bounded contribution. An average lies in the convex
+hull of the row contributions; neither its norm nor the diameter between two
+such averages exceeds the same bounds. Singleton patients attain the examples
+above. Therefore the change benefits patient holdout as well as row holdout;
+it never substitutes a row bound for an unbounded sum of patient records.
+
+### All neighbour cases under the content-based split
+
+Fix the public evaluation model, including any already-DP trained model. Match
+unchanged source units using the canonical multiset and duplicate-occurrence
+rules. Their assignment and contribution multiset is unchanged. Under one
+replacement of a complete privacy unit, write its old and new test indicators
+as `b,b'` in `{0,1}`. The change in the test sufficient vector is exactly
+`b*c(u) - b'*c(v)`:
+
+| Old/new membership | Change | Bound |
 | --- | --- | --- |
-| Binary | sqrt(2) | sqrt(2) |
-| Multiclass/ordinal, J classes | sqrt(2(J+1)) | sqrt(2(J+1)) |
-| Multilabel, L labels | sqrt(2L) | sqrt(2L) |
-| Regression/gamma | sqrt(5) | 2 |
-| Count | sqrt(6) | sqrt(5) |
-| Segmentation | 2 | sqrt(3) |
-| Survival, H horizons | sqrt(2+2H) | sqrt(2+2H) |
+| Test / test | `c(u)-c(v)` | replacement diameter `sqrt(d)` |
+| Train / train | `0` | zero |
+| Test / train | `c(u)` | absent radius `sqrt(1+9d/16)` |
+| Train / test | `-c(v)` | absent radius `sqrt(1+9d/16)` |
+| Present test contribution / absent, including an empty test subset | `+/-c(u)` | same absent radius |
 
-Condition on the already-DP public fold models. A pooled OOF replacement changes
-one contribution from `c(u,M_a)` to `c(v,M_b)`, even if the fold changes. Both lie
-in the same bounded contribution set; patient means lie in its convex hull.
-The replacement diameter remains valid, so OOF explicitly keeps the existing
-bound with no factor of two or K and no per-fold metric release. Raw fold vectors
-are accumulated in fold order and the ordered public model hashes are bound.
+A move across the split is one deletion from or one insertion into the test
+sum, not two test contributions. A replacement within train can change the
+trained model, but training already has its own unchanged DP mechanism and
+budget. Evaluation has the stated bound for every fixed model, so its
+sensitivity argument applies in the existing adaptive composition with
+training. This does not condition away or omit the training charge. The
+absent-contribution bound covers internal changes of test membership; it does
+not expand the global fixed-census replacement contract to an unaccounted
+add/remove contract.
+
+Both empty and nonempty holdout paths keep
+`include_zero_neighbor=True`. The Gaussian calibration function takes the
+maximum of replacement and absent bounds; the accountant, epsilon/delta policy,
+training/metric budget split and number of releases are unchanged.
+
+### Exact recovery and the choice of offset
+
+The node releases one vector `Z = sum(c) + Gaussian(0, sigma^2 I)`. For each
+statistic the researcher recovers
+
+```
+N_hat = Z[0]
+S_hat[j] = Z[j] + (1/4) * Z[0]
+```
+
+using the signed released count before any projection or clamping. Without
+noise this is the exact original sufficient vector, including patient-average
+statistics. With noise it is an unbiased estimate of that original vector:
+`E[N_hat]=N` and `E[S_hat[j]]=S[j]`. Only these reconstructed sufficient
+statistics feed the existing metric formulas and feasible-domain projection.
+No exact count or second private release is used. The metrics retain the same
+noiseless meaning. Ratios, clipping, square roots and R-squared were already
+nonlinear post-processing and are not in general unbiased estimators; the
+layout conversion adds no deterministic bias and does not claim otherwise.
+
+This choice accounts for the noise added back with the released count. If the
+common Gaussian multiplier supplied by the unchanged accountant is `k`, then
+`sigma = k * sensitivity`. Recovery gives
+`Var(S_hat[j]) = sigma^2 * (1 + a^2)` for offset `a`, with covariance
+`a^2 sigma^2` between different reconstructed sums and covariance `a sigma^2`
+with the count. Pooling independent node releases preserves these statements
+with their variances summed.
+
+| Layout | 0.7.1 released coordinate variance / `k^2` | 0.7.3 released coordinate variance / `k^2` | 0.7.3 recovered sum variance / `k^2` |
+| --- | --- | --- | --- |
+| Regression/gamma/native-tree regression | `5` | `4` | `17/4 = 4.25` |
+| Count | `6` | `5` | `85/16 = 5.3125` |
+
+The Gaussian standard deviation therefore returns to the pre-0.7.1 level,
+while the marginal variance of each reconstructed sufficient sum also improves
+on 0.7.1. These marginal statements are not a universal error guarantee for
+every nonlinear metric or every linear combination of the correlated recovered
+statistics.
+
+Alternatives considered:
+
+- **Midpoint centering (`a=1/2`).** This is private, with exact absent radii
+  `sqrt(2)` and `3/2`, and the same calibrated sensitivities `2` and `sqrt(5)`.
+  But recovered sum variances become `5 k^2` for regression and `6.25 k^2` for
+  count: no regression improvement on 0.7.1 and a count regression. The quarter
+  offset already makes replacement dominate, with less reconstruction noise.
+- **Smallest uniform offset.** The coordinate-bound calculation needs
+  `a >= 1 - sqrt(1-1/d)`, approximately `0.133975` for regression and `0.105573`
+  for count. These boundary choices, or smaller safe rational choices than a
+  quarter, further reduce recovery covariance. The fixed dyadic quarter is
+  chosen for simple exact representation, a strict margin below the replacement
+  bound, and one clear contract across all affected holdouts. It is not claimed
+  to optimize metric utility.
+- **Keep the unshifted vector and lower sigma.** Unsafe: the endpoint witnesses
+  above attain the larger absent radii when a unit enters or leaves test.
+- **Position-based or repeatedly resampled splits.** This would lose the
+  required row-order invariance or create fresh releases through nuisance
+  inputs. Stable extra row identifiers would require a new trusted input
+  contract. Neither is necessary for this fix.
+- **Padding, a separate count release or a different Gaussian covariance.**
+  These require a different sufficient-vector or noise mechanism and a separate
+  joint analysis. The reversible fixed translation obtains the requested
+  sensitivity with the existing isotropic Gaussian calibration and one release.
+
+### Layout compatibility, validation and pooled OOF
+
+Only the new numeric holdout layout carries `validation-vector-v4`. An old
+unversioned layout retains its unshifted meaning and original absent bound;
+unknown versions are rejected. The discriminator is included in the existing
+canonical layout and public release request identity, separating legacy and v4
+releases, including their persistent neighbourhood anchors. The request identity
+remains `private-validation-vector/v3`; it already binds the effective layout.
+Bare wire vectors and ephemeral cached replies do not carry a layout discriminator:
+the same five- or six-element geometry alone cannot prevent an old vector from
+being decoded with v4 semantics. Ordinary cross-version execution is prevented by
+exact runner hash admission, staging pins and the import guard, together with
+normal staging/state cleanup. Importing or migrating raw vectors or ephemeral
+caches would require an envelope that includes and verifies the layout version;
+these representations are not self-describing. The content binding, sticky replay,
+row-order invariance and FedProx contracts are unchanged. A layout version is a
+fixed implementation contract, never a new analyst-controlled privacy input.
+
+Standalone validation and pooled OOF retain their original numeric layouts.
+They already use the replacement diameter at fixed unit count, so shifting
+would not reduce their Gaussian scale and would add count noise during
+recovery. Condition on the already-DP public fold models. A pooled OOF
+replacement changes one contribution from `c(u,M_a)` to `c(v,M_b)`, even if the
+fold changes. Both lie in the same bounded contribution set; patient means lie
+in its convex hull. Every source unit contributes once to the pooled OOF sum.
+The replacement diameter remains valid with no factor of two or K and no
+per-fold metric release. Raw fold vectors are accumulated in fold order and
+the ordered public model hashes are bound.
+
+Other layouts retain their complete existing representation and bounds:
+
+| Layout | Replacement bound | Absent bound | Holdout calibration | Validation / pooled OOF calibration |
+| --- | --- | --- | --- | --- |
+| Binary | `sqrt(2)` | `1` | `sqrt(2)` | `sqrt(2)` |
+| Multiclass/ordinal, J classes | `sqrt(2(J+1))` | `sqrt(J+1)` | `sqrt(2(J+1))` | `sqrt(2(J+1))` |
+| Multilabel, L labels | `sqrt(2L)` | `sqrt(L)` | `sqrt(2L)` | `sqrt(2L)` |
+| Segmentation | `sqrt(3)` | `2` | `2` | `sqrt(3)` |
+| Survival, H horizons | `sqrt(2+2H)` | `sqrt(2+2H)` | `sqrt(2+2H)` | `sqrt(2+2H)` |
+| Legacy regression/gamma/native-tree regression | `2` | `sqrt(5)` | `sqrt(5)` | `2` |
+| Legacy count | `sqrt(5)` | `sqrt(6)` | `sqrt(6)` | `sqrt(5)` |
+
+For histogram layouts, each unit contributes one unit of mass per histogram
+family, so the existing absent radius is already below the replacement bound.
+Survival includes an actual zero contribution for an invalid record; the
+existing bound covers that case already. A shifted segmentation holdout could
+also reduce its bound, but it would change a separate patient-mask metric
+contract outside the numeric noise regression addressed here. No improvement
+is assumed for those untouched layouts, and no bound is loosened.
 
 The changed unit participates in all K training comparisons: two complements
 can gain/lose it and the others replace it. Training still receives
