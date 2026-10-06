@@ -375,10 +375,16 @@ test_that("exact exported imaging frames and Arrow tables retain patient admissi
   }
   changed <- raw
   changed$radiomics_mean[[1L]] <- changed$radiomics_mean[[1L]] + 1
-  for (candidate in list(raw[-1L, ], changed)) {
-    assign("bad", candidate, env)
-    expect_error(evalq(flowerInitDS("bad"), env),
-                 "only an unchanged admitted export")
+  for (variant in list(raw[4:1, ], raw[-1L, ], changed)) {
+    parquet <- tempfile(fileext = ".parquet")
+    arrow::write_parquet(variant, parquet)
+    for (candidate in list(variant, arrow::Table$create(variant),
+                            arrow::RecordBatch$create(variant),
+                            arrow::read_parquet(parquet, as_data_frame = FALSE))) {
+      assign("bad", candidate, env)
+      expect_error(evalq(flowerInitDS("bad"), env),
+                   "only an unchanged admitted export")
+    }
   }
   # Copying attributes or copying data to another session does not grant a view.
   other <- new.env(parent = globalenv())

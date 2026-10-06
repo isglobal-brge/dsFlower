@@ -204,10 +204,13 @@ assembly and excludes the opposite side from training and metric contributions.
 A complete radiomics data frame or Arrow table retrieved through dsImaging can
 be passed to `ds.flower.fit()` by its session symbol, including an unchanged
 Parquet round trip. This requires the coordinated dsImaging companion that
-registers exports against its private admitted patient roster. Row permutations
-preserve that authority; changed values, subsets, duplicate/missing sample keys,
-unregistered generic dsHPC tables and revoked sources fail closed. Patient
+registers exports against its private admitted patient roster. Admission requires
+the original export row order; reordered copies, changed values, subsets,
+duplicate/missing sample keys, unregistered generic dsHPC tables and revoked
+sources fail closed. Patient
 identity comes from the protected roster, never from caller-added attributes.
+dsFlower canonicalizes privacy units after admission for row-order-independent
+training.
 The companion prerequisite also applies when the public container has no
 patient-ID column.
 
