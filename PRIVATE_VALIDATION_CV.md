@@ -240,16 +240,83 @@ training sensitivities already cover an absent unit and are unchanged. Complete
 parent source/assignment bindings are checked across phases; a mid-job change
 fails closed.
 
-## Equality-transcript limitation
+## Neighbourhood replay and transcript limitation
 
-The calibrated mechanism and its accountant cover the stated release/training
-and declared privacy unit. Replaying one fixed artifact is post-processing.
-These facts do not by themselves prove privacy for a transcript that lets the
-analyst compare whether related private inputs map to the same sticky artifact.
-In particular, a content-keyed equality pattern can be data dependent even when
-each isolated release has the intended marginal noise distribution; ordinary
-composition requires conditional validity. Fixed-count replacement of one
-privacy unit remains the neural contract, and a change in node census has a
-separate adjacency issue. Small-subset controls and exact dimension releases
-have their own DataSHIELD contracts. The equality residual is documented rather
-than described as solved by those controls.
+Version 0.7.2 mitigates the equality oracle described in
+[isglobal-brge/dsFlower#7](https://github.com/isglobal-brge/dsFlower/issues/7)
+with immutable neighbourhood anchors. For each public request R (including its
+incoming model and round), the node scans **all** retained anchors and returns
+the complete stored payload of the **oldest** anchor at distance `d < k`. If none
+is eligible, it computes the unchanged v3 content-bound release and appends one
+new anchor. Near inputs never become anchors. Newer anchors cannot displace an
+older eligible anchor, so replay is stable without per-input bindings.
+
+Distance counts unordered canonical privacy units with multiplicity:
+`d = max(|M| - c, |N| - c)`, where `c = sum(min(M[t], N[t]))`. One insertion,
+deletion or replacement counts once; in patient mode a patient's complete
+selected records form one unit. The default `k` is the node's `nfilter.subset`
+(or its `default.` option), otherwise 3, with a floor of 2. Custodians can set
+`dsflower.neighbourhood_k` (or `default.dsflower.neighbourhood_k`); the effective
+value is frozen per R. Analysts cannot change it or force refresh.
+
+An analyst can no longer test a one-unit difference against an existing release
+by obtaining a fresh answer inside that anchor's neighbourhood. This is a
+**mitigation, not transcript DP**: the hard `k-1`/`k` boundary and boundaries
+between anchors still distinguish some one-unit neighbours. An input must be
+at least k from **every** anchor to receive a fresh release. Small updates can
+therefore return stale models or statistics; uncertainty intervals do not
+include this staleness. No hit/near/fresh status, distance or anchor identifier is
+returned. Timing and availability remain outside the guarantee.
+
+The rule covers every neural DP-SGD round, gated Hook release, all five native
+tree engines, private validation, holdout, CV fold training and OOF output, and
+association. Each round/fold/evaluation has its own R. Completed federation
+trajectories replay when the same incoming public models and eligible anchor
+choices recur; this is not a universal neighbouring-world transcript claim.
+Calibration, sensitivities, accounting, FedProx and the fresh R/B/K identity
+remain unchanged. Conditional DP mechanisms compose under their existing
+assumptions; no lifetime privacy budget is introduced.
+
+Holdout and CV anchors use complete canonical parent source units, not only the
+current fold's records or reduced validation vector. Training folds and the final
+OOF release have separate public R values; the final R includes the ordered
+public fold-model contents. Every hit still performs current-job admission and
+source-integrity checks. Private fold accumulation is not an extra release, and
+OOF replay still completes/purges that job's accumulator. An anchored training
+model and separately anchored validation result need not describe one coherent
+current-data snapshot. Original fixed-count adjacency, absent-unit holdout
+sensitivity, CV replacement bounds and privacy allocations remain unchanged.
+
+The permanent node-local store defaults to `<node-secret-path>.neighbourhood`.
+First release initializes it automatically and pins its random UUID at
+`<node-secret-path>.neighbourhood-id`, beside the secret rather than inside the
+store. The store uses owner-only directories/files (`0700`/`0600`), keyed unit
+fingerprints, MAC-authenticated records and complete payload bytes; it never
+stores raw source records or noise seeds. Records are verified before decoding,
+and a per-R lock serializes selection and durable anchor commit before release.
+There is no eviction, expiry or per-attempt ticket.
+
+The default limits are 256 anchors per R and 64 GiB of store capacity. Fresh
+commits must fit both logical retained bytes (payloads, fingerprints and record
+overhead) and SQLite allocated pages plus fixed state headroom. Provision extra
+physical disk space for transient SQLite journals and filesystem allocation slack. Only an
+input that would create a new anchor is refused at a limit, with one stable
+error; exact and near replays remain available. A refusal substitutes for a
+fresh release and reveals the same fact that the input is far from every anchor.
+The shared byte cap also exposes a weak cross-user aggregate signal about prior
+store growth. These resource settings are not privacy parameters. Increase
+capacity with all retained state intact; never delete anchors to make space.
+
+Missing or corrupt established state, missing original keys, unsafe permissions
+or a mismatched UUID fail closed. The permanent
+`<node-secret-path>.neighbourhood-id.lock` also detects loss of both the store
+and local UUID pin. Optional `dsflower.neighbourhood_store_id` externally pins
+the UUID and detects loss of all local store markers; without it, losing the
+store, UUID pin and initialization lock together can resemble first use. Stop
+all workers before restoring a consistent backup of the secret, store, UUID pin,
+permanent locks and retained Hook cache. MACs do not detect rollback to an older
+complete valid snapshot: avoiding rollback remains a custodian/storage assumption.
+Runtime upgrades create new public request domains, so drain jobs and upgrade
+both packages together; retain old state and treat new domains as additional
+releases. Existing per-release DP does not prove the private anchor-selection
+transcript DP.

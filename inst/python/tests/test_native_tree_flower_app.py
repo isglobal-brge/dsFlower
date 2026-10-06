@@ -264,6 +264,21 @@ def _request_message(node_id, request_b64, request_sha256, holdout=None):
     }), message_type="train", dst_node_id=node_id)
 
 
+def _node_train(message, context):
+    # The fake federation shares a Python process, but each logical node must
+    # retain its own key/store domain just as the deployed SuperNodes do.
+    node_dir = os.path.join(os.path.dirname(os.environ["DSFLOWER_NODE_SECRET_FILE"]),
+                            "simulated-node-%s" % message.metadata.dst_node_id)
+    os.makedirs(node_dir, mode=0o700, exist_ok=True)
+    secret = os.path.join(node_dir, "node-secret")
+    if not os.path.exists(secret):
+        fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(seeding._node_secret().hex())
+    with mock.patch.dict(os.environ, {"DSFLOWER_NODE_SECRET_FILE": secret}):
+        return client_app.train(message, context)
+
+
 def _release_reply(request, artifact, available=1):
     return Message(content=RecordDict({
         "arrays": ArrayRecord(numpy_ndarrays=[
@@ -456,7 +471,7 @@ class NativeTreeClientTests(unittest.TestCase):
                                 wraps=original_frame_read) as frame_read,
               mock.patch.object(client_app.xgboost_adapter,
                                 "prepare_xgboost_training",
-                                return_value=object()) as prepare,
+                                wraps=client_app.xgboost_adapter.prepare_xgboost_training) as prepare,
               mock.patch.object(client_app.xgboost_adapter,
                                 "train_xgboost_native",
                                 return_value=_native_artifact()) as native,
@@ -519,7 +534,7 @@ class NativeTreeClientTests(unittest.TestCase):
                                 wraps=original_load) as load,
               mock.patch.object(client_app.xgboost_adapter,
                                 "prepare_xgboost_training",
-                                return_value=object()),
+                                wraps=client_app.xgboost_adapter.prepare_xgboost_training),
               mock.patch.object(client_app.xgboost_adapter,
                                 "train_xgboost_native",
                                 return_value=_native_artifact())):
@@ -652,7 +667,7 @@ class NativeTreeClientTests(unittest.TestCase):
                   return_value=assigned),
               mock.patch.object(client_app.xgboost_adapter,
                                 "prepare_xgboost_training",
-                                return_value=object()),
+                                wraps=client_app.xgboost_adapter.prepare_xgboost_training),
               mock.patch.object(client_app.xgboost_adapter,
                                 "train_xgboost_native",
                                 return_value=_native_artifact())):
@@ -769,7 +784,7 @@ class _EndToEndGrid:
 
     def send_and_receive(self, messages, timeout):
         self.send_calls += 1
-        return [client_app.train(message, self.context) for message in messages]
+        return [_node_train(message, self.context) for message in messages]
 
 
 class _HoldoutGrid:
@@ -783,7 +798,7 @@ class _HoldoutGrid:
 
     def send_and_receive(self, messages, timeout):
         self.send_calls += 1
-        return [client_app.train(
+        return [_node_train(
             message, self.contexts[message.metadata.dst_node_id])
             for message in messages]
 
@@ -881,7 +896,7 @@ class NativeTreeServerTests(unittest.TestCase):
                                     wraps=original_load) as load,
                   mock.patch.object(client_app.xgboost_adapter,
                                     "prepare_xgboost_training",
-                                    return_value=object()) as prepare,
+                                    wraps=client_app.xgboost_adapter.prepare_xgboost_training) as prepare,
                   mock.patch.object(client_app.xgboost_adapter,
                                     "train_xgboost_native",
                                     return_value=_native_artifact()),
@@ -1118,7 +1133,7 @@ class NativeTreeServerTests(unittest.TestCase):
                                     wraps=original_load) as load,
                   mock.patch.object(client_app.xgboost_adapter,
                                     "prepare_xgboost_training",
-                                    return_value=object()) as prepare,
+                                    wraps=client_app.xgboost_adapter.prepare_xgboost_training) as prepare,
                   mock.patch.object(client_app.xgboost_adapter,
                                     "train_xgboost_native",
                                     return_value=_native_artifact()) as native):
@@ -1209,7 +1224,7 @@ class NativeTreeServerTests(unittest.TestCase):
                                     wraps=original_load) as load,
                   mock.patch.object(client_app.xgboost_adapter,
                                     "prepare_xgboost_training",
-                                    return_value=object()) as prepare,
+                                    wraps=client_app.xgboost_adapter.prepare_xgboost_training) as prepare,
                   mock.patch.object(client_app.xgboost_adapter,
                                     "train_xgboost_native",
                                     return_value=_native_artifact()),

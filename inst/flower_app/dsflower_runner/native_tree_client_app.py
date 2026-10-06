@@ -466,6 +466,8 @@ def _cache_vector(context, claim, vector):
 
 
 def _replay_vector(context, claim, msg, layout):
+    from . import neighbourhood
+    neighbourhood.NeighbourhoodStore.from_env().verify()
     arrays = _holdout_state(context).get(_REPLY_CACHE)
     if not isinstance(arrays, ArrayRecord):
         raise RuntimeError("native-tree holdout replay state is incomplete")
@@ -635,6 +637,9 @@ def _cache_cv_reply(context, claim, value):
 
 
 def _replay_cv_reply(context, claim, msg):
+    if claim["operation"] in ("cv-train", "cv-release"):
+        from . import neighbourhood
+        neighbourhood.NeighbourhoodStore.from_env().verify()
     state = _holdout_state(context)
     meta = state.get(_REPLY_CACHE_META)
     arrays = state.get(_REPLY_CACHE)
@@ -673,6 +678,7 @@ def _parent_source_binding(context, units, unit_ids, *, cv=False):
             assignment_tokens=units.row_tokens))
     digest = hashlib.sha256(np.ascontiguousarray(assignment, dtype="<i8").tobytes()).hexdigest()
     record = {"units-sha256": units.multiset_digest,
+              "unit-records": list(units.records),
               "assignment-sha256": digest,
               "n-staged-rows": len(units.row_tokens),
               "n-privacy-units": len(units.records)}
@@ -842,13 +848,16 @@ def _cross_validation_release(msg, context, request, privacy, claim):
         operation="cv-oof-release", fold_model_sha256=model_hashes)
     raw = _complete_cv_total(context, request, layout)
     parent = _holdout_state(context)["dsflower-native-parent-binding-v3"]
-    units = SimpleNamespace(multiset_digest=parent["units-sha256"])
-    released, _sigma = validation.private_sufficient_vector(
-        raw, layout, epsilon=privacy["epsilon"], delta=privacy["delta"],
-        num_releases=1, include_zero_neighbor=False,
-        request_selection=selection, request_identity=identity, source_units=units,
-        subset={"role": "oof", "assignment_sha256": parent["assignment-sha256"]})
-    _forget_cv_state(context)
+    units = SimpleNamespace(multiset_digest=parent["units-sha256"],
+                            records=tuple(parent["unit-records"]))
+    try:
+        released, _sigma = validation.private_sufficient_vector(
+            raw, layout, epsilon=privacy["epsilon"], delta=privacy["delta"],
+            num_releases=1, include_zero_neighbor=False,
+            request_selection=selection, request_identity=identity, source_units=units,
+            subset={"role": "oof", "assignment_sha256": parent["assignment-sha256"]})
+    finally:
+        _forget_cv_state(context)
     _cache_cv_reply(context, claim, released)
     return _vector_reply(msg, released)
 
@@ -917,20 +926,11 @@ def train(msg: Message, context: Context) -> Message:
             subset = {"role": "train", "assignment_sha256": digest}
             features, target, unit_ids = _cv_partition(
                 context, features, target, unit_ids, fold=int(claim["fold"]), test=False)
-        if engine == "xgboost":
-            # Preserve the verified native-bundle path byte-for-byte in scope.
-            prepared = xgboost_adapter.prepare_xgboost_training(
-                manifest, features, target, native_bundle=_NATIVE_BUNDLE,
-                unit_ids=unit_ids, request_selection=selection,
-                request_identity=identity, source_units=units, subset=subset)
-            native_artifact = xgboost_adapter.train_xgboost_native(prepared)
-            artifact, _digest = xgboost_adapter.sanitize_xgboost_artifact(
-                manifest, native_artifact)
-        else:
-            artifact = native_tree_engine.train_model(
-                manifest, features, target, unit_ids=unit_ids,
-                request_selection=selection, request_identity=identity,
-                source_units=units, subset=subset)
+        artifact = native_tree_engine.train_model(
+            manifest, features, target, unit_ids=unit_ids,
+            xgboost_bundle=_NATIVE_BUNDLE if engine == "xgboost" else None,
+            request_selection=selection, request_identity=identity,
+            source_units=units, subset=subset)
         if node_manifest.get("resampling-contract-sha256") is not None:
             _mark_training_complete(
                 context, request, node_manifest, artifact)

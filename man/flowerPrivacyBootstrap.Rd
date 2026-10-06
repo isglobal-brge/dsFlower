@@ -10,8 +10,9 @@ flowerPrivacyBootstrap()
 Invisibly, an operational status with `ok` and `key_action`.
 }
 \description{
-Creates or validates only the per-node CSPRNG root. No database, query log,
-counter or model cache is created. Package installation and loading
+Creates or validates the per-node CSPRNG root. The trusted runner initializes
+its permanent neighbourhood store and local UUID pin on first release. An
+established store with a missing root fails closed. Package installation and loading
 deliberately never call this function, so reusable images cannot inherit a
 node identity.
 }

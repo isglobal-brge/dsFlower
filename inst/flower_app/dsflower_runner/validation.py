@@ -1151,7 +1151,7 @@ def private_sufficient_vector(raw, layout, *, epsilon, delta,
                               request_identity=None, data_binding=None,
                               source_units=None, subset=None):
     """Release a fixed vector only with its complete selected source binding."""
-    from . import dp_harness, seeding
+    from . import dp_harness, neighbourhood, seeding
     effective = _effective_validation_layout(layout)
     raw = _canonical_sufficient_vector(raw, effective)
     sensitivity = _validation_release_sensitivity(effective, include_zero_neighbor=include_zero_neighbor)
@@ -1162,13 +1162,17 @@ def private_sufficient_vector(raw, layout, *, epsilon, delta,
     if data_binding is None:
         data_binding = seeding.bind_private_data(request_identity, source_units,
             effective_tensors=(raw,), geometry={"output_sigma": float(sigma), "vector_size": int(raw.size)}, subset=subset)
-    rng = seeding.np_rng(_validation_noise_key(raw, effective, sigma,
-        request_identity=request_identity, data_binding=data_binding))
-    noise = np.asarray(rng.normal(0.0, sigma, size=raw.shape), dtype=np.float64)
-    released = raw + noise
-    if released.shape != raw.shape or not bool(np.all(np.isfinite(released))):
-        raise RuntimeError("private validation release is non-finite")
-    return released, float(sigma)
+    with neighbourhood.release(request_identity, source_units) as slot:
+        if slot.cached is not None:
+            return slot.cached
+        rng = seeding.np_rng(_validation_noise_key(raw, effective, sigma,
+            request_identity=request_identity, data_binding=data_binding))
+        noise = np.asarray(rng.normal(0.0, sigma, size=raw.shape), dtype=np.float64)
+        released = raw + noise
+        if released.shape != raw.shape or not bool(np.all(np.isfinite(released))):
+            raise RuntimeError("private validation release is non-finite")
+        slot.commit(data_binding, (released, float(sigma)))
+        return slot.cached
 
 
 def private_validation_vector(y, predictions, layout, *, epsilon, delta,

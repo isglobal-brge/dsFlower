@@ -251,7 +251,7 @@ def test_first_release_and_retry_encode_identically_for_fortran_arrays(run):
 
 
 @pytest.mark.parametrize("change", ["selection", "data"])
-def test_changed_identity_rejects_committed_coordinate_and_misses_in_new_run(run, change):
+def test_changed_identity_rejects_committed_coordinate_and_resolves_new_run(run, change):
     root, directory = run
     context = _context(directory)
     first = _request(root, directory, context=context)
@@ -268,8 +268,14 @@ def test_changed_identity_rejects_committed_coordinate_and_misses_in_new_run(run
     changed_run = _setup_run(root, "b", **kwargs)
     changed = _request(root, changed_run)
     assert changed[1] == first[1]
-    assert changed[2] == 1
-    assert changed[0] != first[0]
+    if change == "selection":
+        assert changed[2] == 1
+        assert changed[0] != first[0]
+    else:
+        # The same one-unit edit still fails the old job's mutation guard,
+        # but a newly admitted job now returns the existing anchor's bytes.
+        assert changed[2] == 0
+        assert changed[0] == first[0]
 
 
 @pytest.mark.parametrize("same_run", [True, False])
@@ -298,18 +304,19 @@ def test_noised_zero_outcome_is_durably_replayed(tmp_path, body):
     assert np.any(np.load(io.BytesIO(first[0][0][2]), allow_pickle=False))
 
 
-def test_capacity_rejection_precedes_private_data_and_hook(run):
+def test_capacity_rejection_follows_anchor_decision_but_precedes_hook(run):
     root, directory = run
     context = _context(directory)
     environment = _env(root, directory)
     environment["DSFLOWER_RELEASE_CACHE_BYTES"] = "4096"
     with (mock.patch.dict(os.environ, environment),
           mock.patch.object(tier2_lib, "hook_execution_caps", return_value=CAPS),
-          mock.patch.object(client_app, "load_data") as load,
+          mock.patch.object(client_app, "load_data", wraps=client_app.load_data) as load,
+          mock.patch.object(tier2_lib, "pad_hook_release"),
           mock.patch.object(tier2_lib, "gated_local_update") as hook):
         reply = client_app.train(_message(), context)
-    assert reply.content["metrics"].get("public-preflight-unavailable") == 1
-    load.assert_not_called()
+    assert reply.content["metrics"].get("execution-unavailable") == 1
+    load.assert_called_once()
     hook.assert_not_called()
 
 
@@ -331,7 +338,8 @@ def test_disabled_hook_retries_remain_public_without_cache_or_private_work(run):
 
 
 @pytest.mark.parametrize("key", ["release-cache-dir", "release_cache_bytes", "releaseCacheSize",
-                                 "deadline", "gatedDeadline"])
+                                 "deadline", "gatedDeadline", "neighbourhood_k",
+                                 "neighbourhood-max-anchors", "neighbourhoodStoreBytes"])
 def test_cache_controls_rejected_in_flower_config_manifest_and_nested_params(run, key):
     _, directory = run
     context = _context(directory)
@@ -353,3 +361,68 @@ def test_cache_controls_rejected_in_flower_config_manifest_and_nested_params(run
         tier2_lib._sanitize_cfg({"app_params": {"nested": {key: "analyst"}},
                                  "round_index": 1, "num_rounds": 2,
                                  "task": "classification", "num_classes": 2})
+
+
+@pytest.mark.parametrize('sample_aggregate', [False, True])
+def test_neighbourhood_hook_full_payload_near_far_and_near_coordinate_guard(run, sample_aggregate):
+    root, directory = run
+
+    def dataset(token, n, shift=0):
+        path = _setup_run(root, token)
+        values = [(float(i + shift), i % 2) for i in range(n)]
+        (path / 'data.csv').write_text('x,x_alias,y\n' + ''.join(
+            '%s,%s,%s\n' % (x, x, y) for x, y in values))
+        source = path / 'source-projection.jsonl'
+        header = json.loads(source.read_text().splitlines()[0])
+        rows = [{'values': [{'type': 'number', 'value': str(x)},
+                            {'type': 'number', 'value': str(y)}], 'patient_id': None}
+                for x, y in values]
+        source.write_text('\n'.join(json.dumps(item) for item in [header, *rows]) + '\n')
+        manifest_path = path / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(n_samples=n, n_units=n,
+                        source_projection_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                        source_effective_sha256=hashlib.sha256((path / 'data.csv').read_bytes()).hexdigest())
+        manifest['privacy-sample_aggregate'] = int(sample_aggregate)
+        manifest_path.write_text(json.dumps(manifest))
+        return path
+
+    with mock.patch.object(tier2_lib, 'gated_local_update', side_effect=[
+            [np.arange(8, dtype=np.float32)], [np.arange(8, dtype=np.float32) + 4]]) as gate:
+        first = _request(root, dataset('a', 8))
+        near_path = dataset('b', 7)
+        near = _request(root, near_path)
+        assert near[:2] == first[:2]
+        assert _request(root, dataset('c', 6))[:2] == first[:2]
+        assert gate.call_count == 1
+        # Even a coordinate first answered through the outer store retains
+        # the prior Hook mutation guard; near replay creates no Hook entry.
+        dataset('b', 7, shift=1)
+        rejected = _request(root, near_path)
+        assert rejected[1].get('execution-unavailable') == 1
+        assert gate.call_count == 1
+        far = _request(root, dataset('d', 5))
+        assert far[1] == first[1]
+        assert far[0] != first[0]
+        assert gate.call_count == 2
+        assert _request(root, dataset('e', 7))[:2] == first[:2]
+        assert gate.call_count == 2
+
+
+def test_hook_capacity_never_charges_exact_or_near_anchors(run):
+    root, directory = run
+    first = _request(root, directory)
+    for token, data in [('b', 1.0), ('c', 3.0)]:
+        other = _setup_run(root, token, data=data)
+        environment = _env(root, other)
+        environment['DSFLOWER_RELEASE_CACHE_BYTES'] = '1'
+        with (mock.patch.dict(os.environ, environment),
+              mock.patch.object(tier2_lib, 'hook_execution_caps', return_value=CAPS),
+              mock.patch.object(tier2_lib, 'pad_hook_release'),
+              mock.patch.object(tier2_lib, 'gated_local_update') as hook,
+              mock.patch.object(release_cache.ReleaseCache, 'reserve_run',
+                                side_effect=AssertionError('replay must not reserve'))):
+            reply = client_app.train(_message(), _context(other))
+        actual = [(a.dtype, tuple(a.shape), a.data) for a in reply.content['arrays'].values()]
+        assert (actual, dict(reply.content['metrics'])) == first[:2]
+        hook.assert_not_called()

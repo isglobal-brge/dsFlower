@@ -115,48 +115,60 @@ def canonical_profile(manifest):
 def train_model(manifest, features, target, *, unit_ids=None,
                 xgboost_bundle=None, request_selection=None, request_identity=None,
                 source_units=None, subset=None):
-    """Train once and return only a re-sanitized model projection."""
+    """Replay a complete anchor or train and commit one sanitized artifact."""
+    from . import neighbourhood, tree_release
     engine = manifest.get("engine") if isinstance(manifest, dict) else None
+    features, target, unit_ids, units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
+    units = units if source_units is None else source_units
+    common = {"unit_ids": unit_ids, "request_selection": request_selection,
+              "request_identity": request_identity, "source_units": units,
+              "subset": subset}
+    # Complete each adapter's validation/materialization before lookup; none of
+    # these preparers draws private noise. All adaptive stages form one anchor.
     if engine == "xgboost":
         from . import xgboost_adapter
-        prepared = xgboost_adapter.prepare_xgboost_training(
-            manifest, features, target, native_bundle=xgboost_bundle,
-            unit_ids=unit_ids, request_selection=request_selection,
-            request_identity=request_identity, source_units=source_units, subset=subset)
-        artifact = xgboost_adapter.train_xgboost_native(prepared)
-        return xgboost_adapter.sanitize_xgboost_artifact(
-            manifest, artifact)[0]
-    if engine == "extra_trees":
+        adapter = xgboost_adapter
+        prepared = adapter.prepare_xgboost_training(
+            manifest, features, target, native_bundle=xgboost_bundle, **common)
+        train = lambda: adapter.train_xgboost_native(prepared)
+        sanitize = adapter.sanitize_xgboost_artifact
+    elif engine == "extra_trees":
         from . import forest_adapter
-        prepared = forest_adapter.prepare_extra_trees_training(
-            manifest, features, target, unit_ids=unit_ids,
-            request_selection=request_selection, request_identity=request_identity,
-            source_units=source_units, subset=subset)
-        artifact = forest_adapter.train_extra_trees(
+        adapter = forest_adapter
+        prepared = adapter.prepare_extra_trees_training(
+            manifest, features, target, **common)
+        train = lambda: adapter.train_extra_trees(
             prepared, request_selection=request_selection)
-        return forest_adapter.sanitize_extra_trees_artifact(
-            manifest, artifact)[0]
-    if engine == "random_forest":
+        sanitize = adapter.sanitize_extra_trees_artifact
+    elif engine == "random_forest":
         from . import random_forest_adapter
-        prepared = random_forest_adapter.prepare_random_forest_training(
-            manifest, features, target, unit_ids=unit_ids,
-            request_selection=request_selection, request_identity=request_identity,
-            source_units=source_units, subset=subset)
-        artifact = random_forest_adapter.train_random_forest(
+        adapter = random_forest_adapter
+        prepared = adapter.prepare_random_forest_training(
+            manifest, features, target, **common)
+        train = lambda: adapter.train_random_forest(
             prepared, request_selection=request_selection)
-        return random_forest_adapter.sanitize_random_forest_artifact(
-            manifest, artifact)[0]
-    if engine in ("lightgbm", "catboost"):
+        sanitize = adapter.sanitize_random_forest_artifact
+    elif engine in ("lightgbm", "catboost"):
         from . import boosting_adapter
-        prepared = boosting_adapter.prepare_boosting_training(
-            manifest, features, target, unit_ids=unit_ids,
-            request_selection=request_selection, request_identity=request_identity,
-            source_units=source_units, subset=subset)
-        artifact = boosting_adapter.train_boosting(
+        adapter = boosting_adapter
+        prepared = adapter.prepare_boosting_training(
+            manifest, features, target, **common)
+        train = lambda: adapter.train_boosting(
             prepared, request_selection=request_selection)
-        return boosting_adapter.sanitize_boosting_artifact(
-            manifest, artifact)[0]
-    raise ValueError("native-tree engine is unsupported")
+        sanitize = adapter.sanitize_boosting_artifact
+    else:
+        raise ValueError("native-tree engine is unsupported")
+    try:
+        with neighbourhood.release(prepared._request_identity, units) as slot:
+            if slot.cached is not None:
+                return slot.cached
+            artifact = sanitize(manifest, train())[0]
+            slot.commit(prepared._data_binding, artifact)
+            return slot.cached
+    finally:
+        if engine == "xgboost":
+            prepared._noise_key[:] = b"\x00" * len(prepared._noise_key)
 
 
 def build_ensemble(manifest, artifacts):

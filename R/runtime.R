@@ -186,7 +186,7 @@
   if (!is.null(extra_pypath))
     env <- c(env, PYTHONPATH = extra_pypath)
 
-  c(env, .release_cache_environment(staging_dir))
+  c(env, .release_cache_environment(staging_dir), .neighbourhood_environment())
 }
 
 #' Install the mandatory Python code-integrity bootstrap

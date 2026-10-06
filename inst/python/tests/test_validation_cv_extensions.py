@@ -105,7 +105,7 @@ def test_survival_symmetric_clipping_negative_density_and_invalid_sensitivity():
 
 
 @pytest.mark.parametrize("name", ["segmentation", "survival"])
-def test_two_node_gaussian_pool_matches_plain_bounded_statistics_within_noise(name):
+def test_two_node_gaussian_pool_matches_plain_bounded_statistics_within_noise(name, tmp_path, monkeypatch):
     if name == "segmentation":
         layout = validation.validation_layout(name)
         y = np.ones((8, 1, 128, 128))
@@ -118,6 +118,11 @@ def test_two_node_gaussian_pool_matches_plain_bounded_statistics_within_noise(na
     plain = validation.validation_sufficient_vector(y, prediction, layout)
     releases = []
     for index, part in enumerate((slice(0, 4), slice(4, 8))):
+        # Distinct simulated nodes own distinct durable roots as well as keys.
+        secret = tmp_path / ('node-%d' % index)
+        secret.write_text((bytes([index + 1]) * 32).hex())
+        secret.chmod(0o600)
+        monkeypatch.setenv('DSFLOWER_NODE_SECRET_FILE', str(secret))
         with mock.patch.object(seeding, "_node_secret", return_value=bytes([index + 1])*32):
             released, sigma = validation.private_validation_vector(
                 y[part], prediction[part], layout, epsilon=1e6, delta=1e-6)

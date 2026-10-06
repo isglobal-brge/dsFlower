@@ -118,7 +118,7 @@ _PATH_SECURITY_KEY = re.compile(
     r"requirements?|dependencies?)($|_)")
 _DP_KEY = re.compile(
     r"(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping|"
-    r"cache|deadline)($|_)")
+    r"cache|deadline|neighbourhood)($|_)")
 
 
 def load_user_module(module_name):

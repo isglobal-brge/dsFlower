@@ -302,6 +302,7 @@ class NativeTreeValidationClientTests(unittest.TestCase):
                 "available": 1, "num-examples": 1})
 
     def test_contract_digest_alias_and_row_order_replay_but_private_change_rekeys(self):
+        from dsflower_runner import seeding
         with tempfile.TemporaryDirectory() as root, \
                 tempfile.TemporaryDirectory() as results_dir:
             _request, artifact, _profile_bytes, pins = _write_contract(
@@ -309,6 +310,13 @@ class NativeTreeValidationClientTests(unittest.TestCase):
             cfg = _run_config(root, results_dir, "binary", pins)
             context = SimpleNamespace(
                 node_config={"manifest-dir": root}, run_config=cfg)
+
+            bindings = []
+            original_binding = seeding.bind_private_data
+            def capture_binding(*args, **kwargs):
+                binding = original_binding(*args, **kwargs)
+                bindings.append((args[0], binding))
+                return binding
 
             def release():
                 message = server_app._request_messages((1,), cfg, artifact)[0]
@@ -318,7 +326,8 @@ class NativeTreeValidationClientTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {
                     "DSFLOWER_NODE_SECRET_FILE": _secret(root),
                     "DSFLOWER_TEST_ALLOW_EPHEMERAL_SECRET": "1",
-                  }, clear=False):
+                  }, clear=False), mock.patch.object(
+                      seeding, "bind_private_data", side_effect=capture_binding):
                 first = release()
                 frame = pd.read_csv(os.path.join(root, "train.csv"))
                 frame.iloc[::-1].to_csv(
@@ -341,7 +350,11 @@ class NativeTreeValidationClientTests(unittest.TestCase):
                 with open(manifest_path, "w", encoding="utf-8") as handle:
                     _dump_manifest(manifest, handle)
                 changed = release()
-            self.assertNotEqual(first.tobytes(), changed.tobytes())
+                self.assertNotEqual(bindings[0][1].digest, bindings[-1][1].digest)
+                self.assertNotEqual(seeding.release_key(*bindings[0]),
+                                    seeding.release_key(*bindings[-1]))
+            # The fresh key changes; a one-row neighbour keeps the whole release.
+            self.assertEqual(first.tobytes(), changed.tobytes())
 
     def test_regression_target_bounds_come_from_the_node_manifest(self):
         with tempfile.TemporaryDirectory() as root, \

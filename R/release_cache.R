@@ -4,7 +4,7 @@
 .release_cache_control_key <- function(key) {
   key <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", key, perl = TRUE)
   key <- gsub("[-.]", "_", tolower(key))
-  grepl("(^|_)(cache|deadline)($|_)", key, perl = TRUE)
+  grepl("(^|_)(cache|deadline|neighbourhood)($|_)", key, perl = TRUE)
 }
 
 .release_cache_settings <- function(settings = NULL) {
@@ -120,10 +120,10 @@
     settings <- .release_cache_settings()
     staging_dir <- .ensureStagingDir(run_token)
     receipt <- file.path(staging_dir, ".release-cache.json")
-    # Register the exact cleanup target before reserve can persist any pins.
+    # Freeze validated custodian settings and the cleanup target. Capacity is
+    # reserved by Python only after the neighbourhood lookup requires a fresh
+    # anchor, so an exact/near replay cannot be refused by this inner cache.
     .write_manifest_atomic(settings, receipt)
-    .release_cache_command("reserve", run_token, settings,
-                           run_config[["num-server-rounds"]])
     invisible(settings)
   }, error = function(e) stop(
     "The durable Hook release cache is unavailable.", call. = FALSE))
@@ -131,7 +131,7 @@
 
 .release_cache_environment <- function(staging_dir) {
   settings <- .release_cache_receipt(staging_dir)
-  # Public reservation can choose a different eligible staging root before the
+  # Receipt preparation can choose a different eligible staging root before the
   # later data-size check. Find its receipt using only the server run token.
   if (is.null(settings) && grepl("^run_[0-9a-f]{32}$", basename(staging_dir))) {
     for (candidate in .expectedStagingDirs(basename(staging_dir))) {
@@ -151,9 +151,12 @@
   if (!length(settings)) return(invisible(TRUE))
   # Stop every possible worker before closing a reservation. If stopping or
   # closing fails, leave the receipt and staging in place for an exact retry.
+  # A replay-only run has no inner reservation: after confirmed worker shutdown,
+  # cleanup must not create a tombstone or consume fresh-release cache capacity.
+  # The administrator's unconditional close command retains its existing guard.
   for (staging_dir in staging_dirs) .supernode_stop(staging_dir)
   for (setting in settings) {
-    .release_cache_command("close", run_token, setting)
+    .release_cache_command("close-if-reserved", run_token, setting)
   }
   invisible(TRUE)
 }

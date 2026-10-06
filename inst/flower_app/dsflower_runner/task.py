@@ -1007,7 +1007,7 @@ def load_pinned_run_config(context=None):
         for key in source:
             normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
             normalized = normalized.lower().replace("-", "_").replace(".", "_")
-            if re.search(r"(^|_)(cache|deadline)($|_)", normalized):
+            if re.search(r"(^|_)(cache|deadline|neighbourhood)($|_)", normalized):
                 raise ValueError("cache and deadline controls are administrator-only")
     if (manifest.get("resampling-contract-sha256") is not None
             or manifest.get("cv-contract-sha256") is not None):

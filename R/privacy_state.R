@@ -2,8 +2,8 @@
 #
 # Every training receives the same administrator-pinned privacy contract, and
 # sticky randomness is derived from the persistent node secret plus a canonical
-# semantic identity in the trusted runner. Historical use never disables a new
-# operation.
+# semantic identity in the trusted runner. Persistent neighbourhood anchors
+# coalesce nearby inputs without changing the per-training accountant.
 
 .privacy_policy <- function(unit_policy = NULL) {
   epsilon <- suppressWarnings(as.numeric(
@@ -163,8 +163,9 @@
 
 #' Bootstrap persistent differential-privacy state at service runtime
 #'
-#' Creates or validates only the per-node CSPRNG root. No database, query log,
-#' counter or model cache is created. Package installation and loading
+#' Creates or validates the per-node CSPRNG root. The trusted runner initializes
+#' its permanent neighbourhood store and local UUID pin on first release. An
+#' established store with a missing root fails closed. Package installation and loading
 #' deliberately never call this function, so reusable images cannot inherit a
 #' node identity.
 #'
@@ -176,6 +177,7 @@ flowerPrivacyBootstrap <- function() {
 }
 
 .privacy_runtime_bootstrap <- function() {
+  .neighbourhood_settings()
   path <- .node_secret_path()
   existed <- file.exists(path) || .path_is_symlink(path)
   valid_before <- if (isTRUE(existed)) {

@@ -690,7 +690,7 @@
         "hook_admission_and_padding",
         "metric_postprocessing"
       ],
-      "function_sha256": "e79bd98a6eb2a5ddc12092df1ae0f23ee6541ba5b658d0d06d5f83b6153d5f88"
+      "function_sha256": "1c4a77c2f1e816c62801fb65be856a4a63cbe4e4d08e3bcd0fab5f49053cd34e"
     },
     "task:load_pinned_run_config:cfg[key]": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
@@ -728,7 +728,7 @@
         "hook_admission_and_padding",
         "metric_postprocessing"
       ],
-      "function_sha256": "e79bd98a6eb2a5ddc12092df1ae0f23ee6541ba5b658d0d06d5f83b6153d5f88"
+      "function_sha256": "1c4a77c2f1e816c62801fb65be856a4a63cbe4e4d08e3bcd0fab5f49053cd34e"
     },
     "task:load_pinned_run_config:manifest[key]": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
@@ -766,7 +766,7 @@
         "hook_admission_and_padding",
         "metric_postprocessing"
       ],
-      "function_sha256": "e79bd98a6eb2a5ddc12092df1ae0f23ee6541ba5b658d0d06d5f83b6153d5f88"
+      "function_sha256": "1c4a77c2f1e816c62801fb65be856a4a63cbe4e4d08e3bcd0fab5f49053cd34e"
     },
     "task:pinned_bool:manifest.get(key, default)": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",

@@ -164,16 +164,11 @@ def synthetic_release(engine, *, xgboost_bundle=None):
     if engine == "xgboost" and xgboost_bundle is None:
         member = _xgboost_member()
     else:
-        # This is an availability probe over fixed public synthetic data. Keep
-        # it independent of node bootstrap while exercising the exact sticky
-        # PRF path used by real pure-engine training.
-        original_node_secret = seeding._node_secret
-        seeding._node_secret = lambda: b"\x00" * 32
-        try:
+        # Fixed public synthetic data gets its own disposable node domain.
+        from . import probe_state
+        with probe_state.synthetic_node():
             member = native_tree_engine.train_model(
                 manifest, features, target, xgboost_bundle=xgboost_bundle)
-        finally:
-            seeding._node_secret = original_node_secret
     ensemble, digest = native_tree_engine.build_ensemble(manifest, [member])
     if hashlib.sha256(ensemble).hexdigest() != digest:
         raise RuntimeError("native-tree probe ensemble digest differs")

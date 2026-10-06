@@ -1,3 +1,23 @@
+# dsFlower 0.7.2
+
+* Mitigate [isglobal-brge/dsFlower#7](https://github.com/isglobal-brge/dsFlower/issues/7)
+  with immutable neighbourhood anchors and oldest-eligible whole-payload replay.
+  One-unit changes within an existing anchor's neighbourhood no longer obtain a
+  fresh release. The hard k-1/k boundary remains: this is a mitigation, not
+  transcript DP, and small updates intentionally return stale answers.
+* Cover all neural rounds, gated Hooks, all five native trees, private validation,
+  holdout, CV fold training/OOF output and association, preserving fresh v3 R/B/K,
+  calibration, accounting, sensitivities and FedProx.
+* Persist authenticated anchors with owner-only storage, per-request locking,
+  automatic first-use initialization and a UUID pin beside the node secret.
+  Missing/corrupt established state fails closed. Document consistent backups,
+  optional external UUID pinning and the remaining whole-snapshot rollback risk.
+* Custodian options set k (default subset filter or 3, floor 2), 256 anchors per R
+  and 64 GiB storage. Caps refuse only would-be-fresh releases; exact/near replays
+  consume no tickets. Document the weak cross-user aggregate capacity signal.
+* Pair both packages at 0.7.2 with byte-identical pinned runners and unchanged
+  analyst APIs; reject analyst neighbourhood controls at configuration boundaries.
+
 # dsFlower 0.7.1
 
 * Preserve saved 0.7.0 graph predictions in private validation by mapping their

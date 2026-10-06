@@ -495,6 +495,7 @@
          call. = FALSE)
   }
 
+  .neighbourhood_require_retained_secret(path)
   .write_node_secret_atomic(path, parent)
   parent_after <- .validate_node_secret_parent(path, euid)
   if (!identical(parent_after, parent_before)) {

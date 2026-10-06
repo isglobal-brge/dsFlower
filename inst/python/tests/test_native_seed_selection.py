@@ -65,9 +65,19 @@ class NativeRequestSelectionTests(unittest.TestCase):
                     request_selection=selection, request_identity=identity)
                 artifact = bytes(prepared._noise_key)
             else:
-                artifact = native_tree_engine.train_model(
-                    manifest, features, target, unit_ids=units,
-                    request_selection=selection, request_identity=identity)
+                # This suite verifies the unchanged fresh R/B/K mechanism.
+                # Exercise the adapters directly: the complete release boundary
+                # correctly skips these draws on a neighbourhood replay.
+                from dsflower_runner import forest_adapter, random_forest_adapter, boosting_adapter
+                adapter, prepare, train = {
+                    "extra_trees": (forest_adapter, "prepare_extra_trees_training", "train_extra_trees"),
+                    "random_forest": (random_forest_adapter, "prepare_random_forest_training", "train_random_forest"),
+                    "lightgbm": (boosting_adapter, "prepare_boosting_training", "train_boosting"),
+                    "catboost": (boosting_adapter, "prepare_boosting_training", "train_boosting"),
+                }[manifest["engine"]]
+                prepared = getattr(adapter, prepare)(manifest, features, target,
+                    unit_ids=units, request_selection=selection, request_identity=identity)
+                artifact = getattr(adapter, train)(prepared, request_selection=selection)
         self.assertTrue(keys, "test must capture actual private-release keys")
         return keys, artifact
 

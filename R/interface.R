@@ -1093,7 +1093,7 @@ flowerInitDS <- function(data_symbol) {
       normalized, perl = TRUE
     ) ||
     grepl(
-      "(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping|cache|deadline)($|_)",
+      "(^|_)(privacy|dp|epsilon|delta|noise|sensitivity|accountant|clip|clipping|cache|deadline|neighbourhood)($|_)",
       normalized, perl = TRUE
     )
 }
