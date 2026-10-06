@@ -1,0 +1,67 @@
+{
+  "contract": "dsflower-tree-release-kat-v3",
+  "profiles": [
+    {
+      "numeric_profile": {
+        "byteorder": "little",
+        "contract": "dsflower-tree-gaussian-numeric-v1",
+        "machine": "x86_64",
+        "numpy": "2.4.6",
+        "rng": "chacha20-box-muller-four-sample/v2",
+        "system": "linux"
+      },
+      "runtime": {
+        "backend": {
+          "kind": "cpu"
+        },
+        "engine_profile": "tree-release-kat-adapter-v1",
+        "implementation": "CPython",
+        "machine": "x86_64",
+        "native_bundle_sha256": null,
+        "packages": {
+          "cryptography": "46.0.7",
+          "numpy": "2.4.6",
+          "opacus": "1.6.0",
+          "torch": "2.10.0+cpu",
+          "torchvision": "0.25.0+cpu"
+        },
+        "python": "3.11.16",
+        "runner_sha256": "5275c1f6d99a44358b6c0cd1f0f595e9727a9cba5641b8fb64fae61b0be777e1",
+        "system": "linux"
+      },
+      "sigma_hex": "0x1.e439944d8cd2fp+2",
+      "vector_sha256": "265e5886d16b0b6ab8966c0c24a27cbb04194581e5219a0550f076476f09451a"
+    },
+    {
+      "numeric_profile": {
+        "byteorder": "little",
+        "contract": "dsflower-tree-gaussian-numeric-v1",
+        "machine": "x86_64",
+        "numpy": "2.4.6",
+        "rng": "chacha20-box-muller-four-sample/v2",
+        "system": "linux"
+      },
+      "runtime": {
+        "backend": {
+          "kind": "cpu"
+        },
+        "engine_profile": "tree-release-kat-adapter-v1",
+        "implementation": "CPython",
+        "machine": "x86_64",
+        "native_bundle_sha256": null,
+        "packages": {
+          "cryptography": "46.0.7",
+          "numpy": "2.4.6",
+          "opacus": "absent",
+          "torch": "absent",
+          "torchvision": "absent"
+        },
+        "python": "3.11.16",
+        "runner_sha256": "5275c1f6d99a44358b6c0cd1f0f595e9727a9cba5641b8fb64fae61b0be777e1",
+        "system": "linux"
+      },
+      "sigma_hex": "0x1.e439944d8cd2fp+2",
+      "vector_sha256": "791dbaaa59bf93cfed87749dc2aae18cb23bc88dbe8331f16e523b9b3ad21283"
+    }
+  ]
+}

@@ -84,7 +84,7 @@ test_that("native-tree CV job KAT matches the client fixture without neural pins
   baseline <- hash()
   expect_identical(
     baseline,
-    "1f8d5520eb02029caad12b3a8e40e929ab58a142edd494b4cfe751dec826982c")
+    "f8eb8b8980d57f3ad287224f48c098ea3bedef3a4c02379562dd9aa6c5bce6ec")
 
   irrelevant <- config
   irrelevant[["model-spec-b64"]] <- "W10="
@@ -107,7 +107,7 @@ test_that("CV job provenance has a mirrored golden and binds every public group"
   baseline <- hash()
   expect_identical(
     baseline,
-    "5a5dc6cac8b3407895a656fa834862d2dd7615203b0fca5fcdaddf8990ce739e")
+    "742ca3a7fc56b3d78441943fdda514ae3069c5c783627cb3f5bc4e243f6a7563")
 
   mutations <- list(
     cv_contract = c(config[-match("cv-contract-sha256", names(config))],
@@ -179,7 +179,7 @@ test_that("cross-validation contract is canonical, bounded, and seed-free", {
   expect_identical(contract$unit_canonicalization, "trim-utf8-v2")
   expect_identical(
     contract$sha256,
-    "136791e925e1ccc94c3bc02c4ae6b959c783fb6855a1c61a46af2f78ffc80926")
+    "b51ab7a3174f7621219c10bca57e9dad8bd7172f3127c170583b7966a3368b06")
   expect_false(any(grepl(
     "seed|salt|nonce", names(contract), ignore.case = TRUE)))
   expect_error(dsFlower:::.crossValidationContract(1L, "row"), "[2, 10]")
