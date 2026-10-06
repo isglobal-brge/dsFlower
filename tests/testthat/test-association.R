@@ -2,9 +2,9 @@
   paste0("run_", sprintf("%032x", as.integer(index)))
 }
 
-.association_test_config <- function(n_nodes = 2L) {
+.association_test_config <- function(n_nodes = 2L, privacy_unit = "row") {
   contract_sha <- dsFlower:::.association_contract_sha256(
-    "outcome", "exposure", c("no", "yes"), c(0, 1), "row")
+    "outcome", "exposure", c("no", "yes"), c(0, 1), privacy_unit)
   runner_sha <- dsFlower:::.compute_harness_hash()
   list(
     "dp-track" = "association",
@@ -120,6 +120,17 @@ test_that("association in-memory staging preserves every row and unknown cell", 
   expect_identical(manifest$dropped_missing, 0L)
   expect_true(manifest[["association-preencoded"]])
   expect_identical(manifest$feature_columns, "exposure")
+  wire <- jsonlite::fromJSON(file.path(staging, "manifest.json"),
+                             simplifyVector = FALSE)
+  expect_identical(wire$feature_columns, list("exposure"))
+  source <- lapply(readLines(file.path(staging, wire$source_projection_file)),
+                   jsonlite::fromJSON, simplifyVector = FALSE)
+  expect_identical(source[[1L]]$columns, list("exposure", "outcome"))
+  expect_identical(source[[4L]]$values,
+                   list(list(type = "missing"), list(type = "missing")))
+  expect_identical(source[[5L]]$values,
+                   list(list(type = "number", value = "2"),
+                        list(type = "utf8", value = "other")))
 })
 
 test_that("association patient staging keeps the protected identifier only for grouping", {
@@ -150,6 +161,60 @@ test_that("association patient staging keeps the protected identifier only for g
     staged$patient_id[[3L]], "__dsflower_missing_patient_unit__")
   expect_identical(
     staged$patient_id[[4L]], "__dsflower_missing_patient_unit__")
+  wire <- jsonlite::fromJSON(file.path(staging, "manifest.json"),
+                             simplifyVector = FALSE)
+  expect_identical(wire$feature_columns, list("exposure"))
+  source <- lapply(readLines(file.path(staging, wire$source_projection_file))[-1L],
+                   jsonlite::fromJSON, simplifyVector = FALSE)
+  expect_identical(vapply(source, `[[`, character(1), "patient_id"),
+                   staged$patient_id)
+})
+
+test_that("actual R association staging releases and replays through the Python client", {
+  # The lightweight mocks cannot detect an R singleton vector becoming a JSON
+  # string. Exercise the unmodified ClientApp admission and private release.
+  python <- Sys.getenv("DSFLOWER_TEST_ASSOCIATION_PYTHON", "")
+  if (!nzchar(python)) {
+    runtime_root <- Sys.getenv("DSFLOWER_VENV_ROOT", "")
+    if (nzchar(runtime_root)) {
+      python <- dsFlower:::.native_tree_runtime_executable(
+        file.path(runtime_root, "native-tree"), "python")
+    }
+  }
+  skip_if(!nzchar(python) || !file.exists(python),
+          "A native association Python runtime is needed for the R/Python boundary test")
+  root <- withr::local_tempdir()
+  Sys.chmod(root, "0700")
+  secret <- file.path(root, "node-secret")
+  writeLines(strrep("ab", 32L), secret)
+  Sys.chmod(secret, "0600")
+  withr::local_envvar(c(DSFLOWER_NODE_SECRET_FILE = secret))
+  withr::local_options(list(dsflower.staging_root = root))
+  helper <- system.file("python", "tests", "association_staging_probe.py",
+                        package = "dsFlower", mustWork = TRUE)
+  app <- system.file("flower_app", package = "dsFlower", mustWork = TRUE)
+  for (unit in c("row", "patient")) {
+    withr::local_options(list(dsflower.dp_unit = unit,
+                              dsflower.patient_column = "patient_id"))
+    data <- data.frame(outcome = c("no", "yes", NA, "other"),
+                       exposure = c(0, 1, NA, 2),
+                       patient_id = c(" p1 ", "p1", NA, " "))
+    config <- dsFlower:::.addDpConfigToRunConfig(
+      .association_test_config(privacy_unit = unit))
+    # data_type is server-owned, as in the actual stage/start path.
+    config$data_type <- NULL
+    staging <- dsFlower:::.stageAssociationData(
+      data, .association_test_token(if (unit == "row") 809 else 810),
+      "outcome", "exposure", config)
+    output <- system2(python, shQuote(c(helper, "--app-dir", app,
+                                       "--stage-dir", staging)),
+                      stdout = TRUE, stderr = TRUE)
+    expect_identical(attr(output, "status") %||% 0L, 0L,
+                     info = paste(output, collapse = "\n"))
+    expect_true(any(grepl(paste0("CHECK association ", unit,
+                                " available-replay PASS"), output, fixed = TRUE)),
+                info = paste(output, collapse = "\n"))
+  }
 })
 
 test_that("association staged_parquet descriptor selects and totalizes only required columns", {

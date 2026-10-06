@@ -114,6 +114,30 @@ class _Grid:
 
 
 class AssociationClientTests(unittest.TestCase):
+    def test_scalar_manifest_feature_selection_fails_before_private_read(self):
+        # R's auto_unbox used to turn the singleton exposure selection into a
+        # JSON string. Repair the producer; this public admission stays strict.
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.TemporaryDirectory() as results_dir:
+            manifest = _write_node(root)
+            manifest["feature_columns"] = "exposure"
+            with open(os.path.join(root, "manifest.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            cfg = _config(results_dir)
+            context = SimpleNamespace(
+                node_config={"manifest-dir": root}, run_config=cfg)
+            message = server_app._request_messages((1,), cfg)[0]
+            with mock.patch.object(
+                    task, "load_association_data",
+                    side_effect=AssertionError("private data was read")) as load:
+                reply = client_app.train(message, context)
+            load.assert_not_called()
+            self.assertEqual(dict(reply.content["metrics"]), {
+                "available": 0, "noise-sd": 0.0, "num-examples": 1})
+            np.testing.assert_array_equal(
+                reply.content["arrays"].to_numpy_ndarrays()[0], np.zeros(9))
+
     def test_pin_tamper_and_unexpected_fields_fail_before_private_read(self):
         cases = (
             ("typed node count", {"association-n-nodes": True}),

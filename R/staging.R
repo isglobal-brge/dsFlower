@@ -995,6 +995,21 @@
 #' tolerance).
 #' @keywords internal
 .write_manifest_atomic <- function(manifest, manifest_path) {
+  # Column selections have an array schema even when exactly one is selected.
+  # auto_unbox must not turn a singleton exposure/feature list into a JSON
+  # string: the trusted Python admission guard rejects that different schema.
+  if (!is.null(manifest$feature_columns)) {
+    manifest$feature_columns <- unname(as.list(manifest$feature_columns))
+  }
+  bounds <- manifest[["feature-bounds"]]
+  if (is.list(bounds)) {
+    for (bound in c("lower", "upper")) {
+      if (!is.null(bounds[[bound]])) {
+        bounds[[bound]] <- unname(as.list(bounds[[bound]]))
+      }
+    }
+    manifest[["feature-bounds"]] <- bounds
+  }
   tmp <- tempfile(pattern = ".manifest-", tmpdir = dirname(manifest_path))
   on.exit(unlink(tmp), add = TRUE)
   jsonlite::write_json(manifest, tmp, auto_unbox = TRUE, pretty = TRUE,
