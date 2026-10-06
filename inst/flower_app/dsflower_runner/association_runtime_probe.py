@@ -26,13 +26,13 @@ def probe_association_runtime():
     """Exercise synthetic sufficient-vector, Gaussian and pooling paths."""
     if not _dependency_light() or not association_parquet.runtime_ready():
         return False
-    sufficient = epi_association.association_sufficient_vector(
-        np.asarray([0, 1, 1, 2], dtype=np.uint8),
-        np.asarray([0, 0, 1, 2], dtype=np.uint8),
-        outcome_levels=(0, 1), exposure_levels=(0, 1), privacy_unit="row")
     original = seeding._node_secret
     seeding._node_secret = lambda: b"\x00" * 32
     try:
+        sufficient = epi_association.association_sufficient_vector(
+            np.asarray([0, 1, 1, 2], dtype=np.uint8),
+            np.asarray([0, 0, 1, 2], dtype=np.uint8),
+            outcome_levels=(0, 1), exposure_levels=(0, 1), privacy_unit="row")
         released, sigma = epi_association.private_association_vector(
             sufficient, privacy_unit="row", epsilon=1.0, delta=1.0e-6)
     finally:

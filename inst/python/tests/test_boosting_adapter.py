@@ -45,6 +45,17 @@ def _data():
     return features, target
 
 
+_TEST_UNIT_KEY = mock.patch("dsflower_runner.seeding._node_secret", return_value=b"unit-order-test-secret-v3........"[:32])
+
+
+def setUpModule():
+    _TEST_UNIT_KEY.start()
+
+
+def tearDownModule():
+    _TEST_UNIT_KEY.stop()
+
+
 class AccountingTests(unittest.TestCase):
     def test_replace_one_histogram_sensitivity_and_fixed_transcript(self):
         expected = math.sqrt(2.0 * max(

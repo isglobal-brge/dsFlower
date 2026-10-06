@@ -155,6 +155,8 @@ def materialize_forest_units(manifest, features, target, *, unit_ids=None):
             resources["memory_mib"] * 1024 * 1024:
         raise ValueError("complete ExtraTrees training exceeds the memory ceiling")
 
+    features, target, unit_ids, _units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
     X = tree_data._numeric_array(features, "features", 2)
     y = tree_data._numeric_array(target, "target", 1)
     lower = np.asarray(profile["feature_lower"], dtype=np.float32)
@@ -196,7 +198,7 @@ def _policy_hash(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _topology(profile, features, *, request_selection=None):
+def _topology(profile, features, *, request_selection=None, request_identity=None):
     config = {
         "cut_counts": [len(value) for value in profile["public_cuts"]],
         "depth": profile["max_depth"],
@@ -210,9 +212,8 @@ def _topology(profile, features, *, request_selection=None):
         "profile": forest_accounting.TOPOLOGY_PROFILE,
     }
     policy["policy_hash"] = _policy_hash(policy)
-    master = bytearray(seeding.master_seed(
-        "extra-trees/public-topology/v1", config, policy, 1,
-        execution_fingerprint="dsflower-extra-trees-topology-v1"))
+    master = bytearray(seeding.public_execution_key(
+        request_identity, "extra_trees/public-schedule/v3"))
     subkey = None
     try:
         subkey = bytearray(seeding.sub_seed(master, "complete-topology/v1"))
@@ -313,9 +314,9 @@ class PreparedExtraTreesTraining:
     """Frozen one-shot forest release; repr excludes private statistics."""
 
     __slots__ = ("_canonical", "_digest", "_profile", "_sealed", "_stats",
-                 "_topology", "_used")
+                 "_topology", "_used", "_request_identity", "_data_binding")
 
-    def __init__(self, token, canonical, profile, topology, stats):
+    def __init__(self, token, canonical, profile, topology, stats, request_identity=None, data_binding=None):
         if token is not _PREPARED_TOKEN:
             raise TypeError("use prepare_extra_trees_training")
         object.__setattr__(self, "_sealed", False)
@@ -324,6 +325,8 @@ class PreparedExtraTreesTraining:
         self._topology = copy.deepcopy(topology)
         self._stats = stats
         self._used = False
+        self._request_identity = request_identity
+        self._data_binding = data_binding
         self._digest = _prepared_digest(
             self._canonical, self._profile, self._topology, self._stats)
         self._sealed = True
@@ -393,20 +396,28 @@ def _validate_prepared(prepared):
 
 
 def prepare_extra_trees_training(manifest, features, target, *, unit_ids=None,
-                                 request_selection=None):
+                                 request_selection=None, request_identity=None,
+                                 source_units=None, subset=None):
     """Prepare the sole private sufficient vector and sticky release key."""
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_extra_trees_profile(canonical)
+    identity = request_identity or tree_release.native_request_identity(
+        canonical, request_selection, execution_fingerprint=EXECUTION_PROFILE)
+    features, target, unit_ids, units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
     materialized = materialize_forest_units(
         canonical, features, target, unit_ids=unit_ids)
+    binding = tree_release.native_binding(
+        identity, units if source_units is None else source_units, materialized,
+        subset=subset, sigma=profile["sigma"])
     topology = _topology(
         profile, len(canonical["public_schema"]["features"]),
         request_selection=tree_release.request_selection(
-            canonical, request_selection))
+            canonical, request_selection), request_identity=identity)
     stats = _sufficient_vector(materialized, topology, canonical, profile)
     stats.setflags(write=False)
     return PreparedExtraTreesTraining(
-        _PREPARED_TOKEN, canonical, profile, topology, stats)
+        _PREPARED_TOKEN, canonical, profile, topology, stats, identity, binding)
 
 
 def _sanitizer_arguments(canonical, profile):
@@ -438,7 +449,9 @@ def train_extra_trees(prepared, *, request_selection=None):
             sensitivity=profile["sensitivity"], num_releases=1,
             execution_fingerprint=EXECUTION_PROFILE,
             request_selection=tree_release.request_selection(
-                canonical, request_selection))
+                canonical, request_selection),
+                request_identity=prepared._request_identity,
+                data_binding=prepared._data_binding)
         if sigma != profile["sigma"]:
             raise RuntimeError("ExtraTrees accountant and release sigma differ")
         trees = []

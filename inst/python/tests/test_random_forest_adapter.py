@@ -141,6 +141,17 @@ def _train(manifest, X, y, unit_ids=None):
         return adapter.train_random_forest(prepared)
 
 
+_TEST_UNIT_KEY = mock.patch("dsflower_runner.seeding._node_secret", return_value=b"unit-order-test-secret-v3........"[:32])
+
+
+def setUpModule():
+    _TEST_UNIT_KEY.start()
+
+
+def tearDownModule():
+    _TEST_UNIT_KEY.stop()
+
+
 class RandomForestAccountingTests(unittest.TestCase):
     def test_replace_one_sensitivities_and_fixed_composition_are_pinned(self):
         split, leaf = forest_accounting.random_forest_sensitivities(
@@ -175,7 +186,7 @@ class RandomForestAccountingTests(unittest.TestCase):
                 manifest, rows, target)
             with _key():
                 candidates, assignment_key = adapter._public_schedule(
-                    profile, rows.shape[1])
+                    profile, rows.shape[1], request_identity=adapter.tree_release.native_request_identity(manifest))
                 try:
                     assignments = adapter._tree_assignments(
                         materialized._binned_features,
@@ -281,7 +292,7 @@ class RandomForestTranscriptTests(unittest.TestCase):
         ], dtype=np.float64)
         self.y = np.asarray([0, 0, 0, 1, 1, 0], dtype=np.float64)
 
-    def test_replay_permutation_same_bins_and_resources_are_exact(self):
+    def test_permutation_replays_but_changed_source_in_same_bins_rekeys(self):
         manifest = _manifest(trees=8, depth=3, max_features=2)
         first = _train(manifest, self.X, self.y)
         order = np.asarray([5, 2, 0, 4, 1, 3])
@@ -292,8 +303,7 @@ class RandomForestTranscriptTests(unittest.TestCase):
         equivalent[:5, 0] = [-1.8, -0.7, -0.1, 0.1, 0.7]
         equivalent[:5, 1] = [-0.9, -0.1, 0.1, 0.7, 1.1]
         equivalent[:5, 2] = [-0.1, 0.1, 0.7, 1.1, 1.6]
-        np.testing.assert_array_equal(
-            first, _train(manifest, equivalent, self.y))
+        self.assertNotEqual(first, _train(manifest, equivalent, self.y))
 
         wider = copy.deepcopy(manifest)
         wider["resources"].update(
@@ -302,7 +312,7 @@ class RandomForestTranscriptTests(unittest.TestCase):
         np.testing.assert_array_equal(
             first, _train(wider, self.X, self.y))
 
-    def test_schema_selections_separate_noise_but_ids_and_scope_do_not(self):
+    def test_schema_and_patient_ids_are_semantic_but_scope_is_nuisance(self):
         manifest = _manifest(trees=6, depth=2, max_features=2, unit="patient")
         X = np.asarray([
             [-1.4, -0.9, -0.4], [-1.2, -0.7, -0.2],
@@ -316,7 +326,8 @@ class RandomForestTranscriptTests(unittest.TestCase):
         scope["data_scope"]["cohort_hash"] = "d" * 64
         replay = json.loads(_train(
             scope, X, y, ["renamed-1", "renamed-1", "renamed-2", "renamed-2"]))
-        self.assertEqual(first, replay)
+        self.assertNotEqual(first, replay)
+        self.assertEqual(first, json.loads(_train(scope, X, y, ["a", "a", "b", "b"])))
 
         nominal = copy.deepcopy(manifest)
         nominal["public_schema"]["features"] = ["u", "v", "w"]
@@ -339,7 +350,7 @@ class RandomForestTranscriptTests(unittest.TestCase):
             np.asarray([1.0] * 5))
         profile = adapter.canonical_random_forest_profile(manifest)
         with _key():
-            _candidates, key = adapter._public_schedule(profile, 3)
+            _candidates, key = adapter._public_schedule(profile, 3, request_identity=adapter.tree_release.native_request_identity(manifest))
             try:
                 assignments = adapter._tree_assignments(
                     materialized._binned_features,
@@ -349,7 +360,7 @@ class RandomForestTranscriptTests(unittest.TestCase):
         self.assertEqual(len(set(assignments[:4].tolist())), 1)
         order = np.asarray([4, 2, 0, 3, 1])
         with _key():
-            _candidates, key = adapter._public_schedule(profile, 3)
+            _candidates, key = adapter._public_schedule(profile, 3, request_identity=adapter.tree_release.native_request_identity(manifest))
             try:
                 replay = adapter._tree_assignments(
                     materialized._binned_features[order],

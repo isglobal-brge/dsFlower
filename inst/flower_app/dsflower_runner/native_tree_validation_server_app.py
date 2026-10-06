@@ -1,5 +1,7 @@
 """Dedicated coordinator ServerApp for private native-tree validation."""
 
+from . import aggregation
+
 import base64
 import hashlib
 import hmac
@@ -252,11 +254,11 @@ def _collect_vectors(grid, node_ids, cfg, artifact, layout, timeout):
         (source, _vector_from_reply(reply, layout))
         for source, reply in zip(sources, replies)
     ]
-    return [vector for _source, vector in sorted(pairs, key=lambda item: item[0])]
+    return sorted((vector for _source, vector in pairs), key=aggregation.vector_key)
 
 
 def _stable_pool(vectors):
-    stacked = np.stack(vectors, axis=0).astype(np.float64, copy=False)
+    stacked = np.stack(sorted(vectors, key=aggregation.vector_key), axis=0).astype(np.float64, copy=False)
     scale = np.max(np.abs(stacked), axis=0)
     normalized = np.divide(
         stacked, scale, out=np.zeros_like(stacked), where=scale > 0.0)

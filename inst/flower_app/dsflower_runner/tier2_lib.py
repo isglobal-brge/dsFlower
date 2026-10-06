@@ -47,6 +47,15 @@ def _trusted_import(name):
     a malicious entry earlier on sys.path cannot shadow it and execute code in the trusted
     parent. (Plain `import dp_harness` would honour sys.path; the upload's dir may be on it.)"""
     import importlib.util
+    if not __package__:
+        # Bootstrap this one helper by its exact trusted path; all dependencies
+        # then share a private package with a fixed, co-located __path__.
+        helper_path = os.path.join(_HERE, "trusted_imports.py")
+        helper_spec = importlib.util.spec_from_file_location(
+            "_dsflower_trusted_import_bootstrap", helper_path)
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        return helper.load_sibling(name, __file__)
     path = os.path.join(_HERE, name + ".py")
     private_name = "_dsftrusted_" + name
     existing = sys.modules.get(private_name)
@@ -56,6 +65,8 @@ def _trusted_import(name):
         return existing
     spec = importlib.util.spec_from_file_location(private_name, path)
     mod = importlib.util.module_from_spec(spec)
+    if __package__:
+        mod.__package__ = __package__
     sys.modules[private_name] = mod
     try:
         spec.loader.exec_module(mod)
@@ -65,7 +76,10 @@ def _trusted_import(name):
     return mod
 
 
-seeding = _trusted_import("seeding")
+if __package__:
+    from . import seeding
+else:
+    seeding = _trusted_import("seeding")
 dp_harness = _trusted_import("dp_harness")
 
 
@@ -350,54 +364,39 @@ def _sanitize_cfg(cfg):
     }
 
 
+def hook_request_identity(module_name, global_arrays, cfg, pcfg, *, request_selection=None, manifest=None):
+    if not isinstance(module_name, str) or not module_name:
+        raise RuntimeError("Hook semantic module identity is invalid")
+    clean_cfg = _sanitize_cfg(cfg)
+    mechanism = "hook-sample-aggregate/v3" if bool(pcfg.get("sample_aggregate", True)) else "hook-output-perturbation/v3"
+    return seeding.request_identity(mechanism,
+        {"module": module_name, "hook": clean_cfg,
+         "module-sha256": _pinned_user_package(module_name, return_digest=True),
+         "request-selection": request_selection},
+        seeding.select_config(pcfg, _HOOK_SEED_PRIVACY_KEYS),
+        int(clean_cfg["round_index"]), public_arrays=global_arrays, manifest=manifest)
+
+
 def hook_master_seed(module_name, global_arrays, X, y, cfg, pcfg,
-                     unit_ids=None, *, request_selection=None):
-    """Bind Hook randomness and release-cache identity to its effective inputs."""
-    if not isinstance(module_name, str) or not module_name:
-        raise RuntimeError("Hook semantic module identity is invalid")
-    clean_cfg = _sanitize_cfg(cfg)
-    old = _as_f64_list(global_arrays)
-    canonical_units = (None if unit_ids is None else [
-        _canonical_patient_id(value) for value in np.asarray(
-            unit_ids, dtype=object).tolist()
-    ])
-    mechanism = ("hook-sample-aggregate/v1"
-                 if bool(pcfg.get("sample_aggregate", True))
-                 else "hook-output-perturbation/v1")
-    return seeding.master_seed(
-        mechanism,
-        {"module": module_name, "hook": clean_cfg,
-         "module-sha256": _pinned_user_package(module_name, return_digest=True),
-         "request-selection": request_selection or {}},
-        seeding.select_config(pcfg, _HOOK_SEED_PRIVACY_KEYS),
-        int(clean_cfg["round_index"]),
-        public_arrays=old,
-        private_arrays=(np.asarray(X), np.asarray(y)),
-        unit_ids=canonical_units)
+                     unit_ids=None, *, request_selection=None, request_identity=None):
+    from . import canonical_units
+    request = request_identity or hook_request_identity(module_name, global_arrays, cfg, pcfg,
+                                                       request_selection=request_selection)
+    units = canonical_units.source_units(X, y)
+    if units is None:
+        units = canonical_units.canonicalize_arrays(X, y, unit_ids)
+        order = units.row_permutation
+        X, y = np.asarray(X)[order], np.asarray(y)[order]
+    binding = seeding.bind_private_data(request, units, effective_tensors=(X, y),
+        geometry={"n_staged_rows": len(y), "n_privacy_units": len(units.records),
+                  "block_count": int(pcfg.get("sa_blocks", 8)) if pcfg.get("sample_aggregate", True) else 1})
+    return seeding.release_key(request, binding)
 
 
-def hook_execution_seed(module_name, global_arrays, cfg, pcfg, *,
-                        request_selection=None):
-    """Public-only seed for S&A partitions and child training randomness.
-
-    A neighbouring private record must not reshuffle unaffected S&A blocks or
-    change their child RNGs.  The final DP noise uses ``hook_master_seed`` and
-    remains bound to all private inputs and validated pre-noise updates.
-    """
-    if not isinstance(module_name, str) or not module_name:
-        raise RuntimeError("Hook semantic module identity is invalid")
-    clean_cfg = _sanitize_cfg(cfg)
-    mechanism = ("hook-sample-aggregate-execution/v1"
-                 if bool(pcfg.get("sample_aggregate", True))
-                 else "hook-output-execution/v1")
-    return seeding.master_seed(
-        mechanism,
-        {"module": module_name, "hook": clean_cfg,
-         "module-sha256": _pinned_user_package(module_name, return_digest=True),
-         "request-selection": request_selection or {}},
-        seeding.select_config(pcfg, _HOOK_SEED_PRIVACY_KEYS),
-        int(clean_cfg["round_index"]),
-        public_arrays=_as_f64_list(global_arrays))
+def hook_execution_seed(module_name, global_arrays, cfg, pcfg, *, request_selection=None, request_identity=None):
+    request = request_identity or hook_request_identity(module_name, global_arrays, cfg, pcfg,
+                                                       request_selection=request_selection)
+    return seeding.public_execution_key(request, "hook-execution/v3")
 
 
 # --------------------------------------------------------------------------- #
@@ -725,7 +724,7 @@ def _canonical_patient_id(value):
 def _patient_row_blocks(unit_ids, n_rows, k, partition_seed):
     """Assign every row for one privacy unit to exactly one S&A block.
 
-    Assignment is a keyed, data-independent hash of the server-pinned patient
+    Assignment is a keyed, unit-local hash of the server-pinned patient
     identifier.  It does not depend on row values, row multiplicity, or encounter
     order, so changing one patient's records cannot reshuffle other patients.
     Empty blocks are retained: the caller maps a failed/empty block update to zero,
@@ -751,6 +750,29 @@ def _patient_row_blocks(unit_ids, n_rows, k, partition_seed):
             assigned[patient_id] = int.from_bytes(digest[:8], "big") % int(k)
         blocks[assigned[patient_id]].append(row_index)
     return [np.asarray(rows, dtype=np.int64) for rows in blocks], len(assigned)
+
+
+def _row_content_blocks(assignment_tokens, k, partition_seed):
+    """Fixed unit-local buckets, preserving canonical in-block input order.
+
+    A replacement removes/adds at most one occurrence in each content class.
+    All other tokens retain their bucket; at most two clipped blocks can change.
+    """
+    if __package__:
+        from .canonical_units import frame
+    else:
+        frame = _trusted_import("canonical_units").frame
+    if not isinstance(partition_seed, (bytes, bytearray)) or len(partition_seed) != 32:
+        raise RuntimeError("row partitioning requires a 256-bit execution seed")
+    blocks = [[] for _ in range(int(k))]
+    for row_index, token in enumerate(assignment_tokens):
+        if not isinstance(token, bytes) or not token:
+            raise RuntimeError("row partitioning requires canonical occurrence tokens")
+        digest = hmac.new(bytes(partition_seed),
+                          frame("dsflower/hook-row-block/v1", token),
+                          hashlib.sha256).digest()
+        blocks[int.from_bytes(digest, "big") % int(k)].append(row_index)
+    return [np.asarray(rows, dtype=np.int64) for rows in blocks]
 
 
 def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
@@ -786,6 +808,19 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
                        else float(release_started))
     try:
         module_file = _pinned_user_package(module_name)
+        if __package__:
+            from .canonical_units import source_units, canonicalize_arrays
+        else:
+            canonical_module = _trusted_import("canonical_units")
+            source_units, canonicalize_arrays = (canonical_module.source_units,
+                                                 canonical_module.canonicalize_arrays)
+        units = source_units(X, y)
+        if units is None:
+            units = canonicalize_arrays(X, y, unit_ids)
+            order = units.row_permutation
+            X, y = _take_rows(X, order), _take_rows(y, order)
+            if unit_ids is not None:
+                unit_ids = np.asarray(unit_ids)[order]
         partition_seed = seeding.sub_seed(execution_seed, "partition")
         if unit_ids is None:
             n_units = n
@@ -798,18 +833,16 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
         k = _choose_blocks(pcfg, True)
 
         if k >= 2:
-            # A patient privacy unit may span many rows. Keep all those rows in
-            # one independently sandboxed block so one neighbour changes at
-            # most one block output.
+            # A unit replacement changes at most the old and new buckets.
+            # Keeping empty buckets preserves fixed k and min(2C, 4C/k).
             if unit_ids is None:
-                perm = seeding.np_rng(partition_seed).permutation(n)
-                row_blocks = np.array_split(perm, k)
+                row_blocks = _row_content_blocks(units.row_tokens, k, partition_seed)
             else:
                 row_blocks, _ = _patient_row_blocks(
                     unit_ids, n, k, partition_seed)
             block_updates = []
             for block_index, idx in enumerate(row_blocks):
-                r = _validate(_run_isolated(
+                r = None if len(idx) == 0 else _validate(_run_isolated(
                     module_name, module_file, old, _take_rows(X, idx),
                     _take_rows(y, idx), cfg, pcfg, caps, timeout,
                     child_seed=seeding.sub_seed(
@@ -826,10 +859,10 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
                 delta=pcfg["delta"],
                 num_releases=pcfg.get("composition_releases", 1),
                 rng=seeding.np_rng(seeding.bind_seed(
-                    seed, "hook-sample-aggregate-update/v1", bound_updates)),
+                    seed, "hook-update/v3", bound_updates)),
             )
         else:
-            r = _validate(_run_isolated(
+            r = None if n == 0 else _validate(_run_isolated(
                 module_name, module_file, old, X, y, cfg, pcfg, caps, timeout,
                 child_seed=seeding.sub_seed(execution_seed, "child/0")), old)
             new = r if r is not None else [o.copy() for o in old]
@@ -840,7 +873,7 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
                 delta=pcfg["delta"],
                 num_releases=pcfg.get("composition_releases", 1),
                 rng=seeding.np_rng(seeding.bind_seed(
-                    seed, "hook-output-update/v1", new)),
+                    seed, "hook-update/v3", new)),
             )
         return [g.astype(np.float32) for g in gated]
     finally:

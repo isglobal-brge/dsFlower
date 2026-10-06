@@ -29,6 +29,14 @@ from test_forest_adapter import _public_request as forest_request  # noqa: E402
 from test_random_forest_adapter import _manifest as rf_manifest  # noqa: E402
 
 
+def _dump_manifest(manifest, handle):
+    from v3_test_support import source_sidecar
+    directory = os.path.dirname(handle.name)
+    frame = pd.read_csv(os.path.join(directory, manifest["data_file"]))
+    source_sidecar(directory, manifest, frame)
+    json.dump(manifest, handle)
+
+
 def random_forest_request(*, trees=2, depth=1, max_features=1):
     manifest = rf_manifest(
         trees=trees, depth=depth, max_features=max_features, features=2)
@@ -84,6 +92,7 @@ def _node_manifest(request, request_b64, request_sha256):
         "privacy-adjacency": "replace_one", "privacy-epsilon": 3.0,
         "privacy-delta": 1.0e-6, "privacy-clipping_norm": 1.0,
         "privacy-policy-sha256": "a" * 64,
+        "semantic-randomness-contract": "dsflower-semantic-randomness-v3",
         "native-tree-request-b64": request_b64,
         "native-tree-request-sha256": request_sha256,
     }
@@ -200,7 +209,7 @@ class NativeTreeEngineTests(unittest.TestCase):
                     os.path.join(root, "train.csv"), index=False)
                 with open(os.path.join(root, "manifest.json"), "w",
                           encoding="utf-8") as handle:
-                    json.dump(_node_manifest(
+                    _dump_manifest(_node_manifest(
                         request, request_b64, request_sha256), handle)
                 cfg = {
                     "dp-track": "native_tree", "num-server-rounds": 1,

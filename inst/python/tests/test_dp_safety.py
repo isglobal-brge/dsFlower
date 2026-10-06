@@ -42,6 +42,16 @@ import model_spec
 import seeding
 import tier2_lib
 
+# Explicit local-test custodial key: production still requires protected state.
+# Existing secret failure tests independently clear/replace their own key path.
+import tempfile
+_test_secret_dir = tempfile.TemporaryDirectory()
+_test_secret_path = os.path.join(_test_secret_dir.name, "noise_root")
+with open(_test_secret_path, "w", encoding="ascii") as _handle:
+    _handle.write("5a" * 32)
+os.chmod(_test_secret_path, 0o600)
+os.environ["DSFLOWER_NODE_SECRET_FILE"] = _test_secret_path
+
 torch.manual_seed(0)
 np.random.seed(0)
 ok = fail = 0
@@ -493,8 +503,8 @@ try:
             {"op": "linear", "out": "@out"}]}, 2000, 2))
 finally:
     model_spec.nn.Linear = _real_linear
-check("cumulative parameter budget rejects before the overflowing constructor",
-      _cumulative_rejected and len(_linear_calls) == 1)
+check("cumulative parameter budget rejects before any constructor",
+      _cumulative_rejected and len(_linear_calls) == 0)
 check("oversized activation shape rejected before a model forward", raises_value_error(
       lambda: model_spec.build_from_spec({"kind": "sequential", "layers": [
           {"op": "reshape", "shape": [1, 64, 64]},

@@ -17,12 +17,12 @@ import numpy as np
 from . import seeding
 
 
-_VERSION = "dsflower-resampling-v1"
+_VERSION = "dsflower-resampling-v2"
 _METHOD = "holdout"
-_ASSIGNMENT = "hmac-sha256-threshold-v1"
-_CV_VERSION = "dsflower-cross-validation-v1"
+_ASSIGNMENT = "hmac-sha256-threshold-v2"
+_CV_VERSION = "dsflower-cross-validation-v2"
 _CV_METHOD = "cross_validation"
-_CV_ASSIGNMENT = "hmac-sha256-score-v1"
+_CV_ASSIGNMENT = "hmac-sha256-score-v2"
 _DENOMINATOR = 1_000_000
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _CONTRACT_FIELDS = frozenset({
@@ -62,7 +62,7 @@ def _payload(test_numerator, privacy_unit):
         "test_denominator": _DENOMINATOR,
         "test_numerator": numerator,
         "unit_canonicalization": (
-            "trim-utf8-v2" if unit == "patient" else "row-ordinal-v1"),
+            "trim-utf8-v2" if unit == "patient" else "row-content-occurrence-v1"),
         "version": _VERSION,
     }
 
@@ -146,7 +146,7 @@ def _cv_payload(folds, privacy_unit):
         "method": _CV_METHOD,
         "privacy_unit": unit,
         "unit_canonicalization": (
-            "trim-utf8-v2" if unit == "patient" else "row-ordinal-v1"),
+            "trim-utf8-v2" if unit == "patient" else "row-content-occurrence-v1"),
         "version": _CV_VERSION,
     }
 
@@ -213,131 +213,80 @@ def cross_validation_contract_from_manifest(manifest):
     return value
 
 
-def _assignment_domain_hash(contract):
-    # The fraction is a threshold, not a fresh randomization axis.  Excluding
-    # only its numerator makes different requested fractions nested instead of
-    # giving the analyst a partition reroll; every other assignment semantic is
-    # still domain-separated.
-    assignment_domain = {
-        key: contract[key] for key in (
-            "assignment", "method", "privacy_unit", "test_denominator",
-            "unit_canonicalization", "version")
-    }
-    return hashlib.sha256(_wire(assignment_domain)).digest()
+def _assignment_tokens(unit, rows, unit_ids, assignment_tokens):
+    from .canonical_units import frame
+    if unit == "row":
+        if unit_ids is not None:
+            raise ValueError("row assignment does not accept patient identifiers")
+        if assignment_tokens is None:
+            raise ValueError("row assignment requires canonical content occurrence tokens")
+        tokens = tuple(assignment_tokens)
+        if len(tokens) != rows or any(not isinstance(token, bytes) or not token
+                                      for token in tokens):
+            raise ValueError("canonical assignment tokens must match source rows")
+        return tokens
+    if unit_ids is None:
+        raise ValueError("patient assignment requires unit identifiers")
+    ids = np.asarray(unit_ids)
+    if ids.ndim != 1 or len(ids) != rows:
+        raise ValueError("assignment unit identifiers must match row count")
+    from .task import _canonical_patient_id
+    return tuple(frame("patient-id", _canonical_patient_id(item).encode("utf-8"))
+                 for item in ids)
 
 
-def _unit_digest(secret, domain_hash, token):
-    message = (b"dsflower/holdout-unit/v1\x00" + domain_hash
-               + len(token).to_bytes(4, "big") + token)
+def _unit_digest(secret, privacy_unit, token):
+    from .canonical_units import frame
+    message = frame("dsflower/assignment-unit/v2",
+                    frame("privacy-unit", privacy_unit.encode("ascii"))
+                    + frame("token", token))
     return hmac.new(secret, message, hashlib.sha256).digest()
 
 
-def holdout_mask(contract, *, n_rows, unit_ids=None):
+def _scores(privacy_unit, tokens):
+    # Same stable unit score for holdout fractions and all CV fold counts.
+    # It contains no request, dataset-wide hash, hyperparameter, or census.
+    secret = seeding._node_secret()
+    memo = {}
+    for token in tokens:
+        if token not in memo:
+            memo[token] = int.from_bytes(_unit_digest(secret, privacy_unit, token), "big")
+        yield memo[token]
+
+
+def holdout_mask(contract, *, n_rows, unit_ids=None, assignment_tokens=None):
     value = validate_holdout_contract(dict(contract))
     rows = _exact_int(n_rows, "holdout row count", 0, (1 << 63) - 1)
-    unit = value["privacy_unit"]
-    if unit == "row":
-        if unit_ids is not None:
-            raise ValueError("row holdout does not accept patient identifiers")
-        tokens = (b"row\x00" + index.to_bytes(8, "big")
-                  for index in range(rows))
-    else:
-        if unit_ids is None:
-            raise ValueError("patient holdout requires unit identifiers")
-        ids = np.asarray(unit_ids)
-        if ids.ndim != 1 or ids.shape[0] != rows:
-            raise ValueError("holdout unit identifiers must match row count")
-        from . import task
-        tokens = (
-            b"patient\x00" + task._canonical_patient_id(item).encode(
-                "utf-8", errors="strict") for item in ids)
-
-    threshold = (int(value["test_numerator"]) * (1 << 256)
-                 // int(value["test_denominator"]))
-    # Validate/open the custodial root once per partition, never once per row.
-    # Patient tokens are memoized only within this call so repeated records for
-    # one unit cost one HMAC without creating persistent state.
-    secret = seeding._node_secret()
-    domain_hash = _assignment_domain_hash(value)
-    if unit == "row":
-        assigned = (
-            int.from_bytes(_unit_digest(secret, domain_hash, token), "big")
-            < threshold for token in tokens)
-    else:
-        memo = {}
-
-        def patient_assigned(token):
-            if token not in memo:
-                memo[token] = (
-                    int.from_bytes(
-                        _unit_digest(secret, domain_hash, token), "big")
-                    < threshold)
-            return memo[token]
-
-        assigned = (patient_assigned(token) for token in tokens)
-    return np.fromiter(assigned, dtype=np.bool_, count=rows)
+    tokens = _assignment_tokens(value["privacy_unit"], rows, unit_ids, assignment_tokens)
+    numerator, denominator = int(value["test_numerator"]), int(value["test_denominator"])
+    # Exact rational comparison, without rounding a 256-bit threshold.
+    return np.fromiter((score * denominator < numerator * (1 << 256)
+                        for score in _scores(value["privacy_unit"], tokens)),
+                       dtype=np.bool_, count=rows)
 
 
-def holdout_mask_from_context(context, *, n_rows, unit_ids=None):
+def holdout_mask_from_context(context, *, n_rows, unit_ids=None, assignment_tokens=None):
     from . import task
-    manifest = task._load_manifest(context)
-    contract = contract_from_manifest(manifest)
-    return holdout_mask(contract, n_rows=n_rows, unit_ids=unit_ids)
+    contract = contract_from_manifest(task._load_manifest(context))
+    return holdout_mask(contract, n_rows=n_rows, unit_ids=unit_ids,
+                        assignment_tokens=assignment_tokens)
 
 
-def cross_validation_folds(contract, *, n_rows, unit_ids=None):
+def cross_validation_folds(contract, *, n_rows, unit_ids=None, assignment_tokens=None):
     value = validate_cross_validation_contract(dict(contract))
-    rows = _exact_int(
-        n_rows, "cross-validation row count", 0, (1 << 63) - 1)
-    unit = value["privacy_unit"]
-    if unit == "row":
-        if unit_ids is not None:
-            raise ValueError(
-                "row cross-validation does not accept patient identifiers")
-        tokens = (b"row\x00" + index.to_bytes(8, "big")
-                  for index in range(rows))
-    else:
-        if unit_ids is None:
-            raise ValueError(
-                "patient cross-validation requires unit identifiers")
-        ids = np.asarray(unit_ids)
-        if ids.ndim != 1 or ids.shape[0] != rows:
-            raise ValueError(
-                "cross-validation unit identifiers must match row count")
-        from . import task
-        tokens = (
-            b"patient\x00" + task._canonical_patient_id(item).encode(
-                "utf-8", errors="strict") for item in ids)
-
-    assignment_domain = {
-        key: value[key] for key in (
-            "assignment", "method", "privacy_unit",
-            "unit_canonicalization", "version")
-    }
-    domain_hash = hashlib.sha256(_wire(assignment_domain)).digest()
-    secret = seeding._node_secret()
+    rows = _exact_int(n_rows, "cross-validation row count", 0, (1 << 63) - 1)
+    tokens = _assignment_tokens(value["privacy_unit"], rows, unit_ids, assignment_tokens)
     k = int(value["folds"])
-    memo = {}
-
-    def assigned(token):
-        if token not in memo:
-            message = (b"dsflower/cv-unit/v1\x00" + domain_hash
-                       + len(token).to_bytes(4, "big") + token)
-            score = int.from_bytes(
-                hmac.new(secret, message, hashlib.sha256).digest(), "big")
-            memo[token] = (score * k // (1 << 256)) + 1
-        return memo[token]
-
-    return np.fromiter(
-        (assigned(token) for token in tokens), dtype=np.int16, count=rows)
+    return np.fromiter((score * k // (1 << 256) + 1
+                        for score in _scores(value["privacy_unit"], tokens)),
+                       dtype=np.int16, count=rows)
 
 
-def cross_validation_folds_from_context(context, *, n_rows, unit_ids=None):
+def cross_validation_folds_from_context(context, *, n_rows, unit_ids=None, assignment_tokens=None):
     from . import task
-    manifest = task._load_manifest(context)
-    contract = cross_validation_contract_from_manifest(manifest)
-    return cross_validation_folds(
-        contract, n_rows=n_rows, unit_ids=unit_ids)
+    contract = cross_validation_contract_from_manifest(task._load_manifest(context))
+    return cross_validation_folds(contract, n_rows=n_rows, unit_ids=unit_ids,
+                                  assignment_tokens=assignment_tokens)
 
 
 __all__ = [

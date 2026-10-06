@@ -38,6 +38,72 @@ def request_selection(canonical, selection=None, *, parameters=None):
     }
 
 
+def native_request_identity(canonical, selection=None, *, execution_fingerprint=None,
+                            manifest=None, operation="train", fold=None):
+    """Project a validated public engine contract before private materialization."""
+    engine_contract = {name: canonical[name] for name in (
+        "contract_version", "mode", "engine", "task", "public_schema", "engine_params")}
+    if canonical["engine"] == "xgboost":
+        from .xgboost_adapter import canonical_xgboost_profile
+        profile = canonical_xgboost_profile(canonical)
+        engine_contract["engine_params"] = {
+            name: {"type": pin["type"], "value": profile.get(name, pin["value"])}
+            for name, pin in canonical["engine_params"].items()}
+    if selection is None and manifest is None:
+        schema = canonical["public_schema"]
+        target = schema["target"]
+        manifest = {"feature_columns": schema["features"], "target_column": target["name"],
+            "task-type": canonical["task"], "dp-unit": canonical["privacy"]["unit"],
+            "patient-id-canonicalization": canonical["privacy"]["unit_canonicalization"],
+            "feature-bounds": {"lower": schema["lower"], "upper": schema["upper"]},
+            "target-levels": target["levels"],
+            "target-bounds": None if target["lower"] is None else [target["lower"], target["upper"]]}
+    config = {
+        "engine_contract": engine_contract,
+        "mechanism-profile": canonical["privacy"]["mechanism_params"],
+        "request-selection": selection,
+        "operation": operation, "fold": fold,
+    }
+    return seeding.request_identity(
+        "native-" + canonical["engine"].replace("_", "-"), config,
+        canonical["privacy"], 1, execution_fingerprint=execution_fingerprint,
+        manifest=manifest)
+
+
+def canonical_native_inputs(features, target, unit_ids=None):
+    """Canonical source order precedes casts, pooling, binning and summation."""
+    from . import canonical_units
+    retained = canonical_units.source_units(features, target)
+    if retained is not None:
+        return np.asarray(features), np.asarray(target), unit_ids, retained
+    units = canonical_units.canonicalize_arrays(
+        features, target, unit_ids=unit_ids)
+    order = units.row_permutation
+    return (canonical_units.attach_units(np.asarray(features)[order], units),
+            canonical_units.attach_units(np.asarray(target)[order], units),
+            None if unit_ids is None else np.asarray(unit_ids)[order], units)
+
+
+def native_binding(request, units, materialized, *, subset=None, sigma=None,
+                   fixed_point_scale=None):
+    targets = (materialized.target if hasattr(materialized, "target")
+               else materialized._target_units)
+    tensors = (materialized._binned_features, targets)
+    if hasattr(materialized, "features"):
+        # Native DMatrix consumes float features as well as the public bins.
+        # Bind its missingness separately so the finite-array hash preserves
+        # exact effective values without admitting NaNs to the release ABI.
+        values = np.asarray(materialized.features)
+        tensors += (np.nan_to_num(values, nan=0.0), np.isnan(values))
+    return seeding.bind_private_data(
+        request, units, effective_tensors=tensors,
+        geometry={"n_staged_rows": len(units.row_permutation),
+                  "n_privacy_units": len(units.records),
+                  "accounting_n_units": len(units.records),
+                  "output_sigma": sigma, "fixed_point_scale": fixed_point_scale},
+        subset=subset)
+
+
 def _canonical_vector(value):
     array = np.asarray(value)
     if array.dtype.hasobject or array.dtype.kind not in "iuf" or \
@@ -74,7 +140,8 @@ def numeric_execution_profile():
 
 def joint_gaussian_release(
         value, *, mechanism, layout, epsilon, delta, sensitivity,
-        num_releases, execution_fingerprint, request_selection=None):
+        num_releases, execution_fingerprint, request_selection=None,
+        request_identity=None, data_binding=None):
     """Release one fixed-layout sufficient vector with semantic sticky noise.
 
     ``num_releases`` is the fixed transcript count accounted by the caller's
@@ -82,8 +149,8 @@ def joint_gaussian_release(
     ``release_index`` in ``layout`` and call this function exactly that many
     times.  This primitive owns canonicalization, RDP sigma calibration and PRF
     identity; adapters own sensitivity proofs and transcript geometry.  Raw
-    calibration inputs affect that identity only through the exact effective
-    sigma.
+    epsilon and delta remain in the parent public request; this stage also binds
+    its exact calibrated sigma and fixed release count.
     """
     if not isinstance(mechanism, str) or not mechanism or \
             not isinstance(layout, dict) or \
@@ -101,27 +168,20 @@ def joint_gaussian_release(
     canonical = _canonical_vector(value)
     sigma = float(dp_harness.compute_output_sigma(
         epsilon, delta, sensitivity, num_releases=num_releases))
-    semantics = {
-        "layout": layout,
-        "mechanism": mechanism,
-        "sigma": sigma,
-    }
-    # Raw policy inputs calibrate and validate sigma but are not independent
-    # reroll axes.  Equal effective semantics derive the same noise stream.
-    privacy = dict(semantics)
-    privacy["policy_hash"] = _policy_hash(semantics)
-    execution = {
-        "adapter": execution_fingerprint,
-        "numeric": numeric_execution_profile(),
-    }
-    master = bytearray(seeding.master_seed(
-        mechanism, {"layout": layout,
-                    "request-selection": request_selection or {}}, privacy, 1,
-        private_arrays=(canonical,),
-        execution_fingerprint=execution))
+    if not isinstance(request_identity, seeding.RequestIdentity) or not isinstance(
+            data_binding, seeding.DataBinding):
+        raise ValueError("tree releases require public request and private source binding")
+    master = bytearray(seeding.release_key(request_identity, data_binding))
+    # Adaptive stage state is bound below the parent R/B key: no future private
+    # histogram or noised topology participates in the parent key derivation.
+    stage = json.dumps({"mechanism": mechanism, "layout": layout,
+                        "sigma": sigma, "num_releases": num_releases},
+                       sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     subkey = None
     try:
-        subkey = bytearray(seeding.sub_seed(master, _RELEASE_DOMAIN))
+        subkey = bytearray(seeding.bind_seed(
+            seeding.sub_seed(master, _RELEASE_DOMAIN),
+            "tree-stage/v3:" + hashlib.sha256(stage).hexdigest(), (canonical,)))
         rng = seeding.np_rng(subkey)
         subkey[:] = b"\x00" * len(subkey)
         noise = np.asarray(

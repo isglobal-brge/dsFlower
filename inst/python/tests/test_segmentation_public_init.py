@@ -22,6 +22,8 @@ from dsflower_runner import (client_app, dp_harness, params, seeding, segmentati
                              segmentation_checkpoints as checkpoints,
                              server_app, task)
 
+from v3_test_support import fixture_node_secret, fixture_key, tagged_arrays
+
 torch.set_num_threads(1)
 
 
@@ -324,11 +326,11 @@ def test_every_public_identity_changes_semantic_seed_and_replays(registry, key):
     cfg = pinned(registry)
     def derive(config, node):
         selected, _ = client_app._neural_seed_contract(config, pins(), {}, manifest=node)
-        return seeding.master_seed("neural-dpsgd/v1", selected,
-                                   {"sigma": 1., "policy_hash": "1" * 64}, 1,
+        return fixture_key("neural-dpsgd/v3", selected,
+                                   {"sigma": 1., "policy_hash": "1" * 64, "epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, 1,
                                    public_arrays=registry.arrays,
                                    private_arrays=(np.zeros((1, 2), np.float32),),
-                                   execution_fingerprint={})
+                                   execution_fingerprint="fixed-test-execution-v3")
     before = derive(cfg, registry.node)
     value = "resource" if key == checkpoints.ORIGIN_KEY else "f" * 64
     assert before != derive(dict(cfg, **{key: value}), dict(registry.node, **{key: value}))
@@ -380,11 +382,12 @@ def test_public_decoder_runs_two_real_dp_rounds_with_unchanged_budget(registry, 
     X = np.zeros((2, seg.FEATURE_DIM), np.float32)
     y = np.zeros((2, 2, 128, 128), np.float32)
     y[:, 1] = 1
+    X, y, ids = tagged_arrays(X, y, ["a", "b"])
     policy = {"epsilon": 4., "delta": 1e-5, "clipping_norm": 1., "n_samples": 2}
     initial = [a.copy() for a in registry.arrays]
     arrays = initial
     with mock.patch.object(seg, "prepare_encoder", return_value=(object(), "cpu")), \
-            mock.patch.object(seg, "load_subject_tensors", return_value=(X, y, ["a", "b"], 2)), \
+            mock.patch.object(seg, "load_subject_tensors", return_value=(X, y, ids, 2)), \
             mock.patch.object(client_app, "load_privacy_config", return_value=policy), \
             mock.patch.object(client_app.release_cache.ReleaseCache, "from_env",
                               side_effect=AssertionError("segmentation must not open the Hook cache")) as cache, \
@@ -515,7 +518,12 @@ def test_repack_alias_and_administrative_metadata_do_not_change_noise_identity(r
     alias["bundle_sha256"] = sha(second.read_bytes())
     assert seeding.request_selection(alias) == seeding.request_selection(registry.node)
     changed = dict(registry.node, **{checkpoints.MANIFEST_KEY: "b" * 64})
-    assert seeding.request_selection(changed) != seeding.request_selection(registry.node)
+    def identity(node):
+        selected, _ = client_app._neural_seed_contract(dict(registry.cfg, **{
+            checkpoints.MANIFEST_KEY: node[checkpoints.MANIFEST_KEY]}), pins(), {}, manifest=node)
+        return seeding.request_identity("neural-dpsgd/v3", selected, {"epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, 1,
+                                        public_arrays=registry.arrays, execution_fingerprint="fixed-test-execution-v3").digest
+    assert identity(changed) != identity(registry.node)
 
 
 @pytest.mark.parametrize("route,policy", [("client", "resource_only"), ("client", "none"), ("resource", "none")])

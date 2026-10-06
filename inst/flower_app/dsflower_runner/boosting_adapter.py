@@ -140,10 +140,8 @@ def _aggregate_patient_units(features, target, unit_ids, canonical, profile):
     tokens = tree_data._patient_unit_tokens(unit_ids, rows)
     if not rows:
         return features, target
-    order = _canonical_row_order(tokens, features, target)
-    features = np.ascontiguousarray(features[order], dtype=features.dtype)
-    target = np.ascontiguousarray(target[order], dtype=np.float64)
-    tokens = np.ascontiguousarray(tokens[order])
+    # Source-unit canonicalization already groups visits in a fixed keyed
+    # order; keep it for the floating reductions below.
     starts = np.flatnonzero(np.concatenate((
         np.asarray([True]), tokens[1:] != tokens[:-1])))
     counts = np.diff(np.append(starts, rows)).astype(np.int64, copy=False)
@@ -206,8 +204,10 @@ def materialize_boosting_units(manifest, features, target, *, unit_ids=None):
         profile["release_coordinates"] * 40 + 16 * 1024 * 1024
     if memory > resources["memory_mib"] * 1024 * 1024:
         raise ValueError("boosting training exceeds its memory ceiling")
-    X = _numeric_array(X_view, "features", 2, dtype)
-    y = _numeric_array(y_view, "target", 1, np.float64)
+    features, target, unit_ids, _units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
+    X = _numeric_array(features, "features", 2, dtype)
+    y = _numeric_array(target, "target", 1, np.float64)
     X = _totalize_features(X, profile["feature_bounds"], dtype)
     y = _totalize_target(y, manifest_value)
     privacy_unit = manifest_value["privacy"]["unit"]
@@ -310,7 +310,7 @@ def _topology_hash(value):
 
 def _release_histogram(raw, canonical, profile, *, release_index,
                        tree_index, stage_index, topology, selected_features,
-                       request_selection=None):
+                       request_selection=None, release_context=None):
     layout = {
         "engine": profile["engine"],
         "feature_indices": list(selected_features),
@@ -333,6 +333,7 @@ def _release_histogram(raw, canonical, profile, *, release_index,
         execution_fingerprint=profile["execution_profile"],
         request_selection=tree_release.request_selection(
             canonical, request_selection),
+        request_identity=release_context[0], data_binding=release_context[1],
     )[0]
 
 
@@ -393,7 +394,7 @@ def _go_right(bins, feature, cut, default_left):
 
 
 def _train_lightgbm_tree(materialized, canonical, profile, prediction,
-                         tree_index, release_offset, request_selection=None):
+                         tree_index, release_offset, request_selection=None, release_context=None):
     q_gradient, q_hessian = _gradients(
         prediction, materialized.target, canonical["task"],
         profile["gradient_clip"], profile["hessian_clip"])
@@ -431,7 +432,7 @@ def _train_lightgbm_tree(materialized, canonical, profile, prediction,
             release_index=release_index,
             tree_index=tree_index, stage_index=stage, topology=topology,
             selected_features=selected_features,
-            request_selection=request_selection)
+            request_selection=request_selection, release_context=release_context)
         best = None
         best_stats = None
         for node in active:
@@ -508,7 +509,7 @@ def _train_lightgbm_tree(materialized, canonical, profile, prediction,
 
 
 def _train_catboost_tree(materialized, canonical, profile, prediction,
-                         tree_index, release_offset, request_selection=None):
+                         tree_index, release_offset, request_selection=None, release_context=None):
     q_gradient, q_hessian = _gradients(
         prediction, materialized.target, canonical["task"],
         profile["gradient_clip"], profile["hessian_clip"])
@@ -528,7 +529,7 @@ def _train_catboost_tree(materialized, canonical, profile, prediction,
             tree_index=tree_index, stage_index=level,
             topology={"splits": splits},
             selected_features=selected_features,
-            request_selection=request_selection)
+            request_selection=request_selection, release_context=release_context)
         active_leaves = 1 << level
         best = None
         best_stats = None
@@ -583,30 +584,41 @@ def _train_catboost_tree(materialized, canonical, profile, prediction,
 class PreparedBoostingTraining:
     """One immutable, one-shot adaptive DP transcript."""
 
-    __slots__ = ("_canonical", "_materialized", "_profile", "_used")
+    __slots__ = ("_canonical", "_materialized", "_profile", "_used", "_request_identity", "_data_binding")
 
-    def __init__(self, canonical, profile, materialized):
+    def __init__(self, canonical, profile, materialized, request_identity, data_binding):
         self._canonical = copy.deepcopy(canonical)
         self._profile = copy.deepcopy(profile)
         self._materialized = materialized
         self._used = False
+        self._request_identity = request_identity
+        self._data_binding = data_binding
 
     def __repr__(self):
         return "PreparedBoostingTraining(engine=%s, releases=%d)" % (
             self._profile["engine"], self._profile["num_releases"])
 
 
-def prepare_boosting_training(manifest, features, target, *, unit_ids=None):
+def prepare_boosting_training(manifest, features, target, *, unit_ids=None,
+                              request_selection=None, request_identity=None,
+                              source_units=None, subset=None):
     """Prepare bounded units; no model bytes or private statistic leave here."""
     from . import native_tree_contract as tree_contract
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_boosting_profile(canonical)
+    identity = request_identity or tree_release.native_request_identity(
+        canonical, request_selection, execution_fingerprint=profile["execution_profile"])
+    features, target, unit_ids, units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
     materialized = materialize_boosting_units(
         canonical, features, target, unit_ids=unit_ids)
-    return PreparedBoostingTraining(canonical, profile, materialized)
+    binding = tree_release.native_binding(
+        identity, units if source_units is None else source_units, materialized,
+        subset=subset)
+    return PreparedBoostingTraining(canonical, profile, materialized, identity, binding)
 
 
-def train_boosting(prepared, *, request_selection=None):
+def train_boosting(prepared, *, request_selection=None, release_context=None):
     """Consume a fixed transcript and return only a safe canonical projection."""
     if type(prepared) is not PreparedBoostingTraining or prepared._used:
         raise ValueError("boosting request was not prepared by dsFlower")
@@ -614,6 +626,7 @@ def train_boosting(prepared, *, request_selection=None):
     canonical = prepared._canonical
     profile = prepared._profile
     materialized = prepared._materialized
+    release_context = (prepared._request_identity, prepared._data_binding)
     prediction = np.full(
         materialized.target.shape[0], profile["base_score"], dtype=np.float64)
     trees = []
@@ -622,12 +635,12 @@ def train_boosting(prepared, *, request_selection=None):
         if profile["engine"] == "lightgbm":
             tree, update = _train_lightgbm_tree(
                 materialized, canonical, profile, prediction, tree_index,
-                release_offset, request_selection=request_selection)
+                release_offset, request_selection=request_selection, release_context=release_context)
             release_offset += profile["num_leaves"] - 1
         else:
             tree, update = _train_catboost_tree(
                 materialized, canonical, profile, prediction, tree_index,
-                release_offset, request_selection=request_selection)
+                release_offset, request_selection=request_selection, release_context=release_context)
             release_offset += profile["max_depth"]
         trees.append(tree)
         prediction += update

@@ -1,0 +1,2544 @@
+{
+  "contract": "dsflower-semantic-field-coverage-v3",
+  "dynamic_module_declarations": {
+    "association_client_app": "753b3acf47419811889382bbe505bfac1674b1df37e3caa731e082106f9f2376",
+    "initialisation": "66fc45aa09a3d115f64d431c488f789a57cd08eaf957cbe7f68eef4f88e5b2df",
+    "native_tree_client_app": "1eee5f92015e2394a58072b252d84d1bc26d8c5716cfe4cb29f1c3e9f5f38875",
+    "native_tree_validation_client_app": "544a894db0065af1481aa451d7b2733f32f9a8ceff1887cf10a736f797872b24",
+    "seeding": "87898ab752dbc2f26e7be58ef9a316c1e0bd28ccc44d03187578436ab6dbeb0b",
+    "segmentation": "561a51866a10445052292a841a6cbe0deb5331ebdde1d69d987b92ff572152f9",
+    "source_projection": "754e737a9fb7aaa3d79ecf5c8063a592ba43300f21e6bd3a75962d31ad1102a2",
+    "survival": "915e9607b317738a6360ad8a496d47892ee8698c9fd14a9f7a24dca2a75b2a70",
+    "task": "ada45539ef49f204b77e980c58aeb2546acf1425beaa1f3214b3ab8a213d434e"
+  },
+  "dynamic_only_expansions": {
+    "public-initialisation-directory": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Custodian resource locator or admission metadata is checked before private access; normalized content/origin has separate semantic identity fields."
+    },
+    "public-initialisation-identity-version": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Custodian resource locator or admission metadata is checked before private access; normalized content/origin has separate semantic identity fields."
+    },
+    "public-initialisation-policy": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Custodian resource locator or admission metadata is checked before private access; normalized content/origin has separate semantic identity fields."
+    },
+    "public-initialisation-provenance": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Custodian resource locator or admission metadata is checked before private access; normalized content/origin has separate semantic identity fields."
+    },
+    "segmentation-decoder-init": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation.mode"
+      ],
+      "reason": "Random/default aliases normalize to spec-seeded initialization; admitted checkpoint content and mode are distinct semantic inputs."
+    },
+    "source_effective_sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Verify node-private staging integrity; canonical raw records and effective arrays, not row-order-sensitive file checksums, bind B."
+    },
+    "source_projection_sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Verify node-private staging integrity; canonical raw records and effective arrays, not row-order-sensitive file checksums, bind B."
+    },
+    "strategy-beta-1": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Server-only aggregator parameters affect later incoming model bytes, not this node local release; local FedProx mu is classified separately."
+    },
+    "strategy-beta-2": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Server-only aggregator parameters affect later incoming model bytes, not this node local release; local FedProx mu is classified separately."
+    },
+    "strategy-eta": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Server-only aggregator parameters affect later incoming model bytes, not this node local release; local FedProx mu is classified separately."
+    },
+    "strategy-eta-l": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Server-only aggregator parameters affect later incoming model bytes, not this node local release; local FedProx mu is classified separately."
+    },
+    "strategy-server-learning-rate": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Server-only aggregator parameters affect later incoming model bytes, not this node local release; local FedProx mu is classified separately."
+    },
+    "strategy-server-momentum": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Server-only aggregator parameters affect later incoming model bytes, not this node local release; local FedProx mu is classified separately."
+    },
+    "strategy-tau": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Server-only aggregator parameters affect later incoming model bytes, not this node local release; local FedProx mu is classified separately."
+    }
+  },
+  "dynamic_reads": {
+    "association_client_app:_pinned_contract:manifest[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "association",
+        "roster",
+        "transport_integrity",
+        "privacy_unit"
+      ],
+      "function_sha256": "9f0147f1a5d996010408fb96c7e9781959fcc100d6216d9a662296951e5124d6"
+    },
+    "association_client_app:_pinned_contract:run_config[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "association",
+        "roster",
+        "transport_integrity",
+        "privacy_unit"
+      ],
+      "function_sha256": "9f0147f1a5d996010408fb96c7e9781959fcc100d6216d9a662296951e5124d6"
+    },
+    "association_client_app:_validate_public_contract:manifest.get(key)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "association",
+        "roster",
+        "transport_integrity",
+        "privacy_unit"
+      ],
+      "function_sha256": "85347ab1130d1732b8043dcfa18ce1b20929a656bf8707b573b0a9001860c449"
+    },
+    "association_client_app:_validate_public_contract:manifest[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "association",
+        "roster",
+        "transport_integrity",
+        "privacy_unit"
+      ],
+      "function_sha256": "85347ab1130d1732b8043dcfa18ce1b20929a656bf8707b573b0a9001860c449"
+    },
+    "initialisation:canonical_initialisation_spec:cfg.get(checkpoints.CHECKPOINT_KEY)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "public_initialisation"
+      ],
+      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+    },
+    "initialisation:canonical_initialisation_spec:cfg.get(checkpoints.ENCODER_KEY)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "public_initialisation"
+      ],
+      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+    },
+    "initialisation:canonical_initialisation_spec:cfg.get(checkpoints.MANIFEST_KEY)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "public_initialisation"
+      ],
+      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+    },
+    "initialisation:canonical_initialisation_spec:cfg.get(checkpoints.ORIGIN_KEY)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "public_initialisation"
+      ],
+      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+    },
+    "native_tree_client_app:_node_privacy:manifest.get(key)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "released_models",
+        "resampling",
+        "release_coordinate",
+        "roster",
+        "transport_integrity"
+      ],
+      "function_sha256": "f6428eb49b8405de370c2826d99e74c451f06fda0974130bb36ab3255fb6ef66"
+    },
+    "native_tree_validation_client_app:_pinned_public_model:manifest.get(key)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "released_models",
+        "validation_layout",
+        "public_resource_guards",
+        "transport_integrity"
+      ],
+      "function_sha256": "7635b282a6f0bc3a7567c5eb93408acdb73ddb0204f59b64d60b4950f47decce"
+    },
+    "native_tree_validation_client_app:_pinned_public_model:manifest[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "released_models",
+        "validation_layout",
+        "public_resource_guards",
+        "transport_integrity"
+      ],
+      "function_sha256": "7635b282a6f0bc3a7567c5eb93408acdb73ddb0204f59b64d60b4950f47decce"
+    },
+    "native_tree_validation_client_app:_pinned_public_model:run_config.get(key)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "released_models",
+        "validation_layout",
+        "public_resource_guards",
+        "transport_integrity"
+      ],
+      "function_sha256": "7635b282a6f0bc3a7567c5eb93408acdb73ddb0204f59b64d60b4950f47decce"
+    },
+    "seeding:_effective_training:cfg.get('scheduler-' + key.replace('_', '-'), default)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "ca3d77c78ccc10a6eef9b7e2127bcbb6a56994ab3741a53cfa36870dae3841ae"
+    },
+    "seeding:_effective_training:cfg.get(wire, defaults[key])": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "ca3d77c78ccc10a6eef9b7e2127bcbb6a56994ab3741a53cfa36870dae3841ae"
+    },
+    "seeding:asset:m.get(name + '_asset', name + 's')": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2ae7584ad8c3a1870bfec73edda1abac663404d8ecf60c071dcbfa1b0fbf433f"
+    },
+    "seeding:get:cfg.get(wire, default)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "ec9155371b30c1af9f6485eb24a777b18013fcc16b5dadce4a304e197aabdaca"
+    },
+    "seeding:request_identity:cfg.get('segmentation-' + key.replace('_', '-'))": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2f59c61bb7296f5d173f758a987ff584044d03cb8eea34115f54181826a5116b"
+    },
+    "seeding:request_identity:cfg.get(prefix + 'assignment')": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2f59c61bb7296f5d173f758a987ff584044d03cb8eea34115f54181826a5116b"
+    },
+    "seeding:request_identity:cfg.get(prefix + 'method')": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2f59c61bb7296f5d173f758a987ff584044d03cb8eea34115f54181826a5116b"
+    },
+    "seeding:request_identity:cfg.get(prefix + 'privacy-unit')": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2f59c61bb7296f5d173f758a987ff584044d03cb8eea34115f54181826a5116b"
+    },
+    "seeding:request_identity:cfg.get(prefix + 'unit-canonicalization')": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2f59c61bb7296f5d173f758a987ff584044d03cb8eea34115f54181826a5116b"
+    },
+    "seeding:request_identity:cfg.get(prefix + 'version')": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2f59c61bb7296f5d173f758a987ff584044d03cb8eea34115f54181826a5116b"
+    },
+    "seeding:request_identity:cfg[field]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "2f59c61bb7296f5d173f758a987ff584044d03cb8eea34115f54181826a5116b"
+    },
+    "seeding:select_config:config[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "optimizer",
+        "scheduler",
+        "segmentation",
+        "resampling",
+        "rounds_and_training",
+        "scalar_losses",
+        "projection_wrappers",
+        "storage",
+        "hook_policy"
+      ],
+      "function_sha256": "25b83868556dea8c859d584dd5fc09316c8dd45ef63289df9eeedb93f5452797"
+    },
+    "segmentation:validate_config:cfg.get(key)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "segmentation",
+        "vision_profile",
+        "public_initialisation",
+        "storage"
+      ],
+      "function_sha256": "9480c092b21985d1b6f539ae247673e2b4d195d209a39f5c91961f525e1cf0e2"
+    },
+    "segmentation:validate_config:cfg[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "segmentation",
+        "vision_profile",
+        "public_initialisation",
+        "storage"
+      ],
+      "function_sha256": "9480c092b21985d1b6f539ae247673e2b4d195d209a39f5c91961f525e1cf0e2"
+    },
+    "segmentation:verified_encoder_bytes:cfg[checkpoints.DIRECTORY_KEY]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "segmentation",
+        "vision_profile",
+        "public_initialisation",
+        "storage"
+      ],
+      "function_sha256": "b7a0d7f15fb6f1fa1a02993a8a5f1bd4a25489301e77de7b7ad0b3be125d36f9"
+    },
+    "source_projection:records:manifest[_FIELDS[2]]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "storage"
+      ],
+      "function_sha256": "a40fb6a984f81fc87f22680cd8398f4669ce4db26c7480e0e378fe47c9a5e5ce"
+    },
+    "source_projection:records:manifest[_FIELDS[3]]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "storage"
+      ],
+      "function_sha256": "a40fb6a984f81fc87f22680cd8398f4669ce4db26c7480e0e378fe47c9a5e5ce"
+    },
+    "survival:validate_survival_config:config[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "survival"
+      ],
+      "function_sha256": "1b074cee3e95bdd7c147a261bb9eb37d66525b9abb2dadc70df39f537a31388d"
+    },
+    "task:_cv_execution_contract:manifest[field]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "fe3deb7ed0832890efc12225cd053e35141958149c006638c765b110b3b114c2"
+    },
+    "task:_survival_public_contract:manifest.get(key)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "e406317f884fe2a5ed5ff45c43ff1caf10b88cd28cb310bcadf0398a9b802f65"
+    },
+    "task:_survival_public_contract:manifest[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "e406317f884fe2a5ed5ff45c43ff1caf10b88cd28cb310bcadf0398a9b802f65"
+    },
+    "task:_validate_cv_execution_config:cfg[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "330a75c7ded6ef4f390074ec9d72b7a6524750ea078962dd5251d8d711b60ed9"
+    },
+    "task:bounded_float:manifest.get(key, default)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "cb1e1f748c2e50bb13b3d7ebc523ddcd810693445c5e6071bc3c78657ae3df9c"
+    },
+    "task:bounded_int:manifest[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "9b989884a693ff55b0943a4762fdd7a0f7ebd070b6c4e88839a6aad639af7cd8"
+    },
+    "task:load_pinned_run_config:cfg.get(key)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "e79bd98a6eb2a5ddc12092df1ae0f23ee6541ba5b658d0d06d5f83b6153d5f88"
+    },
+    "task:load_pinned_run_config:cfg[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "e79bd98a6eb2a5ddc12092df1ae0f23ee6541ba5b658d0d06d5f83b6153d5f88"
+    },
+    "task:load_pinned_run_config:manifest[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "e79bd98a6eb2a5ddc12092df1ae0f23ee6541ba5b658d0d06d5f83b6153d5f88"
+    },
+    "task:pinned_bool:manifest.get(key, default)": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "8f4165299b0264a980c27eb69f30e677a57da3acf127eb05f1159a7eb60bff4e"
+    },
+    "task:required:manifest[key]": {
+      "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
+      "declared_field_families": [
+        "mechanism_and_model",
+        "source_selection",
+        "target_semantics",
+        "task_geometry",
+        "privacy_unit",
+        "privacy_parameters",
+        "private_census",
+        "hook_policy",
+        "hook_application",
+        "rounds_and_training",
+        "optimizer",
+        "scheduler",
+        "local_strategy",
+        "release_coordinate",
+        "resampling",
+        "validation_layout",
+        "released_models",
+        "association",
+        "vision_profile",
+        "image_roles",
+        "segmentation",
+        "public_initialisation",
+        "scalar_losses",
+        "survival",
+        "survival_validation",
+        "projection_wrappers",
+        "transport_integrity",
+        "roster",
+        "storage",
+        "public_resource_guards",
+        "hook_admission_and_padding",
+        "metric_postprocessing"
+      ],
+      "function_sha256": "66ddfa60fea5a5bbc5e029a50d96cf8186c90fbf8326cd0c45a4b60847d0736e"
+    }
+  },
+  "field_families": {
+    "association": [
+      "association-contract",
+      "association-exposure-levels",
+      "association-outcome-levels",
+      "association-preencoded",
+      "association-unit-semantics"
+    ],
+    "hook_admission_and_padding": [
+      "privacy-egress_time_pad",
+      "privacy-hook_enabled"
+    ],
+    "hook_application": [
+      "app-params-b64",
+      "app_params",
+      "hook",
+      "module",
+      "module-sha256",
+      "user-module",
+      "task",
+      "num_classes",
+      "num_rounds"
+    ],
+    "hook_policy": [
+      "privacy-egress_file_mb",
+      "privacy-egress_memory_mb",
+      "privacy-egress_processes",
+      "privacy-egress_timeout",
+      "privacy-sa_blocks",
+      "privacy-sample_aggregate"
+    ],
+    "image_roles": [
+      "image_path_col",
+      "mask_empty_col",
+      "mask_path_col",
+      "sample_id_col",
+      "subject_id_col"
+    ],
+    "local_strategy": [
+      "strategy",
+      "strategy-mu"
+    ],
+    "mechanism_and_model": [
+      "dp-track",
+      "engine",
+      "engine_contract",
+      "mechanism-profile",
+      "model-spec-b64",
+      "loss-name"
+    ],
+    "metric_postprocessing": [
+      "f1",
+      "roc_auc"
+    ],
+    "optimizer": [
+      "amsgrad",
+      "beta1",
+      "beta2",
+      "eps",
+      "l1-penalty",
+      "momentum",
+      "name",
+      "nesterov",
+      "optimizer-amsgrad",
+      "optimizer-beta1",
+      "optimizer-beta2",
+      "optimizer-eps",
+      "optimizer-momentum",
+      "optimizer-name",
+      "optimizer-nesterov",
+      "optimizer-rmsprop-alpha",
+      "rmsprop_alpha",
+      "weight-decay",
+      "weight_decay"
+    ],
+    "privacy_parameters": [
+      "privacy-adjacency",
+      "privacy-clipping_norm",
+      "privacy-delta",
+      "privacy-epsilon"
+    ],
+    "privacy_unit": [
+      "dp-unit",
+      "privacy_unit",
+      "patient-id-canonicalization",
+      "association-privacy-unit",
+      "resampling-privacy-unit",
+      "cv-privacy-unit"
+    ],
+    "private_census": [
+      "n_samples",
+      "n_units",
+      "survival_shape"
+    ],
+    "projection_wrappers": [
+      "pins",
+      "request-selection",
+      "run"
+    ],
+    "public_initialisation": [
+      "initial-model-sha256",
+      "public-initialisation-admission-policy-sha256",
+      "public-initialisation-checkpoint-sha256",
+      "public-initialisation-encoder-sha256",
+      "public-initialisation-manifest-sha256",
+      "public-initialisation-origin",
+      "segmentation-checkpoint-sha256"
+    ],
+    "public_resource_guards": [
+      "native-tree-artifact-size-bytes",
+      "validation-artifact-size-bytes",
+      "validation-profile-size-bytes"
+    ],
+    "release_coordinate": [
+      "dsflower-operation",
+      "operation",
+      "fold",
+      "round_index",
+      "server-round"
+    ],
+    "released_models": [
+      "fold_model_sha256",
+      "native-tree-artifact-format",
+      "native-tree-artifact-sha256",
+      "native-tree-public-schema-sha256",
+      "native-tree-request-b64",
+      "validation-artifact-format",
+      "validation-artifact-sha256",
+      "validation-model-track",
+      "validation-native-tree-request-b64",
+      "validation-profile-sha256",
+      "validation-public-schema-sha256"
+    ],
+    "resampling": [
+      "cv-assignment",
+      "cv-folds",
+      "cv-method",
+      "cv-unit-canonicalization",
+      "cv-version",
+      "resampling-assignment",
+      "resampling-method",
+      "resampling-test-denominator",
+      "resampling-test-numerator",
+      "resampling-unit-canonicalization",
+      "resampling-version"
+    ],
+    "roster": [
+      "association-n-nodes",
+      "cv-n-nodes",
+      "min-train-nodes",
+      "native-tree-n-nodes"
+    ],
+    "rounds_and_training": [
+      "batch-size",
+      "learning-rate",
+      "local-epochs",
+      "num-server-rounds"
+    ],
+    "scalar_losses": [
+      "gamma-shape",
+      "huber-delta",
+      "nb-dispersion",
+      "quantile-level"
+    ],
+    "scheduler": [
+      "gamma",
+      "min_lr",
+      "scheduler-gamma",
+      "scheduler-min-lr",
+      "scheduler-name",
+      "scheduler-step-size",
+      "step_size"
+    ],
+    "segmentation": [
+      "mask-vocabulary",
+      "segmentation-alpha",
+      "segmentation-output-shape",
+      "segmentation-preprocessing",
+      "segmentation-selection",
+      "segmentation-smooth"
+    ],
+    "source_selection": [
+      "feature_columns",
+      "target_column",
+      "survival_feature_columns",
+      "survival_target_columns",
+      "patient_column"
+    ],
+    "storage": [
+      "data_file",
+      "data_format",
+      "image_asset",
+      "mask_asset",
+      "samples_file",
+      "source_projection_file",
+      "source_projection_schema",
+      "survival_file",
+      "survival_schema",
+      "validation-model-path-b64"
+    ],
+    "survival": [
+      "dispersion",
+      "distribution",
+      "edges",
+      "horizon",
+      "schema_version",
+      "survival-config",
+      "survival-config-b64",
+      "t_min",
+      "time_origin",
+      "time_scale",
+      "time_unit"
+    ],
+    "survival_validation": [
+      "validation-survival-horizons",
+      "validation-survival-nll-bound"
+    ],
+    "target_semantics": [
+      "target-levels",
+      "target-preencoded",
+      "target-bounds",
+      "feature-bounds",
+      "feature-bounds-b64"
+    ],
+    "task_geometry": [
+      "data-kind",
+      "data_type",
+      "num-classes",
+      "num-labels",
+      "num-features",
+      "task-type"
+    ],
+    "transport_integrity": [
+      "app-params-sha256",
+      "cv-contract-sha256",
+      "cv-job-sha256",
+      "native-tree-request-sha256",
+      "privacy-policy-sha256",
+      "resampling-contract-sha256",
+      "semantic-randomness-contract",
+      "validation-native-tree-request-sha256"
+    ],
+    "validation_layout": [
+      "cv-target-lower",
+      "cv-target-upper",
+      "cv-validation-bins",
+      "holdout-target-lower",
+      "holdout-target-upper",
+      "holdout-validation-bins",
+      "layout",
+      "validation-bins",
+      "validation-target-lower",
+      "validation-target-upper",
+      "validation-task"
+    ],
+    "vision_profile": [
+      "backbone",
+      "image-size",
+      "model",
+      "vision-extractor-profile",
+      "assets"
+    ]
+  },
+  "fields": {
+    "amsgrad": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "app-params-b64": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "app-params-sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "app_params": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "assets": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles",
+        "R.selection.preprocessing",
+        "R.initialisation"
+      ],
+      "reason": "Normalize the admitted frozen extractor and logical image/mask asset types; asset roots, identifiers and unused tabular image fields are excluded."
+    },
+    "association-contract": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.association_encoding",
+        "R.mechanism.profile"
+      ],
+      "reason": "Outcome/exposure orientation, typed ordered levels and the fixed contribution rule are public association semantics; raw cross-tab counts remain private."
+    },
+    "association-exposure-levels": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.association_encoding",
+        "R.mechanism.profile"
+      ],
+      "reason": "Outcome/exposure orientation, typed ordered levels and the fixed contribution rule are public association semantics; raw cross-tab counts remain private."
+    },
+    "association-n-nodes": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Federation roster/completeness is an admission guard; node identifiers and reply arrival order must not change an individual node release key."
+    },
+    "association-outcome-levels": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.association_encoding",
+        "R.mechanism.profile"
+      ],
+      "reason": "Outcome/exposure orientation, typed ordered levels and the fixed contribution rule are public association semantics; raw cross-tab counts remain private."
+    },
+    "association-preencoded": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.association_encoding",
+        "R.mechanism.profile"
+      ],
+      "reason": "Outcome/exposure orientation, typed ordered levels and the fixed contribution rule are public association semantics; raw cross-tab counts remain private."
+    },
+    "association-privacy-unit": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy",
+        "R.selection"
+      ],
+      "reason": "Only the effective unit rule enters identity: row-content-occurrence-v1 for rows and trim-utf8-v2 for patients."
+    },
+    "association-unit-semantics": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.association_encoding",
+        "R.mechanism.profile"
+      ],
+      "reason": "Outcome/exposure orientation, typed ordered levels and the fixed contribution rule are public association semantics; raw cross-tab counts remain private."
+    },
+    "backbone": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles",
+        "R.selection.preprocessing",
+        "R.initialisation"
+      ],
+      "reason": "Normalize the admitted frozen extractor and logical image/mask asset types; asset roots, identifiers and unused tabular image fields are excluded."
+    },
+    "batch-size": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training"
+      ],
+      "reason": "Effective public local training schedule after defaults is included; private census and computed sampling geometry are separate B fields."
+    },
+    "beta1": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "beta2": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "cv-assignment": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "cv-contract-sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "cv-folds": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "cv-job-sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "cv-method": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "cv-n-nodes": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Federation roster/completeness is an admission guard; node identifiers and reply arrival order must not change an individual node release key."
+    },
+    "cv-privacy-unit": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy",
+        "R.selection"
+      ],
+      "reason": "Only the effective unit rule enters identity: row-content-occurrence-v1 for rows and trim-utf8-v2 for patients."
+    },
+    "cv-target-lower": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "cv-target-upper": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "cv-unit-canonicalization": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "cv-validation-bins": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "cv-version": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "data-kind": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection",
+        "R.model"
+      ],
+      "reason": "Declared task and actual per-example geometry enter the normalized model and selection; unused class/label fields are removed."
+    },
+    "data_file": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "data_format": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "data_type": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection",
+        "R.model"
+      ],
+      "reason": "Declared task and actual per-example geometry enter the normalized model and selection; unused class/label fields are removed."
+    },
+    "dispersion": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "distribution": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "dp-track": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.mechanism",
+        "R.model"
+      ],
+      "reason": "The admitted mechanism family, canonical model AST and active loss determine the executed local computation."
+    },
+    "dp-unit": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy",
+        "R.selection"
+      ],
+      "reason": "Only the effective unit rule enters identity: row-content-occurrence-v1 for rows and trim-utf8-v2 for patients."
+    },
+    "dsflower-operation": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.operation",
+        "R.coordinate"
+      ],
+      "reason": "The admitted release operation, round and CV fold are semantic coordinates; transport message and run identifiers are not."
+    },
+    "edges": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "engine": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.mechanism",
+        "R.model"
+      ],
+      "reason": "The admitted mechanism family, canonical model AST and active loss determine the executed local computation."
+    },
+    "engine_contract": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.mechanism",
+        "R.model"
+      ],
+      "reason": "The admitted mechanism family, canonical model AST and active loss determine the executed local computation."
+    },
+    "eps": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "f1": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "These reads select fields from already-public postprocessed metrics, not configuration consumed by a new private mechanism."
+    },
+    "feature-bounds": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Decode and normalize the declared ordered levels, target encoding and public clipping domains before identity construction."
+    },
+    "feature-bounds-b64": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Decode and normalize the declared ordered levels, target encoding and public clipping domains before identity construction."
+    },
+    "feature_columns": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Ordered selected column roles are public contracts; source aliases and unrelated columns are excluded."
+    },
+    "fold": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.operation",
+        "R.coordinate"
+      ],
+      "reason": "The admitted release operation, round and CV fold are semantic coordinates; transport message and run identifiers are not."
+    },
+    "fold_model_sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "gamma": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.scheduler"
+      ],
+      "reason": "Only parameters consumed by the selected schedule are retained; integer counts and real coefficients have distinct canonical types."
+    },
+    "gamma-shape": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters"
+      ],
+      "reason": "Only the loss-selected real parameter is canonicalized; other loss parameters are rejected or inapplicable."
+    },
+    "holdout-target-lower": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "holdout-target-upper": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "holdout-validation-bins": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "hook": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "horizon": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "huber-delta": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters"
+      ],
+      "reason": "Only the loss-selected real parameter is canonicalized; other loss parameters are rejected or inapplicable."
+    },
+    "image-size": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles",
+        "R.selection.preprocessing",
+        "R.initialisation"
+      ],
+      "reason": "Normalize the admitted frozen extractor and logical image/mask asset types; asset roots, identifiers and unused tabular image fields are excluded."
+    },
+    "image_asset": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "image_path_col": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles"
+      ],
+      "reason": "Logical image selection columns are scientific inputs where used; actual source paths are resolved only for authorization and decoded content binds privately."
+    },
+    "initial-model-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation"
+      ],
+      "reason": "Bind actual initial arrays and admitted checkpoint/encoder content; the frozen segmentation encoder is distinct from decoder initialization mode."
+    },
+    "l1-penalty": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "layout": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "learning-rate": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training"
+      ],
+      "reason": "Effective public local training schedule after defaults is included; private census and computed sampling geometry are separate B fields."
+    },
+    "local-epochs": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training"
+      ],
+      "reason": "Effective public local training schedule after defaults is included; private census and computed sampling geometry are separate B fields."
+    },
+    "loss-name": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.mechanism",
+        "R.model"
+      ],
+      "reason": "The admitted mechanism family, canonical model AST and active loss determine the executed local computation."
+    },
+    "mask-vocabulary": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters",
+        "R.selection.preprocessing"
+      ],
+      "reason": "The bounded segmentation loss, fixed preprocessing/selection and effective decoder geometry enter the public identity."
+    },
+    "mask_asset": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "mask_empty_col": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles"
+      ],
+      "reason": "Logical image selection columns are scientific inputs where used; actual source paths are resolved only for authorization and decoded content binds privately."
+    },
+    "mask_path_col": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles"
+      ],
+      "reason": "Logical image selection columns are scientific inputs where used; actual source paths are resolved only for authorization and decoded content binds privately."
+    },
+    "mechanism-profile": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.mechanism",
+        "R.model"
+      ],
+      "reason": "The admitted mechanism family, canonical model AST and active loss determine the executed local computation."
+    },
+    "min-train-nodes": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Federation roster/completeness is an admission guard; node identifiers and reply arrival order must not change an individual node release key."
+    },
+    "min_lr": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.scheduler"
+      ],
+      "reason": "Only parameters consumed by the selected schedule are retained; integer counts and real coefficients have distinct canonical types."
+    },
+    "model": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles",
+        "R.selection.preprocessing",
+        "R.initialisation"
+      ],
+      "reason": "Normalize the admitted frozen extractor and logical image/mask asset types; asset roots, identifiers and unused tabular image fields are excluded."
+    },
+    "model-spec-b64": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.mechanism",
+        "R.model"
+      ],
+      "reason": "The admitted mechanism family, canonical model AST and active loss determine the executed local computation."
+    },
+    "module": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "module-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "momentum": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "n_samples": {
+      "category": "private_binding",
+      "identity_paths": [
+        "B.geometry"
+      ],
+      "reason": "Staged source and accounting counts are private execution geometry and must never enter public request identity."
+    },
+    "n_units": {
+      "category": "private_binding",
+      "identity_paths": [
+        "B.geometry"
+      ],
+      "reason": "Staged source and accounting counts are private execution geometry and must never enter public request identity."
+    },
+    "name": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "native-tree-artifact-format": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "native-tree-artifact-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "native-tree-artifact-size-bytes": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Public byte-size bounds guard artifact admission before private reads; sanitized consumed content has its own semantic hash."
+    },
+    "native-tree-n-nodes": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Federation roster/completeness is an admission guard; node identifiers and reply arrival order must not change an individual node release key."
+    },
+    "native-tree-public-schema-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "native-tree-request-b64": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "native-tree-request-sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "nb-dispersion": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters"
+      ],
+      "reason": "Only the loss-selected real parameter is canonicalized; other loss parameters are rejected or inapplicable."
+    },
+    "nesterov": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "num-classes": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection",
+        "R.model"
+      ],
+      "reason": "Declared task and actual per-example geometry enter the normalized model and selection; unused class/label fields are removed."
+    },
+    "num-features": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection",
+        "R.model"
+      ],
+      "reason": "Declared task and actual per-example geometry enter the normalized model and selection; unused class/label fields are removed."
+    },
+    "num-labels": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection",
+        "R.model"
+      ],
+      "reason": "Declared task and actual per-example geometry enter the normalized model and selection; unused class/label fields are removed."
+    },
+    "num-server-rounds": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training"
+      ],
+      "reason": "Effective public local training schedule after defaults is included; private census and computed sampling geometry are separate B fields."
+    },
+    "num_classes": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "num_rounds": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "operation": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.operation",
+        "R.coordinate"
+      ],
+      "reason": "The admitted release operation, round and CV fold are semantic coordinates; transport message and run identifiers are not."
+    },
+    "optimizer-amsgrad": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "optimizer-beta1": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "optimizer-beta2": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "optimizer-eps": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "optimizer-momentum": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "optimizer-name": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "optimizer-nesterov": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "optimizer-rmsprop-alpha": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "patient-id-canonicalization": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy",
+        "R.selection"
+      ],
+      "reason": "Only the effective unit rule enters identity: row-content-occurrence-v1 for rows and trim-utf8-v2 for patients."
+    },
+    "patient_column": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Ordered selected column roles are public contracts; source aliases and unrelated columns are excluded."
+    },
+    "pins": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.selection",
+        "R.training",
+        "R.privacy"
+      ],
+      "reason": "These trusted adapter wrappers are projected field by field onto closed R objects; whole dictionaries or private execution pins are never hashed."
+    },
+    "privacy-adjacency": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy"
+      ],
+      "reason": "Custodian privacy parameters are semantic independently of any numerical collision in computed calibration."
+    },
+    "privacy-clipping_norm": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy"
+      ],
+      "reason": "Custodian privacy parameters are semantic independently of any numerical collision in computed calibration."
+    },
+    "privacy-delta": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy"
+      ],
+      "reason": "Custodian privacy parameters are semantic independently of any numerical collision in computed calibration."
+    },
+    "privacy-egress_file_mb": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application.execution_profile",
+        "R.privacy"
+      ],
+      "reason": "Fixed Hook block policy and execution limits affecting the gated result are public; actual private block contents bind in B."
+    },
+    "privacy-egress_memory_mb": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application.execution_profile",
+        "R.privacy"
+      ],
+      "reason": "Fixed Hook block policy and execution limits affecting the gated result are public; actual private block contents bind in B."
+    },
+    "privacy-egress_processes": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application.execution_profile",
+        "R.privacy"
+      ],
+      "reason": "Fixed Hook block policy and execution limits affecting the gated result are public; actual private block contents bind in B."
+    },
+    "privacy-egress_time_pad": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Hook authorization and fixed timing padding are admission/operational policy; neither changes an admitted gated numerical result."
+    },
+    "privacy-egress_timeout": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application.execution_profile",
+        "R.privacy"
+      ],
+      "reason": "Fixed Hook block policy and execution limits affecting the gated result are public; actual private block contents bind in B."
+    },
+    "privacy-epsilon": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy"
+      ],
+      "reason": "Custodian privacy parameters are semantic independently of any numerical collision in computed calibration."
+    },
+    "privacy-hook_enabled": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Hook authorization and fixed timing padding are admission/operational policy; neither changes an admitted gated numerical result."
+    },
+    "privacy-policy-sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "privacy-sa_blocks": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application.execution_profile",
+        "R.privacy"
+      ],
+      "reason": "Fixed Hook block policy and execution limits affecting the gated result are public; actual private block contents bind in B."
+    },
+    "privacy-sample_aggregate": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application.execution_profile",
+        "R.privacy"
+      ],
+      "reason": "Fixed Hook block policy and execution limits affecting the gated result are public; actual private block contents bind in B."
+    },
+    "privacy_unit": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy",
+        "R.selection"
+      ],
+      "reason": "Only the effective unit rule enters identity: row-content-occurrence-v1 for rows and trim-utf8-v2 for patients."
+    },
+    "public-initialisation-admission-policy-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation"
+      ],
+      "reason": "Bind actual initial arrays and admitted checkpoint/encoder content; the frozen segmentation encoder is distinct from decoder initialization mode."
+    },
+    "public-initialisation-checkpoint-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation"
+      ],
+      "reason": "Bind actual initial arrays and admitted checkpoint/encoder content; the frozen segmentation encoder is distinct from decoder initialization mode."
+    },
+    "public-initialisation-encoder-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation"
+      ],
+      "reason": "Bind actual initial arrays and admitted checkpoint/encoder content; the frozen segmentation encoder is distinct from decoder initialization mode."
+    },
+    "public-initialisation-manifest-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation"
+      ],
+      "reason": "Bind actual initial arrays and admitted checkpoint/encoder content; the frozen segmentation encoder is distinct from decoder initialization mode."
+    },
+    "public-initialisation-origin": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation"
+      ],
+      "reason": "Bind actual initial arrays and admitted checkpoint/encoder content; the frozen segmentation encoder is distinct from decoder initialization mode."
+    },
+    "quantile-level": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters"
+      ],
+      "reason": "Only the loss-selected real parameter is canonicalized; other loss parameters are rejected or inapplicable."
+    },
+    "request-selection": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.selection",
+        "R.training",
+        "R.privacy"
+      ],
+      "reason": "These trusted adapter wrappers are projected field by field onto closed R objects; whole dictionaries or private execution pins are never hashed."
+    },
+    "resampling-assignment": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "resampling-contract-sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "resampling-method": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "resampling-privacy-unit": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.privacy",
+        "R.selection"
+      ],
+      "reason": "Only the effective unit rule enters identity: row-content-occurrence-v1 for rows and trim-utf8-v2 for patients."
+    },
+    "resampling-test-denominator": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "resampling-test-numerator": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "resampling-unit-canonicalization": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "resampling-version": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation.resampling",
+        "R.privacy.budget_allocation"
+      ],
+      "reason": "Public split contract and budget allocation enter R; content token assignments and membership digests enter the private subset in B."
+    },
+    "rmsprop_alpha": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "roc_auc": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "These reads select fields from already-public postprocessed metrics, not configuration consumed by a new private mechanism."
+    },
+    "round_index": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.operation",
+        "R.coordinate"
+      ],
+      "reason": "The admitted release operation, round and CV fold are semantic coordinates; transport message and run identifiers are not."
+    },
+    "run": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.selection",
+        "R.training",
+        "R.privacy"
+      ],
+      "reason": "These trusted adapter wrappers are projected field by field onto closed R objects; whole dictionaries or private execution pins are never hashed."
+    },
+    "sample_id_col": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles"
+      ],
+      "reason": "Logical image selection columns are scientific inputs where used; actual source paths are resolved only for authorization and decoded content binds privately."
+    },
+    "samples_file": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "scheduler-gamma": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.scheduler"
+      ],
+      "reason": "Only parameters consumed by the selected schedule are retained; integer counts and real coefficients have distinct canonical types."
+    },
+    "scheduler-min-lr": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.scheduler"
+      ],
+      "reason": "Only parameters consumed by the selected schedule are retained; integer counts and real coefficients have distinct canonical types."
+    },
+    "scheduler-name": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.scheduler"
+      ],
+      "reason": "Only parameters consumed by the selected schedule are retained; integer counts and real coefficients have distinct canonical types."
+    },
+    "scheduler-step-size": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.scheduler"
+      ],
+      "reason": "Only parameters consumed by the selected schedule are retained; integer counts and real coefficients have distinct canonical types."
+    },
+    "schema_version": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "segmentation-alpha": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters",
+        "R.selection.preprocessing"
+      ],
+      "reason": "The bounded segmentation loss, fixed preprocessing/selection and effective decoder geometry enter the public identity."
+    },
+    "segmentation-checkpoint-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation"
+      ],
+      "reason": "Bind actual initial arrays and admitted checkpoint/encoder content; the frozen segmentation encoder is distinct from decoder initialization mode."
+    },
+    "segmentation-output-shape": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters",
+        "R.selection.preprocessing"
+      ],
+      "reason": "The bounded segmentation loss, fixed preprocessing/selection and effective decoder geometry enter the public identity."
+    },
+    "segmentation-preprocessing": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters",
+        "R.selection.preprocessing"
+      ],
+      "reason": "The bounded segmentation loss, fixed preprocessing/selection and effective decoder geometry enter the public identity."
+    },
+    "segmentation-selection": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters",
+        "R.selection.preprocessing"
+      ],
+      "reason": "The bounded segmentation loss, fixed preprocessing/selection and effective decoder geometry enter the public identity."
+    },
+    "segmentation-smooth": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters",
+        "R.selection.preprocessing"
+      ],
+      "reason": "The bounded segmentation loss, fixed preprocessing/selection and effective decoder geometry enter the public identity."
+    },
+    "semantic-randomness-contract": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "server-round": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.operation",
+        "R.coordinate"
+      ],
+      "reason": "The admitted release operation, round and CV fold are semantic coordinates; transport message and run identifiers are not."
+    },
+    "source_projection_file": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "source_projection_schema": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "step_size": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.scheduler"
+      ],
+      "reason": "Only parameters consumed by the selected schedule are retained; integer counts and real coefficients have distinct canonical types."
+    },
+    "strategy": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.strategy"
+      ],
+      "reason": "Pure server strategies project to none; positive FedProx mu affects the local rule and mu=0 is identical to FedAvg."
+    },
+    "strategy-mu": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.strategy"
+      ],
+      "reason": "Pure server strategies project to none; positive FedProx mu affects the local rule and mu=0 is identical to FedAvg."
+    },
+    "subject_id_col": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles"
+      ],
+      "reason": "Logical image selection columns are scientific inputs where used; actual source paths are resolved only for authorization and decoded content binds privately."
+    },
+    "survival-config": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "survival-config-b64": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "survival_feature_columns": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Ordered selected column roles are public contracts; source aliases and unrelated columns are excluded."
+    },
+    "survival_file": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "survival_schema": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "survival_shape": {
+      "category": "private_binding",
+      "identity_paths": [
+        "B.geometry"
+      ],
+      "reason": "Staged source and accounting counts are private execution geometry and must never enter public request identity."
+    },
+    "survival_target_columns": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Ordered selected column roles are public contracts; source aliases and unrelated columns are excluded."
+    },
+    "t_min": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "target-bounds": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Decode and normalize the declared ordered levels, target encoding and public clipping domains before identity construction."
+    },
+    "target-levels": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Decode and normalize the declared ordered levels, target encoding and public clipping domains before identity construction."
+    },
+    "target-preencoded": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Decode and normalize the declared ordered levels, target encoding and public clipping domains before identity construction."
+    },
+    "target_column": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection"
+      ],
+      "reason": "Ordered selected column roles are public contracts; source aliases and unrelated columns are excluded."
+    },
+    "task": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "task-type": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection",
+        "R.model"
+      ],
+      "reason": "Declared task and actual per-example geometry enter the normalized model and selection; unused class/label fields are removed."
+    },
+    "time_origin": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "time_scale": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "time_unit": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model.loss_parameters.survival"
+      ],
+      "reason": "Decode survival configuration and retain the exact validated public likelihood/time domain; latent patient data and derived validity are B inputs."
+    },
+    "user-module": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.application",
+        "R.initialisation",
+        "R.training"
+      ],
+      "reason": "The pinned logical package, complete admitted Hook parameters, task/classes and rounds can be consumed by sandboxed application code."
+    },
+    "validation-artifact-format": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "validation-artifact-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "validation-artifact-size-bytes": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Public byte-size bounds guard artifact admission before private reads; sanitized consumed content has its own semantic hash."
+    },
+    "validation-bins": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "validation-model-path-b64": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Storage syntax, protected source sidecars and catalogue aliases select authorized bytes; canonical selected source contents enter B independently of these locators."
+    },
+    "validation-model-track": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "validation-native-tree-request-b64": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "validation-native-tree-request-sha256": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Integrity/version admission pins are checked before private access; canonical decoded contents and effective policy are separately projected, so raw digests are not nonce axes."
+    },
+    "validation-profile-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "validation-profile-size-bytes": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Public byte-size bounds guard artifact admission before private reads; sanitized consumed content has its own semantic hash."
+    },
+    "validation-public-schema-sha256": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.model",
+        "R.evaluation"
+      ],
+      "reason": "Canonical native request/profile and sanitized public model content determine prediction semantics; byte count and locator metadata are not hashed."
+    },
+    "validation-survival-horizons": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation"
+      ],
+      "reason": "Ordered public horizons and the bounded NLL profile determine the released survival validation vector."
+    },
+    "validation-survival-nll-bound": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation"
+      ],
+      "reason": "Ordered public horizons and the bounded NLL profile determine the released survival validation vector."
+    },
+    "validation-target-lower": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "validation-target-upper": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "validation-task": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.evaluation",
+        "R.mechanism.profile"
+      ],
+      "reason": "Normalized evaluation layout and clipping bounds determine the fixed sufficient vector; opaque job contract hashes do not."
+    },
+    "vision-extractor-profile": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.selection.image_roles",
+        "R.selection.preprocessing",
+        "R.initialisation"
+      ],
+      "reason": "Normalize the admitted frozen extractor and logical image/mask asset types; asset roots, identifiers and unused tabular image fields are excluded."
+    },
+    "weight-decay": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    },
+    "weight_decay": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.training.optimizer"
+      ],
+      "reason": "Only active optimizer parameters enter the closed default-filled optimizer object; aliases normalize to actual numerical semantics."
+    }
+  }
+}

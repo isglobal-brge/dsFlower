@@ -247,8 +247,12 @@ def _node_privacy(manifest, context, operation):
 
 
 def _pinned_request(msg, context):
+    from .strategy import canonical_local_strategy
+    canonical_local_strategy(dict(context.run_config), "native_tree")
     message_config = _exact_message_config(msg)
     manifest = task._load_manifest(context)
+    if manifest.get("semantic-randomness-contract") != seeding.SEMANTIC_CONTRACT:
+        raise ValueError("native trees require semantic-randomness-contract v3")
     run_config = (task.load_pinned_run_config(context)
                   if (manifest.get("resampling-contract-sha256") is not None or
                       manifest.get("cv-contract-sha256") is not None)
@@ -329,8 +333,11 @@ def _pinned_request(msg, context):
 
 
 def _partition(context, features, target, unit_ids, *, test):
+    from .canonical_units import source_units
+    units = source_units(features, target)
     mask = resampling.holdout_mask_from_context(
-        context, n_rows=int(target.shape[0]), unit_ids=unit_ids)
+        context, n_rows=int(target.shape[0]), unit_ids=unit_ids,
+        assignment_tokens=None if units is None else units.row_tokens)
     selected = mask if test else ~mask
     selected_units = (None if unit_ids is None
                       else np.asarray(unit_ids)[selected])
@@ -338,8 +345,11 @@ def _partition(context, features, target, unit_ids, *, test):
 
 
 def _cv_partition(context, features, target, unit_ids, *, fold, test):
+    from .canonical_units import source_units
+    units = source_units(features, target)
     assigned = resampling.cross_validation_folds_from_context(
-        context, n_rows=int(target.shape[0]), unit_ids=unit_ids)
+        context, n_rows=int(target.shape[0]), unit_ids=unit_ids,
+        assignment_tokens=None if units is None else units.row_tokens)
     selected = assigned == int(fold)
     if not test:
         selected = ~selected
@@ -606,7 +616,8 @@ def _require_cv_training(context, manifest, fold):
 
 def _forget_cv_state(context):
     state = _holdout_state(context)
-    for key in (_CV_OOF_META, _CV_OOF_TOTAL, _CV_TRAIN_META):
+    for key in (_CV_OOF_META, _CV_OOF_TOTAL, _CV_TRAIN_META,
+                "dsflower-native-parent-binding-v3"):
         state.pop(key, None)
 
 
@@ -648,15 +659,30 @@ def _replay_cv_reply(context, claim, msg):
 
 
 def _request_selection(manifest, operation, fold=None, request=None):
-    selection = seeding.request_selection(manifest)
-    selection["release-coordinate"] = {"operation": operation, "fold": fold}
-    if request is not None:
-        selection["native-tree-request"] = {
-            **seeding.select_config(request, ("engine", "mode", "task")),
-            "parameters": request["parameters"],
-            "public-schema-sha256": request["public_schema"]["sha256"],
-        }
-    return selection
+    # Job hashes and transport coordinates remain admission pins, not noise axes.
+    return seeding.request_selection(manifest)
+
+
+def _parent_source_binding(context, units, unit_ids, *, cv=False):
+    """Freeze the complete selected source and unit-local assignments per job."""
+    assignment = (resampling.cross_validation_folds_from_context(
+        context, n_rows=len(units.row_tokens), unit_ids=unit_ids,
+        assignment_tokens=units.row_tokens) if cv else
+        resampling.holdout_mask_from_context(
+            context, n_rows=len(units.row_tokens), unit_ids=unit_ids,
+            assignment_tokens=units.row_tokens))
+    digest = hashlib.sha256(np.ascontiguousarray(assignment, dtype="<i8").tobytes()).hexdigest()
+    record = {"units-sha256": units.multiset_digest,
+              "assignment-sha256": digest,
+              "n-staged-rows": len(units.row_tokens),
+              "n-privacy-units": len(units.records)}
+    key = "dsflower-native-parent-binding-v3"
+    state = _holdout_state(context)
+    existing = state.get(key)
+    if existing is not None and dict(existing) != record:
+        raise RuntimeError("native-tree parent data or assignments changed during the job")
+    state[key] = ConfigRecord(record)
+    return digest
 
 
 def _evaluate_holdout(msg, context, request, node_manifest, privacy):
@@ -683,11 +709,18 @@ def _evaluate_holdout(msg, context, request, node_manifest, privacy):
     if model.task != expected_task or \
             model.num_features != len(request["public_schema"]["features"]):
         raise ValueError("native-tree holdout predictor geometry is invalid")
+    public_arrays = (np.frombuffer(artifact, dtype=np.uint8),)
+    selection = _request_selection(node_manifest, "holdout-evaluate", request=request)
+    identity = validation.build_validation_request(
+        layout, epsilon=privacy["epsilon"], delta=privacy["delta"],
+        request_selection=selection, public_arrays=public_arrays,
+        manifest=node_manifest, operation="holdout-evaluate")
     claim = release_guard.claim_release(context, msg)
     if claim["status"] == "replay":
         return _replay_vector(context, claim, msg, layout)
-    features, target, unit_ids = task.load_native_tree_data(
-        context, manifest=node_manifest)
+    features, target, unit_ids, units = task.load_native_tree_data(
+        context, manifest=node_manifest, include_canonical_units=True)
+    assignment_digest = _parent_source_binding(context, units, unit_ids)
     features, target, unit_ids = _partition(
         context, features, target, unit_ids, test=True)
     bounds = (None if request["task"] == "binary" else {
@@ -702,16 +735,20 @@ def _evaluate_holdout(msg, context, request, node_manifest, privacy):
             np.zeros(int(layout["size"]), dtype=np.float64), layout,
             epsilon=privacy["epsilon"], delta=privacy["delta"],
             num_releases=1,
-            include_zero_neighbor=privacy["unit"] == "patient",
-            request_selection=selection, public_arrays=public_arrays)
+            include_zero_neighbor=True,
+            request_selection=selection, public_arrays=public_arrays,
+            request_identity=identity, source_units=units,
+            subset={"role": "test", "assignment_sha256": assignment_digest})
     else:
         predictions = np.asarray(model.predict(features), dtype=np.float64)
         released, _sigma = validation.private_validation_vector(
             target, predictions, layout, epsilon=privacy["epsilon"],
             delta=privacy["delta"], target_bounds=bounds,
             num_releases=1, unit_ids=unit_ids,
-            include_zero_neighbor=privacy["unit"] == "patient",
-            request_selection=selection, public_arrays=public_arrays)
+            include_zero_neighbor=True,
+            request_selection=selection, public_arrays=public_arrays,
+            request_identity=identity, source_units=units,
+            subset={"role": "test", "assignment_sha256": assignment_digest})
     _cache_vector(context, claim, released)
     return _vector_reply(msg, released)
 
@@ -765,8 +802,9 @@ def _cross_validation_accumulate(msg, context, request, node_manifest,
     if model.task != expected_task or \
             model.num_features != len(request["public_schema"]["features"]):
         raise ValueError("native-tree CV predictor geometry is invalid")
-    features, target, unit_ids = task.load_native_tree_data(
-        context, manifest=node_manifest)
+    features, target, unit_ids, units = task.load_native_tree_data(
+        context, manifest=node_manifest, include_canonical_units=True)
+    _parent_source_binding(context, units, unit_ids, cv=True)
     features, target, unit_ids = _cv_partition(
         context, features, target, unit_ids, fold=fold, test=True)
     bounds = (None if request["task"] == "binary" else {
@@ -787,20 +825,29 @@ def _cross_validation_accumulate(msg, context, request, node_manifest,
 
 
 def _cross_validation_release(msg, context, request, privacy, claim):
+    from types import SimpleNamespace
     config = _exact_message_config(msg)
     layout = _cv_layout(request, config)
-    raw = _complete_cv_total(context, request, layout)
     manifest = task._load_manifest(context)
-    selection = _request_selection(
-        manifest, "cv-release", int(claim["fold"]), request=request)
+    selection = _request_selection(manifest, "cv-oof-release", request=request)
+    # Inspect only the already-public fitted model pins before constructing R;
+    # the raw accumulator is opened afterwards.
     meta = _holdout_state(context)[_CV_OOF_META]
-    selection["fold-artifact-sha256"] = [
-        meta["fold-%d-artifact-sha256" % fold]
+    model_hashes = [{"fold": fold, "model_sha256": meta[
+        "fold-%d-artifact-sha256" % fold]}
         for fold in range(1, int(manifest["cv-folds"]) + 1)]
+    identity = validation.build_validation_request(
+        layout, epsilon=privacy["epsilon"], delta=privacy["delta"],
+        request_selection=selection, manifest=manifest,
+        operation="cv-oof-release", fold_model_sha256=model_hashes)
+    raw = _complete_cv_total(context, request, layout)
+    parent = _holdout_state(context)["dsflower-native-parent-binding-v3"]
+    units = SimpleNamespace(multiset_digest=parent["units-sha256"])
     released, _sigma = validation.private_sufficient_vector(
         raw, layout, epsilon=privacy["epsilon"], delta=privacy["delta"],
         num_releases=1, include_zero_neighbor=False,
-        request_selection=selection)
+        request_selection=selection, request_identity=identity, source_units=units,
+        subset={"role": "oof", "assignment_sha256": parent["assignment-sha256"]})
     _forget_cv_state(context)
     _cache_cv_reply(context, claim, released)
     return _vector_reply(msg, released)
@@ -837,33 +884,45 @@ def train(msg: Message, context: Context) -> Message:
         if native_tree_engine.requires_xgboost_bundle(engine) and not \
                 xgboost_bundle.is_verified_bundle(_NATIVE_BUNDLE):
             return _unavailable_reply(msg)
-        features, target, unit_ids = task.load_native_tree_data(
-            context, manifest=node_manifest)
-        if node_manifest.get("resampling-contract-sha256") is not None:
-            features, target, unit_ids = _partition(
-                context, features, target, unit_ids, test=False)
-        elif operation == "cv-train":
-            features, target, unit_ids = _cv_partition(
-                context, features, target, unit_ids,
-                fold=int(claim["fold"]), test=False)
-        # The generic ABI requires opaque scope fields, but the native adapter
-        # deliberately excludes them from sticky randomness and binds the
-        # canonical effective tensors itself.  Reuse the public schema pin here:
-        # no redundant O(N) pass and no second private identity channel.
+        from . import tree_release, forest_adapter, random_forest_adapter, boosting_adapter
         scope_hash = request["public_schema"]["sha256"]
         manifest = native_tree_request.backend_manifest(
             request, snapshot_hash=scope_hash, cohort_hash=scope_hash,
             **{key: privacy[key] for key in (
-                "epsilon", "delta", "unit", "unit_canonicalization",
-                "gradient_clip")})
-        selection = _request_selection(
-            node_manifest, operation,
-            int(claim["fold"]) if operation == "cv-train" else None)
+                "epsilon", "delta", "unit", "unit_canonicalization", "gradient_clip")})
+        selection = _request_selection(node_manifest, operation)
+        if engine == "xgboost":
+            execution = {"contract": xgboost_adapter.EXECUTION_PROFILE,
+                         "native_bundle_sha256": _NATIVE_BUNDLE.bundle_sha256}
+        elif engine == "extra_trees":
+            execution = forest_adapter.EXECUTION_PROFILE
+        elif engine == "random_forest":
+            execution = random_forest_adapter.EXECUTION_PROFILE
+        else:
+            execution = boosting_adapter.EXECUTION_PROFILES[engine]
+        identity = tree_release.native_request_identity(
+            manifest, selection, execution_fingerprint=execution,
+            manifest=node_manifest, operation=operation,
+            fold=int(claim["fold"]) if operation == "cv-train" else None)
+        features, target, unit_ids, units = task.load_native_tree_data(
+            context, manifest=node_manifest, include_canonical_units=True)
+        subset = None
+        if node_manifest.get("resampling-contract-sha256") is not None:
+            digest = _parent_source_binding(context, units, unit_ids)
+            subset = {"role": "train", "assignment_sha256": digest}
+            features, target, unit_ids = _partition(
+                context, features, target, unit_ids, test=False)
+        elif operation == "cv-train":
+            digest = _parent_source_binding(context, units, unit_ids, cv=True)
+            subset = {"role": "train", "assignment_sha256": digest}
+            features, target, unit_ids = _cv_partition(
+                context, features, target, unit_ids, fold=int(claim["fold"]), test=False)
         if engine == "xgboost":
             # Preserve the verified native-bundle path byte-for-byte in scope.
             prepared = xgboost_adapter.prepare_xgboost_training(
                 manifest, features, target, native_bundle=_NATIVE_BUNDLE,
-                unit_ids=unit_ids, request_selection=selection)
+                unit_ids=unit_ids, request_selection=selection,
+                request_identity=identity, source_units=units, subset=subset)
             native_artifact = xgboost_adapter.train_xgboost_native(prepared)
             artifact, _digest = xgboost_adapter.sanitize_xgboost_artifact(
                 manifest, native_artifact)

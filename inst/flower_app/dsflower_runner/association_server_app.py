@@ -1,5 +1,7 @@
 """Dedicated coordinator ServerApp for one pooled private association."""
 
+from . import aggregation
+
 import json
 import math
 import os
@@ -156,7 +158,7 @@ def _collect_releases(grid, node_ids, cfg, timeout):
         (source, *_release_from_reply(reply))
         for source, reply in zip(sources, replies)
     ]
-    checked.sort(key=lambda item: item[0])
+    checked.sort(key=lambda item: aggregation.arrays_key([item[1], np.asarray(item[2])]))
     return ([item[1] for item in checked], [item[2] for item in checked])
 
 

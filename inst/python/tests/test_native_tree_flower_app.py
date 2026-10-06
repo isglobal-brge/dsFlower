@@ -28,6 +28,14 @@ from dsflower_runner import (release_guard, resampling, seeding, task, validatio
                              xgboost_bundle, xgboost_predictor)  # noqa: E402
 
 
+def _dump_manifest(manifest, handle):
+    from v3_test_support import source_sidecar
+    directory = os.path.dirname(handle.name)
+    frame = pd.read_csv(os.path.join(directory, manifest["data_file"]))
+    source_sidecar(directory, manifest, frame)
+    json.dump(manifest, handle)
+
+
 def _canonical(value):
     return json.dumps(
         value, ensure_ascii=False, allow_nan=False,
@@ -166,6 +174,7 @@ def _node_manifest(request_b64, request_sha256, holdout=None):
         "patient-id-canonicalization": "trim-utf8-v2", "n_units": 2,
         "privacy-adjacency": "replace_one", "privacy-epsilon": 1.0,
         "privacy-delta": 1.0e-6, "privacy-clipping_norm": 1.0,
+        "semantic-randomness-contract": "dsflower-semantic-randomness-v3",
         "privacy-policy-sha256": "a" * 64,
         "native-tree-request-b64": request_b64,
         "native-tree-request-sha256": request_sha256,
@@ -265,6 +274,17 @@ def _release_reply(request, artifact, available=1):
     }), reply_to=request)
 
 
+_TEST_UNIT_KEY = mock.patch("dsflower_runner.seeding._node_secret", return_value=b"unit-order-test-secret-v3........"[:32])
+
+
+def setUpModule():
+    _TEST_UNIT_KEY.start()
+
+
+def tearDownModule():
+    _TEST_UNIT_KEY.stop()
+
+
 class NativeTreeRequestTests(unittest.TestCase):
     def test_exact_public_wire_builds_the_closed_backend_profile(self):
         _request, encoded, digest = _request_wire()
@@ -290,9 +310,10 @@ class NativeTreeClientTests(unittest.TestCase):
             "age": [20.0, 60.0], "marker": [-0.5, 0.5],
             "outcome": [0, 1],
         }).to_csv(os.path.join(self.root.name, "train.csv"), index=False)
+        self.manifest = _node_manifest(self.request_b64, self.request_sha256)
         with open(os.path.join(self.root.name, "manifest.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump(_node_manifest(self.request_b64, self.request_sha256), handle)
+            _dump_manifest(self.manifest, handle)
         self.context = SimpleNamespace(
             node_config={"manifest-dir": self.root.name},
             run_config=_run_config(
@@ -325,7 +346,7 @@ class NativeTreeClientTests(unittest.TestCase):
             self.request_b64, self.request_sha256, folds=2, nodes=1)
         with open(os.path.join(self.root.name, "manifest.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump(manifest, handle)
+            _dump_manifest(manifest, handle)
         self.context.run_config = _cv_run_config(
             self.request_b64, self.request_sha256, folds=2, nodes=1)
         message = server_app._request_messages(
@@ -361,18 +382,36 @@ class NativeTreeClientTests(unittest.TestCase):
         np.testing.assert_array_equal(captured["target"], np.zeros(1))
         self.assertAlmostEqual(captured["epsilon"], 0.4)
 
+    def test_fedprox_zero_and_positive_reject_before_manifest_or_private_read(self):
+        message = _request_message(1, self.request_b64, self.request_sha256)
+        for mu in (0.0, 0.1):
+            self.context.run_config.update(strategy="fedprox", **{"strategy-mu": mu})
+            with mock.patch.object(task, "_load_manifest", side_effect=AssertionError("manifest read")) as load:
+                reply = client_app.train(message, self.context)
+            load.assert_not_called()
+            self.assertEqual(reply.content["metrics"]["available"], 0)
+
+    def test_parent_source_mutation_between_cv_folds_fails_closed(self):
+        from dsflower_runner.canonical_units import canonicalize_arrays
+        left = canonicalize_arrays(np.asarray([[1.], [2.]]), np.asarray([0., 1.]))
+        right = canonicalize_arrays(np.asarray([[1.], [3.]]), np.asarray([0., 1.]))
+        with mock.patch.object(resampling, "cross_validation_folds_from_context", return_value=np.asarray([1, 2])):
+            client_app._parent_source_binding(self.context, left, None, cv=True)
+            with self.assertRaisesRegex(RuntimeError, "parent data"):
+                client_app._parent_source_binding(self.context, right, None, cv=True)
+
     def test_manifest_mismatch_fails_before_private_data_and_is_constant(self):
         message = _request_message(1, self.request_b64, "0" * 64)
         with (mock.patch.object(
                   task, "load_native_tree_data",
                   side_effect=AssertionError("private data was read")) as load,
               mock.patch.object(
-                  seeding, "master_seed",
+                  seeding, "release_key",
                   side_effect=AssertionError(
-                      "seed derived before materialization")) as master_seed):
+                      "seed derived before materialization")) as release_key):
             reply = client_app.train(message, self.context)
         load.assert_not_called()
-        master_seed.assert_not_called()
+        release_key.assert_not_called()
         self.assertEqual(set(reply.content.keys()), {"arrays", "metrics"})
         self.assertEqual(dict(reply.content["metrics"]), {
             "available": 0, "num-examples": 1})
@@ -391,11 +430,11 @@ class NativeTreeClientTests(unittest.TestCase):
                   task, "load_native_tree_data",
                   side_effect=AssertionError("private data was read")) as load,
               mock.patch.object(
-                  seeding, "master_seed",
-                  side_effect=AssertionError("seed was derived")) as master_seed):
+                  seeding, "release_key",
+                  side_effect=AssertionError("seed was derived")) as release_key):
             reply = client_app.train(message, self.context)
         load.assert_not_called()
-        master_seed.assert_not_called()
+        release_key.assert_not_called()
         self.assertEqual(dict(reply.content["metrics"]), {
             "available": 0, "num-examples": 1})
 
@@ -406,7 +445,7 @@ class NativeTreeClientTests(unittest.TestCase):
         original_manifest_load = task._load_manifest
         original_frame_read = task._read_staged_frame
         original_sanitize = client_app.xgboost_adapter.sanitize_xgboost_artifact
-        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", SimpleNamespace(bundle_sha256="f" * 64)),
               mock.patch.object(client_app.xgboost_bundle, "is_verified_bundle",
                                 return_value=True),
               mock.patch.object(task, "load_native_tree_data",
@@ -427,9 +466,7 @@ class NativeTreeClientTests(unittest.TestCase):
             reply = client_app.train(message, self.context)
         load.assert_called_once()
         self.assertEqual(load.call_args.args, (self.context,))
-        self.assertEqual(load.call_args.kwargs["manifest"],
-                         _node_manifest(
-                             self.request_b64, self.request_sha256))
+        self.assertEqual(load.call_args.kwargs["manifest"], self.manifest)
         manifest_load.assert_called_once_with(self.context)
         frame_read.assert_called_once()
         prepare.assert_called_once()
@@ -462,7 +499,7 @@ class NativeTreeClientTests(unittest.TestCase):
             self.request_b64, self.request_sha256, holdout=holdout)
         with open(os.path.join(self.root.name, "manifest.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump(manifest, handle)
+            _dump_manifest(manifest, handle)
         self.context.run_config = _run_config(
             self.request_b64, self.request_sha256, nodes=1,
             holdout=holdout)
@@ -472,7 +509,7 @@ class NativeTreeClientTests(unittest.TestCase):
             holdout=holdout_profile)[0]
         original_load = task.load_native_tree_data
 
-        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", SimpleNamespace(bundle_sha256="f" * 64)),
               mock.patch.object(client_app.xgboost_bundle,
                                 "is_verified_bundle", return_value=True),
               mock.patch.object(
@@ -546,7 +583,7 @@ class NativeTreeClientTests(unittest.TestCase):
         manifest["dp-unit"] = "patient"
         with open(os.path.join(self.root.name, "manifest.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump(manifest, handle)
+            _dump_manifest(manifest, handle)
         self.context.run_config = _run_config(
             self.request_b64, self.request_sha256, nodes=1,
             holdout=holdout)
@@ -566,7 +603,9 @@ class NativeTreeClientTests(unittest.TestCase):
         with (mock.patch.object(
                   task, "load_native_tree_data", return_value=(
                       np.asarray([[20.0, -0.5], [60.0, 0.5]]),
-                      np.asarray([0, 1]), np.asarray(["p0", "p1"]))),
+                      np.asarray([0, 1]), np.asarray(["p0", "p1"]),
+                      __import__("dsflower_runner.canonical_units", fromlist=["canonicalize_arrays"]).canonicalize_arrays(
+                          np.asarray([[20.0, -0.5], [60.0, 0.5]]), np.asarray([0, 1]), ["p0", "p1"]))),
               mock.patch.object(
                   resampling, "holdout_mask_from_context",
                   return_value=np.array([False, False])),
@@ -594,7 +633,7 @@ class NativeTreeClientTests(unittest.TestCase):
             self.request_b64, self.request_sha256, folds=2, nodes=1)
         with open(os.path.join(self.root.name, "manifest.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump(manifest, handle)
+            _dump_manifest(manifest, handle)
         self.context.run_config = _cv_run_config(
             self.request_b64, self.request_sha256, folds=2, nodes=1)
         assigned = np.asarray([1, 2], dtype=np.int16)
@@ -605,7 +644,7 @@ class NativeTreeClientTests(unittest.TestCase):
         public_manifest = native_tree_request.public_backend_manifest(
             self.request)
 
-        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+        with (mock.patch.object(client_app, "_NATIVE_BUNDLE", SimpleNamespace(bundle_sha256="f" * 64)),
               mock.patch.object(client_app.xgboost_bundle,
                                 "is_verified_bundle", return_value=True),
               mock.patch.object(
@@ -663,14 +702,21 @@ class NativeTreeClientTests(unittest.TestCase):
         manifest, contract = _cv_manifest(
             self.request_b64, self.request_sha256,
             folds=2, unit="patient", nodes=1)
+        frame = pd.read_csv(os.path.join(self.root.name, "train.csv"))
+        frame["patient"] = ["p0", "p1"]
+        frame.to_csv(os.path.join(self.root.name, "train.csv"), index=False)
         with open(os.path.join(self.root.name, "manifest.json"), "w",
                   encoding="utf-8") as handle:
-            json.dump(manifest, handle)
+            _dump_manifest(manifest, handle)
         self.context.run_config = _cv_run_config(
             self.request_b64, self.request_sha256,
             folds=2, unit="patient", nodes=1)
         layout = validation.validation_layout(
             "classification", n_classes=2, bins=4)
+        from dsflower_runner.canonical_units import canonicalize_arrays
+        parent_units = canonicalize_arrays(np.asarray([[1.], [2.]]), np.asarray([0., 1.]), ["p0", "p1"])
+        with mock.patch.object(resampling, "cross_validation_folds_from_context", return_value=np.asarray([1, 2])):
+            client_app._parent_source_binding(self.context, parent_units, np.asarray(["p0", "p1"]), cv=True)
         for fold in (1, 2):
             client_app._mark_cv_training(
                 self.context, self.request, manifest, fold,
@@ -814,7 +860,7 @@ class NativeTreeServerTests(unittest.TestCase):
                 frame.to_csv(os.path.join(node_root, "train.csv"), index=False)
                 with open(os.path.join(node_root, "manifest.json"), "w",
                           encoding="utf-8") as handle:
-                    json.dump(manifest, handle)
+                    _dump_manifest(manifest, handle)
                 contexts[node_id] = SimpleNamespace(
                     node_config={"manifest-dir": node_root},
                     run_config=cfg, state=RecordDict())
@@ -825,7 +871,7 @@ class NativeTreeServerTests(unittest.TestCase):
             def deterministic_release(raw, layout, **kwargs):
                 return np.asarray(raw, dtype=np.float64), 0.0
 
-            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", SimpleNamespace(bundle_sha256="f" * 64)),
                   mock.patch.object(client_app.xgboost_bundle,
                                     "is_verified_bundle", return_value=True),
                   mock.patch.object(
@@ -1059,13 +1105,13 @@ class NativeTreeServerTests(unittest.TestCase):
             }).to_csv(os.path.join(root, "train.csv"), index=False)
             with open(os.path.join(root, "manifest.json"), "w",
                       encoding="utf-8") as handle:
-                json.dump(_node_manifest(request_b64, request_sha256), handle)
+                _dump_manifest(_node_manifest(request_b64, request_sha256), handle)
             cfg = _run_config(request_b64, request_sha256, results_dir, nodes=2)
             context = SimpleNamespace(
                 node_config={"manifest-dir": root}, run_config=cfg)
             grid = _EndToEndGrid(context)
             original_load = task.load_native_tree_data
-            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", SimpleNamespace(bundle_sha256="f" * 64)),
                   mock.patch.object(client_app.xgboost_bundle,
                                     "is_verified_bundle", return_value=True),
                   mock.patch.object(task, "load_native_tree_data",
@@ -1139,7 +1185,7 @@ class NativeTreeServerTests(unittest.TestCase):
                 frame.to_csv(os.path.join(node_root, "train.csv"), index=False)
                 with open(os.path.join(node_root, "manifest.json"), "w",
                           encoding="utf-8") as handle:
-                    json.dump(manifest, handle)
+                    _dump_manifest(manifest, handle)
                 contexts[node_id] = SimpleNamespace(
                     node_config={"manifest-dir": node_root},
                     run_config=cfg, state=RecordDict())
@@ -1153,7 +1199,7 @@ class NativeTreeServerTests(unittest.TestCase):
                     unit_ids=kwargs.get("unit_ids"))
                 return raw, 0.0
 
-            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", object()),
+            with (mock.patch.object(client_app, "_NATIVE_BUNDLE", SimpleNamespace(bundle_sha256="f" * 64)),
                   mock.patch.object(client_app.xgboost_bundle,
                                     "is_verified_bundle", return_value=True),
                   mock.patch.object(

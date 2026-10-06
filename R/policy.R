@@ -35,14 +35,14 @@
       available = TRUE,
       tracks = c("neural", "native_tree"),
       data_kinds = c("tabular", "image"),
-      assignment = "hmac-sha256-threshold-v1",
+      assignment = "hmac-sha256-threshold-v2",
       pooled_only = TRUE),
     cross_validation = list(
       available = TRUE,
       tracks = c("neural", "native_tree"),
       data_kinds = c("tabular", "image"),
       folds = c(2L, 10L),
-      assignment = "hmac-sha256-score-v1",
+      assignment = "hmac-sha256-score-v2",
       pooled_only = TRUE)
   )
 )

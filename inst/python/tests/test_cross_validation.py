@@ -1,6 +1,7 @@
 """Dedicated neural cross-validation privacy and orchestration regressions."""
 
 import json
+import base64
 import os
 import stat
 import sys
@@ -20,7 +21,43 @@ if FLOWER_APP not in sys.path:
     sys.path.insert(0, FLOWER_APP)
 
 from dsflower_runner import (client_app, release_guard, resampling, server_app,
-                             task, validation)  # noqa: E402
+                             task, validation, canonical_units)  # noqa: E402
+
+
+def _context():
+    directory = tempfile.TemporaryDirectory()
+    return SimpleNamespace(state=RecordDict(), run_config={},
+                           node_config={"manifest-dir": directory.name}, _directory=directory)
+
+
+def _source_fixture(X, y, ids=None):
+    """Admitted numerical loader fixture with explicit full source metadata.
+
+    Partition unit tests control the row order and assignment masks themselves;
+    canonical execution ordering is independently exercised by loader tests.
+    """
+    numeric = np.asarray(X)
+    if numeric.dtype.kind not in "biuf":
+        # Synthetic image paths stand for selected decoded fixtures here; real
+        # raster content/packaging is exercised in test_canonical_units.
+        records = [canonical_units.encode_row((str(path), float(target)))
+                   for path, target in zip(X, y)]
+        units = canonical_units.canonicalize_units(records, unit_ids=ids, secret=b"f" * 32)
+    else:
+        units = canonical_units.canonicalize_arrays(X, y, ids, secret=b"f" * 32)
+    return (canonical_units.attach_units(X, units),
+            canonical_units.attach_units(y, units), ids)
+
+
+_REAL_EFFECTIVE = client_app.dp_harness.effective_dpsgd_mechanism
+
+
+def _fixed_sigma_geometry(sigma):
+    def mechanism(**kwargs):
+        with mock.patch.object(client_app.dp_harness, "_cached_noise_multiplier", return_value=sigma):
+            return _REAL_EFFECTIVE(**kwargs)
+    return mechanism
+
 
 
 class CvPartitionTests(unittest.TestCase):
@@ -157,6 +194,11 @@ class CvReleaseGuardTests(unittest.TestCase):
 
 
 class CvClientTests(unittest.TestCase):
+    def setUp(self):
+        secret = mock.patch.object(client_app.seeding, "_node_secret", return_value=b"f" * 32)
+        secret.start()
+        self.addCleanup(secret.stop)
+
     @staticmethod
     def _execution_fixture(contract):
         manifest = {
@@ -305,7 +347,7 @@ class CvClientTests(unittest.TestCase):
             return [np.asarray([1.0])], len(target)
 
         with (mock.patch.object(
-                  client_app, "load_data", return_value=(X, y, None)),
+                  client_app, "load_data", return_value=_source_fixture(X, y, None)),
               mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": 9}),
               mock.patch.object(client_app.task_module,
@@ -319,12 +361,12 @@ class CvClientTests(unittest.TestCase):
                                 return_value=({}, {})) as seed_contract,
               mock.patch.object(client_app.dp_harness,
                                 "effective_dpsgd_mechanism",
-                                return_value={"noise_multiplier": 1.0}),
-              mock.patch.object(client_app.seeding, "master_seed",
+                                side_effect=_fixed_sigma_geometry(1.0)),
+              mock.patch.object(client_app.seeding, "release_key",
                                 return_value=b"fold-master"),
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
             client_app._train_neural(
-                None, {"cv-contract-sha256": "a" * 64},
+                _context(), {"cv-contract-sha256": "a" * 64},
                 pcfg, pins,
                 torch.nn.Linear(2, 1), input_dim=2, manifest_image=False,
                 cv_fold=2)
@@ -337,7 +379,7 @@ class CvClientTests(unittest.TestCase):
         self.assertEqual(captured["geometry_n_units"], len(y))
         seed_contract.assert_called_once_with(
             {"cv-contract-sha256": "a" * 64},
-            pins, pcfg, geometry_n_units=len(y), manifest={"n_units": 9})
+            pins, pcfg, manifest={"n_units": 9})
 
     def test_empty_cv_train_side_runs_the_pinned_noise_schedule(self):
         import torch
@@ -368,7 +410,7 @@ class CvClientTests(unittest.TestCase):
             return [np.asarray([9.0])], 1
 
         with (mock.patch.object(
-                  client_app, "load_data", return_value=(X, y, None)),
+                  client_app, "load_data", return_value=_source_fixture(X, y, None)),
               mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": len(y)}),
               mock.patch.object(client_app.task_module,
@@ -380,14 +422,14 @@ class CvClientTests(unittest.TestCase):
                                 return_value=({}, {})),
               mock.patch.object(
                   client_app.dp_harness, "effective_dpsgd_mechanism",
-                  return_value={"noise_multiplier": 2.25}),
+                  side_effect=_fixed_sigma_geometry(2.25)),
               mock.patch.object(
-                  client_app.seeding, "master_seed",
+                  client_app.seeding, "release_key",
                   return_value=b"\x47" * 32) as seed,
               mock.patch.object(client_app, "_dp_fit",
                                 side_effect=noise_only_fit) as fit):
             arrays, n_examples = client_app._train_neural(
-                None, {"cv-contract-sha256": "a" * 64}, pcfg, pins,
+                _context(), {"cv-contract-sha256": "a" * 64}, pcfg, pins,
                 model, input_dim=2, manifest_image=False, cv_fold=2)
 
         self.assertEqual(n_examples, 1)
@@ -425,21 +467,21 @@ class CvClientTests(unittest.TestCase):
               mock.patch.object(
                   client_app.resampling,
                   "cross_validation_folds_from_context",
-                  side_effect=lambda context, n_rows, unit_ids:
+                  side_effect=lambda context, n_rows, unit_ids, **kwargs:
                   np.where(np.isin(unit_ids, ["c", "e"]), 2, 1)),
               mock.patch.object(client_app, "_neural_seed_contract",
                                 return_value=({}, {})),
               mock.patch.object(client_app.dp_harness,
                                 "effective_dpsgd_mechanism",
-                                return_value={"noise_multiplier": 1.0}),
-              mock.patch.object(client_app.seeding, "master_seed",
+                                side_effect=_fixed_sigma_geometry(1.0)),
+              mock.patch.object(client_app.seeding, "release_key",
                                 return_value=b"\x41" * 32),
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
             for roster in rosters:
                 with mock.patch.object(
-                        client_app, "load_data", return_value=(X, y, roster)):
+                        client_app, "load_data", return_value=_source_fixture(X, y, roster)):
                     client_app._train_neural(
-                        None, {"cv-contract-sha256": "a" * 64},
+                        _context(), {"cv-contract-sha256": "a" * 64},
                         {"epsilon": 1.0, "delta": 1e-5,
                          "clipping_norm": 1.0},
                         {"loss_name": "bce_logits", "n_classes": 2,
@@ -451,7 +493,7 @@ class CvClientTests(unittest.TestCase):
         self.assertEqual([item[1] for item in captured], [3, 2])
         self.assertEqual([item[2] for item in captured], [4, 4])
 
-    def test_accumulate_has_no_release_or_custodial_prf(self):
+    def test_accumulate_has_no_release_key_or_noise(self):
         X = np.arange(12, dtype=np.float32).reshape(6, 2)
         y = np.asarray([0, 1, 0, 1, 0, 1], dtype=np.float32)
         assigned = np.asarray([1, 2, 3, 1, 2, 3])
@@ -460,7 +502,7 @@ class CvClientTests(unittest.TestCase):
                "num-classes": 2, "cv-validation-bins": 4}
         with (mock.patch.object(client_app, "is_image_run", return_value=False),
               mock.patch.object(
-                  client_app, "load_data", return_value=(X, y, None)),
+                  client_app, "load_data", return_value=_source_fixture(X, y, None)),
               mock.patch.object(client_app.task_module,
                                 "assert_pinned_unit_count"),
               mock.patch.object(
@@ -479,10 +521,10 @@ class CvClientTests(unittest.TestCase):
                                     fold=fold, raw=raw.copy(), **kwargs)),
               mock.patch.object(validation, "private_sufficient_vector",
                                 side_effect=AssertionError("release called")),
-              mock.patch.object(client_app.seeding, "master_seed",
+              mock.patch.object(client_app.seeding, "release_key",
                                 side_effect=AssertionError("PRF called"))):
             ack = client_app._cross_validation_neural_accumulate(
-                None, cfg, {"loss_name": "bce_logits"}, object(), 2, 2)
+                _context(), cfg, {"loss_name": "bce_logits"}, object(), 2, 2)
         self.assertEqual(captured["fold"], 2)
         self.assertEqual(captured["raw"].shape, (8,))
         np.testing.assert_array_equal(
@@ -499,7 +541,7 @@ class CvClientTests(unittest.TestCase):
                "num-classes": 2, "cv-validation-bins": 4}
         with (mock.patch.object(client_app, "is_image_run", return_value=False),
               mock.patch.object(
-                  client_app, "load_data", return_value=(X, y, None)),
+                  client_app, "load_data", return_value=_source_fixture(X, y, None)),
               mock.patch.object(client_app.task_module,
                                 "assert_pinned_unit_count"),
               mock.patch.object(
@@ -512,7 +554,7 @@ class CvClientTests(unittest.TestCase):
               mock.patch.object(validation, "private_sufficient_vector",
                                 side_effect=AssertionError("release called"))):
             ack = client_app._cross_validation_neural_accumulate(
-                None, cfg, {"loss_name": "bce_logits"},
+                _context(), cfg, {"loss_name": "bce_logits"},
                 torch.nn.Linear(2, 1), 2, 2)
 
         np.testing.assert_array_equal(captured["raw"], np.zeros(8))
@@ -538,6 +580,9 @@ class CvClientTests(unittest.TestCase):
                 "classification", n_classes=2, bins=4)
             vectors = [np.full(layout["size"], value, dtype=np.float64)
                        for value in (1.0, 2.0, 3.0)]
+            source = canonical_units.canonicalize_arrays(np.arange(6).reshape(3, 2), np.zeros(3))
+            client_app._parent_source_binding(context, source)
+
 
             def node_state_round_trip(state):
                 rebuilt = RecordDict()
@@ -569,13 +614,14 @@ class CvClientTests(unittest.TestCase):
                     context, 2, np.full(layout["size"], 9.0), layout)
             with mock.patch.object(
                     validation, "private_sufficient_vector",
-                    side_effect=lambda raw, *args, **kwargs: (raw, 1.0)):
+                    side_effect=lambda raw, *args, **kwargs: (raw, 1.0)) as release:
                 released = client_app._cross_validation_release(
                     context,
                     {"loss-name": "bce_logits", "task-type": "classification",
                      "num-classes": 2, "cv-validation-bins": 4},
                     {"epsilon": 1.0, "delta": 1e-6})
             np.testing.assert_array_equal(released[0], total)
+            self.assertIs(release.call_args.kwargs["include_zero_neighbor"], False)
             self.assertNotIn(client_app._CV_OOF_META_KEY, context.state)
             self.assertNotIn(client_app._CV_OOF_TOTAL_KEY, context.state)
             with self.assertRaisesRegex(RuntimeError, "incomplete"):
@@ -595,7 +641,7 @@ class CvClientTests(unittest.TestCase):
         models = [np.full((1, 2), value, dtype=np.float32)
                   for value in (1.0, 2.0, 3.0)]
         keys = []
-        master_seed = client_app.seeding.master_seed
+        master_seed = client_app.seeding.release_key
 
         def capture_key(*args, **kwargs):
             key = master_seed(*args, **kwargs)
@@ -604,6 +650,8 @@ class CvClientTests(unittest.TestCase):
 
         def release(public_models):
             context = SimpleNamespace(state=RecordDict())
+            source = canonical_units.canonicalize_arrays(np.arange(6).reshape(3, 2), np.zeros(3))
+            client_app._parent_source_binding(context, source)
             for fold, arrays in enumerate(public_models, 1):
                 client_app._store_cv_sufficient(
                     context, fold, raw, layout, public_arrays=[arrays])
@@ -615,7 +663,7 @@ class CvClientTests(unittest.TestCase):
         with (mock.patch.object(task, "_load_manifest", return_value=manifest),
               mock.patch.object(client_app.seeding, "_node_secret",
                                 return_value=b"s" * 32),
-              mock.patch.object(client_app.seeding, "master_seed",
+              mock.patch.object(client_app.seeding, "release_key",
                                 side_effect=capture_key)):
             baseline = release(models)
             replay = release([value.astype(">f4") for value in models])
@@ -719,6 +767,65 @@ class CvClientTests(unittest.TestCase):
                 self.assertEqual(client_app.train(object(), context), "reply")
             self.assertEqual(list(context.state.keys()), [])
 
+    def test_parent_source_binding_rejects_mutation_between_folds(self):
+        manifest = {"dp-unit": "row", "patient_column": None,
+                    **resampling.cross_validation_manifest_fields(
+                        resampling.cross_validation_contract(3, "row"))}
+        X = np.arange(16, dtype=float).reshape(8, 2)
+        y = np.arange(8) % 2
+        source = canonical_units.canonicalize_arrays(X, y)
+        replay = canonical_units.canonicalize_arrays(X[::-1], y[::-1])
+        changed_X = X.copy(); changed_X[0, 0] += .125
+        changed = canonical_units.canonicalize_arrays(changed_X, y)
+        context = _context()
+        with mock.patch.object(task, "_load_manifest", return_value=manifest):
+            first = client_app._parent_source_binding(context, source)
+            self.assertEqual(first, client_app._parent_source_binding(context, replay))
+            with self.assertRaisesRegex(RuntimeError, "source content changed"):
+                client_app._parent_source_binding(context, changed)
+
+    def test_row_fold_movement_changes_all_training_complements_but_one_oof_contribution(self):
+        k = 4
+        X = np.arange(20, dtype=float).reshape(10, 2)
+        y = np.linspace(0., 1., 10)
+        contract = resampling.cross_validation_contract(k, "row")
+        def inputs(features, labels):
+            units = canonical_units.canonicalize_arrays(features, labels)
+            assignment = resampling.cross_validation_folds(contract, n_rows=len(labels),
+                                                           assignment_tokens=units.row_tokens)
+            order = units.row_permutation
+            return units, assignment, labels[order]
+        source, folds, labels = inputs(X, y)
+        old_token = source.row_tokens[list(source.row_permutation).index(9)]
+        old_fold = dict(zip(source.row_tokens, folds))[old_token]
+        for candidate in range(1, 100):
+            changed_X = X.copy(); changed_X[-1, 0] = -candidate
+            changed_y = y.copy(); changed_y[-1] = .25
+            other, other_folds, other_labels = inputs(changed_X, changed_y)
+            new_token = next(iter(set(other.row_tokens) - set(source.row_tokens)))
+            new_fold = dict(zip(other.row_tokens, other_folds))[new_token]
+            if new_fold != old_fold: break
+        self.assertNotEqual(old_fold, new_fold)
+        before = dict(zip(source.row_tokens, folds)); after = dict(zip(other.row_tokens, other_folds))
+        for token in set(before) & set(after): self.assertEqual(before[token], after[token])
+        for fold in range(1, k + 1):
+            old_train = {token for token, assigned in before.items() if assigned != fold}
+            new_train = {token for token, assigned in after.items() if assigned != fold}
+            self.assertNotEqual(old_train, new_train)
+            self.assertLessEqual(len(old_train ^ new_train), 2)
+        layout = validation.validation_layout("regression")
+        # Condition on fixed public fold models with different predictions.
+        contributions = validation.validation_contributions(labels, folds / k, layout,
+                                                             target_bounds=[0., 1.])
+        changed = validation.validation_contributions(other_labels, other_folds / k, layout,
+                                                      target_bounds=[0., 1.])
+        difference = changed.sum(axis=0) - contributions.sum(axis=0)
+        one_difference = changed[list(other.row_tokens).index(new_token)] - contributions[list(source.row_tokens).index(old_token)]
+        np.testing.assert_allclose(difference, one_difference, atol=1e-14, rtol=0)
+        self.assertLessEqual(np.linalg.norm(difference), 2.)
+        self.assertEqual(validation._validation_release_sensitivity(layout,
+                          include_zero_neighbor=False), 2.)
+
     def test_cv_replies_are_not_persisted_but_cache_identity_includes_fold(self):
         self.assertFalse(client_app._reply_cache_allowed({
             "operation": "cv-train"}))
@@ -740,6 +847,7 @@ class CvServerTests(unittest.TestCase):
     @staticmethod
     def _cfg(results_dir=None):
         return {
+            "model-spec-b64": base64.b64encode(json.dumps({"layers": [{"op": "linear", "out": 1}]}).encode()).decode(),
             "cv-contract-sha256": "a" * 64,
             "cv-job-sha256": "b" * 64,
             "cv-folds": 3,
@@ -761,22 +869,15 @@ class CvServerTests(unittest.TestCase):
 
         cfg = self._cfg()
 
-        def random_model(_cfg):
-            return torch.nn.Linear(2, 1)
-
-        with mock.patch.object(server_app, "_build_initial_model",
-                               side_effect=random_model):
-            _m1, first = server_app._cross_validation_initial_arrays(cfg, 2)
-            torch.manual_seed(999)
-            _m2, replay = server_app._cross_validation_initial_arrays(cfg, 2)
-            _m3, other = server_app._cross_validation_initial_arrays(cfg, 3)
-        for left, right in zip(first.to_numpy_ndarrays(),
-                               replay.to_numpy_ndarrays()):
-            np.testing.assert_array_equal(left, right)
-        self.assertTrue(any(
-            not np.array_equal(left, right)
-            for left, right in zip(first.to_numpy_ndarrays(),
-                                   other.to_numpy_ndarrays())))
+        _m1, first = server_app._cross_validation_initial_arrays(cfg, 2)
+        torch.manual_seed(999)
+        _m2, replay = server_app._cross_validation_initial_arrays(cfg, 2)
+        _m3, other = server_app._cross_validation_initial_arrays(cfg, 3)
+        for left, right, another_fold in zip(first.to_numpy_ndarrays(),
+                                            replay.to_numpy_ndarrays(),
+                                            other.to_numpy_ndarrays()):
+            self.assertEqual(left.tobytes(), right.tobytes())
+            self.assertEqual(left.tobytes(), another_fold.tobytes())
 
     def test_orchestration_runs_k_clean_trainings_and_persists_no_model(self):
         cfg = self._cfg()

@@ -172,9 +172,9 @@ test_that("CV job mismatch is rejected before private staging", {
 
 test_that("cross-validation contract is canonical, bounded, and seed-free", {
   contract <- dsFlower:::.crossValidationContract(3L, "patient")
-  expect_identical(contract$version, "dsflower-cross-validation-v1")
+  expect_identical(contract$version, "dsflower-cross-validation-v2")
   expect_identical(contract$method, "cross_validation")
-  expect_identical(contract$assignment, "hmac-sha256-score-v1")
+  expect_identical(contract$assignment, "hmac-sha256-score-v2")
   expect_identical(contract$folds, 3L)
   expect_identical(contract$unit_canonicalization, "trim-utf8-v2")
   expect_identical(

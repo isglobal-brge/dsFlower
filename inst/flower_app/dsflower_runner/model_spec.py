@@ -123,7 +123,16 @@ def read_spec(cfg):
         data = base64.b64decode(raw, validate=True)
         if len(data) > _MAX_SPEC_JSON_BYTES:
             raise ValueError("decoded model spec exceeds %d-byte cap" % _MAX_SPEC_JSON_BYTES)
-        spec = json.loads(data.decode("utf-8"))
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError("duplicate model spec key: %s" % key)
+                result[key] = value
+            return result
+        spec = json.loads(data.decode("utf-8"), object_pairs_hook=pairs,
+                          parse_constant=lambda value: (_ for _ in ()).throw(
+                              ValueError("non-finite model spec value: " + value)))
     except Exception as e:
         raise ValueError("could not decode model spec: %s" % e)
     return spec
@@ -244,7 +253,7 @@ def _require_spatial(shape, op, ndim):
 def _b_linear(s, shape, dims):
     out_raw = s.get("out", "@out")
     out = _resolve_dim(out_raw, dims)
-    if not isinstance(out_raw, str) and out > _MAX_WIDTH:
+    if not isinstance(out_raw, str) and out > _MAX_WIDTH and not getattr(dims, "canonical", False):
         raise ValueError("linear width %d exceeds cap %d" % (out, _MAX_WIDTH))
     bias = s.get("bias", True)
     if not isinstance(bias, bool):
@@ -451,6 +460,8 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
         return build_from_graph(
             spec, in_dim, out_dim, num_labels=num_labels,
             output_limit=output_limit)
+    spec = canonicalize_spec(spec, in_dim, out_dim, num_labels=num_labels,
+                             output_shape=output_shape)
     if kind != "sequential":
         raise ValueError("unsupported spec kind %r (only 'sequential' or 'graph')" % (kind,))
     layers = spec.get("layers")
@@ -465,6 +476,7 @@ def build_from_spec(spec, in_dim, out_dim, *, num_labels=None,
 
     dims = _BuildDims({"@in": _pos_int(in_dim, "in_dim"),
                        "@out": _pos_int(out_dim, "out_dim")})
+    dims.canonical = True
     if num_labels is not None:
         dims["@nlabels"] = _pos_int(num_labels, "num_labels")
 
@@ -670,6 +682,218 @@ _GRAPH_OPS = {"add": _g_add, "mul": _g_mul, "sub": _g_sub, "div": _g_div,
               "matmul": _g_matmul, "transpose": _g_transpose}
 
 
+_OP_FIELDS = {
+    "linear": {"out", "bias"}, "leaky_relu": {"negative_slope"},
+    "dropout": {"p"}, "softmax": {"axis"}, "reshape": {"shape"},
+    "conv1d": {"out_channels", "kernel_size", "stride", "padding", "dilation"},
+    "conv2d": {"out_channels", "kernel_size", "stride", "padding", "dilation"},
+    "maxpool2d": {"kernel_size", "stride"}, "adaptiveavgpool2d": {"output_size"},
+    "upsample": {"scale_factor", "mode"}, "lstm": {"hidden"}, "gru": {"hidden"},
+    "concat": {"axis"}, "affine": {"scale", "shift"}, "transpose": {"dims"},
+}
+
+
+def _canonical_layer(raw, shape, dims):
+    """Validate the effective stock-layer contract without allocating or using RNG."""
+    op = raw["op"]
+    layer = {"op": op}
+    out_shape = shape
+    if op == "linear":
+        value = raw.get("out", "@out")
+        width = _resolve_dim(value, dims)
+        if not isinstance(value, str) and width > _MAX_WIDTH:
+            raise ValueError("linear width %d exceeds cap %d" % (width, _MAX_WIDTH))
+        bias = raw.get("bias", True)
+        if not isinstance(bias, bool):
+            raise ValueError("linear 'bias' must be a bool")
+        layer.update(out=width, bias=bias)
+        out_shape = tuple(shape[:-1]) + (width,)
+        _reserve_parameters(dims, shape[-1] * width + (width if bias else 0), op)
+    elif op == "leaky_relu":
+        layer["negative_slope"] = _unit_float(raw.get("negative_slope", 0.01),
+                                               "negative_slope", hi_open=False)
+    elif op == "dropout":
+        layer["p"] = _unit_float(raw.get("p", 0.5), "dropout p")
+    elif op == "layernorm":
+        _reserve_parameters(dims, 2 * shape[-1], op)
+    elif op == "softmax":
+        axis = raw.get("axis", len(shape) - 1)
+        if type(axis) is not int or not 0 <= axis < len(shape):
+            raise ValueError("softmax axis must be a per-sample axis")
+        layer["axis"] = axis
+    elif op == "reshape":
+        value = raw.get("shape")
+        if not isinstance(value, list) or not 1 <= len(value) <= 3:
+            raise ValueError("reshape shape must be a list of 1..3 positive ints")
+        target = tuple(_pos_int(v, "reshape dim", hi=_MAX_SPATIAL) for v in value)
+        if _prod(target) != _prod(shape):
+            raise ValueError("reshape changes the element count")
+        if len(target) >= 2 and target[0] > _MAX_CHANNELS:
+            raise ValueError("reshape channel count exceeds cap")
+        layer["shape"], out_shape = list(target), target
+    elif op == "flatten":
+        out_shape = (_prod(shape),)
+    elif op in ("conv1d", "conv2d"):
+        rank = 1 if op == "conv1d" else 2
+        _require_spatial(shape, op, rank)
+        channels = _pos_int(raw.get("out_channels", shape[0]), "out_channels", hi=_MAX_CHANNELS)
+        k, stride, pad, dilation = _conv_hparams(raw)
+        layer.update(out_channels=channels, kernel_size=k, stride=stride,
+                     padding=pad, dilation=dilation)
+        out_shape = (channels,) + tuple(_conv_out(n, k, stride, pad, dilation) for n in shape[1:])
+        _reserve_parameters(dims, channels * (shape[0] * k ** rank + 1), op)
+    elif op == "maxpool2d":
+        _require_spatial(shape, op, 2)
+        k = _pos_int(raw.get("kernel_size", 2), "kernel_size", hi=_MAX_SPATIAL)
+        stride = _pos_int(raw.get("stride", k), "stride", hi=_MAX_SPATIAL)
+        layer.update(kernel_size=k, stride=stride)
+        out_shape = (shape[0],) + tuple(_conv_out(n, k, stride, 0, 1) for n in shape[1:])
+    elif op == "adaptiveavgpool2d":
+        _require_spatial(shape, op, 2)
+        value = raw.get("output_size", [1, 1])
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError("adaptiveavgpool2d output_size must be [h, w]")
+        size = [_pos_int(v, "output_size", hi=_MAX_SPATIAL) for v in value]
+        layer["output_size"] = size
+        out_shape = (shape[0], *size)
+    elif op == "upsample":
+        _require_spatial(shape, op, 2)
+        if raw.get("mode", "nearest") != "nearest":
+            raise ValueError("upsample mode must be nearest")
+        scale = _pos_int(raw.get("scale_factor", 2), "scale_factor", hi=64)
+        layer["scale_factor"] = scale
+        out_shape = (shape[0], shape[1] * scale, shape[2] * scale)
+    elif op in ("lstm", "gru"):
+        if len(shape) != 2:
+            raise ValueError("%s needs a (T, F) sequence input" % op)
+        hidden = _pos_int(raw.get("hidden", 64), "hidden", hi=_MAX_WIDTH)
+        layer["hidden"] = hidden
+        _reserve_parameters(dims, (4 if op == "lstm" else 3) * hidden *
+                            (shape[-1] + hidden + 2), op)
+        out_shape = (hidden,)
+    return layer, _validate_shape(out_shape, op)
+
+
+def _canonicalize_spec(spec, in_dim, out_dim, *, num_labels=None, output_shape=None):
+    if not isinstance(spec, dict):
+        raise ValueError("spec must be a JSON object")
+    kind = spec.get("kind", "sequential")
+    if kind not in ("sequential", "graph"):
+        raise ValueError("unsupported spec kind %r" % kind)
+    allowed = {"kind", "layers"} if kind == "sequential" else {"kind", "nodes", "output"}
+    if set(spec) - allowed:
+        raise ValueError("unknown model spec fields: %s" % sorted(set(spec) - allowed))
+    entries = spec.get("layers" if kind == "sequential" else "nodes")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= _MAX_LAYERS:
+        raise ValueError("spec needs 1..%d layers/nodes" % _MAX_LAYERS)
+    dims = _BuildDims({"@in": _pos_int(in_dim, "in_dim"), "@out": _pos_int(out_dim, "out_dim")})
+    if num_labels is not None:
+        dims["@nlabels"] = _pos_int(num_labels, "num_labels")
+    shapes = {"@in": _validate_shape((dims["@in"],), "model input")}
+    normalized = []
+    by_name = {}
+    previous = "@in"
+    for i, raw in enumerate(entries):
+        if not isinstance(raw, dict):
+            raise ValueError("layer/node must be an object")
+        op = raw.get("op")
+        if not isinstance(op, str) or op not in _OPS and (kind != "graph" or op not in _GRAPH_OPS):
+            raise ValueError("unknown op %r" % op)
+        fields = {"op"} | _OP_FIELDS.get(op, set())
+        if kind == "graph":
+            fields |= {"name", "in"}
+        if set(raw) - fields:
+            raise ValueError("unknown fields for %s: %s" % (op, sorted(set(raw) - fields)))
+        name = raw.get("name") if kind == "graph" else str(i)
+        inputs = raw.get("in") if kind == "graph" else [previous]
+        if not isinstance(name, str) or not name or name in shapes or "." in name:
+            raise ValueError("graph node needs a unique valid name")
+        if (not isinstance(inputs, list) or not 1 <= len(inputs) <= _MAX_NODE_INPUTS
+                or any(not isinstance(v, str) or v not in shapes for v in inputs)):
+            raise ValueError("graph node has undefined/forward inputs (topological order required)")
+        if op in _OPS:
+            if len(inputs) != 1:
+                raise ValueError("op %s takes exactly one input" % op)
+            layer, shape = _canonical_layer(raw, shapes[inputs[0]], dims)
+        else:
+            shape = _validate_shape(_GRAPH_OPS[op](raw, [shapes[v] for v in inputs]), op)
+            layer = {"op": op}
+            if op == "concat":
+                layer["axis"] = raw.get("axis", 0)
+            elif op == "affine":
+                layer.update(scale=float(raw.get("scale", 1.0)) or 0.0,
+                             shift=float(raw.get("shift", 0.0)) or 0.0)
+            elif op == "transpose":
+                layer["dims"] = list(raw["dims"])
+        shapes[name] = shape
+        if kind == "graph":
+            layer.update(name=name, **{"in": list(inputs)})
+            by_name[name] = layer
+        normalized.append(layer)
+        previous = name
+    output = spec.get("output") if kind == "graph" else previous
+    if not isinstance(output, str) or output not in shapes or output == "@in":
+        raise ValueError("graph output must name a node")
+    if output_shape is None and (entries[-1].get("op") != "linear" or output != previous):
+        raise ValueError("the final layer/node must be the linear projection to @out")
+    required_shape = (dims["@out"],) if output_shape is None else tuple(output_shape)
+    if shapes[output] != required_shape:
+        raise ValueError("spec output shape %r != required %r" % (shapes[output], required_shape))
+    if kind == "sequential":
+        return {"kind": kind, "layers": normalized}, {}
+    # Ordered dependency postorder removes labels and independent topological
+    # list order, while preserving sharing, operand order, and arithmetic order.
+    visited, ordered = set(), []
+    def visit(name):
+        if name == "@in" or name in visited:
+            return
+        visited.add(name)
+        for dependency in by_name[name]["in"]:
+            visit(dependency)
+        ordered.append(name)
+    visit(output)
+    if len(visited) != len(entries):
+        raise ValueError("graph contains unreachable nodes")
+    mapping = {name: "n%d" % i for i, name in enumerate(ordered)}
+    result = []
+    for name in ordered:
+        layer = dict(by_name[name], name=mapping[name])
+        layer["in"] = [mapping.get(v, v) for v in layer["in"]]
+        result.append(layer)
+    return {"kind": kind, "nodes": result, "output": mapping[output]}, mapping
+
+
+def canonicalize_spec(spec, in_dim, out_dim, *, num_labels=None, output_shape=None):
+    """Canonical execution AST. Validation is pure and consumes no random state."""
+    return _canonicalize_spec(spec, in_dim, out_dim, num_labels=num_labels,
+                              output_shape=output_shape)[0]
+
+
+def graph_name_mapping(spec, in_dim, out_dim, *, num_labels=None):
+    """Validated original-to-canonical node labels for legacy checkpoint keys."""
+    return _canonicalize_spec(spec, in_dim, out_dim, num_labels=num_labels)[1]
+
+
+def canonical_spec(cfg):
+    """Project the public run configuration onto its validated execution AST."""
+    loss = str(cfg.get("loss-name", "bce_logits"))
+    in_dim = int(cfg.get("num-features", 0))
+    spatial = None
+    if str(cfg.get("data-kind", cfg.get("data_type", ""))).lower() == "image":
+        from . import vision
+        _, _, in_dim = vision.require_extractor_config(
+            cfg.get("backbone", cfg.get("model", "resnet18")),
+            cfg.get("vision-extractor-profile"), cfg.get("num-features"), cfg.get("image-size"))
+    raw = read_spec(cfg)
+    if loss == "segmentation_bce_dice":
+        from . import segmentation
+        segmentation.validate_decoder_spec(raw)
+        spatial = segmentation.OUTPUT_SHAPE
+    return canonicalize_spec(raw, in_dim, output_width(loss, cfg),
+                             num_labels=int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None,
+                             output_shape=spatial)
+
+
 def build_from_graph(spec, in_dim, out_dim, *, num_labels=None,
                      output_limit=_MAX_OUTPUT_ABS):
     """Build a node-owned GraphModule from a declarative DAG. Nodes must be listed in
@@ -677,6 +901,7 @@ def build_from_graph(spec, in_dim, out_dim, *, num_labels=None,
     sequential allowlist ``_OPS``; multi-input/functional ops from ``_GRAPH_OPS``. The
     output tensor must be a final ``linear`` projection to ``@out`` (raw logits at the
     loss-decided width)."""
+    spec = canonicalize_spec(spec, in_dim, out_dim, num_labels=num_labels)
     nodes = spec.get("nodes")
     if not isinstance(nodes, list) or not nodes:
         raise ValueError("graph spec needs a non-empty 'nodes' list")
@@ -691,6 +916,7 @@ def build_from_graph(spec, in_dim, out_dim, *, num_labels=None,
 
     dims = _BuildDims({"@in": _pos_int(in_dim, "in_dim"),
                        "@out": _pos_int(out_dim, "out_dim")})
+    dims.canonical = True
     if num_labels is not None:
         dims["@nlabels"] = _pos_int(num_labels, "num_labels")
 

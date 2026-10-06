@@ -436,6 +436,7 @@
   )
   manifest <- .merge_manifest_config(manifest, source_config)
   manifest <- .merge_manifest_config(manifest, extra_config)
+  manifest <- .stageSourceProjection(data, frame$data, manifest, staging_dir)
   manifest <- .normalize_dp_manifest(manifest)
   .write_manifest_atomic(manifest, file.path(staging_dir, "manifest.json"))
   staging_dir

@@ -667,6 +667,7 @@
 #' @return The manifest with mandatory privacy flags applied.
 #' @keywords internal
 .normalize_dp_manifest <- function(manifest) {
+  manifest[["semantic-randomness-contract"]] <- "dsflower-semantic-randomness-v3"
   manifest[["dp_enabled"]]               <- TRUE
   manifest[["allow_per_node_metrics"]]   <- FALSE
   manifest[["allow_exact_num_examples"]] <- FALSE
@@ -675,7 +676,9 @@
 }
 
 .manifest_structural_fields <- function() {
-  c(
+  c("semantic-randomness-contract",
+    "source_projection_file", "source_projection_schema",
+    "source_projection_sha256", "source_effective_sha256",
     "run_token", "data_file", "data_format", "samples_file", "n_samples",
     "n_units",
     "n_input_samples", "dropped_missing", "target", "target_column",
@@ -1101,6 +1104,7 @@
       unit_policy = unit_policy, identity_columns = identity_columns))
   }
   .validateSurvivalColumns(extra_config, target_column, feature_columns, unit_policy)
+  source_projection_data <- data
   data <- .transformPublicTarget(data, target_column, extra_config)
   unit <- if (is.null(unit_policy)) {
     .prepareDpUnitFrame(data)
@@ -1169,6 +1173,7 @@
 
   # Merge the server-authored mechanism and public run configuration.
   manifest <- .merge_manifest_config(manifest, extra_config)
+  manifest <- .stageSourceProjection(source_projection_data, data, manifest, staging_dir)
 
   if (.isSurvivalConfig(extra_config)) {
     manifest <- .stageSurvivalTargets(data, manifest, staging_dir)
@@ -1275,6 +1280,7 @@
          call. = FALSE)
   }
 
+  source_projection_data <- samples_data
   samples_data <- .transformPublicTarget(
     samples_data, target_column, extra_config)
   unit <- .prepareDpUnitFrame(samples_data)
@@ -1320,6 +1326,7 @@
   )
 
   manifest <- .merge_manifest_config(manifest, extra_config)
+  manifest <- .stageSourceProjection(source_projection_data, samples_data, manifest, staging_dir)
 
   manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
@@ -1536,6 +1543,7 @@
     staged_at       = format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3Z", tz = "UTC")
   )
   manifest <- .merge_manifest_config(manifest, extra_config)
+  manifest <- .stageSourceProjection(as.data.frame(tbl), prepared$data, manifest, staging_dir)
 
   manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")
@@ -2172,6 +2180,7 @@
   }
 
   samples_df <- .readStagedSamples(staged_samples, preserve_strings = segmentation)
+  source_projection_data <- samples_df
   samples_df <- .transformPublicTarget(
     samples_df, target_column, extra_config)
   unit <- .prepareImagingPrivacyUnitFrame(samples_df, imaging_unit_policy)
@@ -2346,6 +2355,7 @@
   )
 
   manifest <- .merge_manifest_config(manifest, extra_config)
+  manifest <- .stageSourceProjection(source_projection_data, samples_df, manifest, staging_dir)
 
   manifest <- .normalize_dp_manifest(manifest)
   manifest_path <- file.path(staging_dir, "manifest.json")

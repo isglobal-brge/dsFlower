@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -20,10 +21,9 @@ from flwr.common import ArrayRecord, ConfigRecord, RecordDict
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "..", "..", "flower_app", "dsflower_runner")
-sys.path.insert(0, RUNNER)
+sys.path.insert(0, os.path.dirname(RUNNER))
 
-import release_guard
-import seeding
+from dsflower_runner import canonical_units, release_guard, seeding, validation
 
 
 class _Context:
@@ -251,21 +251,49 @@ class SeedDerivationTest(unittest.TestCase):
     @staticmethod
     def _contract():
         return (
-            {"loss-name": "mse", "optimizer": {"name": "sgd", "lr": 0.1}},
+            {"loss-name": "mse", "learning-rate": 0.1,
+             "optimizer": {"name": "sgd"}},
             {"policy_hash": "1" * 64, "epsilon": 1.0,
              "delta": 1e-6, "clipping_norm": 1.0},
         )
+
+    @staticmethod
+    def _identity(mechanism, config, privacy, round_index=1, *,
+                  public_arrays=None, private_arrays=None, unit_ids=None):
+        """Build complete source-bound v3 fixtures through the production API."""
+        if public_arrays is None:
+            public_arrays = (np.asarray([[1.0]], dtype=np.float32),)
+        if private_arrays is None:
+            private_arrays = (np.asarray([[2.0]], dtype=np.float32),
+                              np.asarray([0], dtype=np.int64))
+        request_config = {"run": config}
+        if mechanism == "private-validation-vector/v3":
+            request_config["layout"] = validation.validation_layout("regression")
+        request = seeding.request_identity(
+            mechanism, request_config, privacy, round_index,
+            public_arrays=public_arrays)
+        units = canonical_units.canonicalize_arrays(
+            private_arrays[0], private_arrays[1], unit_ids)
+        effective = tuple(np.asarray(array)[units.row_permutation]
+                          for array in private_arrays)
+        binding = seeding.bind_private_data(
+            request, units, effective_tensors=effective)
+        return request, binding
+
+    @classmethod
+    def _derive(cls, *args, **kwargs):
+        return seeding.release_key(*cls._identity(*args, **kwargs))
 
     def test_key_is_semantic_sticky_and_operational_metadata_is_ignored(self):
         cfg, privacy = self._contract()
         public = [np.asarray([[1.0]], dtype=np.float32)]
         private = [np.asarray([[2.0]], dtype=np.float32),
                    np.asarray([0], dtype=np.int64)]
-        a = seeding.master_seed(
-            "neural-dpsgd/v1", cfg, privacy, 1,
+        a = self._derive(
+            "neural-dpsgd/v3", cfg, privacy, 1,
             public_arrays=public, private_arrays=private)
-        replay = seeding.master_seed(
-            "neural-dpsgd/v1", dict(reversed(list(cfg.items()))),
+        replay = self._derive(
+            "neural-dpsgd/v3", dict(reversed(list(cfg.items()))),
             dict(reversed(list(privacy.items()))), 1,
             public_arrays=public, private_arrays=private)
         noisy_cfg_a = dict(cfg, **{
@@ -276,8 +304,8 @@ class SeedDerivationTest(unittest.TestCase):
             "manifest-path": "/srv/two", "staged-at": "today"})
         selected_a = seeding.select_config(noisy_cfg_a, cfg)
         selected_b = seeding.select_config(noisy_cfg_b, cfg)
-        operational_change = seeding.master_seed(
-            "neural-dpsgd/v1", selected_b, privacy, 1,
+        operational_change = self._derive(
+            "neural-dpsgd/v3", selected_b, privacy, 1,
             public_arrays=public, private_arrays=private)
         self.assertEqual(a, replay)
         self.assertEqual(selected_a, selected_b)
@@ -289,19 +317,19 @@ class SeedDerivationTest(unittest.TestCase):
         private = [np.asarray([[2.0]], dtype=np.float32),
                    np.asarray([0], dtype=np.int64)]
 
-        def derive(mechanism="neural-dpsgd/v1", config=cfg,
+        def derive(mechanism="neural-dpsgd/v3", config=cfg,
                    policy=privacy, round_index=1, public_arrays=public,
                    private_arrays=private, unit_ids=None):
-            return seeding.master_seed(
+            return self._derive(
                 mechanism, config, policy, round_index,
                 public_arrays=public_arrays, private_arrays=private_arrays,
                 unit_ids=unit_ids)
 
         base = derive()
         changed = (
-            derive(mechanism="validation-gaussian/v1"),
-            derive(config={**cfg, "loss-name": "huber"}),
-            derive(policy={**privacy, "policy_hash": "2" * 64}),
+            derive(mechanism="private-validation-vector/v3"),
+            derive(config={**cfg, "loss-name": "huber", "huber-delta": 1.0}),
+            derive(policy={**privacy, "epsilon": 2.0}),
             derive(round_index=2),
             derive(public_arrays=[np.asarray([[1.5]], dtype=np.float32)]),
             derive(private_arrays=[np.asarray([[2.5]], dtype=np.float32),
@@ -314,47 +342,71 @@ class SeedDerivationTest(unittest.TestCase):
 
     def test_runtime_fingerprint_is_part_of_the_semantic_identity(self):
         cfg, privacy = self._contract()
+        runtime = dict(seeding._runtime_fingerprint())
         with mock.patch.object(
                 seeding, "_runtime_fingerprint",
-                return_value={"backend": "cpu", "version": "one"}):
-            first = seeding.master_seed(
-                "neural-dpsgd/v1", cfg, privacy, 1)
+                return_value={**runtime, "runner_sha256": "1" * 64}):
+            first = self._derive("neural-dpsgd/v3", cfg, privacy, 1)
         with mock.patch.object(
                 seeding, "_runtime_fingerprint",
-                return_value={"backend": "cpu", "version": "two"}):
-            second = seeding.master_seed(
-                "neural-dpsgd/v1", cfg, privacy, 1)
+                return_value={**runtime, "runner_sha256": "2" * 64}):
+            second = self._derive("neural-dpsgd/v3", cfg, privacy, 1)
         self.assertNotEqual(first, second)
 
     def test_oversized_unit_ids_totalize_instead_of_failing(self):
         cfg, privacy = self._contract()
-        oversized = seeding.master_seed(
-            "neural-dpsgd/v1", cfg, privacy, 1,
+        oversized = self._derive(
+            "neural-dpsgd/v3", cfg, privacy, 1,
             unit_ids=["x" * (seeding._MAX_UNIT_ID_BYTES + 1)])
-        sentinel = seeding.master_seed(
-            "neural-dpsgd/v1", cfg, privacy, 1,
+        sentinel = self._derive(
+            "neural-dpsgd/v3", cfg, privacy, 1,
             unit_ids=["__dsflower_missing_patient_unit__"])
         self.assertEqual(oversized, sentinel)
 
     def test_semantic_digest_has_a_cross_platform_golden_contract(self):
         cfg, privacy = self._contract()
-        with mock.patch.object(
-                seeding, "_runtime_fingerprint",
-                return_value={"backend": "test", "version": "1"}):
-            digest = seeding._semantic_digest(
-                "neural-dpsgd/v1", cfg, privacy, 2,
+        runtime = {
+            "python": "3.11.0", "implementation": "CPython",
+            "system": "test", "machine": "test",
+            "packages": dict.fromkeys(
+                ("cryptography", "numpy", "opacus", "torch", "torchvision"), "1"),
+            "backend": {"kind": "cpu"}, "runner_sha256": "c" * 64,
+        }
+        with mock.patch.object(seeding, "_runtime_fingerprint", return_value=runtime):
+            request, binding = self._identity(
+                "neural-dpsgd/v3", cfg, privacy, 2,
                 public_arrays=(np.asarray([[1, -0.0]], dtype=">f4"),),
                 private_arrays=(np.asarray([[2.5]], dtype="<f4"),
                                 np.asarray([3], dtype="<i8")),
                 unit_ids=["p1"])
+        # Regenerated deliberately for the framed, two-layer v3 contract.
+        fixture = Path(__file__).parent / "fixtures" / "semantic_request_v3.json"
+        self.assertEqual(request.canonical_json, fixture.read_bytes())
+        self.assertEqual(request.sha256, "f66fbbc5960670e2d4ba1a766fa0462d0b6b000e0605b66a87e75cc10713cc4f")
+        self.assertEqual(binding.sha256, "e3eefb34ca6b967242538f748712176e19f45edea952ec91a894e0bca303cc5f")
+        self.assertEqual(seeding.release_key(request, binding).hex(), "df915b39bf33a7e68911f365a1d5b1878715f1ce7bbdb88f9a96a8bbf04d47c2")
+
+    def test_public_request_is_independent_of_private_source_binding(self):
+        cfg, privacy = self._contract()
+        one = self._identity("neural-dpsgd/v3", cfg, privacy)
+        two = self._identity("neural-dpsgd/v3", cfg, privacy,
+            private_arrays=(np.asarray([[9.0]], dtype=np.float32),
+                            np.asarray([0], dtype=np.int64)))
+        self.assertEqual(one[0], two[0])
+        self.assertNotEqual(one[1], two[1])
+        self.assertNotEqual(seeding.release_key(*one), seeding.release_key(*two))
+
+    def test_legacy_policy_hash_is_not_an_analyst_nonce(self):
+        cfg, privacy = self._contract()
         self.assertEqual(
-            digest.hex(),
-            "2ab19ab5725886734be51654bb1fc0908ae74a9b67f63ff60065bc1039752c07")
+            self._derive("neural-dpsgd/v3", cfg, privacy),
+            self._derive("neural-dpsgd/v3", cfg,
+                         {**privacy, "policy_hash": "2" * 64}))
 
     def test_stream_is_reproducible_but_domain_separated(self):
         cfg, privacy = self._contract()
-        master = seeding.master_seed(
-            "neural-dpsgd/v1", cfg, privacy, 1)
+        master = self._derive(
+            "neural-dpsgd/v3", cfg, privacy, 1)
         one = seeding.np_rng(seeding.sub_seed(master, "noise")).normal(size=32)
         replay = seeding.np_rng(seeding.sub_seed(master, "noise")).normal(size=32)
         other = seeding.np_rng(seeding.sub_seed(master, "shuffle")).normal(size=32)
@@ -382,7 +434,7 @@ class SeedDerivationTest(unittest.TestCase):
 
     def test_bound_hook_noise_is_sticky_only_for_the_same_update(self):
         cfg, privacy = self._contract()
-        master = seeding.master_seed("hook-output/v1", cfg, privacy, 1)
+        master = self._derive("neural-dpsgd/v3", cfg, privacy, 1)
         update = [np.asarray([1.0, 2.0], dtype=np.float64)]
         replay = [np.asarray([1.0, 2.0], dtype=np.float64)]
         changed = [np.asarray([1.0, 3.0], dtype=np.float64)]

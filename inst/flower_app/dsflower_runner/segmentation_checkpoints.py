@@ -178,7 +178,11 @@ def _decode_arrays(payload, manifest):
             if hashlib.sha256(array.tobytes(order="C")).hexdigest() != _sha(item["sha256"]):
                 raise ValueError("public checkpoint tensor digest mismatch")
             arrays.append(np.array(array, copy=True, order="C"))
-    return arrays
+    # The archive is validated in its original registration order. A legacy DAG
+    # may use arbitrary node labels/order; map each original parameter key to its
+    # canonical key only after every original content digest has been checked.
+    order = _manifest_tensor_order(manifest)
+    return [arrays[index] for index in order]
 
 
 def _canonical(value):
@@ -196,24 +200,51 @@ def _record(record, limit):
 
 
 def _clean_spec(spec):
-    clean = copy.deepcopy(spec)
-    for layer in clean.get("layers", []):
-        if layer.get("op") == "upsample" and layer.get("mode") == "nearest":
-            layer.pop("mode")
-    return clean
+    from . import model_spec, segmentation
+    return model_spec.canonicalize_spec(
+        spec, segmentation.FEATURE_DIM, 1, output_shape=segmentation.OUTPUT_SHAPE)
+
+
+def _tabular_tensor_keys(manifest):
+    """Original and canonical ordered keys, with an exact bijective mapping."""
+    from . import model_spec
+    from .initialisation import isolated_public_rng
+    cfg = manifest["model_config"]
+    loss = cfg["loss-name"]
+    with isolated_public_rng(0):
+        model = model_spec.build_from_spec(
+            manifest["model_spec"], cfg["num-features"],
+            model_spec.output_width(loss, cfg), num_labels=cfg["num-labels"],
+            output_limit=model_spec.output_limit_for_loss(loss))
+    state = model.state_dict()
+    canonical = list(state)
+    if manifest["model_spec"].get("kind", "sequential") != "graph":
+        return canonical, canonical, state
+    mapping = model_spec.graph_name_mapping(
+        manifest["model_spec"], cfg["num-features"],
+        model_spec.output_width(loss, cfg), num_labels=cfg["num-labels"])
+    original = []
+    for node in manifest["model_spec"]["nodes"]:
+        prefix = "_mods." + mapping[node["name"]] + "."
+        original.extend(key for key in canonical if key.startswith(prefix))
+    if len(original) != len(canonical) or len(set(original)) != len(original) or set(original) != set(canonical):
+        raise ValueError("public graph checkpoint parameter mapping is incomplete or ambiguous")
+    return original, canonical, state
 
 
 def _manifest_tensor_shapes(manifest):
     if manifest.get("role") != "tabular_model":
         return _tensor_shapes(manifest["decoder"])
-    from . import model_spec
-    cfg = manifest["model_config"]
-    loss = cfg["loss-name"]
-    model = model_spec.build_from_spec(
-        manifest["model_spec"], cfg["num-features"],
-        model_spec.output_width(loss, cfg), num_labels=cfg["num-labels"],
-        output_limit=model_spec.output_limit_for_loss(loss))
-    return [tuple(value.shape) for value in model.state_dict().values()]
+    original, _, state = _tabular_tensor_keys(manifest)
+    return [tuple(state[key].shape) for key in original]
+
+
+def _manifest_tensor_order(manifest):
+    if manifest.get("role") != "tabular_model":
+        return list(range(len(_tensor_shapes(manifest["decoder"]))))
+    original, canonical, _ = _tabular_tensor_keys(manifest)
+    index = {key: i for i, key in enumerate(original)}
+    return [index[key] for key in canonical]
 
 
 _TABULAR_LOSS_PARAMETERS = {
@@ -251,8 +282,7 @@ def _validate_tabular_manifest(manifest, requested_spec=None):
         raise ValueError("public checkpoint manifest violates the tabular contract")
     spec = manifest["model_spec"]
     if (not isinstance(spec, dict)
-            or manifest["model_spec_sha256"] != hashlib.sha256(_canonical(spec)).hexdigest()
-            or (requested_spec is not None and spec != requested_spec)):
+            or manifest["model_spec_sha256"] != hashlib.sha256(_canonical(spec)).hexdigest()):
         raise ValueError("public checkpoint does not match the requested model spec")
     cfg = manifest["model_config"]
     required_cfg = {"loss-name", "num-features", "num-classes", "num-labels"}
@@ -271,6 +301,13 @@ def _validate_tabular_manifest(manifest, requested_spec=None):
             or not 2 <= cfg["num-labels"] <= 1024):
         raise ValueError("public checkpoint model geometry is invalid")
     _effective_tabular_model_config(cfg)
+    if requested_spec is not None:
+        from . import model_spec
+        def normalize(value):
+            return model_spec.canonicalize_spec(value, cfg["num-features"],
+                model_spec.output_width(cfg["loss-name"], cfg), num_labels=cfg["num-labels"])
+        if normalize(spec) != normalize(requested_spec):
+            raise ValueError("public checkpoint does not match the requested model spec")
     if cfg["loss-name"] in survival_losses:
         from . import survival
         encoded = cfg["survival-config-b64"]
@@ -384,7 +421,7 @@ def _validate_manifest(manifest, decoder_spec=None):
         raise ValueError("public checkpoint creation metadata is invalid")
     expected_spec = segmentation.decoder_spec(manifest["decoder"])
     if (manifest["decoder_spec_sha256"] != hashlib.sha256(_canonical(expected_spec)).hexdigest()
-            or (decoder_spec is not None and _clean_spec(decoder_spec) != expected_spec)):
+            or (decoder_spec is not None and _clean_spec(decoder_spec) != _clean_spec(expected_spec))):
         raise ValueError("public checkpoint does not match the requested decoder")
     for key in ("dataset", "licence"):
         if not isinstance(manifest[key], dict) or not manifest[key]:
@@ -448,7 +485,8 @@ def _summary(manifest):
                            "manifest": manifest},
             "checkpoint_sha256": manifest["checkpoint"]["sha256"],
             "encoder_sha256": manifest.get("encoder_sha256", hashlib.sha256(b"").hexdigest()),
-            "tensor_schema": copy.deepcopy(manifest["tensors"])}
+            "tensor_schema": [dict(copy.deepcopy(manifest["tensors"][index]), name=str(i))
+                              for i, index in enumerate(_manifest_tensor_order(manifest))]}
 
 
 def _verify_evidence(manifest, contents):

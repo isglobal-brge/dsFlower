@@ -36,32 +36,39 @@ class NativeRequestSelectionTests(unittest.TestCase):
         manifest["privacy"]["unit"] = "patient"
         return manifest
 
-    def _release(self, manifest, selection=None):
-        features = np.zeros((4, 2), dtype=np.float64)
-        target = np.asarray([0, 1, 0, 1], dtype=np.float64)
-        units = ["a", "b", "c", "d"]
+    def _release(self, manifest, selection=None, *, operation="train", fold=None, features=None, target=None, units=None):
+        features = np.zeros((4, 2), dtype=np.float64) if features is None else features
+        target = np.asarray([0, 1, 0, 1], dtype=np.float64) if target is None else target
+        units = ["a", "b", "c", "d"] if units is None else units
         if manifest["privacy"]["unit"] == "row":
             units = None
         keys = []
-        original = seeding.master_seed
+        original = seeding.release_key
 
         def capture(*args, **kwargs):
             key = original(*args, **kwargs)
-            keys.append((args[0], key))
+            keys.append((args[0].digest, key))
             return key
 
         with mock.patch.object(seeding, "_node_secret", return_value=b"s" * 32), \
-                mock.patch.object(seeding, "master_seed", side_effect=capture):
+                mock.patch.object(seeding, "release_key", side_effect=capture):
+            from dsflower_runner import tree_release
+            if selection is not None and "layout" not in selection:
+                selection = seeding.request_selection(selection)
+            identity = tree_release.native_request_identity(
+                manifest, selection, operation=operation, fold=fold,
+                execution_fingerprint="test-native-v3")
             if manifest["engine"] == "xgboost":
                 prepared = xgboost_adapter.prepare_xgboost_training(
                     manifest, features, target, unit_ids=units,
                     native_bundle=xgboost_tests.XGBoostPrfAndBoundaryTests._bundle("f" * 64),
-                    request_selection=selection)
+                    request_selection=selection, request_identity=identity)
                 artifact = bytes(prepared._noise_key)
             else:
                 artifact = native_tree_engine.train_model(
                     manifest, features, target, unit_ids=units,
-                    request_selection=selection)
+                    request_selection=selection, request_identity=identity)
+        self.assertTrue(keys, "test must capture actual private-release keys")
         return keys, artifact
 
     def test_identical_tensors_and_selection_replay_for_every_engine(self):
@@ -98,22 +105,31 @@ class NativeRequestSelectionTests(unittest.TestCase):
                     self.assertTrue(set(first).isdisjoint(second))
 
     def test_node_patient_column_and_fold_coordinates_reach_every_engine(self):
-        baseline = {"target_column": "outcome", "patient_column": "patient",
-                    "cv-folds": 3, "cv-assignment": "keyed-unit-v1"}
+        baseline = {"target_column": "outcome", "patient_column": "patient"}
         for engine in ("extra_trees", "random_forest", "xgboost", "lightgbm", "catboost"):
             manifest = self._manifest(engine)
-            selection = native_tree_client_app._request_selection(baseline, "cv-train", 1)
-            first, _ = self._release(manifest, selection)
-            variants = [
-                native_tree_client_app._request_selection(baseline, "cv-train", 2),
-                native_tree_client_app._request_selection(baseline, "train"),
-                native_tree_client_app._request_selection(
-                    dict(baseline, patient_column="other_patient"), "cv-train", 1),
-            ]
-            for changed in variants:
-                with self.subTest(engine=engine, selection=changed):
-                    second, _ = self._release(manifest, changed)
+            first, _ = self._release(manifest, baseline, operation="cv-train", fold=1)
+            for selection, operation, fold in (
+                    (baseline, "cv-train", 2), (baseline, "train", None),
+                    (dict(baseline, patient_column="other_patient"), "cv-train", 1)):
+                with self.subTest(engine=engine, fold=fold):
+                    second, _ = self._release(manifest, selection, operation=operation, fold=fold)
                     self.assertTrue(set(first).isdisjoint(second))
+
+    def test_all_five_engines_replay_shuffle_and_distinguish_same_bins(self):
+        X = np.asarray([[0.1, 0.1], [0.2, 0.2], [0.3, 0.3], [0.4, 0.4]])
+        y = np.asarray([0., 1., 0., 1.])
+        units = np.asarray(["a", "b", "c", "d"])
+        order = np.asarray([3, 1, 0, 2])
+        for engine in ("extra_trees", "random_forest", "xgboost", "lightgbm", "catboost"):
+            with self.subTest(engine=engine):
+                manifest = self._manifest(engine)
+                first = self._release(manifest, features=X, target=y, units=units)
+                replay = self._release(manifest, features=X[order], target=y[order], units=units[order])
+                self.assertEqual(first, replay)
+                changed = X.copy(); changed[0, 0] += 0.001
+                other = self._release(manifest, features=changed, target=y, units=units)
+                self.assertTrue(set(first[0]).isdisjoint(other[0]))
 
     def test_boosting_parameters_separate_identical_first_stage_statistics(self):
         for engine in ("lightgbm", "catboost"):

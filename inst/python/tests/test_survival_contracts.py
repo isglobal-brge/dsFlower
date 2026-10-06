@@ -25,6 +25,8 @@ from opacus import GradSampleModule
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__),
                                                "..", "..", "flower_app")))
 from dsflower_runner import dp_harness, survival
+from flwr.common import RecordDict
+from v3_test_support import fixture_node_secret, fixture_key, source_sidecar
 
 
 def config(distribution="weibull", edges=None, **changes):
@@ -270,7 +272,7 @@ class SurvivalRunnerTests(unittest.TestCase):
             "n_samples":8,"n_units":7,"num-classes":2,"num-labels":2,"batch-size":3,
             "local-epochs":1,"num-server-rounds":1}
         self.context=SimpleNamespace(node_config={"manifest-dir":self.temp.name},
-                                     run_config=wire(self.cfg))
+                                     run_config=wire(self.cfg), state=RecordDict())
         source=pd.DataFrame({"id":["001","b","c","c","d","e","f","NA"],
             "x":[1,2,3,4,5,6,7,8],"z":[.1,.2,.3,.4,.5,.6,.7,.8],
             "time":[5,21,6,6,.5,20,8,7],"event":[1,1,0,0,1,1,2,0]})
@@ -280,7 +282,13 @@ class SurvivalRunnerTests(unittest.TestCase):
             "__survival_valid":[1,1,0,0,1,0,0]})
         source.to_csv(os.path.join(self.temp.name,"source.csv"),index=False)
         self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        self.refresh_source()
         self.write_manifest()
+
+    def refresh_source(self):
+        source = pd.read_csv(os.path.join(self.temp.name,"source.csv"), dtype={"id": str},
+                             keep_default_na=False, float_precision="round_trip")
+        source_sidecar(self.temp.name, self.manifest, source)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -306,8 +314,8 @@ class SurvivalRunnerTests(unittest.TestCase):
         self.hazard_fixture()
         x,y,ids,m=self.task.load_survival_data(self.context)
         self.assertEqual(m,8);self.assertEqual(y.shape,(7,7))
-        np.testing.assert_array_equal(y[0],[1,0,0,1,0,0,1])
-        np.testing.assert_array_equal(y[1],[0,0,0,1,1,1,1])
+        np.testing.assert_array_equal(y[list(ids).index("001")],[1,0,0,1,0,0,1])
+        np.testing.assert_array_equal(y[list(ids).index("b")],[0,0,0,1,1,1,1])
         self.subjects.loc[0,"__survival_m_2"]=1
         self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
         with self.assertRaises(RuntimeError):self.task.load_survival_data(self.context)
@@ -322,8 +330,9 @@ class SurvivalRunnerTests(unittest.TestCase):
         source.to_csv(os.path.join(self.temp.name,"source.csv"),index=False)
         self.subjects.loc[0,["__survival_time","__survival_d_1","__survival_d_2","__survival_m_2"]]=[value,0,1,1]
         self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
-        _,y,_,_=self.task.load_survival_data(self.context)
-        np.testing.assert_array_equal(y[0],[0,1,0,1,1,0,1])
+        self.refresh_source(); self.write_manifest()
+        _,y,ids,_=self.task.load_survival_data(self.context)
+        np.testing.assert_array_equal(y[list(ids).index("001")],[0,1,0,1,1,0,1])
 
     def test_hazard_training_dispatch_preserves_N_and_M(self):
         from dsflower_runner import client_app
@@ -333,9 +342,9 @@ class SurvivalRunnerTests(unittest.TestCase):
         pcfg={"epsilon":4.,"delta":1e-5,"clipping_norm":1.,"n_samples":8}
         with mock.patch.object(client_app,"_pool_by_patient",side_effect=AssertionError("generic pooling")), \
              mock.patch.object(client_app,"_dp_fit",return_value=([],7)) as fit, \
-             mock.patch.object(client_app.seeding,"master_seed",return_value=b"a"*32), \
+             mock.patch.object(client_app.seeding,"release_key",return_value=b"a"*32), \
              mock.patch.object(client_app.dp_harness,"effective_dpsgd_mechanism",
-                return_value={"noise_multiplier":1.,"policy_hash":"f"*64}) as effective:
+                wraps=dp_harness.effective_dpsgd_mechanism) as effective:
             client_app._train_neural(self.context,cfg,pcfg,pins,model(3).float(),2,False)
         self.assertEqual(effective.call_args.kwargs["n_samples"],7)
         args=fit.call_args.args
@@ -375,6 +384,8 @@ class SurvivalRunnerTests(unittest.TestCase):
     def test_source_and_subject_census_and_invalid_totalization(self):
         x,y,ids,m=self.task.load_survival_data(self.context)
         self.assertEqual(m,8);self.assertEqual(len(y),7)
+        p = [list(ids).index(value) for value in self.subjects["id"]]
+        x,y,ids = x[p],y[p],ids[p]
         np.testing.assert_array_equal(y[:,2],[1,1,0,0,1,0,0])
         np.testing.assert_array_equal(x[y[:,2]==0],np.zeros((4,2)))
         np.testing.assert_array_equal(y[:,0],[5,20,1,1,20,1,1])
@@ -439,16 +450,16 @@ class SurvivalRunnerTests(unittest.TestCase):
         from dsflower_runner import client_app,seeding
         pins=self.task.load_run_pins(self.context)
         x,y,ids,m=self.task.load_survival_data(self.context)
-        privacy={"policy_hash":"f"*64}
+        privacy={"policy_hash":"f"*64,"epsilon":1.,"delta":1e-6,"clipping_norm":1.}
         def digest(cfg=wire(self.cfg),target=y,features=x,pinned=pins):
             semantic,_=client_app._neural_seed_contract(cfg,pinned,{},manifest=self.manifest)
-            return seeding._semantic_digest("survival-test",semantic,privacy,1,
-                    private_arrays=(features,target),execution_fingerprint={})
+            return fixture_key("neural-dpsgd/v3",semantic,privacy,1,
+                    private_arrays=(features,target),execution_fingerprint="fixed-test-execution-v3")
         baseline=digest()
         moved=wire(self.cfg);moved["run-token"]="new-token";moved["results-dir"]="new-path"
         self.assertEqual(baseline,digest(moved))
         self.assertNotEqual(baseline,digest(wire(config(dispersion=2.))))
-        changed=y.copy();changed[0,2]=0
+        changed=y.copy();changed[list(ids).index("001"),2]=0
         self.assertNotEqual(baseline,digest(target=changed))
         changed=x.copy();changed[0,0]+=1
         self.assertNotEqual(baseline,digest(features=changed))
@@ -472,8 +483,8 @@ class SurvivalRunnerTests(unittest.TestCase):
                 self.context.run_config={**wire(self.cfg),**extra}
                 cfg=self.task.load_pinned_run_config(self.context)
                 semantic,_=client_app._neural_seed_contract(cfg,pins,{},manifest=self.manifest)
-                return seeding._semantic_digest("survival-wire-test",semantic,
-                    {"policy_hash":"f"*64},1,execution_fingerprint={})
+                return fixture_key("neural-dpsgd/v3",semantic,
+                    {"policy_hash":"f"*64,"epsilon":1.,"delta":1e-6,"clipping_norm":1.},1,execution_fingerprint="fixed-test-execution-v3")
             baseline=digest({})
             for extra in extras:
                 with self.subTest(variant=variant,field=next(iter(extra))):
@@ -497,8 +508,16 @@ class SurvivalRunnerTests(unittest.TestCase):
             if changed_incoming:
                 with torch.no_grad():next(net.parameters()).add_(.01)
             pcfg={"epsilon":4.,"delta":1e-5,"clipping_norm":1.,"n_samples":8}
-            with mock.patch.object(client_app.seeding,"_node_secret",return_value=b"s"*32):
-                result,_=client_app._train_neural(self.context,cfg,pcfg,pins,net,2,False)
+            # Each invocation represents a newly admitted run; durable round-one
+            # pins reject replacing the initial model within an existing run.
+            with tempfile.TemporaryDirectory(dir=self.temp.name) as run:
+                for name in ("source.csv", "subjects.csv", "manifest.json", "source-projection.jsonl"):
+                    shutil.copyfile(os.path.join(self.context.node_config["manifest-dir"],name), os.path.join(run,name))
+                    os.chmod(os.path.join(run,name), 0o600)
+                context = SimpleNamespace(node_config={"manifest-dir": run}, run_config=self.context.run_config,
+                                          state=RecordDict())
+                with mock.patch.object(client_app.seeding,"_node_secret",return_value=b"s"*32):
+                    result,_=client_app._train_neural(context,cfg,pcfg,pins,net,2,False)
             return [a.copy() for a in result]
         def same(a,b):return all(np.array_equal(x,y) for x,y in zip(a,b))
         first=execute()
@@ -509,8 +528,9 @@ class SurvivalRunnerTests(unittest.TestCase):
         for extra in extras:self.assertTrue(same(first,execute(extra=extra)))
         rebound=os.path.join(self.temp.name,"rebound")
         os.mkdir(rebound)
-        for name in ("source.csv","subjects.csv","manifest.json"):
+        for name in ("source.csv","subjects.csv","manifest.json","source-projection.jsonl"):
             shutil.copyfile(os.path.join(self.temp.name,name),os.path.join(rebound,name))
+            os.chmod(os.path.join(rebound,name), 0o600)
         self.context.node_config["manifest-dir"]=rebound
         self.assertTrue(same(first,execute(operational=True)))
         self.context.node_config["manifest-dir"]=self.temp.name
@@ -541,6 +561,7 @@ class SurvivalRunnerTests(unittest.TestCase):
         self.subjects.loc[0,self.subjects.columns[1:]]=0.
         self.subjects.loc[0,"__survival_time"]=1.
         self.subjects.to_csv(os.path.join(self.temp.name,"subjects.csv"),index=False)
+        self.refresh_source(); self.write_manifest()
         self.assertFalse(same(hazard_first,execute()))
 
     def test_reply_releases_only_parameters_and_fixed_weight(self):

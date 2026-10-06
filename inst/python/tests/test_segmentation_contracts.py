@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "flower_a
 from dsflower_runner import (segmentation as seg, client_app, dp_harness,
                              model_spec, params, seeding, task, vision, server_app)
 
+from flwr.common import RecordDict
+from v3_test_support import fixture_node_secret, fixture_key, source_sidecar
+
 torch.set_num_threads(1)
 
 
@@ -205,25 +208,43 @@ def fixture(tmp_path):
                         "images": {"root": root, "path_col": "path"},
                         "masks": {"root": root, "path_col": "mask"}})
     manifest.update({"dp-unit": "patient", "patient-id-canonicalization": "trim-utf8-v2"})
+    source_sidecar(tmp_path, manifest, frame, columns=["empty"])
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
-    return SimpleNamespace(node_config={"manifest-dir": root}, run_config=config()), frame
+    return SimpleNamespace(node_config={"manifest-dir": root}, run_config=config(), state=RecordDict()), frame
+
+
+def write_samples(tmp_path, frame):
+    """Stage an admitted new fixture, including its source projection digest."""
+    frame.to_csv(tmp_path / "samples.csv", index=False)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text())
+    source_sidecar(tmp_path, manifest, frame, columns=["empty"])
+    path.write_text(json.dumps(manifest))
+
+
+def aligned_subjects(X, y, subjects):
+    order = [list(subjects).index(value) for value in ("p1", "p2", "p3")]
+    return np.asarray(X)[order], np.asarray(y)[order]
 
 
 def test_subject_selection_union_invalid_and_declared_empty_keep_n(tmp_path):
     context, frame = fixture(tmp_path)
     X, y, subjects, n = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
     assert n == 5 and len(subjects) == 3
+    X, y = aligned_subjects(X, y, subjects)
     assert y[:, 1, 0, 0].tolist() == [1, 1, 0]
     assert y[0, 0].sum() == 8192 and y[1, 0].sum() == 0
     assert not X[2].any() and not y[2].any()
-    frame.loc[0, "path"] = "image.png"  # unselected image cannot change tensors
-    frame.to_csv(tmp_path / "samples.csv", index=False)
-    X2, y2, _, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    frame.loc[0, "path"] = "image.png"  # unselected source changes order, not tensors per subject
+    write_samples(tmp_path, frame)
+    X2, y2, ids2, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    X2, y2 = aligned_subjects(X2, y2, ids2)
     np.testing.assert_array_equal(X, X2)
     np.testing.assert_array_equal(y, y2)
     frame.loc[1, "path"] = "bad.png"  # selected conflict invalidates p1 only
-    frame.to_csv(tmp_path / "samples.csv", index=False)
-    X3, y3, _, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    write_samples(tmp_path, frame)
+    X3, y3, ids3, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    X3, y3 = aligned_subjects(X3, y3, ids3)
     assert not X3[0].any() and not y3[0].any()
     np.testing.assert_array_equal(X[1:], X3[1:])
     np.testing.assert_array_equal(y[1:], y3[1:])
@@ -247,12 +268,14 @@ def test_csv_image_ids_and_validity_are_not_inferred_from_other_subjects(tmp_pat
     context, frame = fixture(tmp_path)
     frame["image_id"] = ["1", "001", "001", "01", "1"]
     frame["empty"] = ["FALSE", "FALSE", "FALSE", "TRUE", "bad"]
-    frame.to_csv(tmp_path / "samples.csv", index=False)
-    X, y, _, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    write_samples(tmp_path, frame)
+    X, y, subjects, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    X, y = aligned_subjects(X, y, subjects)
     assert y[:, 1, 0, 0].tolist() == [1, 1, 0]
     frame.loc[4, "empty"] = "FALSE"
-    frame.to_csv(tmp_path / "samples.csv", index=False)
-    X2, y2, _, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    write_samples(tmp_path, frame)
+    X2, y2, subjects2, _ = seg.load_subject_tensors(context, config(), FixtureEncoder(), "cpu")
+    X2, y2 = aligned_subjects(X2, y2, subjects2)
     np.testing.assert_array_equal(X, X2)
     np.testing.assert_array_equal(y, y2)
 
@@ -282,12 +305,17 @@ def test_semantic_identity_binds_every_effective_pin_and_tensor_not_paths():
     x, y = np.zeros((2, seg.FEATURE_DIM), np.float32), targets(2).numpy()
     def digest(c, xx=x, yy=y):
         selected, _ = client_app._neural_seed_contract(c, pins, {}, manifest={})
-        return seeding._semantic_digest("seg-test", selected, {"policy_hash": "1" * 64}, 1,
-                                        private_arrays=(xx, yy), execution_fingerprint={})
+        return fixture_key("neural-dpsgd/v3", selected, {"policy_hash": "1" * 64, "epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, 1,
+                                        private_arrays=(xx, yy), execution_fingerprint="fixed-test-execution-v3")
     original = digest(cfg)
     assert digest(dict(cfg, run_token="new", samples_file="/new/path")) == original
     for key in (*seg.PIN_KEYS, "vision-extractor-profile"):
-        assert digest(dict(cfg, **{key: str(cfg[key]) + "changed"})) != original
+        changed = dict(cfg, **{key: str(cfg[key]) + "changed"})
+        # Closed v3 schemas reject malformed pins before constructing a release.
+        try:
+            assert digest(changed) != original
+        except (ValueError, TypeError):
+            pass
     changed = y.copy()
     changed[0, 1] = 0
     assert digest(cfg, yy=changed) != original
@@ -343,7 +371,8 @@ def test_encoder_preflight_failure_does_not_read_private_records(tmp_path):
     with mock.patch.object(seg, "prepare_encoder", side_effect=ValueError("checkpoint")), \
             mock.patch.object(seg, "load_subject_tensors") as load:
         with pytest.raises(ValueError, match="checkpoint"):
-            client_app._train_segmentation(context, config(), {}, {}, decoder())
+            pins = {"round_index": 1, "batch_size": 2, "num_rounds": 1, "local_epochs": 1}
+            client_app._train_segmentation(context, config(), {"epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, pins, decoder())
     load.assert_not_called()
 
 
