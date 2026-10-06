@@ -75,15 +75,13 @@ def _metadata_bytes(rounds):
 
 @lru_cache(maxsize=1)
 def _acl_validator():
-    if __package__:
-        from . import xgboost_bundle
-    else:
-        # The administrator CLI runs as ``python -I /trusted/release_cache.py``.
-        # Import only the colocated trusted helper, never a sys.path candidate.
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xgboost_bundle.py")
-        spec = importlib.util.spec_from_file_location("_dsflower_cache_acl", path)
-        xgboost_bundle = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(xgboost_bundle)
+    # Load only the colocated trusted helper in both package and isolated CLI
+    # contexts. This keeps shared ACL checks available to the dependency-light
+    # association worker without importing the native engine package namespace.
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xgboost_bundle.py")
+    spec = importlib.util.spec_from_file_location("_dsflower_cache_acl", path)
+    xgboost_bundle = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(xgboost_bundle)
     return xgboost_bundle._reject_extended_acl
 
 
@@ -446,6 +444,40 @@ class ReleaseCache:
                 yield slot
             finally:
                 slot.active = False
+
+    def claim_neighbourhood_replay(self, run_fingerprint, coordinate, request_id, key):
+        """Retain the existing per-run mutation guard for an outer-store reply.
+
+        This claims a transport coordinate, not an input-to-answer binding:
+        no payload, entry or pin is created. The immutable neighbourhood anchors
+        remain the sole owner of the selected response.
+        """
+        run = _hex(run_fingerprint, "run fingerprint")
+        key = _hex(key, "semantic key")
+        request_id = _hex(request_id, "public request identity")
+        match = _COORDINATE.fullmatch(coordinate) if isinstance(coordinate, str) else None
+        if match is None:
+            raise RuntimeError("invalid gated cache release coordinate")
+        with self._transaction() as connection:
+            reserved = connection.execute(
+                "SELECT rounds, entry_bytes, closed FROM runs WHERE run=?", (run,)).fetchone()
+            if reserved is None or reserved[2] or int(match[1]) > reserved[0]:
+                raise RuntimeError("gated cache run is unavailable")
+            previous = connection.execute(
+                "SELECT request_id, entry_key, committed FROM claims WHERE run=? AND coordinate=?",
+                (run, coordinate)).fetchone()
+            if previous is not None:
+                if previous[:2] != (request_id, key):
+                    raise RuntimeError("committed release coordinate has a different semantic identity")
+                if previous[2] != 2:
+                    entry = connection.execute(
+                        "SELECT payload, digest FROM entries WHERE entry_key=?", (key,)).fetchone()
+                    if (entry is None or len(entry[0]) > reserved[1]
+                            or hashlib.sha256(entry[0]).hexdigest() != entry[1]):
+                        raise RuntimeError("claimed release coordinate has no durable exact reply")
+            else:
+                connection.execute("INSERT INTO claims VALUES (?, ?, ?, ?, 2)",
+                                   (run, coordinate, request_id, key))
 
     def close_run(self, run_fingerprint):
         """Authoritatively close after all in-flight releases finish; retain tombstone."""

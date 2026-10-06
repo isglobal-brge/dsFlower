@@ -4,7 +4,7 @@
 .release_cache_control_key <- function(key) {
   key <- gsub("([a-z0-9])([A-Z])", "\\1_\\2", key, perl = TRUE)
   key <- gsub("[-.]", "_", tolower(key))
-  grepl("(^|_)(cache|deadline)($|_)", key, perl = TRUE)
+  grepl("(^|_)(cache|deadline|neighbourhood)($|_)", key, perl = TRUE)
 }
 
 .release_cache_settings <- function(settings = NULL) {
