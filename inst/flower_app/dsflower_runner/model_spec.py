@@ -916,10 +916,13 @@ def load_saved_state_dict(model, state, spec, in_dim, out_dim, *,
     checked = {}
     for key, template in expected.items():
         value = state[key]
-        if (value.shape != template.shape or value.dtype != template.dtype
+        if value.shape != template.shape:
+            raise RuntimeError("size mismatch for %s: expected %s, received %s" %
+                               (key, tuple(template.shape), tuple(value.shape)))
+        if (value.dtype != template.dtype
                 or value.layout != torch.strided
                 or not bool(torch.isfinite(value).all())):
-            raise ValueError("saved model tensor shape, dtype or values are invalid: " + key)
+            raise ValueError("saved model tensor dtype or values are invalid: " + key)
         checked[key] = value
     model.load_state_dict(checked, strict=True)
 

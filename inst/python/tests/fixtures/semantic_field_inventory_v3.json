@@ -1468,6 +1468,14 @@
       ],
       "reason": "Only the loss-selected real parameter is canonicalized; other loss parameters are rejected or inapplicable."
     },
+    "graph-parameter-format": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.public_arrays.schema",
+        "R.public_arrays.sha256"
+      ],
+      "reason": "The saved parameter format selects a validated legacy-to-canonical mapping before prediction. Its effective ordered tensor schema/content enters R; equivalent serialized layouts do not add an independent format nonce."
+    },
     "holdout-target-lower": {
       "category": "public_semantic",
       "identity_paths": [

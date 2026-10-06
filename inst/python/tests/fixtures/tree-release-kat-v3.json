@@ -26,11 +26,11 @@
           "torchvision": "0.25.0+cpu"
         },
         "python": "3.11.16",
-        "runner_sha256": "868adf5b9362a366a5298960710ef9a9a5126bf6d9b295af20f4dc564faa80bd",
+        "runner_sha256": "62f83bea1b411a7f9095da9109174db81a20eca0a30837845c62d0a9237eeec1",
         "system": "linux"
       },
       "sigma_hex": "0x1.e439944d8cd2fp+2",
-      "vector_sha256": "f3b530d245edb499bceaa8ad481a528cde8dbfcf1e0dd77ffe4c020e3c1a6137"
+      "vector_sha256": "8fa44be49b29ae8f1cdac56f02508e21b51b20b32bd4db516770807d480ebeec"
     },
     {
       "numeric_profile": {
@@ -57,11 +57,11 @@
           "torchvision": "absent"
         },
         "python": "3.11.16",
-        "runner_sha256": "868adf5b9362a366a5298960710ef9a9a5126bf6d9b295af20f4dc564faa80bd",
+        "runner_sha256": "62f83bea1b411a7f9095da9109174db81a20eca0a30837845c62d0a9237eeec1",
         "system": "linux"
       },
       "sigma_hex": "0x1.e439944d8cd2fp+2",
-      "vector_sha256": "acc1ea19a3b113f300b8e8a6f7675778ee4d3f51588b6324a4dd57b05e2e955d"
+      "vector_sha256": "97f6f4c14485894eec9920d22d5bcd14f49c80f555be1e34977772a82aa3ea4d"
     }
   ]
 }
