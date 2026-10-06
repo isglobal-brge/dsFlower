@@ -1,5 +1,8 @@
 # dsFlower 0.7.1
 
+* Preserve saved 0.7.0 graph predictions in private validation by mapping their
+  original parameter names to the canonical graph layout with strict tensor
+  checks. Versioned saved models use the declared canonical layout.
 * Use the v3 public-request/private-source identity across all release families.
   Canonical source units and computation order remove symbol/path/session/row
   nuisances while preserving initial/current model contents, selected source data,

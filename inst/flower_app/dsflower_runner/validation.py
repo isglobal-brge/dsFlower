@@ -558,7 +558,9 @@ def public_model_arrays(cfg):
     state = _load_public_state(path, cfg, image=image)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
-    model.load_state_dict(state, strict=True)
+    model_spec.load_saved_state_dict(
+        model, state, spec, input_dim, output_dim, num_labels=labels,
+        graph_parameter_format=cfg.get("graph-parameter-format"))
     arrays = get_torch_params(model)
     return _bounded_public_arrays(arrays)
 

@@ -874,6 +874,56 @@ def graph_name_mapping(spec, in_dim, out_dim, *, num_labels=None):
     return _canonicalize_spec(spec, in_dim, out_dim, num_labels=num_labels)[1]
 
 
+GRAPH_PARAMETER_FORMAT = "canonical-v1"
+
+
+def load_saved_state_dict(model, state, spec, in_dim, out_dim, *,
+                          num_labels=None, graph_parameter_format=None):
+    """Strictly load a saved artifact into the canonical execution layout.
+
+    Unversioned (0.7.0) graph artifacts use the original spec's node names and
+    registration order. Always translate those names, even when their key set
+    already matches: canonical-looking legacy names can identify other branches.
+    The version describes both names and dependency-postorder parameter order.
+    """
+    if (graph_parameter_format is not None
+            and graph_parameter_format != GRAPH_PARAMETER_FORMAT):
+        raise ValueError("unsupported saved graph parameter format")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("saved model state_dict must be a non-empty mapping")
+    if any(not isinstance(key, str) or not torch.is_tensor(value)
+           for key, value in state.items()):
+        raise ValueError("saved model state_dict accepts only named tensors")
+    expected = model.state_dict()
+    if spec.get("kind") == "graph" and graph_parameter_format is None:
+        mapping = graph_name_mapping(spec, in_dim, out_dim, num_labels=num_labels)
+        if len(set(mapping.values())) != len(mapping):
+            raise ValueError("saved graph parameter mapping is not bijective")
+        translated = {}
+        for key, value in state.items():
+            parts = key.split(".", 2)
+            if len(parts) != 3 or parts[0] != "_mods" or parts[1] not in mapping:
+                raise ValueError("saved graph state key is outside its original spec")
+            target = "_mods." + mapping[parts[1]] + "." + parts[2]
+            if target in translated:
+                raise ValueError("saved graph parameter mapping is not bijective")
+            translated[target] = value
+        state = translated
+    if set(state) != set(expected):
+        raise ValueError("saved model state keys differ from its declared spec")
+    # torch.load_state_dict can silently cast dtypes; reject those and malformed
+    # values before copying. Iterate the canonical schema to fix array ordering.
+    checked = {}
+    for key, template in expected.items():
+        value = state[key]
+        if (value.shape != template.shape or value.dtype != template.dtype
+                or value.layout != torch.strided
+                or not bool(torch.isfinite(value).all())):
+            raise ValueError("saved model tensor shape, dtype or values are invalid: " + key)
+        checked[key] = value
+    model.load_state_dict(checked, strict=True)
+
+
 def canonical_spec(cfg):
     """Project the public run configuration onto its validated execution AST."""
     loss = str(cfg.get("loss-name", "bce_logits"))
