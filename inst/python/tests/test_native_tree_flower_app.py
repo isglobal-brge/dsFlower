@@ -643,6 +643,72 @@ class NativeTreeClientTests(unittest.TestCase):
         self.assertIs(
             noise_only.call_args.kwargs["include_zero_neighbor"], True)
 
+    def test_regression_holdout_real_release_recovers_metrics_and_replays_after_shuffle(self):
+        from dsflower_runner import dp_harness
+
+        request, request_b64, request_sha256 = _regression_request_wire()
+        holdout = resampling.holdout_contract(500_000, "row")
+        manifest = _node_manifest(request_b64, request_sha256, holdout=holdout)
+        manifest.update({"task-type": "regression", "loss-name": "mse",
+                         "target-bounds": {"lower": -10.0, "upper": 10.0},
+                         "n_units": 24})
+        manifest.pop("target-levels")
+        cfg = _run_config(request_b64, request_sha256, nodes=1, holdout=holdout)
+        cfg.update({"holdout-target-lower": -10.0, "holdout-target-upper": 10.0})
+        member = json.loads(_native_artifact())
+        member["learner"]["objective"]["name"] = "reg:squarederror"
+        member["learner"]["learner_model_param"]["base_score"] = "[0E0]"
+        member = _canonical(member)
+        public_manifest = native_tree_request.public_backend_manifest(request)
+        ensemble, digest = native_tree_engine.build_ensemble(public_manifest, [member])
+        frame = pd.DataFrame({"age": np.linspace(0.0, 100.0, 24),
+                              "marker": np.linspace(-5.0, 5.0, 24),
+                              "outcome": np.linspace(-10.0, 10.0, 24)})
+        layout = server_app._holdout_layout(request, 4)
+        self.assertEqual(layout["version"], "validation-vector-v4")
+        self.assertNotIn("version", server_app._cv_layout(request, 4))
+        self.assertNotIn("version", client_app._cv_layout(request, {"cv-validation-bins": 4}))
+        results = []
+        for run, selected in enumerate((frame, frame.iloc[::-1]), 3):
+            # Fresh admission coordinates replay the same semantic release;
+            # the exact retry inside each job still uses its cached reply.
+            manifest["run_token"] = "run_" + str(run) * 32
+            run_dir = os.path.join(self.root.name, "run-%d" % run)
+            os.mkdir(run_dir)
+            selected.to_csv(os.path.join(run_dir, "train.csv"), index=False)
+            with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as handle:
+                _dump_manifest(manifest, handle)
+            context = SimpleNamespace(node_config={"manifest-dir": run_dir},
+                                      run_config=cfg, state=RecordDict())
+            client_app._mark_training_complete(context, request, manifest, member)
+            message = server_app._evaluation_messages((1,), request, request_b64,
+                request_sha256, dict(holdout, bins=4), ensemble, digest)[0]
+            with (mock.patch.object(validation, "private_sufficient_vector",
+                                    wraps=validation.private_sufficient_vector) as release,
+                  mock.patch.object(dp_harness, "compute_output_sigma",
+                                    wraps=dp_harness.compute_output_sigma) as calibrate,
+                  mock.patch.object(client_app, "_unavailable_reply",
+                                    side_effect=AssertionError("unexpected unavailable release"))):
+                reply = client_app.train(message, context)
+                replay = client_app.train(message, context)
+            self.assertEqual(dict(reply.content["metrics"])["available"], 1)
+            release.assert_called_once()
+            self.assertTrue(release.call_args.kwargs["include_zero_neighbor"])
+            self.assertEqual(calibrate.call_args.args[2], 2.0)
+            vector = server_app._vector_from_reply(reply, layout)
+            self.assertEqual(vector.tobytes(), server_app._vector_from_reply(replay, layout).tobytes())
+            raw = release.call_args.args[0]
+            self.assertGreater(raw[0], 0.0)
+            centered_metrics = validation.validation_metrics(raw, layout, target_bounds=(-10.0, 10.0))
+            unshifted = raw.copy()
+            unshifted[1:] += 0.25 * raw[0]
+            self.assertEqual(centered_metrics, validation.validation_metrics(unshifted,
+                validation.validation_layout("regression"), target_bounds=(-10.0, 10.0)))
+            metrics = validation.validation_metrics(vector, layout, target_bounds=(-10.0, 10.0))
+            self.assertTrue(np.isfinite(metrics["mae"]))
+            results.append(vector)
+        self.assertEqual(results[0].tobytes(), results[1].tobytes())
+
     def test_cv_exact_retry_replays_and_changed_ensemble_is_pre_private(self):
         manifest, contract = _cv_manifest(
             self.request_b64, self.request_sha256, folds=2, nodes=1)
