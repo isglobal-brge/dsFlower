@@ -1,4 +1,4 @@
-# Private validation, holdout and cross-validation in 0.7.0
+# Private validation, holdout and cross-validation in 0.7.1
 
 `ds.flower.validate()` accepts a saved dsFlower model or a complete
 `client:<checkpoint-bundle>` supplied by the analyst. Validation returns only
@@ -198,3 +198,58 @@ synthetic provenance is test evidence, not a template for claims about real data
 The [design note](DESIGN_VALIDATION_CV.md) records the privacy reasoning and
 release identity. Synthetic tests establish implementation behavior, not model
 utility or live Opal/Armadillo deployment.
+
+## Content-based assignment and sensitivity in 0.7.1
+
+The selected source-unit multiset is canonicalized before pooling, prediction or
+partitioning. Row tokens bind selected content and duplicate occurrence; patient
+tokens retain canonical grouping IDs. Row shuffling, symbol aliases and run tokens
+preserve assignments. A changed row can move to another fold; changing selected
+columns can change all row tokens. Model settings and holdout fraction do not
+redraw the score. Default neural starts are specification-seeded and all CV folds
+share the same initial model.
+
+Holdout can gain or lose the changed unit, including in patient mode. Both empty
+and nonempty releases therefore select the existing absent-unit (zero-neighbour)
+bound, rather than only the replacement diameter. The calibration routine itself
+is unchanged. The bounds are:
+
+| Layout | Holdout L2 bound (row or patient) | Pooled OOF L2 bound |
+| --- | --- | --- |
+| Binary | sqrt(2) | sqrt(2) |
+| Multiclass/ordinal, J classes | sqrt(2(J+1)) | sqrt(2(J+1)) |
+| Multilabel, L labels | sqrt(2L) | sqrt(2L) |
+| Regression/gamma | sqrt(5) | 2 |
+| Count | sqrt(6) | sqrt(5) |
+| Segmentation | 2 | sqrt(3) |
+| Survival, H horizons | sqrt(2+2H) | sqrt(2+2H) |
+
+Condition on the already-DP public fold models. A pooled OOF replacement changes
+one contribution from `c(u,M_a)` to `c(v,M_b)`, even if the fold changes. Both lie
+in the same bounded contribution set; patient means lie in its convex hull.
+The replacement diameter remains valid, so OOF explicitly keeps the existing
+bound with no factor of two or K and no per-fold metric release. Raw fold vectors
+are accumulated in fold order and the ordered public model hashes are bound.
+
+The changed unit participates in all K training comparisons: two complements
+can gain/lose it and the others replace it. Training still receives
+`0.8*epsilon/K, 0.8*delta/K` per fold. Neural sampling geometry uses the fixed
+parent population, with the existing add/remove conversion and empty-complement
+noise schedule. The sole OOF vector receives 20% of the job budget. Native
+training sensitivities already cover an absent unit and are unchanged. Complete
+parent source/assignment bindings are checked across phases; a mid-job change
+fails closed.
+
+## Equality-transcript limitation
+
+The calibrated mechanism and its accountant cover the stated release/training
+and declared privacy unit. Replaying one fixed artifact is post-processing.
+These facts do not by themselves prove privacy for a transcript that lets the
+analyst compare whether related private inputs map to the same sticky artifact.
+In particular, a content-keyed equality pattern can be data dependent even when
+each isolated release has the intended marginal noise distribution; ordinary
+composition requires conditional validity. Fixed-count replacement of one
+privacy unit remains the neural contract, and a change in node census has a
+separate adjacency issue. Small-subset controls and exact dimension releases
+have their own DataSHIELD contracts. The equality residual is documented rather
+than described as solved by those controls.

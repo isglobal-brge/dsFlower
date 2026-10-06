@@ -1,3 +1,30 @@
+# dsFlower 0.7.1
+
+* Use the v3 public-request/private-source identity across all release families.
+  Canonical source units and computation order remove symbol/path/session/row
+  nuisances while preserving initial/current model contents, selected source data,
+  runtime and raw privacy policy. Default public model initialization is isolated
+  and specification-seeded; CV folds share it. Changed Hook initializer output
+  remains a new release. Restage jobs and upgrade both runner copies together.
+* Add `ds.flower.strategy.fedprox(mu)` for neural and Hook training. Neural
+  contraction follows the DP optimizer and L1 prox; Hook contraction follows the
+  output gate with eta=1. Zero equals FedAvg. Native trees, association and
+  standalone validation reject FedProx, including zero.
+* Assign holdout/CV units by content tokens and Hook units to fixed local buckets.
+  Holdout now selects the absent-unit sensitivity for rows and patients; pooled
+  OOF replacement bounds and all underlying accountants/calibrators stay unchanged.
+  Released server contributions aggregate in canonical content order.
+* Fail closed on existing invalid node-secret files. Missing-key provisioning
+  and Hook cache eviction/retention policy remain unchanged; cross-run Hook replay
+  lasts while the entry is retained.
+* Preserve concrete native-tree parameters through fit/submit and expose the
+  verified released artifact digest in run results. Accept admitted radiomics
+  data-frame/Arrow exports through the private dsImaging registry (requires the
+  coordinated export-registration companion); unregistered/changed data fail closed.
+* Document the residual equality channel for related prepared inputs, the curated
+  XGBoost bundle setup, local federation verification and runtime migration.
+  Remove GitHub Actions workflows while retaining local tests and requirements.
+
 # dsFlower 0.7.0
 
 * Accept analyst-declared checkpoint bundles as fixed private-validation models,

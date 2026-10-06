@@ -65,13 +65,28 @@ share this path.
 
 The curated bundle is connected to dsFlower's R request interface through a
 fresh fail-closed capability probe. Its fixed manifest status identifier is
-`bundle-core:fixed-point-discrete-v1:internal-only`; the identifier does not by
-itself enable discovery. The runtime first verifies the bundle, ABI, mechanism
+`bundle-core:fixed-point-discrete-v1:internal-only`. This is a legacy, pinned
+ABI/manifest identifier, not an analyst-access restriction. Do not rename it
+without updating the native contract and its provenance together. The identifier
+does not by itself enable discovery. The runtime first verifies the bundle, ABI, mechanism
 and symbols, then completes a synthetic public DMatrix training, sanitization,
 ensemble, sidecar and dependency-light prediction. The normal scaffold status
 `scaffold-only:no-dp-histogram-privatization` never passes this gate.
 
+The source-pinned patch 0003's plugin README describes the build switch as an
+"internal bundle capability" that is "not connected to public discovery". That
+wording records the patch's original integration stage. The current contract is:
+**the switch alone does not enable discovery; a configured, verified curated
+bundle that passes the executable release probe enables the public R API.** The
+source patch is kept byte-identical because its checksum and patched-tree pin
+are part of the native trust contract.
+
 ## Reproduce and verify
+
+Prerequisites are Git, Python 3, Rust/Cargo 1.88 or newer, CMake 3.18 or newer,
+and a C/C++17 compiler toolchain with its build tool. Use a compatible system
+compiler/runtime; the deployed node must be able to load both shared libraries
+without a loader-path override. Rust dependencies use the checked-in Cargo lock.
 
 The scripts accept explicit destinations so no source or build output is
 written into this repository:
@@ -116,7 +131,7 @@ intermediate file is packaged.
 trailing newline.  Schema `dsflower-xgboost-bundle-v1` records bundle version,
 normalized system/machine, the relative paths and SHA-256 hashes of both
 libraries, privacy-context ABI v3, primitive ABI v2, both exact mechanism IDs,
-the internal status, upstream commit/tree, patched tree and patchset version.
+the legacy native status, upstream commit/tree, patched tree and patchset version.
 It has no signature or self-referential hash.  The trusted loader derives the
 bundle identity as SHA-256 of these canonical manifest bytes, whose library
 hashes bind the actual code.  `verify_bundle.py` rejects extra files, symlinks,
