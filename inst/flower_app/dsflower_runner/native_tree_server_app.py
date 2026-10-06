@@ -269,6 +269,12 @@ def _holdout_layout(request, bins):
     if request["task"] == "binary":
         return validation.validation_layout(
             "classification", n_classes=2, bins=bins)
+    return validation.numeric_holdout_layout("regression")
+
+
+def _cv_layout(request, bins):
+    if request["task"] == "binary":
+        return _holdout_layout(request, bins)
     return validation.validation_layout("regression", bins=bins)
 
 
@@ -603,7 +609,7 @@ def _run_cross_validation(grid, request, request_b64, request_sha256,
                           manifest, cross_validation, expected, timeout,
                           results_dir):
     roster = _exact_roster(grid, expected, timeout)
-    layout = _holdout_layout(request, cross_validation["bins"])
+    layout = _cv_layout(request, cross_validation["bins"])
     completed = False
     try:
         for fold in range(1, int(cross_validation["folds"]) + 1):

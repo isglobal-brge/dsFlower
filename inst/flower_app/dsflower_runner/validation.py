@@ -27,6 +27,8 @@ _MAX_PRIVATE_RESULT_BYTES = 160 * 1024 * 1024
 _INFERENCE_BATCH_ROWS = 1024
 _VALIDATION_MECHANISM = "validation-gaussian/v2"
 _VALIDATION_FINGERPRINT = "validation-sufficient-v2"
+_NUMERIC_HOLDOUT_VERSION = "validation-vector-v4"
+_NUMERIC_HOLDOUT_OFFSET = 0.25
 _VISION_ARTIFACT_FORMAT = "pytorch-state-dict-v1"
 
 
@@ -87,6 +89,18 @@ def validation_layout(task, *, n_classes=2, n_labels=2, bins=32,
     raise ValueError("unsupported validation task %r" % task)
 
 
+def numeric_holdout_layout(task):
+    """Trusted shifted numeric layout; no analyst-controlled offset or version."""
+    if task not in ("regression", "count"):
+        raise ValueError("numeric holdout requires regression or count")
+    return dict(validation_layout(task), version=_NUMERIC_HOLDOUT_VERSION)
+
+
+def _numeric_offset(layout):
+    return (_NUMERIC_HOLDOUT_OFFSET
+            if layout.get("version") == _NUMERIC_HOLDOUT_VERSION else 0.0)
+
+
 def _effective_validation_layout(layout):
     """Return the implemented layout, ignoring non-semantic representation."""
     if not isinstance(layout, dict):
@@ -116,6 +130,13 @@ def _effective_validation_layout(layout):
                                       nll_bound=layout.get("nll_bound"))
     else:
         raise ValueError("invalid validation layout")
+    # Unversioned layouts retain their pre-0.7.3 interpretation. A version is
+    # semantic, never an ignorable decoration on an older released vector.
+    if "version" in layout:
+        if (layout["version"] != _NUMERIC_HOLDOUT_VERSION
+                or task not in ("regression", "count")):
+            raise ValueError("unsupported validation layout version")
+        effective = numeric_holdout_layout(task)
     try:
         size = _integer(layout.get("size"), "validation layout size", 1,
                         _MAX_VECTOR)
@@ -129,7 +150,7 @@ def _effective_validation_layout(layout):
 
 
 def _validation_release_sensitivity(layout, *, include_zero_neighbor=False):
-    """Bound replacement, plus absence from a keyed patient partition."""
+    """Bound replacement and absence from content-keyed row/patient splits."""
     effective = _effective_validation_layout(layout)
     if type(include_zero_neighbor) is not bool:
         raise ValueError("zero-neighbor validation flag must be boolean")
@@ -143,6 +164,12 @@ def _validation_release_sensitivity(layout, *, include_zero_neighbor=False):
         absent = math.sqrt(float(effective["classes"] + 1))
     elif task == "multilabel":
         absent = math.sqrt(float(effective["labels"]))
+    elif _numeric_offset(effective):
+        # (1, z_1-a, ..., z_d-a), z_j in [0, 1], a=1/4.
+        # Translation leaves replacement distances unchanged. The exact
+        # uniform absent radius is below that diameter (see privacy note).
+        absent = math.sqrt(1.0 + (effective["size"] - 1)
+                           * (1.0 - _NUMERIC_HOLDOUT_OFFSET) ** 2)
     else:
         absent = math.sqrt(float(effective["size"]))
     return max(sensitivity, absent)
@@ -263,7 +290,7 @@ def holdout_layout_from_config(cfg):
             raise ValueError("count holdout requires non-negative target bounds")
         if loss == "gamma_nll" and bounds["lower"] <= 0.0:
             raise ValueError("gamma holdout requires strictly positive target bounds")
-        return validation_layout(task)
+        return numeric_holdout_layout(task)
     raise ValueError("loss/task has no trusted holdout validation semantics")
 
 
@@ -298,7 +325,13 @@ def cross_validation_layout_from_config(cfg):
             "lower": cfg.get("cv-target-lower"),
             "upper": cfg.get("cv-target-upper"),
         }
-    return holdout_layout_from_config(nested)
+    layout = holdout_layout_from_config(nested)
+    # OOF replaces one contribution even when the changed unit switches folds.
+    # It already uses the smaller diameter; shifting would only add covariance
+    # when recovering sums, so preserve its existing layout and release.
+    if layout["task"] in ("regression", "count"):
+        return validation_layout(layout["task"])
+    return layout
 
 
 def cross_validation_target_bounds_from_config(cfg):
@@ -856,7 +889,9 @@ def _numeric_contributions(y, predictions, layout, target_bounds):
                                      - (upper - floor)))
         cap = max(1.0e-12, *candidates)
         cols.append(np.clip(dev / cap, 0.0, 1.0))
-    return np.column_stack(cols)
+    out = np.column_stack(cols)
+    out[:, 1:] -= _numeric_offset(layout)
+    return out
 
 
 def _segmentation_contributions(target, scores, layout):
@@ -891,8 +926,7 @@ def _survival_contributions(target, scores, layout):
 
 
 def validation_contributions(y, predictions, layout, *, target_bounds=None):
-    if not isinstance(layout, dict) or int(layout.get("size", 0)) > _MAX_VECTOR:
-        raise ValueError("invalid validation layout")
+    layout = _effective_validation_layout(layout)
     target = _finite_array(y, "validation targets")
     scores = _finite_array(predictions, "validation predictions")
     if target.shape[0] != scores.shape[0]:
@@ -920,7 +954,7 @@ def _unit_contributions(contributions, unit_ids=None):
 
     Row adjacency needs no grouping.  Under patient adjacency, averaging all
     records for one canonical identifier keeps every coordinate in the same
-    public [0, 1] domain as a single record.  Consequently the declared
+    public coordinate domain as a single record. Consequently the declared
     replace-one sensitivity remains valid regardless of visits per patient.
     """
     values = np.asarray(contributions, dtype=np.float64)
@@ -997,7 +1031,7 @@ def _patient_histogram_sum(inverse, counts, indices, size):
         size)
 
 
-def _stable_numeric_sum(contributions, inverse, counts):
+def _stable_numeric_sum(contributions, inverse, counts, *, offset=0.0):
     """Sum numeric sufficient statistics independent of row and ID order."""
     values = np.asarray(contributions, dtype=np.float64)
     total = np.zeros(values.shape[1], dtype=np.float64)
@@ -1012,7 +1046,8 @@ def _stable_numeric_sum(contributions, inverse, counts):
         order = np.lexsort((coordinate, inverse))
         starts = np.cumsum(np.r_[0, counts[:-1]], dtype=np.int64)
         unit_sums = np.add.reduceat(coordinate[order], starts)
-        unit_means = np.clip(unit_sums / counts, 0.0, 1.0)
+        shift = offset if column > 0 else 0.0
+        unit_means = np.clip(unit_sums / counts, -shift, 1.0 - shift)
         total[column] = np.sum(np.sort(unit_means), dtype=np.float64)
     return total
 
@@ -1127,7 +1162,8 @@ def _summed_validation_contributions(y, predictions, layout, *,
     elif task in ("regression", "count"):
         contribution = _numeric_contributions(
             target, scores, layout, target_bounds)
-        total[:] = _stable_numeric_sum(contribution, inverse, counts)
+        total[:] = _stable_numeric_sum(
+            contribution, inverse, counts, offset=_numeric_offset(layout))
     else:
         raise ValueError("unsupported validation task %r" % task)
     if not bool(np.all(np.isfinite(total))):
@@ -1341,6 +1377,7 @@ def _binary_metrics(hist):
 
 def validation_metrics(released, layout, *, target_bounds=None):
     """Post-process pooled private statistics into researcher-facing metrics."""
+    layout = _effective_validation_layout(layout)
     value = np.asarray(released, dtype=np.float64).reshape(-1)
     if value.shape != (int(layout["size"]),) or not bool(np.all(np.isfinite(value))):
         raise ValueError("private validation vector has invalid geometry")
@@ -1411,6 +1448,13 @@ def validation_metrics(released, layout, *, target_bounds=None):
                       "scores": [_safe_ratio(a, b) for a, b in zip(errors, eligible)],
                       "eligible_n": eligible.tolist()},
             "brier_method": "observed-status"}
+    # Invert the shift with the *unprojected noisy* count from this same release.
+    # These reconstructed sufficient sums are unbiased; the existing nonlinear
+    # ratios/projections below, as before, need not be unbiased estimators.
+    if _numeric_offset(layout):
+        value = value.copy()
+        with np.errstate(over="ignore", invalid="ignore"):
+            value[1:] += _NUMERIC_HOLDOUT_OFFSET * value[0]
     n = max(float(value[0]), 0.0)
     # Each remaining numeric coordinate is the sum of per-unit contributions
     # already bounded to [0, 1]. Project noisy pooled coordinates back onto that
