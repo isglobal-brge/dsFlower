@@ -340,3 +340,165 @@ test_that("missing dsImaging safety hooks fail with a stable public error", {
     dsFlower:::.dsImagingSafetyHook(".missing_test_safety_hook"),
     "installed dsImaging version does not provide.*safety contract")
 })
+
+test_that("exact exported imaging frames and Arrow tables retain patient admission", {
+  local_feature_view_privacy_state()
+  skip_if_not_installed("dsImaging")
+  skip_if_not(exists(".register_imaging_feature_table_export",
+    envir = asNamespace("dsImaging"), inherits = FALSE))
+  withr::local_options(list(dsimaging.asset_db = tempfile(fileext = ".sqlite"),
+    dsimaging.nfilter.subset = 3L, dsflower.nfilter.subset = 3L,
+    dsflower.dp_unit = "row"))
+  env <- new.env(parent = globalenv())
+  fixture <- imaging_feature_fixture(env)
+  assign("imagingLoadAssetDS", dsImaging::imagingLoadAssetDS, env)
+  assign("flowerInitDS", dsFlower::flowerInitDS, env)
+  raw <- evalq(imagingLoadAssetDS("img", asset_id,
+    include_metadata = TRUE), env)
+  assign("rad", raw, env)
+  parquet <- tempfile(fileext = ".parquet")
+  arrow::write_parquet(raw, parquet)
+  assign("rad_arrow", arrow::read_parquet(parquet, as_data_frame = FALSE), env)
+  for (symbol in c("rad", "rad_arrow")) {
+    reference <- eval(substitute(flowerInitDS(S), list(S = symbol)), env)
+    assign("flower", reference, env)
+    handle <- evalq(dsFlower:::.getHandle("flower"), env)
+    expect_identical(handle$source_kind, "imaging_feature_view")
+    expect_identical(dsFlower:::.imagingPrivacyUnitPolicy(handle$descriptor)$dp_unit,
+                     "patient")
+    authorized <- dsImaging:::.resolve_imaging_feature_view_for_consumer(
+      symbol, handle$imaging_feature_view_capability, env)
+    expect_identical(authorized$privacy_roster$privacy_unit_count, 3L)
+    expect_identical(nrow(authorized$data), 4L)
+    expect_identical(authorized$data$patient_id, fixture$rows$patient_id)
+    evalq(dsFlower:::.removeHandle("flower"), env)
+  }
+  changed <- raw
+  changed$radiomics_mean[[1L]] <- changed$radiomics_mean[[1L]] + 1
+  for (candidate in list(raw[-1L, ], changed)) {
+    assign("bad", candidate, env)
+    expect_error(evalq(flowerInitDS("bad"), env),
+                 "only an unchanged admitted export")
+  }
+  # Copying attributes or copying data to another session does not grant a view.
+  other <- new.env(parent = globalenv())
+  assign("rad", raw, other)
+  expect_error(dsImaging:::.resolve_imaging_feature_view_for_consumer(
+    "rad", owner_env = other), "Unknown, stale, or cross-session")
+  evalq(dsImaging::imagingDestroyDS("img"), env)
+  expect_error(evalq(flowerInitDS("rad"), env),
+               "only an unchanged admitted export")
+})
+
+test_that("identical values from distinct imaging authorities are ambiguous", {
+  local_feature_view_privacy_state()
+  skip_if_not_installed("dsImaging")
+  skip_if_not(exists(".register_imaging_feature_table_export",
+    envir=asNamespace("dsImaging"),inherits=FALSE))
+  withr::local_options(list(dsimaging.asset_db=tempfile(fileext=".sqlite"),
+    dsimaging.nfilter.subset=3L))
+  env <- new.env(parent=globalenv())
+  imaging_feature_fixture(env)
+  raw <- evalq(dsImaging::imagingLoadAssetDS("img", asset_id,
+    include_metadata=TRUE), env)
+  assign("rad", raw, env)
+  state <- dsImaging:::.imaging_session_state(env)
+  before <- length(ls(state$feature_views))
+  # Reloading the same immutable authority is idempotent.
+  evalq(dsImaging::imagingLoadAssetDS("img", asset_id,
+    include_metadata=TRUE), env)
+  expect_identical(length(ls(state$feature_views)), before)
+  # A custodian creates another admitted authority with equal public values.
+  # Even before that authority is resolved, no arbitrary match may be selected.
+  entries <- state$feature_views
+  original <- entries[[ls(entries)[[1]]]]
+  original$source_handle_capability <- paste0("imgh_",strrep("b",64))
+  entries[[paste0("imgf_",strrep("c",64))]] <- original
+  expect_error(evalq(dsFlower::flowerInitDS("rad"),env),
+    "only an unchanged admitted export")
+})
+
+test_that("whole-table name repair cannot replace an imaging structural role", {
+  local_feature_view_privacy_state()
+  skip_if_not_installed("dsImaging")
+  skip_if_not(exists(".register_imaging_feature_table_export",
+    envir=asNamespace("dsImaging"),inherits=FALSE))
+  withr::local_options(list(dsimaging.asset_db=tempfile(fileext=".sqlite"),
+    dsimaging.nfilter.subset=3L))
+  env <- new.env(parent=globalenv())
+  imaging_feature_fixture(env)
+  auth <- dsImaging:::.authorized_imaging_dataset("img",owner_env=env)
+  raw <- evalq(dsImaging::imagingLoadAssetDS("img", asset_id,
+    include_metadata=TRUE),env)
+  # A feature precedes the declared label and consumes its repaired name.
+  raw[["diag-nosis"]] <- 1:4
+  raw <- raw[c("sample_id","diag-nosis","diagnosis")]
+  names(raw)[names(raw)=="diagnosis"] <- "diag.nosis"
+  auth$privacy$label_col <- "diag.nosis"
+  auth$manifest$metadata$label_col <- "diag.nosis"
+  original_names <- names(raw)
+  names(raw) <- make.names(names(raw),unique=TRUE)
+  # R prioritizes already-syntactic names, preserving the actual target.
+  expect_identical(names(raw),c("sample_id","diag.nosis.1","diag.nosis"))
+  expect_type(dsImaging:::.register_imaging_feature_table_export(
+    raw,auth,"img",env,TRUE,original_names), "character")
+  # Column selection can drop the real target before repair: the remaining
+  # feature must not be promoted into the missing target role.
+  selected <- raw[c("sample_id","diag.nosis.1")]
+  original_selected <- c("sample_id","diag-nosis")
+  names(selected) <- make.names(original_selected,unique=TRUE)
+  expect_identical(names(selected),c("sample_id","diag.nosis"))
+  expect_null(dsImaging:::.register_imaging_feature_table_export(
+    selected,auth,"img",env,TRUE,original_selected))
+  # Also reject a conflicting structural position from any repaired-name path.
+  names(raw) <- c("sample_id","diag.nosis","diag.nosis.1")
+  expect_null(dsImaging:::.register_imaging_feature_table_export(
+    raw,auth,"img",env,TRUE,original_names))
+})
+
+test_that("radiomics workflow loader registers the same admitted table contract", {
+  local_feature_view_privacy_state()
+  skip_if_not_installed("dsImaging")
+  skip_if_not(exists(".register_imaging_feature_table_export",
+    envir=asNamespace("dsImaging"),inherits=FALSE))
+  withr::local_options(list(dsimaging.asset_db=tempfile(fileext=".sqlite"),
+    dsimaging.nfilter.subset=3L))
+  env <- new.env(parent=globalenv())
+  fixture <- imaging_feature_fixture(env)
+  request <- dsImaging:::.dsr_encode(list(handle="img", asset_id=fixture$asset_id,
+    include_metadata=TRUE))
+  rad <- eval(substitute(dsImaging::imagingLoadRadiomicsFeaturesDS(REQUEST),
+    list(REQUEST=request)),env)
+  assign("rad",rad,env)
+  reference <- evalq(dsFlower::flowerInitDS("rad"),env)
+  assign("flower",reference,env)
+  handle <- evalq(dsFlower:::.getHandle("flower"),env)
+  expect_identical(handle$source_kind,"imaging_feature_view")
+  expect_identical(dsFlower:::.imagingPrivacyUnitPolicy(handle$descriptor)$dp_unit,
+                   "patient")
+})
+
+
+test_that("legacy companion exports fail closed without table admission support", {
+  local_feature_view_privacy_state()
+  skip_if_not_installed("dsImaging")
+  if (exists(".register_imaging_feature_table_export", envir = asNamespace("dsImaging"),
+             inherits = FALSE)) skip("installed companion supports admitted table exports")
+  withr::local_options(list(dsimaging.asset_db = tempfile(fileext = ".sqlite"),
+    dsimaging.nfilter.subset = 3L, dsflower.nfilter.subset = 3L))
+  env <- new.env(parent = globalenv())
+  fixture <- imaging_feature_fixture(env)
+  raw <- evalq(dsImaging::imagingLoadAssetDS("img", asset_id, include_metadata = TRUE), env)
+  assign("rad", raw, env)
+  expect_error(evalq(dsFlower::flowerInitDS("rad"), env),
+               "only an unchanged admitted export")
+})
+
+
+test_that("missing companion cannot provide an imaging authorization", {
+  if (requireNamespace("dsImaging", quietly = TRUE))
+    skip("installed companion is covered by the admitted export tests")
+  expect_error(dsFlower:::.dsImagingSafetyHook(
+    ".resolve_imaging_feature_view_for_consumer"),
+    "Package 'dsImaging' is required for this imaging safety contract", fixed = TRUE)
+})

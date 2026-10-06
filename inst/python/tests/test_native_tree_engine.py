@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+from flwr.common import RecordDict
 
 import numpy as np
 import pandas as pd
@@ -183,6 +184,87 @@ class NativeTreeEngineTests(unittest.TestCase):
             native_tree_engine.validate_prediction_profile(
                 profile, request, request_b64, request_sha256,
                 artifact + b" ")
+
+    def test_client_forwards_public_identity_full_source_and_subset_for_every_pure_engine(self):
+        from dsflower_runner import resampling, task, tree_release
+        from test_native_tree_flower_app import _cv_manifest, _cv_run_config, _run_config
+        cases = (forest_request(trees=2, depth=1), random_forest_request(),
+                 boosting_request("lightgbm"), boosting_request("catboost"))
+        for request in cases:
+            for mode in ("ordinary", "holdout", "cv"):
+                with self.subTest(engine=request["engine"], mode=mode), tempfile.TemporaryDirectory() as root:
+                    encoded, digest = _wire(request)
+                    manifest = _node_manifest(request, encoded, digest)
+                    config = _run_config(encoded, digest, nodes=1)
+                    options = {}
+                    if mode == "holdout":
+                        contract = resampling.holdout_contract(500_000, "row")
+                        manifest.update(resampling.manifest_fields(contract))
+                        manifest.update({"holdout-validation-bins": 4,
+                            "privacy-training-epsilon": 2.4, "privacy-training-delta": 8e-7,
+                            "privacy-holdout-epsilon": .6, "privacy-holdout-delta": 2e-7,
+                            "run_token": "run_" + "3" * 32})
+                        config = _run_config(encoded, digest, nodes=1, holdout=contract)
+                        options["holdout"] = dict(contract, bins=4)
+                    elif mode == "cv":
+                        parent, contract = _cv_manifest(encoded, digest, folds=2, nodes=1)
+                        manifest.update({k: v for k, v in parent.items()
+                            if k.startswith(("cv-", "privacy-")) or k == "run_token"})
+                        manifest["num-features"] = len(request["public_schema"]["features"])
+                        config = _cv_run_config(encoded, digest, folds=2, nodes=1)
+                        options.update(cross_validation=dict(contract, bins=4, job_sha256="c" * 64), fold=1)
+                    schema = request["public_schema"]
+                    frame = pd.DataFrame({name: np.linspace(lower, upper, 8)
+                        for name, lower, upper in zip(schema["features"], schema["lower"], schema["upper"])})
+                    frame[schema["target"]["name"]] = [0, 0, 0, 0, 1, 1, 1, 1]
+                    frame.to_csv(os.path.join(root, "train.csv"), index=False)
+                    with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as handle:
+                        _dump_manifest(manifest, handle)
+                    context = SimpleNamespace(node_config={"manifest-dir": root}, run_config=config, state=RecordDict())
+                    public_requests, private_sources = [], []
+                    original_request, original_load = tree_release.native_request_identity, task.load_native_tree_data
+                    def public(*args, **kwargs):
+                        self.assertFalse(private_sources, "public R must precede source loading")
+                        result = original_request(*args, **kwargs)
+                        public_requests.append(result)
+                        return result
+                    def private(*args, **kwargs):
+                        result = original_load(*args, **kwargs)
+                        private_sources.append(result[-1])
+                        return result
+                    with (mock.patch("dsflower_runner.seeding._node_secret", return_value=bytes(range(32))),
+                          mock.patch.object(tree_release, "native_request_identity", side_effect=public),
+                          mock.patch.object(task, "load_native_tree_data", side_effect=private),
+                          mock.patch.object(native_tree_engine, "train_model", wraps=native_tree_engine.train_model) as fit,
+                          mock.patch.object(resampling, "holdout_mask_from_context", return_value=np.array([True] * 4 + [False] * 4)),
+                          mock.patch.object(resampling, "cross_validation_folds_from_context", return_value=np.array([1] * 4 + [2] * 4))):
+                        message = server_app._request_messages((1,), encoded, digest, **options)[0]
+                        reply = client_app.train(message, context)
+                    self.assertEqual(reply.content["metrics"]["available"], 1)
+                    fit.assert_called_once()
+                    self.assertEqual(len(public_requests), 1)
+                    self.assertEqual(len(private_sources), 1)
+                    self.assertIs(fit.call_args.kwargs["request_identity"], public_requests[0])
+                    self.assertIs(fit.call_args.kwargs["source_units"], private_sources[0])
+                    self.assertEqual(len(private_sources[0].records), 8)
+                    actual_request = json.loads(public_requests[0].canonical_json)
+                    self.assertEqual(actual_request["operation"], "cv-train" if mode == "cv" else "train")
+                    self.assertEqual(actual_request["coordinate"]["fold"], 1 if mode == "cv" else None)
+                    if mode == "ordinary":
+                        self.assertIsNone(fit.call_args.kwargs["subset"])
+                    else:
+                        self.assertEqual(fit.call_args.kwargs["subset"]["role"], "train")
+                        self.assertRegex(fit.call_args.kwargs["subset"]["assignment_sha256"], r"^[0-9a-f]{64}$")
+                        self.assertEqual(len(fit.call_args.args[1]), 4)
+                    if mode == "ordinary":
+                        # A fresh Flower Context and message/node ID must preserve
+                        # actual sanitized bytes, independently of R result metadata.
+                        fresh = SimpleNamespace(node_config={"manifest-dir": root}, run_config=config, state=RecordDict())
+                        with mock.patch("dsflower_runner.seeding._node_secret", return_value=bytes(range(32))):
+                            replay = client_app.train(server_app._request_messages((987,), encoded, digest)[0], fresh)
+                        self.assertEqual(replay.content["metrics"]["available"], 1)
+                        self.assertEqual(reply.content["arrays"].to_numpy_ndarrays()[0].tobytes(),
+                                         replay.content["arrays"].to_numpy_ndarrays()[0].tobytes())
 
     def test_pure_engines_complete_one_flower_round_and_reopen(self):
         cases = (

@@ -929,7 +929,8 @@ def train(msg: Message, context: Context) -> Message:
         else:
             artifact = native_tree_engine.train_model(
                 manifest, features, target, unit_ids=unit_ids,
-                request_selection=selection)
+                request_selection=selection, request_identity=identity,
+                source_units=units, subset=subset)
         if node_manifest.get("resampling-contract-sha256") is not None:
             _mark_training_complete(
                 context, request, node_manifest, artifact)

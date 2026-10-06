@@ -14,8 +14,13 @@ A Flower handle object (assigned server-side).
 }
 \description{
 DataSHIELD ASSIGN method. Creates a Flower federation handle from
-a data.frame or matrix already assigned in the R session. The data
-can come from any DataSHIELD operation: \code{datashield.assign.table},
+a data.frame, matrix, or Arrow Table/RecordBatch already assigned in the
+R session. Exact dsImaging table exports retain their admitted patient
+roster through dsImaging's private same-session registry. This requires a
+companion version providing admitted table exports; older versions fail closed
+and continue to require \code{imagingFeatureViewDS()}. Changed imaging
+tables require an authorized feature view; generic tables can come from
+any DataSHIELD operation: \code{datashield.assign.table},
 \code{datashield.assign.resource} + \code{as.resource.data.frame},
 or any transformation via \code{datashield.assign.expr}.
 }
