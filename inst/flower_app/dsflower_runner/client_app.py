@@ -488,6 +488,11 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master, noise_multiplier,
     # Validated non-negative; both 0 -> identical to the plain path.
     l1_penalty = float(pins["optimizer"]["l1_penalty"])
     model = model.to(device)
+    from .strategy import NONE, apply_neural_prox, validate_prox_horizon
+    local_strategy = pins.get("strategy", NONE)
+    validate_prox_horizon(pins)
+    reference = ({id(p): p.detach().clone() for p in model.parameters()}
+                 if local_strategy["mu"] else None)
     optimizer = _build_optimizer(model, pins)
     dataset = TensorDataset(torch.from_numpy(X).float(),
                             _prep_target(y, loss_name, int(pins["n_classes"])))
@@ -555,6 +560,9 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master, noise_multiplier,
                     thr = l1_penalty * current_lr
                     for p in model.parameters():
                         p.copy_(torch.sign(p) * torch.clamp(p.abs() - thr, min=0.0))
+                if local_strategy["mu"]:
+                    apply_neural_prox(optimizer, reference, local_strategy)
+                    _assert_finite_release(model)
     # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
     # a buffer / frozen param / new parameter registered lazily inside the
     # researcher's forward appears only AFTER load, and Opacus noises ONLY the
@@ -1474,13 +1482,15 @@ def train(msg: Message, context: Context) -> Message:
                         execution_seed = tier2_lib.hook_execution_seed(
                             module_name, old, public_hook_cfg, pcfg_round,
                             request_identity=hook_request)
+                        from .strategy import canonical_local_strategy
                         new_arrays = tier2_lib.gated_local_update(
                             module_name, old, X, y, public_hook_cfg, pcfg_round,
                             seed=seeding.sub_seed(master, "noise"),
                             execution_seed=seeding.sub_seed(
                                 execution_seed, "egress-execution"),
                             hook_caps=hook_caps, unit_ids=unit_ids,
-                            release_started=hook_started, pad_release=False)
+                            release_started=hook_started, pad_release=False,
+                            local_strategy=canonical_local_strategy(cfg, "egress"))
                         metrics = {"num-examples": 1, "hook-executed": 1}
                         slot.commit(new_arrays, metrics)
                         new_arrays, metrics = slot.cached

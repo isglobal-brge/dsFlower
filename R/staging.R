@@ -892,7 +892,7 @@
     "scheduler-min-lr",
     "strategy", "strategy-eta", "strategy-eta-l", "strategy-beta-1",
     "strategy-beta-2", "strategy-tau", "strategy-server-learning-rate",
-    "strategy-server-momentum",
+    "strategy-server-momentum", "strategy-mu",
     "native-tree-request-b64", "native-tree-request-sha256",
     "validation-model-track", "validation-task", "validation-bins",
     "validation-contract-sha256", "validation-native-tree-request-b64",
@@ -948,7 +948,7 @@
     stop("run_config contains unsupported field(s): ",
          paste(unsupported, collapse = ", "), ".", call. = FALSE)
   }
-  run_config
+  .validate_local_strategy(run_config)
 }
 
 .merge_manifest_config <- function(manifest, extra_config) {

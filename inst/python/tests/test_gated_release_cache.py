@@ -207,6 +207,32 @@ def test_nondeterministic_hook_replays_after_symbol_rename_and_row_shuffle(run):
     assert (first[2], replay[2]) == (1, 0)
 
 
+def test_zero_fedprox_reuses_fedavg_cache_and_positive_prox_is_applied_once(run):
+    from dsflower_runner import strategy
+    root, directory = run
+    average = _request(root, directory)
+
+    def prox_run(token, mu):
+        path = _setup_run(root, token)
+        manifest_path = path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(strategy="fedprox", **{"strategy-mu": mu})
+        manifest_path.write_text(json.dumps(manifest))
+        return path
+
+    zero = _request(root, prox_run("b", 0.))
+    assert zero[:2] == average[:2]
+    assert zero[2] == 0
+    with mock.patch.object(strategy, "apply_gated_prox", wraps=strategy.apply_gated_prox) as apply:
+        positive = _request(root, prox_run("c", 0.2))
+        assert positive[2] == 1
+        apply.assert_called_once()
+        replay = _request(root, prox_run("d", 0.2))
+        assert replay[:2] == positive[:2]
+        assert replay[2] == 0
+        apply.assert_called_once()
+
+
 def test_first_release_and_retry_encode_identically_for_fortran_arrays(run):
     root, directory = run
     released = np.asfortranarray(np.arange(8, dtype=np.float32).reshape(2, 4))

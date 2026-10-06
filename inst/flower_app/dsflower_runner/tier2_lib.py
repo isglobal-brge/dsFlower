@@ -379,7 +379,10 @@ def hook_request_identity(module_name, global_arrays, cfg, pcfg, *, request_sele
 
 def hook_master_seed(module_name, global_arrays, X, y, cfg, pcfg,
                      unit_ids=None, *, request_selection=None, request_identity=None):
-    from . import canonical_units
+    if __package__:
+        from . import canonical_units
+    else:
+        canonical_units = _trusted_import("canonical_units")
     request = request_identity or hook_request_identity(module_name, global_arrays, cfg, pcfg,
                                                        request_selection=request_selection)
     units = canonical_units.source_units(X, y)
@@ -777,7 +780,7 @@ def _row_content_blocks(assignment_tokens, k, partition_seed):
 
 def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
                        execution_seed=None, hook_caps=None, unit_ids=None,
-                       release_started=None, pad_release=True):
+                       release_started=None, pad_release=True, local_strategy=None):
     """Run the upload out-of-process from the global model, then apply the DP gate in the
     trusted parent. The NODE picks the mechanism: sample-and-aggregate
     (conservative sensitivity min(2C,4C/k)) when the
@@ -875,6 +878,12 @@ def gated_local_update(module_name, global_arrays, X, y, cfg, pcfg, seed=None,
                 rng=seeding.np_rng(seeding.bind_seed(
                     seed, "hook-update/v3", new)),
             )
+        if local_strategy is not None and local_strategy["mu"]:
+            if __package__:
+                from .strategy import apply_gated_prox
+            else:
+                apply_gated_prox = _trusted_import("strategy").apply_gated_prox
+            gated = apply_gated_prox(gated, old, local_strategy)
         return [g.astype(np.float32) for g in gated]
     finally:
         # One minimum-duration envelope covers the complete release, including

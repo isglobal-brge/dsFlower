@@ -341,6 +341,7 @@
     run_config[["strategy"]] %||% "fedavg", "strategy", "character"))
   expected <- switch(name,
     fedavg = character(),
+    fedprox = "strategy-mu",
     fedadam = c("strategy-eta", "strategy-eta-l", "strategy-beta-1",
                "strategy-beta-2", "strategy-tau"),
     fedadagrad = c("strategy-eta", "strategy-eta-l", "strategy-tau"),
@@ -362,6 +363,7 @@
     .cv_job_scalar(value, key, "number", lower, upper)
   }
   params <- list(
+    mu = number("strategy-mu", lower = 0, upper = 1),
     eta = number("strategy-eta"),
     eta_l = number("strategy-eta-l"),
     beta_1 = number("strategy-beta-1", lower = 0, upper = 1),
@@ -379,6 +381,10 @@
                  logical(1)))) {
     stop("Cross-validation strategy parameters are outside their contract.",
          call. = FALSE)
+  }
+  if (identical(name, "fedprox") && identical(params$mu, 0)) {
+    name <- "fedavg"
+    params["mu"] <- list(NULL)
   }
   list(name = name, params = params)
 }
@@ -706,7 +712,7 @@
   loss <- tolower(.cv_job_scalar(
     run_config[["loss-name"]], "loss-name", "character"))
   payload <- list(
-    version = "dsflower-cv-job-v1",
+    version = "dsflower-cv-job-v2",
     runner = common$runner,
     privacy = common$privacy,
     cross_validation = common$cross_validation,

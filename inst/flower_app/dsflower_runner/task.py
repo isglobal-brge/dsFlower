@@ -919,7 +919,9 @@ def load_run_pins(context=None):
     if loss_name == "bce_logits" and n_classes != 2:
         raise ValueError("bce_logits is binary only; use cross_entropy")
 
-    return {
+    from .strategy import canonical_local_strategy, validate_prox_horizon
+    pins = {
+        "strategy": canonical_local_strategy(manifest, "neural"),
         "loss_name": loss_name,
         "batch_size": bounded_int("batch-size", _MAX_BATCH_SIZE),
         "local_epochs": bounded_int("local-epochs", _MAX_LOCAL_EPOCHS),
@@ -929,6 +931,8 @@ def load_run_pins(context=None):
         "optimizer": optimizer_config,
         "scheduler": scheduler_config,
     }
+    validate_prox_horizon(pins)
+    return pins
 
 
 def _cv_execution_contract(manifest):
@@ -1210,7 +1214,7 @@ def load_pinned_run_config(context=None):
         strategy_fields = {
             "strategy", "strategy-eta", "strategy-eta-l",
             "strategy-beta-1", "strategy-beta-2", "strategy-tau",
-            "strategy-server-learning-rate", "strategy-server-momentum",
+            "strategy-server-learning-rate", "strategy-server-momentum", "strategy-mu",
         }
         manifest_strategy = {
             key for key in strategy_fields if key in manifest}
@@ -1306,6 +1310,13 @@ def load_pinned_run_config(context=None):
     # The analyst-facing Flower config may name a module for the researcher-side
     # ServerApp, but node execution accepts only the package name derived and
     # written by flowerTier2PinDS after installation/hash verification.
+    from .strategy import canonical_local_strategy
+    track = str(manifest.get("dp-track", "neural")).lower()
+    expected_local = canonical_local_strategy(manifest, track)
+    supplied_local = canonical_local_strategy(cfg, track)
+    if expected_local != supplied_local:
+        raise ValueError("Flower local strategy does not match node manifest pin")
+    cfg.pop("strategy-mu", None)
     cfg.pop("user-module", None)
     keys = (
         "segmentation-alpha", "segmentation-smooth", "mask-vocabulary",
@@ -1351,7 +1362,7 @@ def load_pinned_run_config(context=None):
         "cv-contract-sha256", "cv-validation-bins", "cv-n-nodes",
         "cv-job-sha256", "strategy", "strategy-eta", "strategy-eta-l",
         "strategy-beta-1", "strategy-beta-2", "strategy-tau",
-        "strategy-server-learning-rate", "strategy-server-momentum",
+        "strategy-server-learning-rate", "strategy-server-momentum", "strategy-mu",
     )
     for key in keys:
         if key in manifest:

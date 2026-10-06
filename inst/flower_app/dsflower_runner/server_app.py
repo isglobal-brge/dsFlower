@@ -463,13 +463,16 @@ class _StrictFedAvgM(_RequireCompleteTrain, FedAvgM):
 _STRATEGIES = {
     "fedavg": _StrictFedAvg, "fedadam": _StrictFedAdam,
     "fedadagrad": _StrictFedAdagrad, "fedyogi": _StrictFedYogi,
-    "fedavgm": _StrictFedAvgM,
+    "fedavgm": _StrictFedAvgM, "fedprox": _StrictFedAvg,
 }
 
 
 def _build_strategy(cfg, min_nodes, track=None, stable_roster=False,
                     required_roster=None, operation=None, fold=0):
+    from .strategy import canonical_local_strategy
+    canonical_local_strategy(cfg, track or "neural")
     name = str(cfg.get("strategy", "fedavg")).lower()
+    if name == "prox": name = "fedprox"
     if name not in _STRATEGIES:
         raise ValueError(f"Unsupported aggregation strategy: {name}")
     common = dict(
