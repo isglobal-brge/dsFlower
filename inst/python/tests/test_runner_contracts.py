@@ -18,7 +18,19 @@ FLOWER_APP = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "flower_app")
 sys.path.insert(0, FLOWER_APP)
 
-from dsflower_runner import client_app, server_app, task  # noqa: E402
+from dsflower_runner import client_app, seeding, server_app, task  # noqa: E402
+from v3_test_support import source_sidecar
+
+
+_TEST_SECRET = mock.patch.object(seeding, "_node_secret", return_value=b"r" * 32)
+
+
+def setUpModule():
+    _TEST_SECRET.start()
+
+
+def tearDownModule():
+    _TEST_SECRET.stop()
 
 
 class ReplaySafetyTests(unittest.TestCase):
@@ -52,15 +64,15 @@ class ReplaySafetyTests(unittest.TestCase):
                   client_app, "load_image_collection",
                   side_effect=private_access) as load_images,
               mock.patch.object(
-                  client_app.seeding, "master_seed",
-                  side_effect=private_access) as master_seed,
+                  client_app.seeding, "release_key",
+                  side_effect=private_access) as release_key,
               mock.patch.object(
                   client_app, "_train_neural",
                   side_effect=private_access) as train_neural):
             reply = client_app.train(msg, context)
 
         for private_call in (
-                load_config, load_data, load_images, master_seed, train_neural):
+                load_config, load_data, load_images, release_key, train_neural):
             private_call.assert_not_called()
         self.assertFalse(reply.has_error())
         actual = reply.content["arrays"].to_numpy_ndarrays()[0]
@@ -133,27 +145,36 @@ class MultilabelRuntimeTests(unittest.TestCase):
             }).to_csv(os.path.join(manifest_dir, "data.csv"), index=False)
             with open(os.path.join(manifest_dir, "manifest.json"), "w",
                       encoding="utf-8") as handle:
-                json.dump({
+                manifest = {
                     "data_file": "data.csv", "data_format": "csv",
                     "target_column": ["a", "b"], "feature_columns": ["x"],
                     "task-type": "classification", "loss-name": "multilabel_bce",
-                    "num-classes": 2, "num-labels": 2,
-                }, handle)
+                    "num-classes": 2, "num-labels": 2, "dp-unit": "row",
+                    "semantic-randomness-contract": seeding.SEMANTIC_CONTRACT,
+                    "n_units": 2, "n_samples": 2,
+                }
+                source_sidecar(manifest_dir, manifest, pd.read_csv(
+                    os.path.join(manifest_dir, "data.csv")))
+                json.dump(manifest, handle)
             context = SimpleNamespace(
                 node_config={"manifest-dir": manifest_dir})
 
             X, y = task.load_data(context)
-            np.testing.assert_array_equal(X, np.asarray([[1], [2]], np.float32))
+            order = X.canonical_units.row_permutation
             np.testing.assert_array_equal(
-                y, np.asarray([[0, 1], [1, 0]], np.float32))
+                X, np.asarray([[1], [2]], np.float32)[order])
+            np.testing.assert_array_equal(
+                y, np.asarray([[0, 1], [1, 0]], np.float32)[order])
 
     def test_patient_pooling_uses_majority_per_label(self):
         X, y = client_app._pool_by_patient(
             np.asarray([[1.0], [3.0], [5.0]], np.float32),
             np.asarray([[0, 1], [1, 1], [0, 0]], np.float32),
             np.asarray(["p1", "p1", "p2"]), "multilabel_bce")
-        np.testing.assert_array_equal(X, np.asarray([[2], [5]], np.float32))
-        np.testing.assert_array_equal(y, np.asarray([[1, 1], [0, 0]], np.float32))
+        order = np.argsort(X[:, 0])
+        np.testing.assert_array_equal(X[order], np.asarray([[2], [5]], np.float32))
+        np.testing.assert_array_equal(
+            y[order], np.asarray([[1, 1], [0, 0]], np.float32))
 
 
 class StrategyRuntimeTests(unittest.TestCase):
@@ -205,7 +226,8 @@ class StrategyRuntimeTests(unittest.TestCase):
         for name in server_app._STRATEGIES:
             with self.subTest(strategy=name):
                 candidate = server_app._build_strategy(
-                    {"strategy": name}, min_nodes=2)
+                    {"strategy": name, **({"strategy-mu": 0.1}
+                                          if name == "fedprox" else {})}, min_nodes=2)
                 with self.assertRaisesRegex(
                         RuntimeError, "1 of 2.*degraded federation"):
                     candidate.aggregate_train(1, [

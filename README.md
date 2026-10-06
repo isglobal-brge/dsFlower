@@ -41,6 +41,59 @@ PyArrow 23.0.1 and cryptography 46.0.7 exactly. It does not install upstream
 XGBoost, LightGBM or CatBoost: XGBoost remains in its separately verified native
 bundle, while the other two names identify dsFlower-style numeric engines.
 
+## Configure the curated XGBoost bundle
+
+`dsflower.xgboost_bundle_root` is a **node/custodian configuration option**: the
+absolute path to a platform-specific directory containing the verified
+`manifest.json` and the XGBoost and dsFlower DP primitive shared libraries under
+`lib/`. It is not an analyst request parameter or a path to an upstream XGBoost
+installation. The ordinary R package installer does not build this bundle.
+
+From a dsFlower source checkout, a custodian with Git, Python 3, Rust/Cargo 1.88
+or newer, CMake 3.18 or newer, and a C/C++17 toolchain can build it as follows
+(the output directory must not already exist):
+
+```sh
+work_dir="$(mktemp -d)"
+native/xgboost/scripts/fetch_upstream.sh "$work_dir/xgboost"
+native/xgboost/scripts/apply_patches.sh "$work_dir/xgboost"
+native/xgboost/scripts/verify_patched.sh "$work_dir/xgboost"
+native/xgboost/scripts/build_bundle.sh "$work_dir/xgboost" /srv/dsflower/xgboost-bundle
+python3 native/xgboost/scripts/verify_bundle.py /srv/dsflower/xgboost-bundle
+```
+
+Create the destination's parent directory beforehand. Deploy the complete bundle
+in a canonical absolute path without symlinks. On POSIX, its files, directories
+and parent chain must be owned by root or the node account and must not be group
+or world writable. Ensure the node service account can read the files and
+traverse the directories; a bundle built by another custodian account needs an
+explicit ownership or read-permission handoff. Configure equivalent owner-only
+write permissions on Windows.
+The native libraries must load without `LD_*` or `DYLD_*` loader overrides.
+The verifier rejects extra files, so store associated licenses and operational
+logs outside the bundle directory. See the [native build documentation](native/xgboost/README.md)
+for source pins, platform suffixes and the complete native test.
+
+Configure each DataSHIELD node's R process before serving analyst requests:
+
+```r
+options(dsflower.xgboost_bundle_root = "/srv/dsflower/xgboost-bundle")
+```
+
+Alternatively set `DSFLOWER_XGBOOST_BUNDLE_ROOT` in the node service environment;
+a nonempty environment value takes precedence over the R option (which also
+supports the `default.dsflower.xgboost_bundle_root` option fallback). The
+`native-tree` Python runtime must also be provisioned; its default location is
+`native-tree` under the node's configured venv root, with an optional
+`dsflower.native_tree_runtime` / `DSFLOWER_NATIVE_TREE_RUNTIME` override.
+
+Each capability check verifies the bundle and runs a synthetic public training,
+sanitization, ensemble and prediction probe. An absent, mismatched, tampered or
+unloadable bundle, or a failed executable probe, keeps XGBoost unavailable and
+training fails closed. There is no fallback to upstream or non-private XGBoost.
+Analysts can submit `ds.flower.model.xgboost()` through the normal R API only
+when all selected nodes advertise the resulting capability.
+
 ## Computation contracts
 
 | Request | Enforced node-side behavior |
@@ -146,6 +199,21 @@ roster completes both phases. Vision paths and patient IDs are partitioned
 before pixel decode for ordinary vision. Segmentation uses its canonical patient
 assembly and excludes the opposite side from training and metric contributions.
 
+### Admitted radiomics tables
+
+A complete radiomics data frame or Arrow table retrieved through dsImaging can
+be passed to `ds.flower.fit()` by its session symbol, including an unchanged
+Parquet round trip. This requires the coordinated dsImaging companion that
+registers exports against its private admitted patient roster. Admission requires
+the original export row order; reordered copies, changed values, subsets,
+duplicate/missing sample keys, unregistered generic dsHPC tables and revoked
+sources fail closed. Patient
+identity comes from the protected roster, never from caller-added attributes.
+dsFlower canonicalizes privacy units after admission for row-order-independent
+training.
+The companion prerequisite also applies when the public container has no
+patient-ID column.
+
 ## Per-training privacy
 
 Privacy is server-authoritative. The client cannot set epsilon, delta, clipping
@@ -179,8 +247,10 @@ answers can cancel it. `dsFlower` derives deterministic randomness from a
 canonical, mechanism-bound semantic identity:
 
 ```text
-release_key = HMAC-SHA256(noise_root,
-                          protocol_version || mechanism || semantic_id)
+R = SHA256(frame("request-v3", canonical_public_request))
+B = SHA256(frame("data-binding-v1", canonical_private_binding))
+release_key = HMAC-SHA256(noise_root, frame("dsflower/semantic-prf/v3", R)
+                                     || frame("data-binding", B))
 subkey      = HMAC-SHA256(release_key, mechanism_axis)
 ```
 
@@ -197,26 +267,41 @@ and both Docker builds assert that no seed entered the image. A
 bootstrap storage error does not take Rock down; every private entry point
 retries and remains fail-closed until the mount is repaired.
 
-A missing, malformed or permissively-mode'd regular key owned by the service UID
-is atomically replaced from fresh OS entropy. A symlink, foreign-owned file or
-unsafe parent is never followed or overwritten. Rotation starts an independent
-noise domain and never blocks a query. The secret is deliberately independent
-of R's mutable RNG and `datashield.seed`. DP
-Gaussian noise, Poisson sampling and HookApp partitioning use separate
-ChaCha20-backed streams. Data-independent Torch initialization/dropout uses a
-separate HMAC-derived seed in the framework PRNG; it is not used as the DP noise
-source. The semantic identity binds the effective public configuration, policy,
-round, incoming public arrays, transformed or patient-pooled private tensors and
-a runtime fingerprint (runner bytes, dependency versions and selected backend).
-The `dsflower-semantic-randomness-v2` contract also binds server-authored source
-operands, ordered feature/target columns, public vocabularies, imaging roles and
-resampling contracts. Distinct selections receive separate keys even when the
-resulting private tensors or statistics coincide. Public segmentation
-initialisation binds its origin and versioned canonical manifest, checkpoint,
-tensor-contract and encoder digests. Checkpoint labels are excluded. Analysts
-cannot override this node-authored selection block.
-Paths, run tokens, message IDs and timestamps are deliberately excluded. The
-private-input digest never leaves the node.
+A missing key is provisioned from OS entropy as before. An existing malformed,
+wrong-owner or wrong-mode key fails closed with a custodian recovery instruction;
+it is never silently replaced. Symlinks and unsafe parents remain rejected.
+Persist the secret and Hook cache across service/container replacements. Explicit
+rotation or state loss creates a new release domain; no initialization marker or
+lifetime privacy ledger is introduced.
+
+The v3 public request R binds effective selected column/asset roles, canonical
+model specification, initial and incoming model contents, mechanism, raw privacy
+policy, local training/strategy semantics, round/fold and measured runtime. The
+private B binds complete selected source units as well as final tensors and
+private execution geometry. Distinct source data remain distinct even if they
+pool or bin to equal statistics. Canonical keyed row/patient ordering precedes
+computation. Symbols, handles, paths, row order, session/run/message IDs and pure
+server aggregation settings do not create noise axes. Existing authorization
+checks remain in force and private digests never leave the node.
+
+All default neural server initializers are seeded from the canonical public model
+specification in an isolated Python/NumPy/Torch context; every CV fold shares the
+same start. Nodes retain array admission and content binding without recomputing
+round-one default arrays, preserving heterogeneous runtime support. Hook server
+`initial_arrays` receives the same RNG isolation, but nondeterministic output
+creates a new release per run. Public checkpoints retain their independent
+verification. See [the randomness contract](inst/flower_app/dsflower_runner/SEEDING.md).
+
+Exact semantic retries return the same released model or statistic. In 0.7.1,
+the node's secret noise key also binds the effective private data. This prevents
+reuse of one noise stream for different data, but comparing related prepared
+datasets can reveal whether a preparation changed the effective input: a no-op
+gives the same release, while changed inputs usually give different releases.
+This equality pattern is outside the per-release DP guarantee. DataSHIELD
+admission and disclosure controls can restrict such preparations; they do not
+supply a general transcript-DP proof. Distinct analyses still compose when their
+conditional mechanisms satisfy DP, and dsFlower does not impose a lifetime
+privacy budget.
 
 Within one Flower run, a bounded claim ledger in the private staging directory
 reserves every operation/fold/round coordinate atomically before private work.
@@ -346,7 +431,7 @@ their declared `mask_root` asset and retain their existing patient roster checks
 Neither route accepts an analyst-supplied filesystem root.
 
 The decoder defaults to `decoder_init = "random"`. Two digest-bound public
-initialisation routes are available in 0.7.0:
+initialisation routes are available in 0.7.1:
 
 - `client:<path-to-bundle>` validates researcher-local public material and declares
   its provenance and digests. This route supports research iteration.
@@ -365,8 +450,9 @@ secret, installer and manifest allowlist no longer authorize initialisation.
 Both routes use a complete verified bundle, including the frozen encoder,
 checkpoint, manifest, provenance, licence, protocol and audit evidence. The node
 verifies a protected snapshot before private staging; the trusted runner verifies
-it again before private access and checks the first round's public arrays against
-its admitted tensors. Missing or altered material fails closed. Status returns
+it again before private access. Incoming training arrays retain shape, dtype and
+value admission and their actual content identity; nodes do not compare them to
+expected round-one tensors. Missing or altered bundle material fails closed. Status returns
 public identity, provenance and geometry; it never exports checkpoint bytes.
 Canonical content identity excludes resource names, session symbols, locations
 and archive packaging, so aliases and repacking do not create another noise draw.
@@ -378,7 +464,7 @@ The [BUSI reference records](inst/extdata/segmentation-public-checkpoints/README
 retain the original hashes and evidence. The three original decoder binaries are
 still absent; synthetic tests do not establish recovery of those checkpoints.
 Public initialisation does not change the DP accountant, clipping, sampler,
-training algorithm, release cache or identity-v2 machinery. Segmentation remains
+training algorithm, release cache or v3 identity machinery. Segmentation remains
 experimental; the mirror's licence declaration retains its original qualification.
 
 Private validation, holdout and CV release bounded pooled foreground Dice.
@@ -442,7 +528,7 @@ HookApp remains a data-independent no-op.
 
 Every admitted HookApp uses the durable release cache. Identical semantic
 requests, including nondeterministic applications, replay the exact first
-released arrays and constant metrics without re-executing the Hook. The v2 key
+released arrays and constant metrics without re-executing the Hook. The v3 key
 binds effective private data, source/column selections, verified application
 contents, public model, policy and round; run tokens, paths and cache capacity
 do not reroll the release. Changed data or selections miss, but cannot authorize
@@ -634,3 +720,22 @@ DSI::datashield.logout(conns)
 - **Juan R González** — juanr.gonzalez@isglobal.org
 
 [Barcelona Institute for Global Health (ISGlobal)](https://www.isglobal.org/)
+
+## FedProx and local verification
+
+The analyst may select `dsFlowerClient::ds.flower.strategy.fedprox(mu = 0.01)`
+for neural training or an admitted Hook. The node validates finite `mu` in `[0,1]`
+and, for positive neural mu, `learning_rate * mu <= 1` throughout the public
+schedule. Neural contraction is applied after each DP optimizer step and L1 prox,
+using the fixed incoming round model. This is post-processing of DP/public
+values; clipping, gradients and the step accountant remain unchanged. Hook
+contraction is one update-level relaxation after the output gate, with eta=1;
+it does not instrument arbitrary Hook optimizers. A cache hit returns the final
+contracted bytes. Zero is exactly FedAvg on supported tracks. All five tree
+engines, association and standalone validation reject FedProx, including zero.
+
+GitHub Actions workflows are removed in 0.7.1. Local R/Python suites, native
+verification scripts and integration harnesses remain available. A real
+federation is verified by a local multi-node integration harness. Use a private
+R library, private working/state directories and one harness session at a time;
+see the client [local integration instructions](https://github.com/isglobal-brge/dsFlowerClient/blob/main/tools/integration/README.md).

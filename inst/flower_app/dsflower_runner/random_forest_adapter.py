@@ -187,6 +187,8 @@ def materialize_random_forest_units(
             resources["memory_mib"] * 1024 * 1024:
         raise ValueError("complete Random Forest training exceeds the memory ceiling")
 
+    features, target, unit_ids, _units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
     X = tree_data._numeric_array(features, "features", 2)
     y = tree_data._numeric_array(target, "target", 1)
     lower = np.asarray(profile["feature_lower"], dtype=np.float32)
@@ -251,7 +253,7 @@ def _sample_without_replacement(rng, population, count):
     return result
 
 
-def _public_schedule(profile, features, *, request_selection=None):
+def _public_schedule(profile, features, *, request_selection=None, request_identity=None):
     config = {
         "cut_counts": [len(value) for value in profile["public_cuts"]],
         "depth": profile["max_depth"],
@@ -265,9 +267,8 @@ def _public_schedule(profile, features, *, request_selection=None):
         "partition": forest_accounting.RANDOM_FOREST_PARTITION_PROFILE,
     }
     policy["policy_hash"] = _policy_hash(policy)
-    master = bytearray(seeding.master_seed(
-        "random-forest/public-prf/v1", config, policy, 1,
-        execution_fingerprint="dsflower-random-forest-public-prf-v1"))
+    master = bytearray(seeding.public_execution_key(
+        request_identity, "random_forest/public-schedule/v3"))
     candidate_key = None
     assignment_key = None
     try:
@@ -360,10 +361,10 @@ class PreparedRandomForestTraining:
     """Frozen one-shot adaptive transcript; repr excludes private contents."""
 
     __slots__ = ("_assignments", "_binned", "_candidates", "_canonical",
-                 "_digest", "_profile", "_sealed", "_targets", "_used")
+                 "_digest", "_profile", "_sealed", "_targets", "_used", "_request_identity", "_data_binding")
 
     def __init__(self, token, canonical, profile, candidates, binned,
-                 targets, assignments):
+                 targets, assignments, request_identity, data_binding):
         if token is not _PREPARED_TOKEN:
             raise TypeError("use prepare_random_forest_training")
         object.__setattr__(self, "_sealed", False)
@@ -374,6 +375,8 @@ class PreparedRandomForestTraining:
         self._targets = targets
         self._assignments = assignments
         self._used = False
+        self._request_identity = request_identity
+        self._data_binding = data_binding
         self._digest = _prepared_digest(
             self._canonical, self._profile, self._candidates,
             self._binned, self._targets, self._assignments)
@@ -430,16 +433,24 @@ def _validate_prepared(prepared):
 
 
 def prepare_random_forest_training(
-        manifest, features, target, *, unit_ids=None, request_selection=None):
+        manifest, features, target, *, unit_ids=None, request_selection=None, request_identity=None,
+                                 source_units=None, subset=None):
     """Freeze the bounded units and public-PRF schedule for one transcript."""
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_random_forest_profile(canonical)
+    identity = request_identity or tree_release.native_request_identity(
+        canonical, request_selection, execution_fingerprint=EXECUTION_PROFILE)
+    features, target, unit_ids, units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
     materialized = materialize_random_forest_units(
         canonical, features, target, unit_ids=unit_ids)
+    binding = tree_release.native_binding(
+        identity, units if source_units is None else source_units, materialized,
+        subset=subset)
     candidates, assignment_key = _public_schedule(
         profile, len(canonical["public_schema"]["features"]),
         request_selection=tree_release.request_selection(
-            canonical, request_selection))
+            canonical, request_selection), request_identity=identity)
     try:
         assignments = _tree_assignments(
             materialized._binned_features, materialized._target_units,
@@ -449,7 +460,7 @@ def prepare_random_forest_training(
     return PreparedRandomForestTraining(
         _PREPARED_TOKEN, canonical, profile, candidates,
         materialized._binned_features, materialized._target_units,
-        assignments)
+        assignments, identity, binding)
 
 
 def _schedule_hash(candidates):
@@ -670,7 +681,9 @@ def train_random_forest(prepared, *, request_selection=None):
                 num_releases=profile["num_releases"],
                 execution_fingerprint=EXECUTION_PROFILE,
                 request_selection=tree_release.request_selection(
-                    canonical, request_selection))
+                    canonical, request_selection),
+                request_identity=prepared._request_identity,
+                data_binding=prepared._data_binding)
             if sigma != profile["split_sigma"]:
                 raise RuntimeError("Random Forest accountant and split sigma differ")
             features, cuts, defaults = _choose_splits(
@@ -697,7 +710,9 @@ def train_random_forest(prepared, *, request_selection=None):
             num_releases=profile["num_releases"],
             execution_fingerprint=EXECUTION_PROFILE,
             request_selection=tree_release.request_selection(
-                canonical, request_selection))
+                canonical, request_selection),
+                request_identity=prepared._request_identity,
+                data_binding=prepared._data_binding)
         if sigma != profile["leaf_sigma"]:
             raise RuntimeError("Random Forest accountant and leaf sigma differ")
         if canonical["task"] == "binary_classification":

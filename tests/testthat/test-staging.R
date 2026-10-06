@@ -12,6 +12,82 @@
   ), list(...))
 }
 
+test_that("manifest column selections retain their JSON array schema at every cardinality", {
+  directory <- withr::local_tempdir()
+  path <- file.path(directory, "manifest.json")
+  for (columns in list(character(), "x", c("z", "x"))) {
+    dsFlower:::.write_manifest_atomic(
+      list(feature_columns = columns, target_column = "y"), path)
+    wire <- jsonlite::fromJSON(path, simplifyVector = FALSE)
+    expect_identical(wire$feature_columns, unname(as.list(columns)))
+    expect_identical(wire$target_column, "y")
+    dsFlower:::.write_manifest_atomic(wire, path)
+    expect_identical(jsonlite::fromJSON(path, simplifyVector = FALSE), wire)
+  }
+})
+
+test_that("single-feature tabular staging writes an array accepted by the runner schema", {
+  root <- withr::local_tempdir()
+  withr::local_options(list(dsflower.staging_root = root, dsflower.dp_unit = "row"))
+  staging <- dsFlower:::.stageData(
+    data.frame(x = c(1, 2), y = c(0, 1)), .test_run_token(104), "y", "x")
+  wire <- jsonlite::fromJSON(file.path(staging, "manifest.json"),
+                             simplifyVector = FALSE)
+  expect_identical(wire$feature_columns, list("x"))
+  expect_identical(wire$target_column, "y")
+})
+
+test_that("feature-bound vectors retain array shape without changing scalar target bounds", {
+  directory <- withr::local_tempdir()
+  path <- file.path(directory, "manifest.json")
+  for (size in c(1L, 3L)) {
+    bounds <- list(lower = rep(-2.5, size), upper = rep(4.5, size))
+    config <- dsFlower:::.normalizePublicFeatureBounds(list("feature-bounds" = bounds))
+    config[["target-bounds"]] <- list(lower = -1, upper = 1)
+    dsFlower:::.write_manifest_atomic(config, path)
+    wire <- jsonlite::fromJSON(path, simplifyVector = FALSE)
+    expect_identical(wire[["feature-bounds"]],
+                     lapply(bounds, function(value) unname(as.list(value))))
+    expect_identical(wire[["target-bounds"]], list(lower = -1L, upper = 1L))
+    dsFlower:::.write_manifest_atomic(wire, path)
+    expect_identical(jsonlite::fromJSON(path, simplifyVector = FALSE), wire)
+  }
+})
+
+test_that("actual R singleton bounds reach Python training and validation unchanged", {
+  python <- Sys.getenv("DSFLOWER_TEST_NEURAL_PYTHON", "")
+  if (!nzchar(python)) {
+    runtime_root <- Sys.getenv("DSFLOWER_VENV_ROOT", "")
+    if (nzchar(runtime_root)) {
+      python <- dsFlower:::.native_tree_runtime_executable(
+        file.path(runtime_root, "pytorch"), "python")
+    }
+  }
+  skip_if(!nzchar(python) || !file.exists(python),
+          "A neural Python runtime is needed for the R/Python bounds boundary test")
+  root <- withr::local_tempdir()
+  Sys.chmod(root, "0700")
+  secret <- file.path(root, "node-secret")
+  writeLines(strrep("ab", 32L), secret)
+  Sys.chmod(secret, "0600")
+  withr::local_envvar(c(DSFLOWER_NODE_SECRET_FILE = secret))
+  withr::local_options(list(dsflower.staging_root = root, dsflower.dp_unit = "row"))
+  staging <- dsFlower:::.stageData(
+    data.frame(x = c(-1, 2, 9, NA), y = c(0, 1, 0, 1)),
+    .test_run_token(105), "y", "x",
+    extra_config = list("feature-bounds" = list(lower = 0, upper = 4)))
+  helper <- system.file("python", "tests", "staging_bounds_probe.py",
+                        package = "dsFlower", mustWork = TRUE)
+  app <- system.file("flower_app", package = "dsFlower", mustWork = TRUE)
+  output <- system2(python, shQuote(c(helper, "--app-dir", app,
+                                     "--stage-dir", staging)),
+                    stdout = TRUE, stderr = TRUE)
+  expect_identical(attr(output, "status") %||% 0L, 0L,
+                   info = paste(output, collapse = "\n"))
+  expect_true(any(grepl("CHECK singleton bounds train-validation PASS", output, fixed = TRUE)),
+              info = paste(output, collapse = "\n"))
+})
+
 test_that(".generate_run_token produces expected format", {
   token <- dsFlower:::.generate_run_token()
   expect_type(token, "character")

@@ -26,6 +26,8 @@ BUNDLE_SCHEMA = "dsflower-xgboost-bundle-v1"
 BUNDLE_VERSION = 1
 XGBOOST_PRIVACY_CONTEXT_ABI = 3
 DP_PRIMITIVES_ABI = 2
+# Legacy ABI/manifest identifier, not an analyst-access restriction.
+# Public R requests are enabled only by the complete executable release probe.
 XGBOOST_STATUS = "bundle-core:fixed-point-discrete-v1:internal-only"
 XGBOOST_MECHANISM = "xgboost/fixed-point-discrete/v1"
 DP_PRIMITIVES_MECHANISM = "cks20-discrete-gaussian-i64-hmac-sha256-v1"

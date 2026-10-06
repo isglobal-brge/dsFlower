@@ -14,6 +14,7 @@ import torch
 
 from test_segmentation_public_init import registry, pinned, message, pins
 from test_survival_contracts import config as survival_config
+from v3_test_support import tagged_arrays
 from dsflower_runner import (client_app, params, resampling, seeding,
                              segmentation, segmentation_checkpoints as checkpoints,
                              server_app, survival, task, validation)
@@ -144,7 +145,7 @@ def validation_fixture(registry):
 def test_fixed_declared_segmentation_checkpoint_one_and_two_node_validation(registry):
     cfg, model, X, y = validation_fixture(registry)
     with mock.patch.object(segmentation, "prepare_encoder", return_value=(None, "cpu")), \
-            mock.patch.object(segmentation, "load_subject_tensors", return_value=(X, y, np.array(["a", "b", "c"]), 3)):
+            mock.patch.object(segmentation, "load_subject_tensors", return_value=(*tagged_arrays(X, y, np.array(["a", "b", "c"])), 3)):
         single = validation.private_model_validation(registry.context, cfg, {"epsilon": 1e6, "delta": 1e-6}, 1, registry.arrays)[0]
     layout = validation.layout_from_config(cfg)
     expected = validation.validation_sufficient_vector(y, validation.neural_predictions(model, X, cfg["loss-name"]), layout)
@@ -205,7 +206,7 @@ def test_segmentation_empty_cv_fold_retains_pinned_accounting_geometry(registry)
     y = np.ones((3, 2, 128, 128), np.float32)
     training = dict(pins(), n_classes=2, batch_size=2, local_epochs=1)
     with mock.patch.object(segmentation, "prepare_encoder", return_value=(None, "cpu")), \
-            mock.patch.object(segmentation, "load_subject_tensors", return_value=(X, y, np.array(["a", "b", "c"]), 3)), \
+            mock.patch.object(segmentation, "load_subject_tensors", return_value=(*tagged_arrays(X, y, np.array(["a", "b", "c"])), 3)), \
             mock.patch.object(client_app, "_cross_validation_partition", return_value=(X[:0], y[:0], np.array([], dtype=str))), \
             mock.patch.object(client_app, "_dp_fit", return_value=([], 3)) as fit:
         client_app._train_segmentation(registry.context, cfg, {"epsilon": 2, "delta": 1e-6, "clipping_norm": 1},
@@ -221,7 +222,8 @@ def staged_survival():
     fixture = fixtures.SurvivalRunnerTests()
     fixture.setUp()
     try:
-        yield fixture
+        with mock.patch.object(seeding, "_node_secret", return_value=b"s" * 32):
+            yield fixture
     finally:
         fixture.tearDown()
 
@@ -332,7 +334,7 @@ def test_saved_segmentation_artifact_preflight_arrays_and_private_inference(regi
     for expected, actual in zip(registry.arrays, transported):
         np.testing.assert_array_equal(actual, expected)
     with mock.patch.object(segmentation, "prepare_encoder", return_value=(None, "cpu")), \
-            mock.patch.object(segmentation, "load_subject_tensors", return_value=(X, y, np.array(["a", "b", "c"]), 3)):
+            mock.patch.object(segmentation, "load_subject_tensors", return_value=(*tagged_arrays(X, y, np.array(["a", "b", "c"])), 3)):
         released = validation.private_model_validation(registry.context, cfg,
             {"epsilon": 1e6, "delta": 1e-6}, 1, transported)[0]
     assert validation.validation_metrics(released, validation.layout_from_config(cfg))["foreground_dice"] == pytest.approx(1., abs=.01)
@@ -410,7 +412,7 @@ def test_segmentation_cv_accumulates_both_patient_folds_without_holdout_alias(re
     y = np.ones((3, 2, 128, 128), np.float32)
     ids = np.array(["a", "b", "c"])
     with mock.patch.object(segmentation, "prepare_encoder", return_value=(None, "cpu")), \
-            mock.patch.object(segmentation, "load_subject_tensors", return_value=(X, y, ids, 3)):
+            mock.patch.object(segmentation, "load_subject_tensors", return_value=(*tagged_arrays(X, y, ids), 3)):
         for fold in (1, 2):
             returned = client_app._cross_validation_neural_accumulate(registry.context,
                 cfg, {"loss_name": cfg["loss-name"]}, model, segmentation.FEATURE_DIM, fold)
@@ -434,8 +436,12 @@ def test_survival_metric_times_preserve_adjacent_horizon_and_hazard_intervals(st
     fixture.subjects["__survival_time"] = fixture.subjects["__survival_time"].astype(float)
     fixture.subjects.loc[0, ["__survival_time", "__survival_d_1", "__survival_d_2", "__survival_m_2"]] = [boundary, 0, 1, 1]
     fixture.subjects.to_csv(Path(fixture.temp.name) / "subjects.csv", index=False)
+    # This is a newly staged source, so its protected integrity pins are rebuilt.
+    fixture.refresh_source()
+    fixture.write_manifest()
     X, y, ids, _ = task.load_survival_data(fixture.context, metric_targets=True)
-    assert y.dtype == np.float64 and y[0, 0] == boundary and y[0, 0] > 5
+    subject_index = ids.tolist().index("001")
+    assert y.dtype == np.float64 and y[subject_index, 0] == boundary and y[subject_index, 0] > 5
     cfg = dict(fixture.manifest, **{"validation-task": "survival", "validation-survival-horizons": "[5]"})
     model = torch.nn.Linear(2, 3)
     with torch.no_grad():
@@ -446,6 +452,6 @@ def test_survival_metric_times_preserve_adjacent_horizon_and_hazard_intervals(st
     logits = torch.full((1, 3), 2.)
     packed = survival.period_targets([boundary], [1.], [1.], fixture.cfg)
     expected_loss = float(survival.loss_factory(cfg["loss-name"], cfg)(logits, torch.as_tensor(packed)))
-    assert prediction[0, 0] == pytest.approx(expected_loss)
-    row = validation.validation_contributions(y[:1], prediction[:1], layout)[0]
-    assert row[2] == pytest.approx((1.0-prediction[0, 1])**2)
+    assert prediction[subject_index, 0] == pytest.approx(expected_loss)
+    row = validation.validation_contributions(y[subject_index:subject_index+1], prediction[subject_index:subject_index+1], layout)[0]
+    assert row[2] == pytest.approx((1.0-prediction[subject_index, 1])**2)

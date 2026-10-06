@@ -1,7 +1,7 @@
 """Durable replay at the Flower boundary with a real nondeterministic Hook.
 
 Sandbox attestation and sleeping are replaced for this local test; the child,
-private CSV loading, v2 identity, DP mechanism, ledger, cache and Flower arrays
+private CSV loading, v3 identity, DP mechanism, ledger, cache and Flower arrays
 are real. These tests do not assert fixed-duration or deployment isolation.
 """
 
@@ -51,6 +51,8 @@ def _setup_run(root, token="a", *, selection="x", data=1.0, hook=HOOK):
     (directory / "pinned_packages.json").write_text(json.dumps({"random_hook": digest}))
     manifest = {
         "run_token": directory.name, "dp-track": "egress", "user-module": "random_hook",
+        "semantic-randomness-contract": "dsflower-semantic-randomness-v3",
+        "strategy": "fedavg",
         "privacy-adjacency": "replace_one", "privacy-policy-sha256": "1" * 64,
         "privacy-epsilon": 1.0, "privacy-delta": 1e-5, "privacy-clipping_norm": 1.0,
         "privacy-hook_enabled": 1, "privacy-sample_aggregate": 0,
@@ -63,6 +65,15 @@ def _setup_run(root, token="a", *, selection="x", data=1.0, hook=HOOK):
         "request-source": {"source": "table", "data_symbol": "cohort"},
         "n_samples": 2, "n_units": 2,
     }
+    source = directory / "source-projection.jsonl"
+    header = {"schema": "dsflower-source-projection-v1", "columns": [selection, "y"], "patient_column": None}
+    rows = [{"values": [{"type": "number", "value": str(x)}, {"type": "number", "value": str(y)}], "patient_id": None}
+            for x, y in ((data, 0), (2, 1))]
+    source.write_text("\n".join(json.dumps(item) for item in [header, *rows]) + "\n")
+    source.chmod(0o600)
+    manifest.update(source_projection_file=source.name, source_projection_schema=header["schema"],
+                    source_projection_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+                    source_effective_sha256=hashlib.sha256((directory / "data.csv").read_bytes()).hexdigest())
     (directory / "manifest.json").write_text(json.dumps(manifest))
     return directory
 
@@ -173,6 +184,53 @@ def test_retained_release_replays_across_new_run_tokens_and_paths(run):
     replay = _request(root, other)
     assert first[:2] == replay[:2]
     assert (first[2], replay[2]) == (1, 0)
+
+
+def test_nondeterministic_hook_replays_after_symbol_rename_and_row_shuffle(run):
+    root, directory = run
+    first = _request(root, directory)
+    other = _setup_run(root, "b")
+    data = other / "data.csv"
+    lines = data.read_text().splitlines()
+    data.write_text("\n".join([lines[0], *reversed(lines[1:])]) + "\n")
+    source = other / "source-projection.jsonl"
+    lines = source.read_text().splitlines()
+    source.write_text("\n".join([lines[0], *reversed(lines[1:])]) + "\n")
+    path = other / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["request-source"]["data_symbol"] = "another_symbol"
+    manifest["source_projection_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    manifest["source_effective_sha256"] = hashlib.sha256(data.read_bytes()).hexdigest()
+    path.write_text(json.dumps(manifest))
+    replay = _request(root, other)
+    assert replay[:2] == first[:2]
+    assert (first[2], replay[2]) == (1, 0)
+
+
+def test_zero_fedprox_reuses_fedavg_cache_and_positive_prox_is_applied_once(run):
+    from dsflower_runner import strategy
+    root, directory = run
+    average = _request(root, directory)
+
+    def prox_run(token, mu):
+        path = _setup_run(root, token)
+        manifest_path = path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(strategy="fedprox", **{"strategy-mu": mu})
+        manifest_path.write_text(json.dumps(manifest))
+        return path
+
+    zero = _request(root, prox_run("b", 0.))
+    assert zero[:2] == average[:2]
+    assert zero[2] == 0
+    with mock.patch.object(strategy, "apply_gated_prox", wraps=strategy.apply_gated_prox) as apply:
+        positive = _request(root, prox_run("c", 0.2))
+        assert positive[2] == 1
+        apply.assert_called_once()
+        replay = _request(root, prox_run("d", 0.2))
+        assert replay[:2] == positive[:2]
+        assert replay[2] == 0
+        apply.assert_called_once()
 
 
 def test_first_release_and_retry_encode_identically_for_fortran_arrays(run):

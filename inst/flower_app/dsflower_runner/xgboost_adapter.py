@@ -2,9 +2,9 @@
 
 The adapter validates and materializes the complete effective training input,
 then derives sticky randomness with the runner's existing stateless PRF.  The
-verified node-owned bundle is mandatory.  Public R/Flower routing remains
-disabled until its own release gates pass; this module is only the internal
-execution boundary.
+verified node-owned bundle is mandatory. Public R/Flower requests reach this
+trusted execution boundary only after the node's fresh executable capability
+probe verifies the bundle and completes the full release path.
 
 Sanitization is deliberately separate from provenance: parsing native-looking
 JSON cannot prove that its topology and leaves came from privatized histograms.
@@ -403,10 +403,8 @@ def _canonical_group_order(tokens, features, target):
 def _aggregate_patient_units(features, target, tokens, task, feature_lower,
                              feature_upper, target_lower, target_upper):
     """Materialize one deterministic mean/majority record per fixed token."""
-    order = _canonical_group_order(tokens, features, target)
-    features = np.ascontiguousarray(features[order], dtype=np.float32)
-    target = np.ascontiguousarray(target[order], dtype=np.float32)
-    tokens = np.ascontiguousarray(tokens[order])
+    # Complete patient groups and their visits already follow source-unit
+    # keyed canonical order, before totalization. Preserve that reduction order.
 
     starts = np.flatnonzero(np.concatenate((
         np.asarray([True]), tokens[1:] != tokens[:-1])))
@@ -538,6 +536,8 @@ def materialize_xgboost_units(manifest, features, target, *, unit_ids=None):
             canonical["resources"]["memory_mib"] * 1024 * 1024:
         raise ValueError("complete native training exceeds the memory ceiling")
 
+    features, target, unit_ids, _units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
     X = _numeric_array(features, "features", 2)
     y = _numeric_array(target, "target", 1)
 
@@ -580,11 +580,9 @@ def materialize_xgboost_units(manifest, features, target, *, unit_ids=None):
     # identity contain the effective bounded records, never identifiers or raw
     # visit multiplicities.
     binned = _public_bin_indices(X, profile["public_cuts"])
-    order = _canonical_row_order(binned, y, X)
-
-    X = np.ascontiguousarray(X[order], dtype=np.float32)
-    y = np.ascontiguousarray(y[order], dtype=np.float32)
-    binned = np.ascontiguousarray(binned[order], dtype=np.uint32)
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    y = np.ascontiguousarray(y, dtype=np.float32)
+    binned = np.ascontiguousarray(binned, dtype=np.uint32)
 
     X.setflags(write=False)
     y.setflags(write=False)
@@ -631,72 +629,25 @@ def _native_parameters(canonical, profile):
 
 
 def prepare_xgboost_training(manifest, features, target, *, native_bundle,
-                             unit_ids=None, request_selection=None):
+                             unit_ids=None, request_selection=None, request_identity=None,
+                             source_units=None, subset=None):
     """Prepare one complete T-tree training and its private-bound sticky key."""
     if not xgboost_bundle.is_verified_bundle(native_bundle):
         raise ValueError("verified native XGBoost bundle is required")
     canonical = tree_contract.canonical_engine_manifest(manifest)
     profile = canonical_xgboost_profile(canonical)
+    identity = request_identity or tree_release.native_request_identity(
+        canonical, request_selection, execution_fingerprint={
+            "contract": EXECUTION_PROFILE,
+            "native_bundle_sha256": native_bundle.bundle_sha256})
+    features, target, unit_ids, units = tree_release.canonical_native_inputs(
+        features, target, unit_ids)
     materialized = materialize_xgboost_units(
         canonical, features, target, unit_ids=unit_ids)
-
-    # Resources are rejection/operational ceilings and cannot create a reroll.
-    # Opaque snapshot/cohort labels are likewise excluded: the effective
-    # canonical private tensors below bind the complete model input directly.
-    # One native invocation trains all T trees, so the sole outer runner round
-    # coordinate is fixed to one; T and depth remain inside the semantic config.
-    # Public schema selections remain distinct even when their bounded private
-    # records happen to coincide.
-    semantic_config = {
-        "contract_version": canonical["contract_version"],
-        "engine": "xgboost",
-        "mode": "native-tight",
-        "task": canonical["task"],
-        "native_profile": {
-            name: copy.deepcopy(profile[name]) for name in (
-                "base_score", "learning_rate", "max_bin",
-                "max_delta_step", "max_depth", "min_child_weight",
-                "min_split_loss", "num_boost_round", "objective",
-                "public_cuts", "reg_alpha", "reg_lambda")
-        },
-    }
-    semantic_config["request-selection"] = tree_release.request_selection(
-        canonical, request_selection,
-        parameters=semantic_config["native_profile"])
-    source_privacy = canonical["privacy"]
-    privacy_policy = {
-        "mechanism": MECHANISM_PROFILE,
-        "unit": source_privacy["unit"],
-        "adjacency": source_privacy["adjacency"],
-        "unit_canonicalization": source_privacy["unit_canonicalization"],
-        "contribution_strategy": source_privacy["contribution_strategy"],
-        "max_rows_per_unit": source_privacy["max_rows_per_unit"],
-        "mechanism_params": {
-            "fixed_point_scale": profile["fixed_point_scale"],
-            "gradient_clip": profile["gradient_clip"],
-            "hessian_clip": profile["hessian_clip"],
-            "level_noise_scale": profile["level_noise_scale"],
-            "releases": profile["releases"],
-            "root_noise_scale": profile["root_noise_scale"],
-        },
-    }
-    privacy_wire = json.dumps(
-        privacy_policy, ensure_ascii=True, allow_nan=False, sort_keys=True,
-        separators=(",", ":"),
-    ).encode("ascii")
-    privacy_policy["policy_hash"] = hashlib.sha256(privacy_wire).hexdigest()
-    private_arrays = (materialized._binned_features, materialized.target)
-    master = bytearray(seeding.master_seed(
-        MECHANISM_PROFILE,
-        semantic_config,
-        privacy_policy,
-        1,
-        private_arrays=private_arrays,
-        execution_fingerprint={
-            "contract": EXECUTION_PROFILE,
-            "native_bundle_sha256": native_bundle.bundle_sha256,
-        },
-    ))
+    binding = tree_release.native_binding(
+        identity, units if source_units is None else source_units, materialized,
+        subset=subset, fixed_point_scale=profile["fixed_point_scale"])
+    master = bytearray(seeding.release_key(identity, binding))
     try:
         noise_key = bytearray(seeding.sub_seed(
             master, "xgboost/native-fixed-point-noise/v1"))

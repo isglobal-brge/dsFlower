@@ -639,8 +639,8 @@ def output_perturbation(new_weights, old_weights, clipping_norm, epsilon, delta,
 def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, delta,
                          rng=None, num_releases=1):
     """Improved universal floor (Nissim-Raskhodnikova-Smith sample-and-aggregate): given
-    the user's black-box update computed INDEPENDENTLY on each of k DISJOINT, data-
-    independent blocks of the private data, release the clip-and-average aggregate under
+    the user's black-box update computed INDEPENDENTLY on each of k DISJOINT,
+    unit-local blocks of the private data, release the clip-and-average aggregate under
     the Gaussian mechanism.
 
     Why it is sound AND tighter than `output_perturbation`: each privacy unit (a patient
@@ -653,12 +653,14 @@ def sample_and_aggregate(block_updates, old_weights, clipping_norm, epsilon, del
     claims no amplification; k>2 can still improve utility. It composes as an ordinary
     per-round Gaussian release in the training's RDP/PRV accountant.
 
-    The CALLER must (1) build the block partition independently of feature/label VALUES
-    (a random row permutation, or a keyed assignment that keeps each patient's rows
-    together -- never sorting/stratifying on model inputs) and
-    (2) map any failed/non-finite block to a zero delta. Both are leak-safe: a zero delta
-    is inside the C-ball, so it cannot escape the conservative multi-block bound, and
-    the partition cannot encode feature/label values."""
+    The CALLER must (1) use a fixed public k and unit-local bucket assignment:
+    canonical patient IDs, or canonical row content plus duplicate occurrence,
+    keyed independently of the whole dataset. Unchanged units retain buckets;
+    one replacement changes at most the old and new buckets. Sort within buckets
+    canonically, never split a global sorted/permuted array at shifting boundaries.
+    Child randomness depends only on the public execution contract and bucket.
+    (2) Map failed/empty/non-finite blocks to zero delta while retaining all k
+    blocks. Zero lies in the C-ball, preserving the same min(2C, 4C/k) bound."""
     k = len(block_updates)
     if k < 1:
         raise ValueError("sample_and_aggregate needs at least one block update")

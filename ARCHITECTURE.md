@@ -189,7 +189,7 @@ holdout fraction. The client encodes that fraction exactly as integer
 millionths and the node combines
 the canonical contract with its custodial secret in an HMAC-SHA256 PRF. There is
 no submitted seed, run identifier, clock, database, counter or history input.
-Row mode hashes the stable staged row ordinal; patient mode hashes the canonical
+Row mode hashes canonical selected row content plus duplicate occurrence; patient mode hashes the canonical
 patient identifier, so every row for one patient is assigned to the same side.
 Repeating the same contract under the same node secret recreates the same
 partition. The fraction changes only the PRF threshold, not its domain, so
@@ -197,8 +197,10 @@ fractions are nested instead of acting as analyst-controlled partition rerolls.
 Assignments are intentionally node-owned; duplicate people observed at different
 nodes are not linkable or jointly assigned without a separately governed
 cross-site identity protocol.
-Row ordinals are stable only for the staged dataset contract: reordering rows
-constitutes a different dataset and can therefore change row-level assignments.
+Row shuffling preserves assignments. Changing one selected row can move that
+unit between folds; unchanged content tokens remain fixed. Changing the selected
+columns can change all row tokens. Full parent source/assignment bindings are
+checked across phases.
 
 Assignment happens before patient pooling and before any training step. Every
 neural round, or the single native-tree round, trains only on the complement.
@@ -271,7 +273,7 @@ pins contribute to sticky semantic identity; path names alone do not identify
 the training data.
 
 The decoder defaults to `decoder_init = "random"`. Two digest-bound public
-initialisation routes are available in 0.7.0:
+initialisation routes are available in 0.7.1:
 
 - `client:<path-to-bundle>` validates researcher-local public material and declares
   its provenance and digests. This route supports research iteration.
@@ -290,8 +292,9 @@ secret, installer and manifest allowlist no longer authorize initialisation.
 Both routes use a complete verified bundle, including the frozen encoder,
 checkpoint, manifest, provenance, licence, protocol and audit evidence. The node
 verifies a protected snapshot before private staging; the trusted runner verifies
-it again before private access and checks the first round's public arrays against
-its admitted tensors. Missing or altered material fails closed. Status returns
+it again before private access. Incoming training arrays retain shape, dtype and
+value admission and their actual content identity; nodes do not compare them to
+expected round-one tensors. Missing or altered bundle material fails closed. Status returns
 public identity, provenance and geometry; it never exports checkpoint bytes.
 Canonical content identity excludes resource names, session symbols, locations
 and archive packaging, so aliases and repacking do not create another noise draw.
@@ -303,7 +306,7 @@ The [BUSI reference records](inst/extdata/segmentation-public-checkpoints/README
 retain the original hashes and evidence. The three original decoder binaries are
 still absent; synthetic tests do not establish recovery of those checkpoints.
 Public initialisation does not change the DP accountant, clipping, sampler,
-training algorithm, release cache or identity-v2 machinery. Segmentation remains
+training algorithm, release cache or v3 identity machinery. Segmentation remains
 experimental; the mirror's licence declaration retains its original qualification.
 
 Private-data-dependent releases are restricted to DP-trained decoder parameters;
@@ -334,7 +337,7 @@ Determinism is retained as semantic-scoped, secret-keyed randomness:
 
 ```text
 release_key = HMAC-SHA256(noise_root,
-                          protocol_version || mechanism || semantic_id)
+                          frame("dsflower/semantic-prf/v3", R) || frame("data-binding", B))
 subkey      = HMAC-SHA256(release_key, mechanism_axis)
 ```
 
@@ -356,55 +359,67 @@ negative assertions for the key. If runtime storage is unavailable, Rock
 remains up for operational repair, while private entry points retry and remain
 fail-closed.
 
-Missing, malformed or permissively-mode'd service-owned regular keys are
-atomically regenerated. Symlinks, foreign-owned files and unsafe parents remain
-fail-closed. Rotation starts an independent deterministic-noise domain and never
-introduces a query-count lockout.
+A missing key is provisioned as before. An existing malformed, wrong-owner or
+wrong-mode file fails closed with a custodian recovery instruction. It is never
+silently regenerated. There is no initialization marker. Persistent deployment
+state is required for replay: explicit key rotation or loss creates a new domain.
 
-DP Gaussian values come from a ChaCha20 stream with domain-separated subkeys.
-Poisson sampling and HookApp partitioning use their own ChaCha20 subkeys. Torch
-initialization/dropout is data-independent and uses a separate HMAC-derived seed
-through the framework PRNG; it is not a DP-noise source. No privacy-critical
-stream is reused. The canonical identity includes the effective configuration,
-per-training policy, round, incoming public arrays, transformed or patient-pooled
-private tensors and a runtime fingerprint. The `dsflower-semantic-randomness-v2`
-contract also binds a public request-selection block derived from the node's
-server-authored manifest: target columns (including ordered survival time/event
-roles), ordered feature columns, patient column and unit policy, public target
-vocabularies/bounds, imaging asset aliases and path/id/mask column roles, and
-holdout/CV geometry and assignment contracts. Public segmentation initialisation
-also binds its origin and versioned canonical manifest, checkpoint, tensor-contract
-and encoder digests; checkpoint labels are excluded.
-Native engines bind their validated schema, engine parameters and contribution
-policy, including the active CV fold; validation and association bind their
-public request contracts even when their
-private sufficient statistics coincide. Hook keys bind the verified uploaded
-package contents as well as manifest selections and the validated update.
-The server preserves selected source operands and descriptor identities in
-protected `request-source` manifest metadata. Canonical selection/schema digests
-keep large public column lists within the outer key encoder's limits. Pooled CV
-also binds the ordered public fold-model digests held in existing node RAM.
-The node never accepts an analyst-authored request-selection blob. Operational paths, tokens, message
-IDs and timestamps are excluded, and the private digest remains node-local.
+The v3 public request R is built from validated public semantics before private
+access. Its closed schema binds selected roles, canonical model and initial/current
+array content, local training strategy, raw node policy, coordinates and runtime.
+The separate private binding B contains complete selected source units, final
+effective tensors, execution geometry and subset assignment. K is the node-secret
+HMAC of separately framed R and B. Adaptive stage statistics are bound below K.
+Source/handle aliases, row order, paths, timestamps and run/message identifiers
+are excluded while their admission checks remain. Patient IDs/grouping, selected
+columns and public fold-model contents stay semantic. Raw private values remain
+bound even when pooling or binning produces equal sufficient statistics.
 
-A single fixed noise vector for all distinct queries is unsafe because correlated
-answers can cancel it. Sticky noise only solves repeated identical queries. In
-dsFlower, equivalent canonical identities reuse one deterministic noise stream,
-while distinct semantic identities receive domain-separated keys.
-In particular, selecting different private columns cannot reuse a key merely
-because their contents happen to match. Request-selection changes affect key
-derivation only: noise distribution, calibration, accounting, clipping,
-partition-assignment algorithms and training paths are unchanged. Earlier-runner
-evidence remains valid as measurements of the same mechanism, although v2 draws
-different deterministic noise realizations. See the runner's
-[`SEEDING.md`](inst/flower_app/dsflower_runner/SEEDING.md) for the identity boundary.
+Keyed canonical ordering happens before reductions, pooling, model batches,
+branch decisions and native DMatrix construction; duplicates retain multiplicity.
+Image/mask binding uses decoded content. Public model initialization is isolated
+and specification-seeded on every server path, with the same initial model for
+all CV folds. Nodes perform existing admission/content checks without recomputing
+the default model. The Hook server initializer receives isolated public RNG state;
+its nondeterministic output is a new incoming model and therefore a new release.
+
+Gaussian noise, sampling and training use distinct subkeys. Hook block execution
+uses a separate public-R-only key and fixed unit-local buckets; one replacement
+changes at most two blocks, retaining the existing `min(2C,4C/k)` sensitivity.
+Holdout now selects the absent-unit bound for both row and patient modes, while
+pooled OOF retains its replacement diameter. The accountants/calibrators remain
+unchanged; see [validation and resampling](PRIVATE_VALIDATION_CV.md). Server sums
+and ensembles sort released canonical content rather than reply/node IDs.
+
+FedProx validates `mu` in `[0,1]` and positive neural `eta * mu <= 1` for the public
+schedule. After the DP optimizer and L1 prox it applies
+`w <- w - eta*mu*(w - w_global)`, with the incoming round model as reference.
+This is post-processing of DP/public values. Hook relaxation uses eta=1 after the
+complete output gate and before caching, with no second contraction on replay.
+Zero normalizes to FedAvg without extra arithmetic; unsupported tree/association/
+validation tracks reject raw FedProx including zero. Positive mu enters R.
+
+The calibrated mechanism and its accountant cover the stated release/training
+and declared privacy unit. Replaying one fixed artifact is post-processing.
+These facts do not by themselves prove privacy for a transcript that lets the
+analyst compare whether related private inputs map to the same sticky artifact.
+In particular, a content-keyed equality pattern can be data dependent even when
+each isolated release has the intended marginal noise distribution; ordinary
+composition requires conditional validity. Fixed-count replacement of one
+privacy unit remains the neural contract, and a change in node census has a
+separate adjacency issue. Small-subset controls and exact dimension releases
+have their own DataSHIELD contracts. The equality residual is documented rather
+than described as solved by those controls.
+
+See [the v3 randomness contract](inst/flower_app/dsflower_runner/SEEDING.md)
+for migration, identity fields and replay scope.
 
 Trusted built-in tracks request strict deterministic Torch kernels. HookApps are
 seeded for Python, NumPy and Torch and bind final noise to the validated clipped
 update, but arbitrary native uploaded code cannot be proven deterministic by
 static inspection. Every admitted HookApp, deterministic or not, therefore uses
 a durable node-owned release cache. Its domain-separated key is derived from the
-v2 Hook master identity before execution. The cache stores exact final noised
+v3 Hook master identity before execution. The cache stores exact final noised
 array dtype, shape and bytes and constant reply metrics, including noised-zero
 outcomes, without storing the master or noise keys. Exact retries replay that
 release without executing the application; current Flower transport metadata is
@@ -540,8 +555,8 @@ important privacy options are:
 The supplied Rock runtime performs early bootstrap when the deployment provides
 `DSFLOWER_NODE_SECRET_FILE`. Otherwise it defers to the first session because
 Opal/Armadillo inject profile R options only after that session exists. The
-environment path takes precedence over a stale key-path option so recoverable
-regeneration never blocks. Policy options such as epsilon and delta remain
+environment path takes precedence over a stale key-path option. A missing key
+is provisioned; an existing invalid key requires custodian repair. Policy options such as epsilon and delta remain
 session/profile options.
 
 | Option | Default | Meaning |
@@ -601,12 +616,12 @@ contract. Metric and threshold selection over one released DP model is
 post-processing; HPO or CV that trains new models creates new per-training
 releases.
 
-Seed loss, malformation or an unsafe mode causes automatic CSPRNG rotation and
-does not depend on cumulative privacy-budget history. Coordinate claims and
-cache-capacity checks still govern release admission. Administrators can select a
-secret-manager path through `DSFLOWER_NODE_SECRET_FILE`.
-That process-level path is authoritative if a stale DataSHIELD profile option
-names another key, so the mismatch never blocks a recoverable rotation.
+Missing-key provisioning uses OS entropy and does not depend on cumulative
+privacy-budget history. Malformed, wrong-owner or unsafe-mode existing keys fail
+closed and are never automatically rotated. Coordinate claims and cache-capacity
+checks still govern release admission. Administrators can select a secret-manager
+path through `DSFLOWER_NODE_SECRET_FILE`; that process-level path remains
+authoritative over a stale DataSHIELD profile option.
 
 Deterministic noise is generated from HMAC(node secret, canonical semantic
 identity) and a domain-separated ChaCha20 stream. It gives computational DP
@@ -660,7 +675,8 @@ noise across replacements is desired, together with the gated-Hook cache
 (default `/var/lib/dsflower/privacy/release-cache`) for exact replay of retained
 releases. Cache directories and files require service ownership, modes `0700`
 and `0600` respectively, and no symlinks. A missing seed is recoverable and creates
-an independent noise domain. Do not clone one secret to concurrent nodes.
+an independent noise domain; an invalid existing secret fails closed pending
+custodian repair. Do not clone one secret to concurrent nodes.
 Mounting all of `/var/lib/dsflower` would hide the baked `venvs/` and is therefore
 not recommended. The package intentionally leaves volume wiring to the Rock or
 cluster orchestrator.

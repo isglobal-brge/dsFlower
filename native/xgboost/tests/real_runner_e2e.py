@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
+from unittest import mock
 
 
 def _canonical(value):
@@ -71,6 +72,7 @@ def _request_wire(task):
 
 def _node_manifest(task, request_b64, request_sha256, rows):
     result = {
+        "semantic-randomness-contract": "dsflower-semantic-randomness-v3",
         "data_type": "tabular", "data_file": "train.csv",
         "data_format": "csv", "dp-track": "native_tree",
         "num-server-rounds": 1, "target-preencoded": True,
@@ -104,9 +106,38 @@ def _write_node(root, task, request_b64, request_sha256, rows):
         writer = csv.writer(handle)
         writer.writerow(("age", "marker", "outcome"))
         writer.writerows(rows)
+    # Preserve every original selected value before the native loader's
+    # totalization/clipping. These private transport pins are not public R.
+    manifest = _node_manifest(task, request_b64, request_sha256, rows)
+    header = {
+        "schema": "dsflower-source-projection-v1",
+        "columns": ["age", "marker", "outcome"], "patient_column": None,
+    }
+    def scalar(value):
+        number = float(value)
+        if math.isnan(number):
+            return {"type": "nan"}
+        if math.isinf(number):
+            return {"type": "posinf" if number > 0 else "neginf"}
+        return {"type": "number", "value": format(number, ".17g")}
+
+    source = root / "source-projection.jsonl"
+    records = [header] + [
+        {"values": [scalar(value) for value in row], "patient_id": None}
+        for row in rows]
+    source.write_bytes(b"\n".join(_canonical(row) for row in records) + b"\n")
+    if os.name != "nt":
+        source.chmod(0o600)
+    manifest.update({
+        "source_projection_file": source.name,
+        "source_projection_schema": header["schema"],
+        "source_projection_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "source_effective_sha256": hashlib.sha256(
+            (root / "train.csv").read_bytes()).hexdigest(),
+    })
     with (root / "manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(
-            _node_manifest(task, request_b64, request_sha256, rows),
+            manifest,
             handle, allow_nan=False, separators=(",", ":"))
 
 
@@ -150,6 +181,24 @@ def _single_release(client_app, server_app, context, request_b64,
         context))
 
 
+def _keyed_release(*args):
+    """Observe the real derivation without replacing its inputs or output."""
+    from dsflower_runner import seeding
+    identities = []
+    derive = seeding.release_key
+
+    def capture(request, binding):
+        key = derive(request, binding)
+        identities.append((request.digest, binding.digest, key))
+        return key
+
+    with mock.patch.object(seeding, "release_key", side_effect=capture):
+        artifact = _single_release(*args)
+    if len(identities) != 1:
+        raise AssertionError("native release did not derive exactly one v3 key")
+    return artifact, identities[0]
+
+
 class _Grid:
     def __init__(self, contexts, client_app):
         self.contexts = contexts
@@ -173,7 +222,7 @@ def _exercise_task(work, task, client_app, server_app, native_tree_engine,
             (20.0, -0.5, 0.0), (60.0, 0.5, 1.0),
             ("NaN", 1.5, 1.0), (1000.0, "-Inf", 0.0),
         ]
-        equivalent_rows = [
+        same_bin_rows = [
             ("NaN", 1.25, 1.0), (64.0, 0.75, 1.0),
             (25.0, -0.25, 0.0), (100.0, 0.0, 0.0),
         ]
@@ -182,7 +231,7 @@ def _exercise_task(work, task, client_app, server_app, native_tree_engine,
             (20.0, -0.5, -4.0), (60.0, 0.5, 3.0),
             ("NaN", 1.5, "NaN"), (1000.0, "Inf", 20.0),
         ]
-        equivalent_rows = None
+        same_bin_rows = None
 
     node_one = work / (task + "-node-one")
     node_two = work / (task + "-node-two")
@@ -192,12 +241,16 @@ def _exercise_task(work, task, client_app, server_app, native_tree_engine,
     context_one = _context(node_one, request_b64, request_sha256)
     context_two = _context(node_two, request_b64, request_sha256)
 
-    first = _single_release(
+    first, first_identity = _keyed_release(
         client_app, server_app, context_one, request_b64, request_sha256)
-    replay = _single_release(
+    replay, replay_identity = _keyed_release(
         client_app, server_app, context_one, request_b64, request_sha256)
-    if first != replay:
+    if first != replay or first_identity != replay_identity:
         raise AssertionError("native semantic replay was not byte-identical")
+    permuted, permuted_identity = _keyed_release(
+        client_app, server_app, context_two, request_b64, request_sha256, 22)
+    if first != permuted or first_identity != permuted_identity:
+        raise AssertionError("row permutation changed native identity or output")
 
     empty_node = work / (task + "-empty-node")
     _write_node(empty_node, task, request_b64, request_sha256, [])
@@ -219,15 +272,17 @@ def _exercise_task(work, task, client_app, server_app, native_tree_engine,
             empty_predictions[0]):
         raise AssertionError("empty native ensemble prediction is invalid")
 
-    if equivalent_rows is not None:
+    if same_bin_rows is not None:
         _write_node(
-            node_one, task, request_b64, request_sha256, equivalent_rows)
-        equivalent = _single_release(
+            node_one, task, request_b64, request_sha256, same_bin_rows)
+        _, changed_identity = _keyed_release(
             client_app, server_app, context_one,
             request_b64, request_sha256)
-        if first != equivalent:
+        if first_identity[0] != changed_identity[0] or \
+                first_identity[1] == changed_identity[1] or \
+                first_identity[2] == changed_identity[2]:
             raise AssertionError(
-                "permutation and same-bin values changed native output")
+                "changed same-bin source must preserve R and change B and K")
         _write_node(node_one, task, request_b64, request_sha256, first_rows)
 
     results = work / (task + "-results")

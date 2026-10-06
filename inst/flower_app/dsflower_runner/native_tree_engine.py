@@ -113,14 +113,16 @@ def canonical_profile(manifest):
 
 
 def train_model(manifest, features, target, *, unit_ids=None,
-                xgboost_bundle=None, request_selection=None):
+                xgboost_bundle=None, request_selection=None, request_identity=None,
+                source_units=None, subset=None):
     """Train once and return only a re-sanitized model projection."""
     engine = manifest.get("engine") if isinstance(manifest, dict) else None
     if engine == "xgboost":
         from . import xgboost_adapter
         prepared = xgboost_adapter.prepare_xgboost_training(
             manifest, features, target, native_bundle=xgboost_bundle,
-            unit_ids=unit_ids, request_selection=request_selection)
+            unit_ids=unit_ids, request_selection=request_selection,
+            request_identity=request_identity, source_units=source_units, subset=subset)
         artifact = xgboost_adapter.train_xgboost_native(prepared)
         return xgboost_adapter.sanitize_xgboost_artifact(
             manifest, artifact)[0]
@@ -128,7 +130,8 @@ def train_model(manifest, features, target, *, unit_ids=None,
         from . import forest_adapter
         prepared = forest_adapter.prepare_extra_trees_training(
             manifest, features, target, unit_ids=unit_ids,
-            request_selection=request_selection)
+            request_selection=request_selection, request_identity=request_identity,
+            source_units=source_units, subset=subset)
         artifact = forest_adapter.train_extra_trees(
             prepared, request_selection=request_selection)
         return forest_adapter.sanitize_extra_trees_artifact(
@@ -137,7 +140,8 @@ def train_model(manifest, features, target, *, unit_ids=None,
         from . import random_forest_adapter
         prepared = random_forest_adapter.prepare_random_forest_training(
             manifest, features, target, unit_ids=unit_ids,
-            request_selection=request_selection)
+            request_selection=request_selection, request_identity=request_identity,
+            source_units=source_units, subset=subset)
         artifact = random_forest_adapter.train_random_forest(
             prepared, request_selection=request_selection)
         return random_forest_adapter.sanitize_random_forest_artifact(
@@ -145,7 +149,9 @@ def train_model(manifest, features, target, *, unit_ids=None,
     if engine in ("lightgbm", "catboost"):
         from . import boosting_adapter
         prepared = boosting_adapter.prepare_boosting_training(
-            manifest, features, target, unit_ids=unit_ids)
+            manifest, features, target, unit_ids=unit_ids,
+            request_selection=request_selection, request_identity=request_identity,
+            source_units=source_units, subset=subset)
         artifact = boosting_adapter.train_boosting(
             prepared, request_selection=request_selection)
         return boosting_adapter.sanitize_boosting_artifact(

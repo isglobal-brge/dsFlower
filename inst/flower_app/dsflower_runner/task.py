@@ -202,7 +202,15 @@ def _read_staged_frame(path, manifest):
     )
 
 
-def load_data(context=None, *, include_unit_ids=False):
+def _canonical_source_units(context, manifest, effective, columns, unit_ids):
+    from . import source_projection
+    from .canonical_units import canonicalize_frame, canonicalize_units
+    records = source_projection.records(context, manifest, effective, columns)
+    return (canonicalize_frame(effective, columns, unit_ids=unit_ids) if records is None
+            else canonicalize_units(records, unit_ids=unit_ids))
+
+
+def load_data(context=None, *, include_unit_ids=False, include_canonical_units=False):
     """Load supervised tensors and, when requested, units from one frame."""
     manifest = _load_manifest(context)
     manifest_dir = _get_manifest_dir(context)
@@ -236,6 +244,14 @@ def load_data(context=None, *, include_unit_ids=False):
     else:
         excluded = target_cols + ([patient_col] if patient_col else [])
         feat = df.drop(columns=excluded)
+    from .canonical_units import canonicalize_frame, attach_units
+    unit_ids = _load_patient_ids(df, manifest)
+    units = _canonical_source_units(context, manifest, df, list(feat.columns) + target_cols, unit_ids)
+    order = units.row_permutation
+    df = df.iloc[order]
+    feat = feat.iloc[order]
+    if unit_ids is not None:
+        unit_ids = unit_ids[order]
     X = _load_features(feat, manifest)
     if multilabel:
         y = np.column_stack([
@@ -243,9 +259,12 @@ def load_data(context=None, *, include_unit_ids=False):
         ]).astype(np.float32)
     else:
         y = _load_target(df[target_col], manifest)
+    result = (attach_units(X, units), attach_units(y, units))
     if include_unit_ids:
-        return X, y, _load_patient_ids(df, manifest)
-    return X, y
+        result += (unit_ids,)
+    if include_canonical_units:
+        result += (units,)
+    return result
 
 
 def _survival_public_contract(manifest):
@@ -285,7 +304,7 @@ def _survival_public_contract(manifest):
     return config
 
 
-def load_survival_data(context=None, *, metric_targets=False):
+def load_survival_data(context=None, *, metric_targets=False, include_canonical_units=False):
     """Verify M source rows/N subjects and their server-staged subject tensors.
 
     Duplicate subject rows and invalid private outcomes are zero contributions;
@@ -354,10 +373,19 @@ def load_survival_data(context=None, *, metric_targets=False):
     y = metric_y if metric_targets else train_y
     # Public horizon comparisons and interval packing must retain the exact
     # staged time: rounding to float32 can move an event across a boundary.
-    return expected_x,y.astype(np.float64 if metric_targets else np.float32),np.asarray(unique),len(source)
+    from .canonical_units import canonicalize_frame, attach_units
+    units = _canonical_source_units(context, manifest, source, features + manifest["target_column"], ids)
+    # Artifact verification above deliberately uses the original staging roster.
+    # Reorder only complete verified subjects, never their hazard interval axes.
+    original = {patient: index for index, patient in enumerate(unique)}
+    order = np.asarray([original[patient] for patient in units.unit_ids], dtype=np.intp)
+    result = (attach_units(expected_x[order], units),
+              attach_units(y[order].astype(np.float64 if metric_targets else np.float32), units),
+              np.asarray(units.unit_ids), len(source))
+    return result + (units,) if include_canonical_units else result
 
 
-def load_native_tree_data(context=None, *, manifest=None):
+def load_native_tree_data(context=None, *, manifest=None, include_canonical_units=False):
     """Load one tabular native-tree input without reopening its staged table."""
     if manifest is None:
         manifest = _load_manifest(context)
@@ -381,13 +409,19 @@ def load_native_tree_data(context=None, *, manifest=None):
             any(column not in frame.columns for column in feature_columns):
         raise ValueError("native-tree manifest features are invalid")
 
+    from .canonical_units import canonicalize_frame, attach_units
+    unit_ids = _load_patient_ids(frame, manifest)
+    units = _canonical_source_units(context, manifest, frame, feature_columns + [target_column], unit_ids)
+    order = units.row_permutation
+    frame = frame.iloc[order]
+    unit_ids = None if unit_ids is None else unit_ids[order]
     features = _load_features(frame[feature_columns], manifest)
     target = _load_target(frame[target_column], manifest)
-    unit_ids = _load_patient_ids(frame, manifest)
     assert_pinned_unit_count(
         context, int(features.shape[0]), patient_ids=unit_ids,
         manifest=manifest)
-    return features, target, unit_ids
+    result = (attach_units(features, units), attach_units(target, units), unit_ids)
+    return result + (units,) if include_canonical_units else result
 
 
 def _load_association_codes(series):
@@ -398,7 +432,7 @@ def _load_association_codes(series):
     return np.where(valid, numeric, 2.0).astype(np.uint8)
 
 
-def load_association_data(context=None, *, manifest=None):
+def load_association_data(context=None, *, manifest=None, include_canonical_units=False):
     """Load the two pre-encoded axes for one private association release."""
     if manifest is None:
         manifest = _load_manifest(context)
@@ -422,12 +456,18 @@ def load_association_data(context=None, *, manifest=None):
     if target_column not in frame.columns or exposure_column not in frame.columns:
         raise ValueError("association staged columns are unavailable")
 
+    from .canonical_units import canonicalize_frame, attach_units
+    unit_ids = _load_patient_ids(frame, manifest)
+    units = _canonical_source_units(context, manifest, frame, [exposure_column, target_column], unit_ids)
+    order = units.row_permutation
+    frame = frame.iloc[order]
+    unit_ids = None if unit_ids is None else unit_ids[order]
     outcome = _load_association_codes(frame[target_column])
     exposure = _load_association_codes(frame[exposure_column])
-    unit_ids = _load_patient_ids(frame, manifest)
     assert_pinned_unit_count(
         context, int(outcome.size), patient_ids=unit_ids, manifest=manifest)
-    return outcome, exposure, unit_ids
+    result = (attach_units(outcome, units), attach_units(exposure, units), unit_ids)
+    return result + (units,) if include_canonical_units else result
 
 
 def is_image_run(context=None):
@@ -523,7 +563,7 @@ def _resolve_image_path(images_root, value):
     return candidate
 
 
-def load_image_collection(context=None, *, allow_empty=False):
+def load_image_collection(context=None, *, allow_empty=False, include_canonical_units=False):
     """Resolve a staged dsImaging collection to (image_paths, y, patient_ids).
 
     The R side (.stageFromDescriptor_image) already resolved the dsImaging dataset
@@ -569,8 +609,22 @@ def load_image_collection(context=None, *, allow_empty=False):
             # A private bad/missing path is one bounded zero-image record. Never
             # pass the sentinel to a filesystem API in the vision reader.
             paths.append(None)
+    from .canonical_units import canonicalize_units, encode_row, encode_numeric, attach_units
+    from .vision import canonical_image_record
     groups = _load_patient_ids(df, manifest)
-    return paths, _load_target(df[target_col], manifest), groups
+    # Bind decoded source pixels before resizing/feature extraction, never paths
+    # or compressed file bytes. Only one decoded image is resident at a time.
+    from . import source_projection
+    raw_records = source_projection.records(context, manifest, df, [target_col])
+    records = (encode_row((canonical_image_record(path),
+                           raw_records[index] if raw_records is not None else encode_numeric(target)))
+               for index, (path, target) in enumerate(zip(paths, df[target_col])))
+    units = canonicalize_units(records, unit_ids=groups)
+    order = units.row_permutation
+    result = ([paths[index] for index in order],
+              attach_units(_load_target(df[target_col], manifest)[order], units),
+              None if groups is None else groups[order])
+    return result + (units,) if include_canonical_units else result
 
 
 def load_privacy_config(context=None):
@@ -580,6 +634,9 @@ def load_privacy_config(context=None):
     per-node metrics are suppressed/bucketed by default (disclosure backstop).
     """
     manifest = _load_manifest(context)
+    if manifest.get("semantic-randomness-contract") != "dsflower-semantic-randomness-v3":
+        raise ValueError("Node manifest requires semantic-randomness-contract v3; drain and restage pre-0.7.1 jobs")
+
     epsilon = float(manifest.get("privacy-epsilon", 0.0))
     delta = float(manifest.get("privacy-delta", 0.0))
     clipping_norm = float(manifest.get("privacy-clipping_norm", 1.0))
@@ -862,7 +919,9 @@ def load_run_pins(context=None):
     if loss_name == "bce_logits" and n_classes != 2:
         raise ValueError("bce_logits is binary only; use cross_entropy")
 
-    return {
+    from .strategy import canonical_local_strategy, validate_prox_horizon
+    pins = {
+        "strategy": canonical_local_strategy(manifest, "neural"),
         "loss_name": loss_name,
         "batch_size": bounded_int("batch-size", _MAX_BATCH_SIZE),
         "local_epochs": bounded_int("local-epochs", _MAX_LOCAL_EPOCHS),
@@ -872,6 +931,8 @@ def load_run_pins(context=None):
         "optimizer": optimizer_config,
         "scheduler": scheduler_config,
     }
+    validate_prox_horizon(pins)
+    return pins
 
 
 def _cv_execution_contract(manifest):
@@ -1153,7 +1214,7 @@ def load_pinned_run_config(context=None):
         strategy_fields = {
             "strategy", "strategy-eta", "strategy-eta-l",
             "strategy-beta-1", "strategy-beta-2", "strategy-tau",
-            "strategy-server-learning-rate", "strategy-server-momentum",
+            "strategy-server-learning-rate", "strategy-server-momentum", "strategy-mu",
         }
         manifest_strategy = {
             key for key in strategy_fields if key in manifest}
@@ -1249,6 +1310,13 @@ def load_pinned_run_config(context=None):
     # The analyst-facing Flower config may name a module for the researcher-side
     # ServerApp, but node execution accepts only the package name derived and
     # written by flowerTier2PinDS after installation/hash verification.
+    from .strategy import canonical_local_strategy
+    track = str(manifest.get("dp-track", "neural")).lower()
+    expected_local = canonical_local_strategy(manifest, track)
+    supplied_local = canonical_local_strategy(cfg, track)
+    if expected_local != supplied_local:
+        raise ValueError("Flower local strategy does not match node manifest pin")
+    cfg.pop("strategy-mu", None)
     cfg.pop("user-module", None)
     keys = (
         "segmentation-alpha", "segmentation-smooth", "mask-vocabulary",
@@ -1294,7 +1362,7 @@ def load_pinned_run_config(context=None):
         "cv-contract-sha256", "cv-validation-bins", "cv-n-nodes",
         "cv-job-sha256", "strategy", "strategy-eta", "strategy-eta-l",
         "strategy-beta-1", "strategy-beta-2", "strategy-tau",
-        "strategy-server-learning-rate", "strategy-server-momentum",
+        "strategy-server-learning-rate", "strategy-server-momentum", "strategy-mu",
     )
     for key in keys:
         if key in manifest:

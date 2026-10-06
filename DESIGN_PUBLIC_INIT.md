@@ -1,5 +1,10 @@
 # Public initialisation routes — dsFlower 0.7.0
 
+0.7.1 integration note: incoming training arrays are admitted and content-bound
+without expected round-one equality checks. Checkpoint artifact admission stays
+intact; current release identity, initialization and partitions follow SEEDING.md.
+
+
 Token: `FLOWER_PUBLIC_INIT_2026-09-23`. This design is written before implementation,
 against the binding audit `thesis-tasks/RESOURCES_ANALYSIS.md` §§1, 3 and 5.
 It supersedes the earlier draft in this workspace. Both repositories start at
@@ -10,7 +15,9 @@ v0.6.0 and use `feat/public-initialisation-routes`.
 Replace `public:<id>` and its registry beside the node secret with two explicitly
 admitted routes for the trusted segmentation decoder contract. The ordinary
 public-model channel still carries initial arrays. No changes to the DP mechanism,
-accountant, clipping, sampling, training algorithms, release cache or identity v2.
+accountant, clipping or sampling. The integrated 0.7.1 release uses identity v3,
+re-keys the existing Hook cache without changing retention, and implements the
+public FedProx processing described in the package README.
 Content canonicalisation has its own explicit version. No resource bytes,
 credentials or storage locators appear in node status. C1 also removes ordinary
 vision-backbone weight downloads; missing verified encoder material fails closed.
@@ -61,8 +68,9 @@ explicit public-material ingress under the analyst policy, never resource admiss
 Local paths never enter node configuration. The node verifies and snapshots the
 bundle in its protected checkpoint cache; no file is placed beside the node secret.
 The coordinator initializes the ordinary Flower public arrays from its local copy.
-The trusted runner repeats snapshot verification before private access and hashes
-and compares the first-round incoming tensors with the admitted checkpoint.
+In 0.7.1 the trusted runner repeats snapshot verification before private access.
+Incoming training arrays retain geometry, dtype and value admission; their actual
+contents enter the release identity, without an expected round-one equality check.
 Manifest/release records say `initialisation = "analyst-declared"` and contain the
 canonical digests and public provenance. Later rounds use normal federated updates.
 
@@ -99,7 +107,8 @@ The coordinator obtains its weights independently through researcher-local
 `public_checkpoint_file`, checked against every node's admitted public identity.
 That file grants no node authority. Status returns only identity, provenance and
 tensor geometry. The runner reopens/re-verifies protected artifacts before private
-access and checks first-round tensor equality. Manifest/release records say
+access. Incoming training tensors are content-bound without first-round equality
+verification. Manifest/release records say
 `initialisation = "resource:<canonical-manifest-digest>"`.
 
 ## Custodian policy and encoders

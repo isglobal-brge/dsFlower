@@ -27,6 +27,29 @@ sys.path.insert(0, FLOWER_APP)
 from dsflower_runner import (client_app, dp_harness, egress_child,
                              model_spec, params, seeding, task, tier2_lib,
                              vision, server_app)  # noqa: E402
+from v3_test_support import fixture_node_secret, fixture_key, tagged_arrays, source_sidecar
+
+
+def _admit_fixture_source(directory, frame=None):
+    """Write mandatory v3 source pins for a synthetic loader fixture."""
+    path = os.path.join(directory, "manifest.json")
+    with open(path) as handle:
+        manifest = json.load(handle)
+    staged = os.path.join(directory, manifest.get("data_file", manifest.get("samples_file")))
+    if frame is None:
+        frame = pd.read_csv(staged, dtype={manifest.get("patient_column", ""): str},
+                            keep_default_na=False)
+    elif manifest.get("data_format") == "parquet":
+        frame.to_parquet(staged, index=False)
+    else:
+        frame.to_csv(staged, index=False)
+    target = manifest["target_column"]
+    targets = target if isinstance(target, list) else [target]
+    columns = ([column for column in manifest.get("feature_columns", [])
+                if column != manifest.get("patient_column")] + targets)
+    source_sidecar(directory, manifest, frame, columns=columns)
+    with open(path, "w") as handle:
+        json.dump(manifest, handle)
 
 
 def _hook_wire(app_params=None, rounds=2, task_type="classification",
@@ -68,6 +91,7 @@ def _package_hash(package_dir):
 class ManifestPrivacyContractTests(unittest.TestCase):
     def test_adjacency_and_hook_resource_limits_are_server_pinned(self):
         manifest = {
+            "semantic-randomness-contract": seeding.SEMANTIC_CONTRACT,
             "privacy-policy-sha256": "1" * 64,
             "privacy-epsilon": 1.0,
             "privacy-delta": 1e-5,
@@ -474,7 +498,7 @@ class NeuralSemanticConfigTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (1, 1024))
 
     def test_resampling_geometry_is_a_sticky_seed_axis_only_when_present(self):
-        cfg = {"model-spec-b64": "e30=", "loss-name": "bce_logits"}
+        cfg = {"model-spec-b64": base64.b64encode(json.dumps({"layers": [{"op": "linear", "out": "@out"}]}).encode()).decode(), "num-features": 2, "loss-name": "bce_logits"}
         pins = {"round_index": 1, "batch_size": 2}
         privacy = {"policy_hash": "1" * 64, "n_samples": 8}
         public = (np.asarray([0.25, -0.5], dtype=np.float32),)
@@ -486,10 +510,11 @@ class NeuralSemanticConfigTests(unittest.TestCase):
         def derive(geometry):
             config, _ = client_app._neural_seed_contract(
                 cfg, pins, privacy, geometry_n_units=geometry, manifest={})
-            return seeding.master_seed(
-                "neural-dpsgd/v1", config, {"policy_hash": "1" * 64}, 1,
+            return fixture_key(
+                "neural-dpsgd/v3", config, {"policy_hash": "1" * 64, "epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, 1,
+                geometry={"accounting_n_units": geometry},
                 public_arrays=public, private_arrays=private,
-                execution_fingerprint={"runtime": "fixed-test"})
+                execution_fingerprint="fixed-test-execution-v3")
 
         with mock.patch.object(
                 seeding, "_node_secret", return_value=b"\x51" * 32):
@@ -502,7 +527,7 @@ class NeuralSemanticConfigTests(unittest.TestCase):
 
 
 class DpSgdAccountingTests(unittest.TestCase):
-    def test_master_seed_tracks_effective_not_raw_dpsgd_policy(self):
+    def test_v3_key_binds_raw_policy_and_effective_dpsgd_geometry(self):
         config = {"run": {"loss-name": "mse"}, "pins": {"round_index": 1}}
         public = (np.asarray([0.25, -0.5], dtype=np.float32),)
         private = (np.asarray([[1.0, 2.0]], dtype=np.float32),)
@@ -519,10 +544,11 @@ class DpSgdAccountingTests(unittest.TestCase):
                     epsilon=raw_policy["epsilon"], delta=raw_policy["delta"],
                     **values)
             mechanism["privacy_unit"] = "row"
-            return seeding.master_seed(
-                "neural-dpsgd/v1", config, mechanism, 1,
+            return fixture_key(
+                "neural-dpsgd/v3", config, {**raw_policy, "clipping_norm": values["clipping_norm"]}, 1,
+                geometry={"accounting_n_units": values["n_samples"], "noise_multiplier": noise},
                 public_arrays=public, private_arrays=private,
-                execution_fingerprint={"runtime": "fixed-test"})
+                execution_fingerprint="fixed-test-execution-v3")
 
         first_policy = {
             "epsilon": 1.0, "delta": 1e-5, "policy_hash": "1" * 64,
@@ -538,7 +564,7 @@ class DpSgdAccountingTests(unittest.TestCase):
             changed_clip = derive(first_policy, 1.25, clipping_norm=3.0)
             changed_geometry = derive(first_policy, 1.25, n_samples=16)
 
-        self.assertEqual(first, same_effective)
+        self.assertNotEqual(first, same_effective)
         self.assertNotEqual(first, changed_sigma)
         self.assertNotEqual(first, changed_clip)
         self.assertNotEqual(first, changed_geometry)
@@ -980,8 +1006,11 @@ class FiniteGateTests(unittest.TestCase):
                 expected_X, expected_y = reference(X, y, groups, loss_name)
                 actual_X, actual_y = client_app._pool_by_patient(
                     X, y, groups, loss_name)
-                np.testing.assert_allclose(actual_X, expected_X, rtol=0, atol=0)
-                np.testing.assert_array_equal(actual_y, expected_y)
+                # Content-keyed unit order is independent of input patient order.
+                actual_order = np.argsort(actual_X[:, 0])
+                expected_order = np.argsort(expected_X[:, 0])
+                np.testing.assert_allclose(actual_X[actual_order], expected_X[expected_order], rtol=0, atol=0)
+                np.testing.assert_array_equal(actual_y[actual_order], expected_y[expected_order])
 
     def test_public_hook_arrays_are_bounded_and_finite(self):
         valid = client_app._validate_public_egress_arrays([
@@ -1138,6 +1167,9 @@ class StrictNeuralInitializationTests(unittest.TestCase):
                 vision.extractor_profile_for("resnet18"),
             "num-features": 512, "image-size": 16,
         }
+        context = SimpleNamespace(state=RecordDict())
+        pins = {"n_classes": 2, "round_index": 1}
+        public_model = torch.nn.Linear(512, 1)
         cases = (
             RuntimeError("dependency unavailable"),
             (FixedEncoder(512), 1024),
@@ -1151,6 +1183,8 @@ class StrictNeuralInitializationTests(unittest.TestCase):
                      else mock.Mock(return_value=build_result))
             with self.subTest(build_result=build_result), \
                     mock.patch.object(vision, "build_backbone", build), \
+                    mock.patch.object(task, "_load_manifest", return_value={}), \
+                    mock.patch.object(client_app, "_initial_model_hash", return_value="a" * 64), \
                     mock.patch.object(
                         vision, "pick_device", return_value=torch.device("cpu")), \
                     mock.patch.object(
@@ -1158,7 +1192,7 @@ class StrictNeuralInitializationTests(unittest.TestCase):
                         side_effect=AssertionError("private read")) as private:
                 with self.assertRaises(RuntimeError):
                     client_app._train_neural(
-                        None, cfg, {}, {"n_classes": 2}, object(), 512, True,
+                        context, cfg, {"epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, pins, public_model, 512, True,
                         on_private_start=callback)
             callback.assert_not_called()
             private.assert_not_called()
@@ -1175,43 +1209,34 @@ class StrictNeuralInitializationTests(unittest.TestCase):
                 vision, "pick_device", return_value=torch.device("cpu")), \
                 mock.patch.object(
                     client_app, "load_image_collection",
-                    side_effect=private_after_callback) as private:
+                    side_effect=private_after_callback) as private, \
+                mock.patch.object(task, "_load_manifest", return_value={}), \
+                mock.patch.object(client_app, "_initial_model_hash", return_value="a" * 64):
             with self.assertRaisesRegex(RuntimeError, "private read sentinel"):
                 client_app._train_neural(
-                    None, cfg, {}, {"n_classes": 2}, object(), 512, True,
+                    context, cfg, {"epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, pins, public_model, 512, True,
                     on_private_start=callback)
-        private.assert_called_once_with(None)
+        private.assert_called_once_with(context)
 
-    def test_prepare_neural_model_seed_is_independent_of_raw_privacy(self):
+    def test_prepare_neural_model_accepts_admitted_arrays_without_node_seed(self):
         model = torch.nn.Linear(2, 1)
         msg = SimpleNamespace(content=RecordDict({
             "arrays": ArrayRecord(numpy_ndarrays=self._model_arrays(model)),
         }))
-        cfg = {"data-kind": "tabular", "model-spec-b64": "e30="}
-        pcfg = {"policy_hash": "1" * 64, "n_samples": 4}
+        cfg = {"data-kind": "tabular"}
         pins = {"round_index": 1, "loss_name": "mse"}
-        original_contract = client_app._neural_seed_contract
-
-        with (mock.patch.object(client_app.task_module, "_load_manifest", return_value={}),
-              mock.patch.object(client_app, "is_image_run", return_value=False),
+        rng_before = torch.random.get_rng_state().clone()
+        with (mock.patch.object(client_app, "is_image_run", return_value=False),
               mock.patch.object(client_app, "_neural_input_dim", return_value=2),
-              mock.patch.object(client_app, "_neural_seed_contract",
-                                wraps=original_contract) as seed_contract,
-              mock.patch.object(client_app.seeding, "master_seed",
-                                return_value=b"\x61" * 32) as master_seed,
-              mock.patch.object(client_app.seeding, "seed_torch"),
-              mock.patch.object(client_app, "load_user_model",
-                                return_value=model)):
+              mock.patch.object(client_app.seeding, "_node_secret",
+                                side_effect=AssertionError("public admission uses no secret")),
+              mock.patch.object(client_app, "load_user_model", return_value=model)):
             prepared, input_dim, manifest_image = client_app._prepare_neural_model(
-                msg, None, cfg, pcfg, pins)
-
+                msg, None, cfg, {"epsilon": 1.0}, pins)
         self.assertIs(prepared, model)
         self.assertEqual(input_dim, 2)
         self.assertFalse(manifest_image)
-        seed_contract.assert_called_once_with(cfg, pins, {}, manifest={})
-        self.assertEqual(master_seed.call_args.args[2], {
-            "policy_hash": client_app._NEURAL_PUBLIC_INIT_POLICY_HASH,
-        })
+        torch.testing.assert_close(torch.random.get_rng_state(), rng_before, rtol=0, atol=0)
 
     def test_invalid_neural_initial_model_is_rejected_before_private_read(self):
         # Shapes and dtype match a Linear(2,1), but magnitude is hostile.
@@ -1245,8 +1270,6 @@ class StrictNeuralInitializationTests(unittest.TestCase):
               mock.patch.object(client_app, "load_run_pins", return_value=pins),
               mock.patch.object(client_app, "is_image_run", return_value=False),
               mock.patch.object(client_app, "_neural_input_dim", return_value=2),
-              mock.patch.object(client_app.seeding, "master_seed",
-                                return_value=b"m" * 32),
               mock.patch.object(client_app.seeding, "seed_torch"),
               mock.patch.object(client_app, "load_user_model", return_value=model),
               mock.patch.object(client_app, "load_data",
@@ -1310,6 +1333,7 @@ class StrictNeuralInitializationTests(unittest.TestCase):
             "loss_name": "mse", "batch_size": 2, "local_epochs": 1,
             "num_rounds": 1, "n_classes": 2, "learning_rate": 0.01,
         }
+        X, y, _ = tagged_arrays(X, y)
         model = torch.nn.Linear(1, 1)
         effective = {
             "policy_hash": "3" * 64,
@@ -1331,12 +1355,15 @@ class StrictNeuralInitializationTests(unittest.TestCase):
               mock.patch.object(
                   client_app.dp_harness, "effective_dpsgd_mechanism",
                   return_value=effective.copy()) as mechanism,
-              mock.patch.object(client_app.seeding, "master_seed",
-                                return_value=b"m" * 32) as master_seed,
+              mock.patch.object(client_app, "_initial_model_hash", return_value="a" * 64),
+              mock.patch.object(client_app.seeding, "request_identity", wraps=seeding.request_identity) as request,
+              mock.patch.object(client_app.seeding, "bind_private_data", wraps=seeding.bind_private_data) as binding,
+              mock.patch.object(client_app.seeding, "release_key",
+                                return_value=b"m" * 32) as release_key,
               mock.patch.object(client_app, "_dp_fit",
                                 return_value=([np.zeros(1)], 2)) as fit):
             result = client_app._train_neural(
-                SimpleNamespace(), {}, pcfg,
+                SimpleNamespace(state=RecordDict()), {}, pcfg,
                 {**pins, "round_index": 1}, model,
                 input_dim=1, manifest_image=False)
 
@@ -1346,13 +1373,14 @@ class StrictNeuralInitializationTests(unittest.TestCase):
         mechanism.assert_called_once_with(
             epsilon=1.0, delta=1e-5, clipping_norm=1.0,
             n_samples=2, batch_size=2, local_epochs=1, num_rounds=1)
-        self.assertEqual(master_seed.call_args.args[0], "neural-dpsgd/v1")
-        self.assertEqual(master_seed.call_args.args[1]["request-selection"],
+        self.assertEqual(request.call_args.args[0], "neural-dpsgd/v3")
+        self.assertEqual(request.call_args.args[1]["request-selection"],
                          seeding.request_selection({"target_column": "outcome"}))
-        self.assertEqual(master_seed.call_args.args[2], {
-            **effective, "privacy_unit": "row",
-        })
-        private_arrays = master_seed.call_args.kwargs["private_arrays"]
+        self.assertEqual(request.call_args.args[2], pcfg)
+        self.assertIsInstance(release_key.call_args.args[0], seeding.RequestIdentity)
+        self.assertIsInstance(release_key.call_args.args[1], seeding.DataBinding)
+        self.assertEqual(binding.call_args.kwargs["geometry"]["noise_multiplier"], 1.75)
+        private_arrays = binding.call_args.kwargs["effective_tensors"]
         np.testing.assert_array_equal(private_arrays[0], X)
         np.testing.assert_array_equal(private_arrays[1], y.astype(np.float32))
         self.assertEqual(fit.call_args.kwargs["noise_multiplier"], 1.75)
@@ -1833,6 +1861,8 @@ class HookAppPublicConfigTests(unittest.TestCase):
                   np.zeros(2, dtype=np.float32), None)),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
               mock.patch.object(client_app.task_module, "_load_manifest", return_value={}),
+              mock.patch.object(client_app, "_initial_model_hash", return_value="a" * 64),
+              mock.patch.object(tier2_lib, "hook_request_identity", return_value=object()),
               mock.patch.object(tier2_lib, "hook_master_seed",
                                 return_value=b"m" * 32),
               mock.patch.object(tier2_lib, "hook_execution_seed",
@@ -2134,11 +2164,12 @@ class PatientIdGateTests(unittest.TestCase):
                     "dp-unit": "patient",
                     "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
+            _admit_fixture_source(manifest_dir)
             _, _, groups = task.load_data(
                 context, include_unit_ids=True)
             self.assertEqual(
-                groups.tolist(),
-                ["p1", task._MISSING_PATIENT_UNIT],
+                sorted(groups.tolist()),
+                sorted(["p1", task._MISSING_PATIENT_UNIT]),
             )
 
             pd.DataFrame({
@@ -2160,9 +2191,10 @@ class PatientIdGateTests(unittest.TestCase):
                     "dp-unit": "patient",
                     "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
+            _admit_fixture_source(manifest_dir)
             _, _, groups = task.load_image_collection(context)
             self.assertEqual(
-                groups.tolist(), ["p1", task._MISSING_PATIENT_UNIT])
+                sorted(groups.tolist()), sorted(["p1", task._MISSING_PATIENT_UNIT]))
 
     def test_csv_patient_ids_are_lossless_and_match_pinned_roster(self):
         with tempfile.TemporaryDirectory() as manifest_dir:
@@ -2181,10 +2213,11 @@ class PatientIdGateTests(unittest.TestCase):
                     "patient-id-canonicalization": "trim-utf8-v2",
                     "n_units": 3,
                 }, handle)
+            _admit_fixture_source(manifest_dir)
             context = SimpleNamespace(
                 node_config={"manifest-dir": manifest_dir})
             _, _, ids = task.load_data(context, include_unit_ids=True)
-            self.assertEqual(ids.tolist(), ["001", "1", "N/A"])
+            self.assertEqual(sorted(ids.tolist()), ["001", "1", "N/A"])
             task.assert_pinned_unit_count(context, 3, ids)
 
     def test_pinned_roster_mismatch_is_structural_failure(self):
@@ -2248,10 +2281,10 @@ class PatientIdGateTests(unittest.TestCase):
                     "dp-unit": "row", "patient_column": None,
                     "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
+            _admit_fixture_source(root)
             context = SimpleNamespace(node_config={"manifest-dir": root})
             paths, labels, groups = task.load_image_collection(context)
-            self.assertEqual(paths, [None, os.path.realpath(corrupt)])
-            np.testing.assert_array_equal(labels, np.asarray([0, 1], np.float32))
+            self.assertEqual(dict(zip(paths, labels)), {None: 0., os.path.realpath(corrupt): 1.})
             self.assertIsNone(groups)
 
             with mock.patch.object(
@@ -2551,11 +2584,13 @@ class PublicTargetTests(unittest.TestCase):
                     "dp-unit": "patient", "patient_column": "patient_id",
                     "patient-id-canonicalization": "trim-utf8-v2",
                 }, handle)
+            _admit_fixture_source(manifest_dir)
             context = SimpleNamespace(
                 node_config={"manifest-dir": manifest_dir})
             X, y = task.load_data(context)
-            np.testing.assert_array_equal(X, np.asarray([[1], [2]], np.float32))
-            np.testing.assert_array_equal(y, np.asarray([0, 1], np.float32))
+            p = np.argsort(X[:, 0])
+            np.testing.assert_array_equal(X[p], np.asarray([[1], [2]], np.float32))
+            np.testing.assert_array_equal(y[p], np.asarray([0, 1], np.float32))
 
     def test_combined_tabular_loader_reads_once_and_preserves_units(self):
         frame = pd.DataFrame({
@@ -2583,6 +2618,7 @@ class PublicTargetTests(unittest.TestCase):
                             "patient_column": patient_column,
                             "patient-id-canonicalization": "trim-utf8-v2",
                         }, handle)
+                    _admit_fixture_source(manifest_dir, frame)
                     context = SimpleNamespace(
                         node_config={"manifest-dir": manifest_dir})
                     with mock.patch.object(
@@ -2592,14 +2628,15 @@ class PublicTargetTests(unittest.TestCase):
                             context, include_unit_ids=True)
 
                     read_frame.assert_called_once()
+                    p = np.argsort(X[:, 0])
                     np.testing.assert_array_equal(
-                        X, np.asarray([[1], [2]], np.float32))
+                        X[p], np.asarray([[1], [2]], np.float32))
                     np.testing.assert_array_equal(
-                        y, np.asarray([0, 1], np.float32))
+                        y[p], np.asarray([0, 1], np.float32))
                     if privacy_unit == "row":
                         self.assertIsNone(unit_ids)
                     else:
-                        self.assertEqual(unit_ids.tolist(), ["001", "p2"])
+                        self.assertEqual(unit_ids[p].tolist(), ["001", "p2"])
 
 
 class PatientPartitionTests(unittest.TestCase):

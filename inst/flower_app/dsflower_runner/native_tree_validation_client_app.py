@@ -187,6 +187,8 @@ def _validate_node_manifest(request, manifest, message_config):
 
 
 def _pinned_public_model(msg, context):
+    from .strategy import canonical_local_strategy
+    canonical_local_strategy(dict(context.run_config), "validation")
     message_config = _exact_message_config(msg)
     manifest = task._load_manifest(context)
     raw_config = dict(context.run_config)
@@ -246,8 +248,12 @@ def train(msg: Message, context: Context) -> Message:
     try:
         model, layout, node_manifest, cfg = _pinned_public_model(msg, context)
         pcfg = task.load_privacy_config(context)
-        features, target, unit_ids = task.load_native_tree_data(
-            context, manifest=node_manifest)
+        identity = validation.build_validation_request(
+            layout, epsilon=pcfg["epsilon"], delta=pcfg["delta"],
+            request_selection=seeding.request_selection(node_manifest),
+            manifest=node_manifest)
+        features, target, unit_ids, units = task.load_native_tree_data(
+            context, manifest=node_manifest, include_canonical_units=True)
         predictions = np.asarray(model.predict(features), dtype=np.float64)
         target_bounds = (validation.target_bounds_from_config(cfg)
                          if layout["task"] == "regression" else None)
@@ -255,7 +261,8 @@ def train(msg: Message, context: Context) -> Message:
             target, predictions, layout, epsilon=pcfg["epsilon"],
             delta=pcfg["delta"], target_bounds=target_bounds,
             num_releases=1, unit_ids=unit_ids,
-            request_selection=seeding.request_selection(node_manifest))
+            request_selection=seeding.request_selection(node_manifest),
+            request_identity=identity, source_units=units)
         return _reply(msg, released.astype(np.float64), True)
     except Exception:
         # Never expose paths, parser diagnostics, private counts or exceptions.

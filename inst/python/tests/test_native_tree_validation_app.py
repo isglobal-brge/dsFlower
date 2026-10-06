@@ -28,6 +28,14 @@ from dsflower_runner import native_tree_validation_server_app as server_app
 from test_xgboost_predictor import _ensemble, _manifest, _member, _schema
 
 
+def _dump_manifest(manifest, handle):
+    from v3_test_support import source_sidecar
+    directory = os.path.dirname(handle.name)
+    frame = pd.read_csv(os.path.join(directory, manifest["data_file"]))
+    source_sidecar(directory, manifest, frame)
+    json.dump(manifest, handle)
+
+
 def _canonical(value):
     return json.dumps(
         value, ensure_ascii=True, allow_nan=False, sort_keys=True,
@@ -130,6 +138,7 @@ def _node_manifest(task_name, pins):
         "n_samples": 4, "privacy-adjacency": "replace_one",
         "privacy-epsilon": 1.0, "privacy-delta": 1.0e-6,
         "privacy-clipping_norm": 1.0,
+        "semantic-randomness-contract": "dsflower-semantic-randomness-v3",
         "privacy-policy-sha256": "a" * 64,
         **pins,
     }
@@ -182,7 +191,7 @@ def _write_contract(root, task_name, rows=None):
         handle.write(profile)
     with open(os.path.join(root, "manifest.json"), "w",
               encoding="utf-8") as handle:
-        json.dump(_node_manifest(task_name, pins), handle)
+        _dump_manifest(_node_manifest(task_name, pins), handle)
     return request, artifact, profile, pins
 
 
@@ -200,6 +209,17 @@ def _vector_reply(request, vector):
             np.asarray(vector, dtype=np.float64)]),
         "metrics": MetricRecord({"available": 1, "num-examples": 1}),
     }), reply_to=request)
+
+
+_TEST_UNIT_KEY = mock.patch("dsflower_runner.seeding._node_secret", return_value=b"unit-order-test-secret-v3........"[:32])
+
+
+def setUpModule():
+    _TEST_UNIT_KEY.start()
+
+
+def tearDownModule():
+    _TEST_UNIT_KEY.stop()
 
 
 class _Grid:
@@ -281,7 +301,7 @@ class NativeTreeValidationClientTests(unittest.TestCase):
             self.assertEqual(dict(reply.content["metrics"]), {
                 "available": 1, "num-examples": 1})
 
-    def test_request_contract_separates_noise_and_row_order_replays(self):
+    def test_contract_digest_alias_and_row_order_replay_but_private_change_rekeys(self):
         with tempfile.TemporaryDirectory() as root, \
                 tempfile.TemporaryDirectory() as results_dir:
             _request, artifact, _profile_bytes, pins = _write_contract(
@@ -303,17 +323,25 @@ class NativeTreeValidationClientTests(unittest.TestCase):
                 frame = pd.read_csv(os.path.join(root, "train.csv"))
                 frame.iloc[::-1].to_csv(
                     os.path.join(root, "train.csv"), index=False)
-                np.testing.assert_array_equal(first, release())
                 manifest_path = os.path.join(root, "manifest.json")
                 with open(manifest_path, encoding="utf-8") as handle:
                     manifest = json.load(handle)
+                with open(manifest_path, "w", encoding="utf-8") as handle:
+                    _dump_manifest(manifest, handle)
+                np.testing.assert_array_equal(first, release())
                 manifest["validation-contract-sha256"] = "d" * 64
                 with open(manifest_path, "w", encoding="utf-8") as handle:
-                    json.dump(manifest, handle)
+                    _dump_manifest(manifest, handle)
                 cfg["validation-contract-sha256"] = "d" * 64
                 context.run_config = cfg
                 second = release()
-            self.assertFalse(np.array_equal(first, second))
+                self.assertEqual(first.tobytes(), second.tobytes())
+                frame.loc[0, "age"] += 0.1
+                frame.to_csv(os.path.join(root, "train.csv"), index=False)
+                with open(manifest_path, "w", encoding="utf-8") as handle:
+                    _dump_manifest(manifest, handle)
+                changed = release()
+            self.assertNotEqual(first.tobytes(), changed.tobytes())
 
     def test_regression_target_bounds_come_from_the_node_manifest(self):
         with tempfile.TemporaryDirectory() as root, \

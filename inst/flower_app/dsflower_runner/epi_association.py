@@ -194,6 +194,30 @@ def association_sufficient_vector(
         outcome, exposure, *, outcome_levels, exposure_levels,
         privacy_unit, unit_ids=None):
     """Return the canonical 3x3 sufficient vector before DP release."""
+    from . import canonical_units
+    units = canonical_units.source_units(outcome, exposure)
+    if units is None:
+        outcome_values = _private_vector(outcome, "outcome")
+        exposure_values = _private_vector(exposure, "exposure")
+        if outcome_values.shape != exposure_values.shape:
+            raise ValueError("association outcome and exposure lengths differ")
+        encoded_rows = {}
+        def source_rows():
+            for o, e in zip(outcome_values, exposure_values):
+                key = (type(o), o, type(e), e)
+                encoded = encoded_rows.get(key)
+                if encoded is None:
+                    values = tuple(float(v) if isinstance(v, (int, float, np.number))
+                                   and not isinstance(v, (bool, np.bool_)) else v
+                                   for v in (o, e))
+                    encoded = canonical_units.encode_row(values)
+                    encoded_rows[key] = encoded
+                yield encoded
+        units = canonical_units.canonicalize_units(source_rows(), unit_ids=unit_ids)
+        order = units.row_permutation
+        outcome, exposure = outcome_values[order], exposure_values[order]
+        if unit_ids is not None:
+            unit_ids = np.asarray(unit_ids)[order]
     outcome_codes = _encode_binary(outcome, outcome_levels, "outcome")
     exposure_codes = _encode_binary(exposure, exposure_levels, "exposure")
     if outcome_codes.shape != exposure_codes.shape:
@@ -206,13 +230,14 @@ def association_sufficient_vector(
             raise ValueError(
                 "row-level association must not carry patient identifiers")
     else:
-        inverse, units = _patient_inverse(unit_ids, rows)
-        outcome_codes = _patient_codes(outcome_codes, inverse, units)
-        exposure_codes = _patient_codes(exposure_codes, inverse, units)
+        inverse, count = _patient_inverse(unit_ids, rows)
+        outcome_codes = _patient_codes(outcome_codes, inverse, count)
+        exposure_codes = _patient_codes(exposure_codes, inverse, count)
 
     cells = exposure_codes.astype(np.int64) * 3 + outcome_codes
     vector = np.bincount(cells, minlength=9)[:9].astype(np.float64)
     vector = np.ascontiguousarray(vector, dtype=np.float64)
+    vector = canonical_units.attach_units(vector, units)
     vector.setflags(write=False)
     return vector
 
@@ -233,14 +258,27 @@ def _canonical_sufficient_vector(value):
 
 
 def private_association_vector(
-        sufficient, *, privacy_unit, epsilon, delta, request_selection=None):
+        sufficient, *, privacy_unit, epsilon, delta, request_selection=None,
+        request_identity=None, source_units=None):
     """Apply the sole sticky joint Gaussian release for one node."""
+    from . import canonical_units, seeding
+    units = source_units or canonical_units.source_units(sufficient)
+    layout = association_layout(privacy_unit)
+    identity = request_identity or seeding.request_identity(
+        "association-vector", {"layout": layout,
+            "mechanism-profile": layout, "request-selection": request_selection},
+        {"epsilon": epsilon, "delta": delta, "unit": privacy_unit},
+        execution_fingerprint=EXECUTION_PROFILE)
     raw = _canonical_sufficient_vector(sufficient)
+    binding = seeding.bind_private_data(
+        identity, units, effective_tensors=(raw,),
+        geometry={"vector_size": 9})
     released, sigma = tree_release.joint_gaussian_release(
         raw, mechanism=MECHANISM, layout=association_layout(privacy_unit),
         epsilon=epsilon, delta=delta, sensitivity=SENSITIVITY,
         num_releases=1, execution_fingerprint=EXECUTION_PROFILE,
-        request_selection=request_selection)
+        request_selection=request_selection, request_identity=identity,
+        data_binding=binding)
     vector = np.ascontiguousarray(released, dtype=np.float64).reshape(9)
     if not bool(np.all(np.isfinite(vector))):
         raise RuntimeError("private association release is non-finite")
@@ -326,7 +364,8 @@ def _pooled_vector(vectors):
     checked = [_released_vector(value) for value in vectors]
     if not checked:
         raise ValueError("no private association vectors are available")
-    stacked = np.stack(checked, axis=0).astype(np.float64, copy=False)
+    from .aggregation import vector_key
+    stacked = np.stack(sorted(checked, key=vector_key), axis=0).astype(np.float64, copy=False)
     scale = np.max(np.abs(stacked), axis=0)
     normalized = np.divide(
         stacked, scale, out=np.zeros_like(stacked), where=scale > 0.0)
@@ -380,7 +419,7 @@ def build_pooled_association_result(
             return result
         pooled = _pooled_vector(vectors)
         pooled_sigma = 0.0
-        for sigma in checked_sigmas:
+        for sigma in sorted(checked_sigmas):
             pooled_sigma = math.hypot(pooled_sigma, sigma)
         if not math.isfinite(pooled_sigma) or pooled_sigma <= 0.0:
             return result

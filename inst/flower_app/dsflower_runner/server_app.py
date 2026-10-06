@@ -16,6 +16,8 @@ a bounded portable weight record and history (neural/egress), or pooled DP
 metrics only (validation).
 """
 
+from . import aggregation
+
 import hashlib
 import json
 import math
@@ -84,55 +86,9 @@ def _save_portable_arrays(results_dir, arrays, round_number):
 # --------------------------------------------------------------------------- #
 
 def _build_initial_model(cfg):
-    """Seed the global model's array SHAPES from the researcher's declarative spec
-    (DATA, node-built by model_spec). Random initialization is the default; public
-    segmentation uses the node-verified checkpoint relayed through status. The
-    nodes independently rebuild/verify and enforce all DP + hardening. No
-    researcher code is imported here."""
-    try:
-        import model_spec
-    except ImportError:
-        from . import model_spec
-    if str(cfg.get("data-kind", "")).lower() == "image":
-        from . import vision
-        _backbone, _image_size, in_dim = vision.require_extractor_config(
-            cfg.get("backbone", cfg.get("model", "resnet18")),
-            cfg.get("vision-extractor-profile"), cfg.get("num-features"),
-            cfg.get("image-size"))
-    else:
-        in_dim = int(cfg.get("num-features", 0))
-        if in_dim <= 0:
-            raise ValueError("num-features must be set in the run config "
-                             "(the researcher passes len(feature_columns)).")
-    spec = model_spec.read_spec(cfg)
-    loss_name = str(cfg.get("loss-name", "bce_logits"))
-    out_dim = model_spec.output_width(loss_name, cfg)
-    num_labels = int(cfg["num-labels"]) if cfg.get("num-labels") is not None else None
-    spatial = {}
-    if loss_name == "segmentation_bce_dice":
-        from . import segmentation
-        segmentation.validate_config(cfg)
-        segmentation.configure_runtime()
-        spatial["output_shape"] = segmentation.OUTPUT_SHAPE
-    if loss_name in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
-        # Public fixed initialization makes exact benchmark twins reproducible.
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(0)
-            model = model_spec.build_from_spec(
-                spec, in_dim=in_dim, out_dim=out_dim, num_labels=num_labels,
-                output_limit=model_spec.output_limit_for_loss(loss_name))
-    else:
-        model = model_spec.build_from_spec(spec, in_dim=in_dim, out_dim=out_dim,
-                                           num_labels=num_labels, **spatial)
-    if not isinstance(model, torch.nn.Module):
-        raise ValueError("build_from_spec must return a torch.nn.Module")
-    from . import segmentation_checkpoints
-    if segmentation_checkpoints.checkpoint_id(cfg) is not None:
-        from .params import set_torch_params
-        arrays = segmentation_checkpoints.server_initialization(cfg)
-        if arrays is not None:
-            set_torch_params(model, arrays)
-    return model
+    """Build the reproducible public default; nodes admit incoming arrays separately."""
+    from .initialisation import build_initial_model
+    return build_initial_model(cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,7 +154,7 @@ def _run_validation(grid, cfg):
             continue
     if len(replies) != expected or len(vectors) != expected:
         return None, expected, False
-    stacked = np.stack(vectors, axis=0).astype(np.float64, copy=False)
+    stacked = np.stack(sorted(vectors, key=aggregation.vector_key), axis=0).astype(np.float64, copy=False)
     scale = np.max(np.abs(stacked), axis=0)
     normalized = np.divide(
         stacked, scale, out=np.zeros_like(stacked), where=scale > 0.0)
@@ -236,7 +192,7 @@ def _pool_private_vectors(vectors, size):
         if vector.shape != (int(size),) or not bool(np.all(np.isfinite(vector))):
             raise RuntimeError("private validation vector has invalid geometry")
         checked.append(vector)
-    stacked = np.stack(checked, axis=0).astype(np.float64, copy=False)
+    stacked = np.stack(sorted(checked, key=aggregation.vector_key), axis=0).astype(np.float64, copy=False)
     scale = np.max(np.abs(stacked), axis=0)
     normalized = np.divide(
         stacked, scale, out=np.zeros_like(stacked), where=scale > 0.0)
@@ -288,8 +244,6 @@ def _run_holdout(grid, cfg, final_arrays, training_roster):
     if (len(replies) != expected or len(set(sources)) != expected
             or set(sources) != {int(value) for value in node_ids}):
         raise RuntimeError("holdout replies do not match the training roster")
-    replies = [reply for _, reply in sorted(
-        zip(sources, replies), key=lambda item: item[0])]
     vectors = []
     for reply in replies:
         if reply.has_error():
@@ -342,8 +296,13 @@ def _initial_arrays(cfg, track):
         public_cfg = tier2_lib.public_hook_config(dict(cfg), round_index=0)
         user_mod = tier2_lib.load_user_module(str(cfg["user-module"]))
         n = int(cfg.get("num-features", 0))
-        arrays = [np.asarray(a, dtype=np.float64)
-                  for a in user_mod.initial_arrays(public_cfg, n)]
+        from .initialisation import (hook_initialisation_contract,
+                                     isolated_public_rng, public_initialisation_seed)
+        contract = hook_initialisation_contract(cfg, public_cfg, user_mod)
+        with isolated_public_rng(public_initialisation_seed(
+                cfg, application_init_contract=contract)):
+            arrays = [np.asarray(a, dtype=np.float64)
+                      for a in user_mod.initial_arrays(public_cfg, n)]
         return None, ArrayRecord(numpy_ndarrays=arrays)
     model = _build_initial_model(cfg)
     return model, ArrayRecord(numpy_ndarrays=get_torch_params(model))
@@ -352,8 +311,8 @@ def _initial_arrays(cfg, track):
 # Selectable server-side aggregation. Every strategy here runs ONLY on the
 # already-DP client updates, on the researcher's SuperLink -- so by the DP
 # post-processing theorem the per-node (epsilon, delta) guarantee is unchanged.
-# The strategy is pure aggregation, never a privacy knob. FedProx is excluded
-# (it needs a node-side proximal term).
+# The strategy is pure aggregation, never a privacy knob. FedProx uses FedAvg
+# aggregation and applies its proximal step on each node.
 
 
 class _RequireCompleteTrain:
@@ -471,6 +430,7 @@ class _RequireCompleteTrain:
                 raise RuntimeError(
                     "Hook execution is not available on every configured node; "
                     "refusing to report an unchanged model as trained.")
+        replies.sort(key=aggregation.reply_key)
         arrays, metrics = super().aggregate_train(server_round, replies)
         self._round_input_arrays.pop(int(server_round), None)
         self._round_expected_nodes.pop(int(server_round), None)
@@ -503,13 +463,16 @@ class _StrictFedAvgM(_RequireCompleteTrain, FedAvgM):
 _STRATEGIES = {
     "fedavg": _StrictFedAvg, "fedadam": _StrictFedAdam,
     "fedadagrad": _StrictFedAdagrad, "fedyogi": _StrictFedYogi,
-    "fedavgm": _StrictFedAvgM,
+    "fedavgm": _StrictFedAvgM, "fedprox": _StrictFedAvg,
 }
 
 
 def _build_strategy(cfg, min_nodes, track=None, stable_roster=False,
                     required_roster=None, operation=None, fold=0):
+    from .strategy import canonical_local_strategy
+    canonical_local_strategy(cfg, track or "neural")
     name = str(cfg.get("strategy", "fedavg")).lower()
+    if name == "prox": name = "fedprox"
     if name not in _STRATEGIES:
         raise ValueError(f"Unsupported aggregation strategy: {name}")
     common = dict(
@@ -553,24 +516,8 @@ def _build_strategy(cfg, min_nodes, track=None, stable_roster=False,
 
 
 def _cross_validation_initial_arrays(cfg, fold):
-    """Build one clean deterministic public initialization for a CV fold."""
-    material = {
-        "contract": str(cfg.get("cv-contract-sha256", "")),
-        "fold": int(fold),
-        "loss": str(cfg.get("loss-name", "")),
-        "model_spec": str(cfg.get("model-spec-b64", "")),
-        "num_classes": int(cfg.get("num-classes", 2)),
-        "num_features": int(cfg.get("num-features", 0)),
-        "num_labels": int(cfg.get("num-labels", 2)),
-    }
-    wire = json.dumps(
-        material, allow_nan=False, ensure_ascii=False, sort_keys=True,
-        separators=(",", ":")).encode("utf-8")
-    seed = int.from_bytes(hashlib.sha256(
-        b"dsflower/cv-public-init/v1\x00" + wire).digest()[:8], "big")
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        model = _build_initial_model(cfg)
+    """Every CV fold starts from the same clean public initial model."""
+    model = _build_initial_model(cfg)
     return model, ArrayRecord(numpy_ndarrays=get_torch_params(model))
 
 

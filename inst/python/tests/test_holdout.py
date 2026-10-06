@@ -19,7 +19,43 @@ if FLOWER_APP not in sys.path:
     sys.path.insert(0, FLOWER_APP)
 
 from dsflower_runner import (client_app, dp_harness, release_guard, resampling,
-                             server_app, validation, vision)  # noqa: E402
+                             server_app, validation, vision, canonical_units)  # noqa: E402
+
+
+def _context():
+    directory = tempfile.TemporaryDirectory()
+    return SimpleNamespace(state=RecordDict(), run_config={},
+                           node_config={"manifest-dir": directory.name}, _directory=directory)
+
+
+def _source_fixture(X, y, ids=None):
+    """Admitted numerical loader fixture with explicit full source metadata.
+
+    Partition unit tests control the row order and assignment masks themselves;
+    canonical execution ordering is independently exercised by loader tests.
+    """
+    numeric = np.asarray(X)
+    if numeric.dtype.kind not in "biuf":
+        # Synthetic image paths stand for selected decoded fixtures here; real
+        # raster content/packaging is exercised in test_canonical_units.
+        records = [canonical_units.encode_row((str(path), float(target)))
+                   for path, target in zip(X, y)]
+        units = canonical_units.canonicalize_units(records, unit_ids=ids, secret=b"f" * 32)
+    else:
+        units = canonical_units.canonicalize_arrays(X, y, ids, secret=b"f" * 32)
+    return (canonical_units.attach_units(X, units),
+            canonical_units.attach_units(y, units), ids)
+
+
+_REAL_EFFECTIVE = client_app.dp_harness.effective_dpsgd_mechanism
+
+
+def _fixed_sigma_geometry(sigma):
+    def mechanism(**kwargs):
+        with mock.patch.object(client_app.dp_harness, "_cached_noise_multiplier", return_value=sigma):
+            return _REAL_EFFECTIVE(**kwargs)
+    return mechanism
+
 
 
 class PartitionTests(unittest.TestCase):
@@ -62,37 +98,40 @@ class PartitionTests(unittest.TestCase):
             first, resampling.holdout_mask(
                 contract, n_rows=len(ids), unit_ids=ids))
 
-    def test_row_assignment_depends_only_on_ordinal_and_contract(self):
+    def test_row_assignment_depends_on_content_and_replays_after_shuffle(self):
         contract = self.contract(unit="row", numerator=500000)
-        first = resampling.holdout_mask(contract, n_rows=128)
-        replay = resampling.holdout_mask(contract, n_rows=128)
-        changed_values = np.linspace(-1e9, 1e9, 128)  # never an input axis
-        del changed_values
+        rows = [[float(index)] for index in range(128)]
+        tokens = canonical_units.canonicalize_units(rows).row_tokens
+        shuffled = canonical_units.canonicalize_units(list(reversed(rows))).row_tokens
+        first = resampling.holdout_mask(contract, n_rows=128, assignment_tokens=tokens)
+        replay = resampling.holdout_mask(contract, n_rows=128, assignment_tokens=shuffled)
         np.testing.assert_array_equal(first, replay)
         self.assertTrue(bool(np.any(first)))
         self.assertTrue(bool(np.any(~first)))
 
     def test_fraction_changes_are_nested_not_partition_rerolls(self):
+        tokens = canonical_units.canonicalize_units([[float(i)] for i in range(4096)]).row_tokens
         small = resampling.holdout_mask(
-            self.contract(unit="row", numerator=200000), n_rows=4096)
+            self.contract(unit="row", numerator=200000), n_rows=4096, assignment_tokens=tokens)
         large = resampling.holdout_mask(
-            self.contract(unit="row", numerator=300000), n_rows=4096)
+            self.contract(unit="row", numerator=300000), n_rows=4096, assignment_tokens=tokens)
         self.assertTrue(bool(np.all(~small | large)))
         self.assertGreater(int(np.sum(large)), int(np.sum(small)))
 
     def test_partition_opens_the_custodial_secret_once_not_per_row(self):
+        tokens = canonical_units.canonicalize_units([[float(i)] for i in range(4096)]).row_tokens
         original = resampling.seeding._node_secret
         with mock.patch.object(
                 resampling.seeding, "_node_secret", wraps=original) as read_secret:
             resampling.holdout_mask(
-                self.contract(unit="row", numerator=200000), n_rows=4096)
+                self.contract(unit="row", numerator=200000), n_rows=4096, assignment_tokens=tokens)
         self.assertEqual(read_secret.call_count, 1)
 
     def test_contract_rejects_seed_fields_and_hash_drift(self):
         contract = self.contract()
         self.assertEqual(
             contract["sha256"],
-            "00b0a490eb3d92fec7ce532e452523a32cbf73d19953372194faffc21eb4c75b")
+            "186917c9bc324525e7c7563c5cb8339fee755bc856a1fecd0af59b5e5488c703")
         with self.assertRaisesRegex(ValueError, "field|seed"):
             resampling.validate_holdout_contract({**contract, "seed": 7})
         with self.assertRaisesRegex(ValueError, "SHA-256"):
@@ -182,6 +221,11 @@ class ReleaseGuardHoldoutTests(unittest.TestCase):
 
 
 class NeuralHoldoutTests(unittest.TestCase):
+    def setUp(self):
+        secret = mock.patch.object(client_app.seeding, "_node_secret", return_value=b"f" * 32)
+        secret.start()
+        self.addCleanup(secret.stop)
+
     def test_training_receives_only_complement_and_evaluation_only_test(self):
         X = np.arange(12, dtype=np.float32).reshape(6, 2)
         y = np.asarray([0, 1, 0, 1, 0, 1], dtype=np.float32)
@@ -212,7 +256,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                     "patient_column": "patient", "dp-unit": "patient"}
         captured = {}
         with (mock.patch.object(
-                  client_app, "load_data", return_value=(X, y, patient_ids)),
+                  client_app, "load_data", return_value=_source_fixture(X, y, patient_ids)),
               mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value=manifest),
               mock.patch.object(client_app, "get_torch_params",
@@ -237,7 +281,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                                        "include_zero_neighbor"))
                    or (np.ones(layout["size"]), 1.0)))):
             released = client_app._holdout_neural_release(
-                None, cfg, {"epsilon": 0.4, "delta": 2e-6}, pins,
+                _context(), cfg, {"epsilon": 0.4, "delta": 2e-6}, pins,
                 model, input_dim=2)
 
         np.testing.assert_array_equal(captured["y"], y[mask])
@@ -321,10 +365,10 @@ class NeuralHoldoutTests(unittest.TestCase):
                           client_app.resampling, "holdout_mask_from_context",
                           return_value=np.ones(len(y), dtype=bool)),
                       mock.patch.object(
-                          client_app, "load_data", return_value=(X, y, groups)),
+                          client_app, "load_data", return_value=_source_fixture(X, y, groups)),
                       mock.patch.object(
                           client_app, "load_image_collection",
-                          return_value=(paths, y, groups)),
+                          return_value=_source_fixture(paths, y, groups)),
                       mock.patch.object(
                           vision, "prepare_backbone",
                           return_value=(object(), 32, False, "cpu")),
@@ -336,14 +380,14 @@ class NeuralHoldoutTests(unittest.TestCase):
                           return_value=({}, {})),
                       mock.patch.object(
                           client_app.dp_harness, "effective_dpsgd_mechanism",
-                          return_value={"noise_multiplier": 1.75}) as mechanism,
+                          side_effect=_fixed_sigma_geometry(1.75)) as mechanism,
                       mock.patch.object(
-                          client_app.seeding, "master_seed",
+                          client_app.seeding, "release_key",
                           return_value=b"\x3d" * 32) as seed,
                       mock.patch.object(client_app, "_dp_fit",
                                         side_effect=noise_only_fit) as fit):
                     arrays, n_examples = client_app._train_neural(
-                        None, cfg, pcfg, pins, model, input_dim=2,
+                        _context(), cfg, pcfg, pins, model, input_dim=2,
                         manifest_image=manifest_image,
                         on_private_start=callback)
 
@@ -397,10 +441,10 @@ class NeuralHoldoutTests(unittest.TestCase):
                           client_app.task_module, "_load_manifest",
                           return_value=manifest),
                       mock.patch.object(
-                          client_app, "load_data", return_value=(X, y, groups)),
+                          client_app, "load_data", return_value=_source_fixture(X, y, groups)),
                       mock.patch.object(
                           client_app, "load_image_collection",
-                          return_value=(paths, y, groups)),
+                          return_value=_source_fixture(paths, y, groups)),
                       mock.patch.object(
                           client_app.task_module, "assert_pinned_unit_count"),
                       mock.patch.object(
@@ -415,13 +459,13 @@ class NeuralHoldoutTests(unittest.TestCase):
                       mock.patch.object(
                           dp_harness, "compute_output_sigma", return_value=1.0),
                       mock.patch.object(
-                          client_app.seeding, "master_seed",
+                          client_app.seeding, "release_key",
                           return_value=b"\x5a" * 32),
                       mock.patch.object(
                           validation, "private_validation_vector",
                           wraps=validation.private_validation_vector) as release):
                     arrays = client_app._holdout_neural_release(
-                        None, cfg, {"epsilon": 0.4, "delta": 2e-6},
+                        _context(), cfg, {"epsilon": 0.4, "delta": 2e-6},
                         {"loss_name": "cross_entropy"},
                         model, input_dim=2,
                         on_private_start=callback)
@@ -432,6 +476,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                 self.assertEqual(release.call_count, 1)
                 self.assertEqual(release.call_args.args[0].shape, (0,))
                 self.assertEqual(release.call_args.args[1].shape, (0, 2))
+                self.assertIs(release.call_args.kwargs["include_zero_neighbor"], True)
                 self.assertEqual(
                     release.call_args.kwargs["request_selection"],
                     client_app.seeding.request_selection(manifest))
@@ -467,7 +512,7 @@ class NeuralHoldoutTests(unittest.TestCase):
             return [np.asarray([1.0])], len(values)
 
         with (mock.patch.object(client_app, "load_data",
-                                return_value=(X, y, None)),
+                                return_value=_source_fixture(X, y, None)),
               mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": len(y)}),
               mock.patch.object(client_app.task_module,
@@ -476,8 +521,8 @@ class NeuralHoldoutTests(unittest.TestCase):
                                 return_value=({}, {})),
               mock.patch.object(
                   client_app.dp_harness, "effective_dpsgd_mechanism",
-                  return_value={"noise_multiplier": 1.5}) as mechanism,
-              mock.patch.object(client_app.seeding, "master_seed",
+                  side_effect=_fixed_sigma_geometry(1.5)) as mechanism,
+              mock.patch.object(client_app.seeding, "release_key",
                                 side_effect=(b"\x51" * 32, b"\x52" * 32)),
               mock.patch.object(client_app, "_dp_fit", side_effect=fit)):
             for mask in (
@@ -487,7 +532,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                         client_app.resampling, "holdout_mask_from_context",
                         return_value=mask):
                     client_app._train_neural(
-                        None, cfg, pcfg, pins, torch.nn.Linear(2, 1),
+                        _context(), cfg, pcfg, pins, torch.nn.Linear(2, 1),
                         input_dim=2, manifest_image=False)
 
         self.assertEqual(mechanism.call_count, 2)
@@ -527,7 +572,7 @@ class NeuralHoldoutTests(unittest.TestCase):
             return [np.asarray([1.0])], len(target)
 
         with (mock.patch.object(
-                  client_app, "load_data", return_value=(X, y, None)),
+                  client_app, "load_data", return_value=_source_fixture(X, y, None)),
               mock.patch.object(client_app.task_module, "_load_manifest",
                                 return_value={"n_units": 6}),
               mock.patch.object(client_app.task_module, "assert_pinned_unit_count"),
@@ -540,12 +585,12 @@ class NeuralHoldoutTests(unittest.TestCase):
                                 return_value=({}, {})) as seed_contract,
               mock.patch.object(client_app.dp_harness,
                                 "effective_dpsgd_mechanism",
-                                return_value={"noise_multiplier": 1.0}),
-              mock.patch.object(client_app.seeding, "master_seed",
+                                side_effect=_fixed_sigma_geometry(1.0)),
+              mock.patch.object(client_app.seeding, "release_key",
                                 return_value=b"semantic-master"),
               mock.patch.object(client_app, "_dp_fit", side_effect=fake_fit)):
             client_app._train_neural(
-                None, cfg, pcfg, pins, model, input_dim=2,
+                _context(), cfg, pcfg, pins, model, input_dim=2,
                 manifest_image=False)
 
         np.testing.assert_array_equal(captured["X"], X[~mask])
@@ -553,7 +598,7 @@ class NeuralHoldoutTests(unittest.TestCase):
         self.assertEqual(captured["n_staged"], len(y))
         self.assertEqual(captured["geometry_n_units"], len(y))
         seed_contract.assert_called_once_with(
-            cfg, pins, pcfg, geometry_n_units=len(y), manifest={"n_units": 6})
+            cfg, pins, pcfg, manifest={"n_units": 6})
 
     def test_patient_replacement_keeps_fixed_dp_sampling_geometry(self):
         import torch
@@ -599,11 +644,11 @@ class NeuralHoldoutTests(unittest.TestCase):
                                 side_effect=lambda values, ignored: values),
               mock.patch.object(
                   client_app.resampling, "holdout_mask_from_context",
-                  side_effect=lambda context, n_rows, unit_ids:
+                  side_effect=lambda context, n_rows, unit_ids, **kwargs:
                   np.isin(unit_ids, ["c", "e"])),
               mock.patch.object(client_app, "_neural_seed_contract",
                                 return_value=({}, {})),
-              mock.patch.object(client_app.seeding, "master_seed",
+              mock.patch.object(client_app.seeding, "release_key",
                                 return_value=b"\x39" * 32),
               mock.patch.object(dp_harness, "_cached_noise_multiplier",
                                 return_value=1.75),
@@ -614,9 +659,9 @@ class NeuralHoldoutTests(unittest.TestCase):
                 model._dsflower_release_keys = tuple(
                     name for name, _ in torch.nn.Module.named_parameters(model))
                 with mock.patch.object(
-                        client_app, "load_data", return_value=(X, y, roster)):
+                        client_app, "load_data", return_value=_source_fixture(X, y, roster)):
                     client_app._train_neural(
-                        None, cfg, pcfg, pins, model, input_dim=2,
+                        _context(), cfg, pcfg, pins, model, input_dim=2,
                         manifest_image=False)
 
         self.assertEqual([item["subset-units"] for item in captured], [3, 2])
@@ -632,7 +677,7 @@ class NeuralHoldoutTests(unittest.TestCase):
               mock.patch.object(client_app, "load_data") as load,
               self.assertRaisesRegex(ValueError, "privacy-unit count")):
             client_app._train_neural(
-                None, {"resampling-contract-sha256": "a" * 64}, {},
+                _context(), {"resampling-contract-sha256": "a" * 64}, {},
                 {"loss_name": "bce_logits", "n_classes": 2}, object(),
                 input_dim=2, manifest_image=False)
         load.assert_not_called()
@@ -671,7 +716,7 @@ class NeuralHoldoutTests(unittest.TestCase):
 
                 def load(_context):
                     events.append("paths")
-                    return paths, y, groups
+                    return _source_fixture(paths, y, groups)
 
                 def extract(_encoder, selected_paths, _size, got_3d, **_kwargs):
                     events.append("decode")
@@ -704,12 +749,12 @@ class NeuralHoldoutTests(unittest.TestCase):
                                         return_value=({}, {})),
                       mock.patch.object(
                           client_app.dp_harness, "effective_dpsgd_mechanism",
-                          return_value={"noise_multiplier": 1.0}),
-                      mock.patch.object(client_app.seeding, "master_seed",
+                          side_effect=_fixed_sigma_geometry(1.0)),
+                      mock.patch.object(client_app.seeding, "release_key",
                                         return_value=b"vision-master"),
                       mock.patch.object(client_app, "_dp_fit", side_effect=fit)):
                     client_app._train_neural(
-                        None, cfg, pcfg, pins, model, input_dim=2,
+                        _context(), cfg, pcfg, pins, model, input_dim=2,
                         manifest_image=True,
                         on_private_start=lambda: events.append("private"))
 
@@ -751,7 +796,7 @@ class NeuralHoldoutTests(unittest.TestCase):
 
                 def load(_context):
                     events.append("paths")
-                    return paths, y, groups
+                    return _source_fixture(paths, y, groups)
 
                 def extract(_encoder, selected_paths, _size, got_3d, **_kwargs):
                     events.append("decode")
@@ -793,7 +838,7 @@ class NeuralHoldoutTests(unittest.TestCase):
                           validation, "private_validation_vector",
                           side_effect=release)):
                     released = client_app._holdout_neural_release(
-                        None, cfg, {"epsilon": 0.4, "delta": 2e-6}, pins,
+                        _context(), cfg, {"epsilon": 0.4, "delta": 2e-6}, pins,
                         object(), input_dim=2,
                         on_private_start=lambda: events.append("private"))
 

@@ -1,7 +1,7 @@
 """Durable exact replies for gated Hooks, with public admission reservations.
 
 Only released arrays and constant metrics are cached. Keys are independent
-subkeys of the v2 semantic master; no master or noise key is stored. SQLite
+subkeys of the v3 semantic master; no master or noise key is stored. SQLite
 commits precede replies, and persistent run pins survive process crashes.
 The configured quota covers encoded replies and conservative metadata charges;
 SQLite journals and filesystem allocation overhead need additional disk space.
@@ -44,7 +44,7 @@ def cache_key(master):
         from . import seeding
     except ImportError:  # Direct module tests; CLI admission never imports it.
         import seeding
-    return seeding.sub_seed(master, "gated-release-cache-key/v1").hex()
+    return seeding.sub_seed(master, "gated-release-cache-key/v3").hex()
 
 
 def run_fingerprint(run_token):

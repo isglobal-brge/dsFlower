@@ -41,7 +41,7 @@ from .params import get_torch_params, set_torch_params, load_user_model
 # sys.path / PYTHONPATH cannot shadow dp_harness and execute in the parent at
 # ClientApp import time. (The ClientApp is always loaded as a package -- see the relative
 # .task / .params imports above.)
-from . import (dp_harness, release_cache, release_guard, resampling, seeding,
+from . import (canonical_units, dp_harness, release_cache, release_guard, resampling, seeding,
                task as task_module, validation)
 
 
@@ -320,27 +320,21 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
             + ("an image collection" if manifest_image else "tabular")
             + ". Use a vision model for imaging collections, a tabular model otherwise.")
     input_dim = _neural_input_dim(context, cfg, manifest_image)
-    seed_config, _ = _neural_seed_contract(
-        cfg, pins, {}, manifest=task_module._load_manifest(context))
-    public_master = seeding.master_seed(
-        "neural-public-init/v1", seed_config,
-        {"policy_hash": _NEURAL_PUBLIC_INIT_POLICY_HASH},
-        int(pins["round_index"]))
-    seeding.seed_torch(seeding.sub_seed(public_master, "init"))
     checkpoint_arrays = None
     from . import segmentation_checkpoints
     if (pins["loss_name"] == "segmentation_bce_dice"
             or segmentation_checkpoints.checkpoint_id(cfg) is not None):
-        checkpoint_arrays, checkpoint_summary = segmentation_checkpoints.verify_node_checkpoint(
+        checkpoint_arrays, _checkpoint_summary = segmentation_checkpoints.verify_node_checkpoint(
             cfg, task_module._load_manifest(context))
         if checkpoint_arrays is not None and pins["loss_name"] == "segmentation_bce_dice":
             from . import segmentation
             segmentation.verified_encoder_bytes(cfg)
-    model = load_user_model(cfg, input_dim, pins["loss_name"])
-    initial_arrays = _validate_public_neural_arrays(msg.content["arrays"], model)
-    if checkpoint_arrays is not None and int(pins["round_index"]) == 1:
-        validation.assert_checkpoint_arrays(initial_arrays, checkpoint_arrays, checkpoint_summary)
-        set_torch_params(model, checkpoint_arrays)
+    # The skeleton is public; the admitted incoming weights are authoritative.
+    with torch.random.fork_rng(devices=[]):
+        model = load_user_model(cfg, input_dim, pins["loss_name"])
+    # Checkpoint integrity/provenance above does not constrain the analyst's
+    # admitted initial model bytes. Those bytes are semantic inputs bound in R.
+    _validate_public_neural_arrays(msg.content["arrays"], model)
     return model, input_dim, manifest_image
 
 
@@ -493,6 +487,11 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master, noise_multiplier,
     # Validated non-negative; both 0 -> identical to the plain path.
     l1_penalty = float(pins["optimizer"]["l1_penalty"])
     model = model.to(device)
+    from .strategy import NONE, apply_neural_prox, validate_prox_horizon
+    local_strategy = pins.get("strategy", NONE)
+    validate_prox_horizon(pins)
+    reference = ({id(p): p.detach().clone() for p in model.parameters()}
+                 if local_strategy["mu"] else None)
     optimizer = _build_optimizer(model, pins)
     dataset = TensorDataset(torch.from_numpy(X).float(),
                             _prep_target(y, loss_name, int(pins["n_classes"])))
@@ -560,6 +559,9 @@ def _dp_fit(model, X, y, pcfg, pins, n_staged, cfg, master, noise_multiplier,
                     thr = l1_penalty * current_lr
                     for p in model.parameters():
                         p.copy_(torch.sign(p) * torch.clamp(p.abs() - thr, min=0.0))
+                if local_strategy["mu"]:
+                    apply_neural_prox(optimizer, reference, local_strategy)
+                    _assert_finite_release(model)
     # RELEASE-TIME gate (the load-time assert_releasable is NOT enough on its own:
     # a buffer / frozen param / new parameter registered lazily inside the
     # researcher's forward appears only AFTER load, and Opacus noises ONLY the
@@ -611,11 +613,17 @@ def _pool_by_patient(X, y, groups, loss_name):
     outcomes use a deterministic mode, and multilabel outcomes use majority per
     label. These are local preprocessing operations on one privacy unit.
     """
+    from .canonical_units import source_units, canonicalize_arrays, attach_units
+    units = source_units(X, y)
+    if units is None:
+        units = canonicalize_arrays(X, y, groups)
+        order = units.row_permutation
+        X, y, groups = np.asarray(X)[order], np.asarray(y)[order], np.asarray(groups)[order]
     g = np.asarray(
         [task_module._canonical_patient_id(gv) for gv in groups],
         dtype=object)
-    # Assign compact group indices in first-appearance order.  Aggregation then
-    # becomes O(rows) rather than scanning all rows once per patient.
+    # The loader has ordered whole source units and rows within each patient.
+    # First appearance now follows that canonical order, including reductions.
     group_index = {}
     inverse = np.empty(len(g), dtype=np.intp)
     for row, key in enumerate(g.tolist()):
@@ -660,7 +668,7 @@ def _pool_by_patient(X, y, groups, loss_name):
         yp = np.zeros(n_groups, dtype=np.float64)
         np.add.at(yp, inverse, np.asarray(values, dtype=np.float64))
         yp /= counts
-    return Xp, np.asarray(yp, dtype=y.dtype)
+    return attach_units(Xp, units), attach_units(np.asarray(yp, dtype=y.dtype), units)
 
 
 def _effective_feature_bounds(cfg):
@@ -700,6 +708,85 @@ def _apply_feature_bounds(X, cfg):
     return _totalize_private_features(X)
 
 
+def _initial_model_hash(context, arrays, round_index, fold=None):
+    """Retain the admitted initial content hash, never recompute expected weights."""
+    import stat
+    key = "dsflower-initial-model-v3-" + (str(fold) if fold is not None else "ordinary")
+    digest = seeding.public_array_identity(arrays)["sha256"]
+    record = context.state.get(key)
+    directory = release_guard._manifest_dir(context)
+    path = os.path.join(directory, key + ".json")
+    if int(round_index) == 1:
+        encoded = json.dumps({"sha256": digest}, sort_keys=True).encode("ascii")
+        import tempfile
+        descriptor, temporary = tempfile.mkstemp(prefix=".initial-model-", dir=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                pass
+        finally:
+            os.unlink(temporary)
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 256 or seeding._is_windows_reparse_point(info) or (os.name == "posix" and (
+                info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600)):
+            raise RuntimeError("initial model content pin is unsafe")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0))
+        with os.fdopen(descriptor, "r", encoding="ascii") as handle:
+            opened = os.fstat(handle.fileno())
+            if not seeding._same_file_identity(info, opened, windows=os.name == "nt"):
+                raise RuntimeError("initial model content pin changed while opening")
+            durable = seeding.decode_json(handle.read(256))
+        if set(durable) != {"sha256"} or seeding._POLICY_HASH.fullmatch(durable["sha256"]) is None:
+            raise ValueError("invalid digest")
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("initial model content pin is unavailable or corrupt") from exc
+    if (int(round_index) == 1 and durable["sha256"] != digest) or (record is not None and dict(record) != durable):
+        raise RuntimeError("initial model changed within a training coordinate")
+    context.state[key] = ConfigRecord(durable)
+    return durable["sha256"]
+
+
+def _private_training_geometry(effective, n_staged, units, local_epochs):
+    return {"n_staged_rows": int(n_staged), "n_privacy_units": len(units.records),
+        "accounting_n_units": effective["accounting_population"],
+        "sample_rate": effective["sample_rate"],
+        "steps_per_round": effective["steps_per_epoch"] * int(local_epochs),
+        "expected_batch_size": effective["expected_batch_size"],
+        "total_steps": effective["total_steps"], "noise_multiplier": effective["noise_multiplier"]}
+
+
+def _source_partition(context, units, holdout):
+    ids = None if units.unit_ids is None else [patient for patient, span in zip(units.unit_ids, units.unit_slices) for _ in range(span.stop-span.start)]
+    method = resampling.holdout_mask_from_context if holdout else resampling.cross_validation_folds_from_context
+    return method(context, n_rows=len(units.row_tokens), unit_ids=ids, assignment_tokens=units.row_tokens)
+
+
+def _parent_source_binding(context, units, holdout=False):
+    assignment = _source_partition(context, units, holdout)
+    digest = hashlib.sha256()
+    seeding._update_arrays(digest, "assignment", [assignment])
+    value = {"units-sha256": units.multiset_digest, "assignment-sha256": digest.hexdigest()}
+    key = "dsflower-resampling-source-v3"
+    previous = context.state.get(key)
+    if previous is not None and dict(previous) != value:
+        raise RuntimeError("resampling source content changed between phases")
+    context.state[key] = ConfigRecord(value)
+    return digest.hexdigest()
+
+
+def _training_subset(context, units, holdout, fold):
+    if not holdout and fold is None:
+        return {"role": "all", "assignment_sha256": None}
+    return {"role": "train", "assignment_sha256": _parent_source_binding(context, units, holdout)}
+
+
 def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
                   cv_fold=None, on_private_start=None):
     if pins.get("loss_name") == "segmentation_bce_dice":
@@ -725,6 +812,14 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
             raise ValueError(
                 "resampling requires a positive pinned privacy-unit count")
 
+    manifest = task_module._load_manifest(context)
+    seed_config, _ = _neural_seed_contract(cfg, pins, pcfg, manifest=manifest)
+    seed_config["operation"] = "cv-train" if has_cv else "train"
+    seed_config["fold"] = cv_fold
+    seed_config["initial-model-sha256"] = _initial_model_hash(context, get_torch_params(model), pins["round_index"], cv_fold)
+    request = seeding.request_identity("neural-dpsgd/v3", seed_config, pcfg,
+        int(pins["round_index"]), public_arrays=get_torch_params(model), manifest=manifest)
+
     survival_run = pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
     if survival_run and manifest_image:
         raise ValueError("survival image inputs are unsupported")
@@ -748,6 +843,7 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
     if not survival_run:
         n_staged = len(y)                      # pre-pool staged count (== manifest n_samples)
 
+    units = canonical_units.source_units(values, y)
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=groups, manifest=resampling_manifest)
     if has_holdout:
@@ -780,9 +876,6 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         seed_target = np.asarray(y, dtype=np.int64)
     else:
         seed_target = np.asarray(y, dtype=np.float32)
-    seed_config, _ = _neural_seed_contract(
-        cfg, pins, pcfg, geometry_n_units=geometry_n_units,
-        manifest=task_module._load_manifest(context))
     accounting_population = (len(y) if geometry_n_units is None
                              else int(geometry_n_units))
     effective_privacy = dp_harness.effective_dpsgd_mechanism(
@@ -793,11 +886,11 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
         num_rounds=int(pins["num_rounds"]))
     effective_privacy["privacy_unit"] = (
         "patient" if groups is not None else "row")
-    master = seeding.master_seed(
-        "neural-dpsgd/v1", seed_config, effective_privacy,
-        int(pins["round_index"]),
-        public_arrays=get_torch_params(model),
-        private_arrays=(np.asarray(X, dtype=np.float32), seed_target))
+    geometry = _private_training_geometry(effective_privacy, n_staged, units, pins["local_epochs"])
+    binding = seeding.bind_private_data(request, units,
+        effective_tensors=(np.asarray(X, dtype=np.float32), seed_target), geometry=geometry,
+        subset=_training_subset(context, units, has_holdout, cv_fold))
+    master = seeding.release_key(request, binding)
 
     fit_X, fit_y = X, y
     if empty_training:
@@ -834,11 +927,17 @@ def _train_segmentation(context, cfg, pcfg, pins, model, cv_fold=None,
                 if has_holdout or has_cv else None)
     if geometry is not None and geometry < 1:
         raise ValueError("resampling requires a positive pinned privacy-unit count")
+    seed_config, _ = _neural_seed_contract(cfg, pins, pcfg, manifest=manifest)
+    seed_config.update(operation="cv-train" if has_cv else "train", fold=cv_fold)
+    seed_config["initial-model-sha256"] = _initial_model_hash(context, get_torch_params(model), pins["round_index"], cv_fold)
+    request = seeding.request_identity("neural-dpsgd/v3", seed_config, pcfg,
+        int(pins["round_index"]), public_arrays=get_torch_params(model), manifest=manifest)
     encoder, device = segmentation.prepare_encoder(cfg)
     if on_private_start is not None:
         on_private_start()
     X, y, subjects, n_staged = segmentation.load_subject_tensors(context, cfg, encoder, device)
     del encoder
+    units = canonical_units.source_units(X, y)
     if has_holdout:
         X, y, subjects = _holdout_partition(context, X, y, subjects, subset="train")
     elif has_cv:
@@ -851,10 +950,10 @@ def _train_segmentation(context, cfg, pcfg, pins, model, cv_fold=None,
         batch_size=int(pins["batch_size"]), local_epochs=int(pins["local_epochs"]),
         num_rounds=int(pins["num_rounds"]))
     effective["privacy_unit"] = "patient"
-    seed_config, _ = _neural_seed_contract(cfg, pins, pcfg, geometry_n_units=geometry, manifest=manifest)
-    master = seeding.master_seed(
-        "neural-dpsgd/v1", seed_config, effective, int(pins["round_index"]),
-        public_arrays=get_torch_params(model), private_arrays=(X, y))
+    binding = seeding.bind_private_data(request, units, effective_tensors=(X, y),
+        geometry=_private_training_geometry(effective, n_staged, units, pins["local_epochs"]),
+        subset=_training_subset(context, units, has_holdout, cv_fold))
+    master = seeding.release_key(request, binding)
     empty = len(y) == 0
     if empty:
         X = np.zeros((1, segmentation.FEATURE_DIM), dtype=np.float32)
@@ -868,35 +967,41 @@ def _holdout_partition(context, X, y, unit_ids, *, subset):
     """Select one pre-training holdout side without exposing its roster."""
     if subset not in ("train", "test"):
         raise ValueError("holdout subset must be train or test")
+    units = canonical_units.source_units(X, y)
     values = np.asarray(X)
     target = np.asarray(y)
     if values.ndim < 1 or target.ndim < 1 or values.shape[0] != target.shape[0]:
         raise RuntimeError("holdout inputs must share one row axis")
     mask = resampling.holdout_mask_from_context(
-        context, n_rows=int(target.shape[0]), unit_ids=unit_ids)
+        context, n_rows=int(target.shape[0]), unit_ids=unit_ids,
+        assignment_tokens=None if units is None else units.row_tokens)
     selected = mask if subset == "test" else ~mask
     selected_units = (None if unit_ids is None
                       else np.asarray(unit_ids)[selected])
-    return values[selected], target[selected], selected_units
+    return (canonical_units.attach_units(values[selected], units),
+            canonical_units.attach_units(target[selected], units), selected_units)
 
 
 def _cross_validation_partition(context, X, y, unit_ids, *, fold, subset):
     """Select one HMAC-assigned fold side before any model computation."""
     if subset not in ("train", "test"):
         raise ValueError("cross-validation subset must be train or test")
+    units = canonical_units.source_units(X, y)
     values = np.asarray(X)
     target = np.asarray(y)
     if values.ndim < 1 or target.ndim < 1 or values.shape[0] != target.shape[0]:
         raise RuntimeError("cross-validation inputs must share one row axis")
     assigned = resampling.cross_validation_folds_from_context(
-        context, n_rows=int(target.shape[0]), unit_ids=unit_ids)
+        context, n_rows=int(target.shape[0]), unit_ids=unit_ids,
+        assignment_tokens=None if units is None else units.row_tokens)
     fold = int(fold)
     selected = assigned == fold
     if subset == "train":
         selected = ~selected
     selected_units = (None if unit_ids is None
                       else np.asarray(unit_ids)[selected])
-    return values[selected], target[selected], selected_units
+    return (canonical_units.attach_units(values[selected], units),
+            canonical_units.attach_units(target[selected], units), selected_units)
 
 
 def _cv_state_binding(context, layout):
@@ -1019,6 +1124,7 @@ def _load_complete_cv_sufficient(context, layout):
 def _forget_cv_sufficient(context):
     context.state.pop(_CV_OOF_META_KEY, None)
     context.state.pop(_CV_OOF_TOTAL_KEY, None)
+    context.state.pop("dsflower-resampling-source-v3", None)
 
 
 def _evaluation_inputs(context, cfg, input_dim, on_private_start=None):
@@ -1040,7 +1146,8 @@ def _evaluation_inputs(context, cfg, input_dim, on_private_start=None):
     if X.ndim != 2 or int(X.shape[1]) != int(input_dim):
         raise RuntimeError("staged feature width changed before evaluation")
     task_module.assert_pinned_unit_count(context, len(y), patient_ids=ids)
-    X = _apply_feature_bounds(X, cfg)
+    units = canonical_units.source_units(X, y)
+    X = canonical_units.attach_units(_apply_feature_bounds(X, cfg), units)
     if loss in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
         X[y[:, -1] == 0] = 0.0
     return X, y, ids
@@ -1053,6 +1160,8 @@ def _cross_validation_neural_accumulate(context, cfg, pins, model,
         raise RuntimeError("cross-validation image contract is unsupported")
     layout = validation.cross_validation_layout_from_config(cfg)
     X, y, unit_ids = _evaluation_inputs(context, cfg, input_dim, on_private_start)
+    units = canonical_units.source_units(X, y)
+    _parent_source_binding(context, units)
     X, y, unit_ids = _cross_validation_partition(
         context, X, y, unit_ids, fold=int(fold), subset="test")
     predictions = validation.metric_predictions(model, X, y, cfg, layout)
@@ -1064,17 +1173,38 @@ def _cross_validation_neural_accumulate(context, cfg, pins, model,
     return [np.zeros(1, dtype=np.float64)]
 
 
+def _read_cv_public_models(context, layout):
+    # Deliberately does not read the private ArrayRecord holding raw totals.
+    binding = _cv_state_binding(context, layout)
+    meta = context.state.get(_CV_OOF_META_KEY)
+    if not isinstance(meta, ConfigRecord) or any(meta.get(k) != v for k, v in binding.items()):
+        raise RuntimeError("cross-validation public model state is incomplete")
+    models = meta.get("model-digests")
+    if not isinstance(models, list) or len(models) != binding["folds"] or any(
+            not isinstance(item, str) or seeding._POLICY_HASH.fullmatch(item) is None for item in models):
+        raise RuntimeError("cross-validation public model identities are incomplete")
+    return [{"fold": i + 1, "model_sha256": digest} for i, digest in enumerate(models)]
+
+
 def _cross_validation_release(context, cfg, pcfg):
-    """Apply the sole OOF Gaussian release and consume its in-memory state."""
+    """Build public R from fold models before touching the private OOF total."""
+    from types import SimpleNamespace
     layout = validation.cross_validation_layout_from_config(cfg)
+    manifest = task_module._load_manifest(context)
+    models = _read_cv_public_models(context, layout)
+    request = validation.build_validation_request(layout, pcfg["epsilon"], pcfg["delta"],
+        manifest=manifest, operation="cv-oof-release", fold_model_sha256=models,
+        request_selection=seeding.request_selection(manifest))
     try:
+        parent = context.state.get("dsflower-resampling-source-v3")
+        if not isinstance(parent, ConfigRecord):
+            raise RuntimeError("cross-validation source binding is unavailable")
+        units = SimpleNamespace(multiset_digest=parent["units-sha256"])
         raw = _load_complete_cv_sufficient(context, layout)
-        selection = seeding.request_selection(task_module._load_manifest(context))
-        selection["cv-public-model-sha256"] = list(
-            context.state[_CV_OOF_META_KEY]["model-digests"])
-        released, _sigma = validation.private_sufficient_vector(
-            raw, layout, epsilon=pcfg["epsilon"], delta=pcfg["delta"],
-            num_releases=1, request_selection=selection)
+        released, _sigma = validation.private_sufficient_vector(raw, layout,
+            epsilon=pcfg["epsilon"], delta=pcfg["delta"], num_releases=1,
+            include_zero_neighbor=False, request_identity=request, source_units=units,
+            subset={"role": "oof", "assignment_sha256": parent["assignment-sha256"]})
         return [released.astype(np.float64)]
     finally:
         _forget_cv_sufficient(context)
@@ -1084,6 +1214,10 @@ def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim,
                             on_private_start=None):
     """Evaluate the final public aggregate on test units and release one vector."""
     layout = validation.holdout_layout_from_config(cfg)
+    manifest = task_module._load_manifest(context)
+    request = validation.build_validation_request(layout, pcfg["epsilon"], pcfg["delta"],
+        manifest=manifest, operation="holdout-evaluate", public_arrays=get_torch_params(model),
+        request_selection=seeding.request_selection(manifest))
     special = pins["loss_name"] in ("segmentation_bce_dice", "aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll")
     manifest_image = is_image_run(context) and not special
     if special:
@@ -1106,6 +1240,8 @@ def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim,
                 "staged feature width changed before holdout evaluation")
     task_module.assert_pinned_unit_count(
         context, len(y), patient_ids=unit_ids)
+    units = canonical_units.source_units(values, y)
+    assignment_digest = _parent_source_binding(context, units, holdout=True)
     values, y, unit_ids = _holdout_partition(
         context, values, y, unit_ids, subset="test")
     if manifest_image:
@@ -1123,9 +1259,10 @@ def _holdout_neural_release(context, cfg, pcfg, pins, model, input_dim,
     released, _sigma = validation.private_validation_vector(
         y, predictions, layout, epsilon=pcfg["epsilon"], delta=pcfg["delta"],
         target_bounds=bounds, num_releases=1, unit_ids=unit_ids,
-        include_zero_neighbor=privacy_unit == "patient",
+        include_zero_neighbor=True,
         request_selection=seeding.request_selection(task_module._load_manifest(context)),
-        public_arrays=get_torch_params(model))
+        public_arrays=get_torch_params(model), request_identity=request, source_units=units,
+        subset={"role": "test", "assignment_sha256": assignment_digest})
     return [released.astype(np.float64)]
 
 
@@ -1322,6 +1459,10 @@ def train(msg: Message, context: Context) -> Message:
             cache.reserve_run(claim["run_fingerprint"], num_rounds)
             hook_public_ready = True
             module_name = str(cfg["user-module"])
+            hook_request = tier2_lib.hook_request_identity(module_name, old, public_hook_cfg, pcfg_round,
+                request_selection=seeding.request_selection(task_module._load_manifest(context)),
+                manifest=dict(task_module._load_manifest(context), **{
+                    "initial-model-sha256": _initial_model_hash(context, old, claim["release_index"])}))
             hook_started = time.monotonic()
             try:
                 mark_private_started()
@@ -1330,8 +1471,7 @@ def train(msg: Message, context: Context) -> Message:
                 task_module.assert_pinned_unit_count(context, len(y), unit_ids)
                 master = tier2_lib.hook_master_seed(
                     module_name, old, X, y, public_hook_cfg, pcfg_round,
-                    unit_ids=unit_ids, request_selection=seeding.request_selection(
-                        task_module._load_manifest(context)))
+                    unit_ids=unit_ids, request_identity=hook_request)
                 with cache.release(
                         claim["run_fingerprint"], claim["coordinate"],
                         claim["request_id"], release_cache.cache_key(master)) as slot:
@@ -1340,15 +1480,16 @@ def train(msg: Message, context: Context) -> Message:
                     else:
                         execution_seed = tier2_lib.hook_execution_seed(
                             module_name, old, public_hook_cfg, pcfg_round,
-                            request_selection=seeding.request_selection(
-                                task_module._load_manifest(context)))
+                            request_identity=hook_request)
+                        from .strategy import canonical_local_strategy
                         new_arrays = tier2_lib.gated_local_update(
                             module_name, old, X, y, public_hook_cfg, pcfg_round,
-                            seed=seeding.sub_seed(master, "egress"),
+                            seed=seeding.sub_seed(master, "noise"),
                             execution_seed=seeding.sub_seed(
                                 execution_seed, "egress-execution"),
                             hook_caps=hook_caps, unit_ids=unit_ids,
-                            release_started=hook_started, pad_release=False)
+                            release_started=hook_started, pad_release=False,
+                            local_strategy=canonical_local_strategy(cfg, "egress"))
                         metrics = {"num-examples": 1, "hook-executed": 1}
                         slot.commit(new_arrays, metrics)
                         new_arrays, metrics = slot.cached

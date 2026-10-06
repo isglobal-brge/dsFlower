@@ -17,10 +17,22 @@ RUNNER_ROOT = os.path.abspath(os.path.join(
 if RUNNER_ROOT not in sys.path:
     sys.path.insert(0, RUNNER_ROOT)
 
-from dsflower_runner import (client_app, dp_harness, params, seeding, server_app,
+from dsflower_runner import (canonical_units, client_app, dp_harness, params, seeding, server_app,
                              task, validation, vision)  # noqa: E402
 from flwr.common import (ArrayRecord, ConfigRecord, Message, MetricRecord,
                          RecordDict)  # noqa: E402
+
+
+def source_noise_key(raw, layout, sigma, *, source, unit_ids=None,
+                     request_selection=None, public_arrays=()):
+    y, predictions = source
+    units = canonical_units.canonicalize_arrays(predictions, y, unit_ids)
+    request = validation.build_validation_request(layout, 1.0, 1e-5,
+        request_selection=request_selection, public_arrays=public_arrays)
+    binding = seeding.bind_private_data(request, units, effective_tensors=(raw,),
+        geometry={"output_sigma": float(sigma), "vector_size": int(np.asarray(raw).size)})
+    return validation._validation_noise_key(raw, layout, sigma,
+        request_identity=request, data_binding=binding)
 
 
 class ValidationSensitivityTests(unittest.TestCase):
@@ -98,7 +110,8 @@ class ValidationSensitivityTests(unittest.TestCase):
                   validation, "_validation_noise_key", return_value=b"\x00" * 32)):
             validation.private_sufficient_vector(
                 np.zeros(layout["size"]), layout, epsilon=1.0, delta=1e-6,
-                include_zero_neighbor=True)
+                include_zero_neighbor=True, source_units=canonical_units.canonicalize_arrays(
+                    np.zeros((1, 1)), np.zeros(1), secret=b"t" * 32))
         self.assertEqual(sigma.call_args.args[2], math.sqrt(5.0))
 
     def test_layout_caps_dimension(self):
@@ -140,7 +153,7 @@ class ValidationReleaseTests(unittest.TestCase):
             y, predictions, layout, unit_ids=unit_ids)
         sigma = dp_harness.compute_output_sigma(
             1.0, 1e-5, layout["sensitivity"], num_releases=1)
-        return raw, validation._validation_noise_key(raw, layout, sigma)
+        return raw, source_noise_key(raw, layout, sigma, source=(y, predictions), unit_ids=unit_ids)
 
     def test_private_release_requires_custodial_secret(self):
         layout = validation.validation_layout("classification", bins=8)
@@ -183,8 +196,8 @@ class ValidationReleaseTests(unittest.TestCase):
         }
         arrays = [np.zeros((1, 2), dtype=np.float32)]
         selection = seeding.request_selection(manifest)
-        base_key = validation._validation_noise_key(
-            raw, layout, 1.0, request_selection=selection,
+        base_key = source_noise_key(
+            raw, layout, 1.0, source=(y, predictions), request_selection=selection,
             public_arrays=arrays)
         base, sigma = validation.private_validation_vector(
             y, predictions, layout, epsilon=1.0, delta=1e-5,
@@ -205,16 +218,16 @@ class ValidationReleaseTests(unittest.TestCase):
         for changed in alternatives:
             with self.subTest(changed=changed):
                 selected = seeding.request_selection({**manifest, **changed})
-                self.assertNotEqual(base_key, validation._validation_noise_key(
-                    raw, layout, 1.0, request_selection=selected,
+                self.assertNotEqual(base_key, source_noise_key(
+                    raw, layout, 1.0, source=(y, predictions), request_selection=selected,
                     public_arrays=arrays))
                 released, changed_sigma = validation.private_validation_vector(
                     y, predictions, layout, epsilon=1.0, delta=1e-5,
                     request_selection=selected, public_arrays=arrays)
                 self.assertFalse(np.array_equal(base, released))
                 self.assertEqual(sigma, changed_sigma)
-        self.assertNotEqual(base_key, validation._validation_noise_key(
-            raw, layout, 1.0, request_selection=selection,
+        self.assertNotEqual(base_key, source_noise_key(
+            raw, layout, 1.0, source=(y, predictions), request_selection=selection,
             public_arrays=[np.ones((1, 2), dtype=np.float32)]))
 
     def test_numeric_bounds_separate_equal_normalized_statistics(self):
@@ -240,7 +253,7 @@ class ValidationReleaseTests(unittest.TestCase):
         self.assertEqual(sigma, replay_sigma)
         self.assertEqual(sigma, changed_sigma)
 
-    def test_row_permutation_and_patient_relabel_keep_release_and_key(self):
+    def test_row_permutation_keeps_release_but_patient_relabel_changes_key(self):
         layout = validation.validation_layout("classification", bins=8)
         y = np.asarray([0, 1, 0, 1, 1, 0])
         predictions = np.asarray([0.1, 0.8, 0.3, 0.7, 0.9, 0.2])
@@ -252,7 +265,7 @@ class ValidationReleaseTests(unittest.TestCase):
             y, predictions, layout, unit_ids=patient_ids)
         permuted_raw, permuted_key = self._raw_and_key(
             y[permutation], predictions[permutation], layout,
-            unit_ids=relabeled[permutation])
+            unit_ids=patient_ids[permutation])
         np.testing.assert_array_equal(raw, permuted_raw)
         self.assertEqual(key, permuted_key)
 
@@ -262,10 +275,12 @@ class ValidationReleaseTests(unittest.TestCase):
         permuted, _ = validation.private_validation_vector(
             y[permutation], predictions[permutation], layout,
             epsilon=1.0, delta=1e-5,
-            unit_ids=relabeled[permutation])
+            unit_ids=patient_ids[permutation])
         np.testing.assert_array_equal(released, permuted)
+        _, relabeled_key = self._raw_and_key(y, predictions, layout, unit_ids=relabeled)
+        self.assertNotEqual(key, relabeled_key)
 
-    def test_distinct_scores_in_same_bins_keep_release_and_key(self):
+    def test_same_statistics_distinct_unit_inputs_change_binding_and_key(self):
         layout = validation.validation_layout("classification", bins=8)
         y = np.asarray([0, 0, 1, 1], dtype=np.int32)
         first_scores = np.asarray([0.02, 0.24, 0.76, 0.99])
@@ -278,13 +293,13 @@ class ValidationReleaseTests(unittest.TestCase):
         second_raw, second_key = self._raw_and_key(
             y.astype(np.float64), second_scores, represented_layout)
         np.testing.assert_array_equal(first_raw, second_raw)
-        self.assertEqual(first_key, second_key)
+        self.assertNotEqual(first_key, second_key)
         first, _ = validation.private_validation_vector(
             y, first_scores, layout, epsilon=1.0, delta=1e-5)
         second, _ = validation.private_validation_vector(
             y.astype(np.float64), second_scores, layout,
             epsilon=1.0, delta=1e-5)
-        np.testing.assert_array_equal(first, second)
+        self.assertNotEqual(first.tobytes(), second.tobytes())
 
     def test_changed_sufficient_statistic_changes_release_key(self):
         layout = validation.validation_layout("classification", bins=8)
@@ -300,8 +315,8 @@ class ValidationReleaseTests(unittest.TestCase):
         layout = validation.validation_layout("classification", bins=8)
         raw = validation._summed_validation_contributions(
             np.asarray([0, 1]), np.asarray([0.1, 0.9]), layout)
-        first = validation._validation_noise_key(raw, layout, 1.0)
-        second = validation._validation_noise_key(raw, layout, 2.0)
+        first = source_noise_key(raw, layout, 1.0, source=(np.asarray([0, 1]), np.asarray([0.1, 0.9])))
+        second = source_noise_key(raw, layout, 2.0, source=(np.asarray([0, 1]), np.asarray([0.1, 0.9])))
         self.assertNotEqual(first, second)
 
     def test_metric_subset_is_postprocessing_of_one_release(self):

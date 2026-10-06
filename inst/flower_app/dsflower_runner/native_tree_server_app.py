@@ -1,5 +1,7 @@
 """Dedicated coordinator ServerApp for one atomic native-tree federation."""
 
+from . import aggregation
+
 import hashlib
 import json
 import math
@@ -260,7 +262,7 @@ def _collect_artifacts(grid, node_ids, request_b64, request_sha256,
         raise RuntimeError("native-tree reply roster is incomplete or duplicated")
     pairs = [(source, _artifact_from_reply(reply, byte_cap))
              for source, reply in zip(sources, replies)]
-    return [artifact for _source, artifact in sorted(pairs)]
+    return sorted((artifact for _source, artifact in pairs), key=aggregation.bytes_key)
 
 
 def _holdout_layout(request, bins):
@@ -473,11 +475,11 @@ def _collect_holdout_vectors(grid, node_ids, request, request_b64,
             "native-tree holdout reply roster is incomplete or duplicated")
     pairs = [(source, _vector_from_reply(reply, layout))
              for source, reply in zip(sources, replies)]
-    return [value for _source, value in sorted(pairs)]
+    return sorted((value for _source, value in pairs), key=aggregation.vector_key)
 
 
 def _stable_pool(vectors):
-    stacked = np.stack(vectors, axis=0).astype(np.float64, copy=False)
+    stacked = np.stack(sorted(vectors, key=aggregation.vector_key), axis=0).astype(np.float64, copy=False)
     scale = np.max(np.abs(stacked), axis=0)
     normalized = np.divide(
         stacked, scale, out=np.zeros_like(stacked), where=scale > 0.0)

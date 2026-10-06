@@ -2,16 +2,16 @@ test_that("holdout contract is canonical and has no analyst seed axis", {
   contract <- dsFlower:::.holdoutContract(
     test_millionths = 200000L, privacy_unit = "patient")
 
-  expect_identical(contract$version, "dsflower-resampling-v1")
+  expect_identical(contract$version, "dsflower-resampling-v2")
   expect_identical(contract$method, "holdout")
-  expect_identical(contract$assignment, "hmac-sha256-threshold-v1")
+  expect_identical(contract$assignment, "hmac-sha256-threshold-v2")
   expect_identical(contract$test_numerator, 200000L)
   expect_identical(contract$test_denominator, 1000000L)
   expect_identical(contract$privacy_unit, "patient")
   expect_identical(contract$unit_canonicalization, "trim-utf8-v2")
   expect_identical(
     contract$sha256,
-    "00b0a490eb3d92fec7ce532e452523a32cbf73d19953372194faffc21eb4c75b")
+    "186917c9bc324525e7c7563c5cb8339fee755bc856a1fecd0af59b5e5488c703")
   expect_false(any(grepl("seed|salt|nonce", names(contract), ignore.case = TRUE)))
 
   expect_identical(

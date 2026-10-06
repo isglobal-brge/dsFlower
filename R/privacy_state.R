@@ -190,8 +190,6 @@ flowerPrivacyBootstrap <- function() {
   list(
     key_action = if (isTRUE(valid_before)) {
       "reused"
-    } else if (isTRUE(existed)) {
-      "rotated"
     } else {
       "initialized"
     },

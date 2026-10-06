@@ -287,8 +287,13 @@
 #' Initialize Flower Handle
 #'
 #' DataSHIELD ASSIGN method. Creates a Flower federation handle from
-#' a data.frame or matrix already assigned in the R session. The data
-#' can come from any DataSHIELD operation: \code{datashield.assign.table},
+#' a data.frame, matrix, or Arrow Table/RecordBatch already assigned in the
+#' R session. Exact dsImaging table exports retain their admitted patient
+#' roster through dsImaging's private same-session registry. This requires a
+#' companion version providing admitted table exports; older versions fail closed
+#' and continue to require \code{imagingFeatureViewDS()}. Changed imaging
+#' tables require an authorized feature view; generic tables can come from
+#' any DataSHIELD operation: \code{datashield.assign.table},
 #' \code{datashield.assign.resource} + \code{as.resource.data.frame},
 #' or any transformation via \code{datashield.assign.expr}.
 #'
@@ -307,7 +312,9 @@ flowerInitDS <- function(data_symbol) {
   owner_env <- parent.frame()
   obj <- get(data_symbol, envir = owner_env, inherits = FALSE)
 
-  if (is.matrix(obj)) obj <- as.data.frame(obj)
+  if (is.matrix(obj) || inherits(obj, c("Table", "RecordBatch"))) {
+    obj <- as.data.frame(obj)
+  }
 
   # Existing path: data.frame
   if (is.data.frame(obj)) {
@@ -315,9 +322,31 @@ flowerInitDS <- function(data_symbol) {
       session_tainted <- .dsImagingSafetyHook(
         ".imaging_session_exported_feature_table")
       if (isTRUE(session_tainted(owner_env))) {
-        stop("This session exported a naked imaging feature table, so generic ",
-             "table initialization is blocked. Create a new session and use ",
-             "imagingFeatureViewDS() for dsFlower.", call. = FALSE)
+        resolver <- .dsImagingSafetyHook(
+          ".resolve_imaging_feature_view_for_consumer")
+        authorized <- tryCatch(
+          resolver(data_symbol, owner_env = owner_env),
+          error = function(e) NULL)
+        if (!is.list(authorized) || !is.data.frame(authorized$data) ||
+            !is.list(authorized$manifest) || !is.list(authorized$privacy_roster) ||
+            !is.character(authorized$feature_view_capability) ||
+            length(authorized$feature_view_capability) != 1L ||
+            is.na(authorized$feature_view_capability) ||
+            !grepl("^imgf_[0-9a-f]{64}$", authorized$feature_view_capability)) {
+          stop("This session exported a naked imaging feature table; only an ",
+               "unchanged admitted export or imagingFeatureViewDS() can ",
+               "initialize dsFlower.", call. = FALSE)
+        }
+        desc <- flower_dataset_descriptor(
+          dataset_id = authorized$dataset_id,
+          source_kind = "imaging_feature_view",
+          metadata = authorized$manifest$metadata,
+          assets = list(), manifest = authorized$manifest)
+        handle <- .createHandleFromDescriptor(desc, data_symbol = data_symbol)
+        handle$imaging_feature_view_symbol <- data_symbol
+        handle$imaging_feature_view_capability <-
+          authorized$feature_view_capability
+        return(.registerHandle(handle, owner_env))
       }
     }
     return(.registerHandle(

@@ -122,6 +122,8 @@ def _validate_public_contract(manifest, config):
 
 
 def _pinned_contract(msg, context):
+    from .strategy import canonical_local_strategy
+    canonical_local_strategy(dict(context.run_config), "association")
     message_config = _exact_message_config(msg)
     manifest = task._load_manifest(context)
     raw_config = dict(context.run_config)
@@ -151,15 +153,22 @@ def train(msg: Message, context: Context) -> Message:
     try:
         node_manifest, cfg = _pinned_contract(msg, context)
         privacy = task.load_privacy_config(context)
-        outcome, exposure, unit_ids = task.load_association_data(
-            context, manifest=node_manifest)
+        layout = epi_association.association_layout(cfg["association-privacy-unit"])
+        identity = seeding.request_identity(
+            "association-vector", {"layout": layout, "mechanism-profile": layout,
+                "request-selection": seeding.request_selection(node_manifest)},
+            privacy, execution_fingerprint=epi_association.EXECUTION_PROFILE,
+            manifest=node_manifest)
+        outcome, exposure, unit_ids, units = task.load_association_data(
+            context, manifest=node_manifest, include_canonical_units=True)
         sufficient = epi_association.association_sufficient_vector(
             outcome, exposure, outcome_levels=(0, 1), exposure_levels=(0, 1),
             privacy_unit=cfg["association-privacy-unit"], unit_ids=unit_ids)
         released, sigma = epi_association.private_association_vector(
             sufficient, privacy_unit=cfg["association-privacy-unit"],
             epsilon=privacy["epsilon"], delta=privacy["delta"],
-            request_selection=seeding.request_selection(node_manifest))
+            request_selection=seeding.request_selection(node_manifest),
+            request_identity=identity, source_units=units)
         if not math.isfinite(sigma) or sigma <= 0.0:
             raise RuntimeError("association noise scale is invalid")
         return _reply(msg, released, sigma, True)

@@ -115,6 +115,17 @@ def _data():
     )
 
 
+_TEST_UNIT_KEY = mock.patch("dsflower_runner.seeding._node_secret", return_value=b"unit-order-test-secret-v3........"[:32])
+
+
+def setUpModule():
+    _TEST_UNIT_KEY.start()
+
+
+def tearDownModule():
+    _TEST_UNIT_KEY.stop()
+
+
 class XGBoostManifestTests(unittest.TestCase):
     def test_exact_parameter_profile_is_canonical_and_server_pinned(self):
         profile = adapter.canonical_xgboost_profile(_manifest())
@@ -262,9 +273,9 @@ class XGBoostMaterializationTests(unittest.TestCase):
         unicode_order = adapter.materialize_xgboost_units(
             _manifest(), X, y, unit_ids=["é", "z", "a"])
         self.assertEqual(unicode_order.privacy_unit, "patient")
-        np.testing.assert_array_equal(
-            unicode_order.features, materialized.features)
-        np.testing.assert_array_equal(unicode_order.target, materialized.target)
+        self.assertCountEqual(
+            [(tuple(x), y) for x, y in zip(unicode_order.features, unicode_order.target)],
+            [(tuple(x), y) for x, y in zip(materialized.features, materialized.target)])
 
     def test_patient_duplicates_and_invalid_ids_aggregate_without_oracle(self):
         X = np.asarray([
@@ -351,7 +362,10 @@ class XGBoostMaterializationTests(unittest.TestCase):
             record_keys.append(
                 np.asarray(bins, dtype="<u4").tobytes() +
                 normalized_outcome.tobytes())
-        self.assertEqual(record_keys, sorted(record_keys))
+        # The trusted source-unit HMAC orders records, not effective-bin bytes.
+        from dsflower_runner.canonical_units import canonicalize_arrays
+        source = canonicalize_arrays(X, y)
+        np.testing.assert_array_equal(first.features, X[source.row_permutation])
 
         variant = X.copy()
         variant.view(np.uint32)[0, 0] = np.uint32(0x7FA12345)
@@ -599,7 +613,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
 
         X, y, units = _data()
         same_bin_x = X.copy(); same_bin_x[0, 0] = 64.0
-        self.assertEqual(
+        self.assertNotEqual(
             first._noise_key,
             self._prepare(X=same_bin_x, y=y, units=units)._noise_key)
         changed_bin_x = X.copy(); changed_bin_x[0, 0] = 39.0
@@ -608,14 +622,13 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
             self._prepare(X=changed_bin_x, y=y, units=units)._noise_key)
         changed_units = list(units)
         changed_units[0] = "different-patient"
-        self.assertEqual(
+        self.assertNotEqual(
             first._noise_key,
             self._prepare(X=X, y=y, units=changed_units)._noise_key)
 
-        with mock.patch.object(
-                seeding, "_runtime_fingerprint",
-                side_effect=AssertionError("unrelated runtime fingerprint used")):
-            self.assertEqual(first._noise_key, self._prepare()._noise_key)
+        runtime = dict(seeding._runtime_fingerprint(), runner_sha256="0" * 64)
+        with mock.patch.object(seeding, "_runtime_fingerprint", return_value=runtime):
+            self.assertNotEqual(first._noise_key, self._prepare()._noise_key)
         with mock.patch.object(
                 adapter, "EXECUTION_PROFILE",
                 "dsflower-xgboost-execution-v2-test"):
@@ -643,7 +656,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
         self.assertEqual(
             first.profile["root_noise_scale"],
             self._prepare(manifest=same_pins).profile["root_noise_scale"])
-        self.assertEqual(
+        self.assertNotEqual(
             first._noise_key, self._prepare(manifest=same_pins)._noise_key)
 
         self.assertNotEqual(
@@ -693,7 +706,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
                 manifest=manifest, X=changed, y=y,
                 units=None)._noise_key)
 
-    def test_patient_prf_binds_only_effective_bounded_records(self):
+    def test_patient_prf_binds_full_source_even_when_pooled_records_match(self):
         raw_x = np.asarray([
             [10.0, -5.0], [30.0, 5.0], [60.0, 0.0], [70.0, 1.0],
         ], dtype=np.float64)
@@ -705,7 +718,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
             X=np.asarray([[20.0, 0.0], [65.0, 0.5]], dtype=np.float64),
             y=np.asarray([0.0, 1.0], dtype=np.float64),
             units=["effective-a", "effective-b"])
-        self.assertEqual(first._noise_key, effective._noise_key)
+        self.assertNotEqual(first._noise_key, effective._noise_key)
         self.assertNotIn("rows", repr(first))
 
         permutation = np.asarray([3, 1, 0, 2])
@@ -721,7 +734,7 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
         duplicate_units = raw_units + ["patient"]
         duplicate = self._prepare(
             X=duplicate_x, y=duplicate_y, units=duplicate_units)
-        self.assertEqual(first._noise_key, duplicate._noise_key)
+        self.assertNotEqual(first._noise_key, duplicate._noise_key)
 
         equivalent_x = raw_x.copy()
         equivalent_x[0, 0] = 11.0
@@ -729,13 +742,13 @@ class XGBoostPrfAndBoundaryTests(unittest.TestCase):
         equivalent_units = ["patient", "patient", "", "x" * 5000]
         equivalent = self._prepare(
             X=equivalent_x, y=raw_y, units=equivalent_units)
-        self.assertEqual(first._noise_key, equivalent._noise_key)
+        self.assertNotEqual(first._noise_key, equivalent._noise_key)
 
         outlier_x = raw_x.copy()
         outlier_x[3, 0] = np.inf
         clipped_x = raw_x.copy()
         clipped_x[3, 0] = 100.0
-        self.assertEqual(
+        self.assertNotEqual(
             self._prepare(
                 X=outlier_x, y=raw_y, units=raw_units)._noise_key,
             self._prepare(

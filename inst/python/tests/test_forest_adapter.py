@@ -152,6 +152,17 @@ def _train(manifest, X, y, unit_ids=None):
         return adapter.train_extra_trees(prepared)
 
 
+_TEST_UNIT_KEY = mock.patch("dsflower_runner.seeding._node_secret", return_value=b"unit-order-test-secret-v3........"[:32])
+
+
+def setUpModule():
+    _TEST_UNIT_KEY.start()
+
+
+def tearDownModule():
+    _TEST_UNIT_KEY.stop()
+
+
 class ExtraTreesAccountingTests(unittest.TestCase):
     def test_public_request_bridge_injects_exact_forest_mechanisms(self):
         request = _public_request()
@@ -253,7 +264,7 @@ class ExtraTreesStickyTests(unittest.TestCase):
         ], dtype=np.float64)
         self.y = np.asarray([0, 0, 1, 1, 0], dtype=np.float64)
 
-    def test_replay_permutation_same_bins_and_resources_are_exact(self):
+    def test_permutation_replays_but_changed_source_in_same_bins_rekeys(self):
         manifest = _manifest(trees=8, depth=3)
         first = _train(manifest, self.X, self.y)
         order = np.asarray([4, 2, 0, 3, 1])
@@ -263,7 +274,7 @@ class ExtraTreesStickyTests(unittest.TestCase):
         equivalent = self.X.copy()
         equivalent[:4, 0] = [-1.9, -0.1, 0.1, 1.9]
         same_bins = _train(manifest, equivalent, self.y)
-        np.testing.assert_array_equal(first, same_bins)
+        self.assertNotEqual(first, same_bins)
 
         wider = copy.deepcopy(manifest)
         wider["resources"].update(

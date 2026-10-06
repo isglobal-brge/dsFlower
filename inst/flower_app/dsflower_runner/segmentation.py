@@ -91,13 +91,16 @@ def decoder_spec(variant="current"):
 
 
 def validate_decoder_spec(spec):
-    # Permit the explicit nearest label as well as the builder's nearest default.
-    import copy
-    clean = copy.deepcopy(spec)
-    for layer in clean.get("layers", []):
-        if layer.get("op") == "upsample" and layer.get("mode") == "nearest":
-            layer.pop("mode")
-    if clean not in [decoder_spec(name) for name in ("current", "narrow", "pointwise")]:
+    # Normalize without calling the builder (which itself enforces this gate).
+    # This keeps the exact decoder allowlist while admitting explicit defaults.
+    if __package__:
+        from .model_spec import canonicalize_spec
+    else:
+        from model_spec import canonicalize_spec
+    def normalize(value):
+        return canonicalize_spec(value, FEATURE_DIM, 1, output_shape=OUTPUT_SHAPE)
+    clean = normalize(spec)
+    if clean not in [normalize(decoder_spec(name)) for name in ("current", "narrow", "pointwise")]:
         raise ValueError("segmentation requires the pinned convolutional decoder")
 
 
@@ -253,7 +256,7 @@ def _canonical_image_id(value):
     return "" if text == _MISSING_PATIENT_UNIT else unicodedata.normalize("NFC", text)
 
 
-def load_subject_tensors(context, cfg, encoder, device):
+def load_subject_tensors(context, cfg, encoder, device, *, include_canonical_units=False):
     """Read paired assets and select once per subject without changing its census."""
     from . import task
     validate_config(cfg)
@@ -277,10 +280,6 @@ def load_subject_tensors(context, cfg, encoder, device):
     columns = [sample_col, image_col, mask_col] + ([empty_col] if empty_col else [])
     if any(column not in frame.columns for column in columns):
         raise ValueError("segmentation samples schema does not match its manifest")
-    subjects = sorted(set(groups))
-    X = np.zeros((len(subjects), FEATURE_DIM), np.float32)
-    y = np.zeros((len(subjects), 2, 128, 128), np.float32)
-    ids = [_canonical_image_id(value) for value in frame[sample_col]]
 
     def resolve(root, value):
         try:
@@ -288,6 +287,53 @@ def load_subject_tensors(context, cfg, encoder, device):
         except (OSError, TypeError, ValueError):
             return None
 
+    from .canonical_units import (array_record, canonicalize_units, encode_row,
+                                  encode_numeric, frame as frame_bytes, attach_units)
+    image_records, mask_records, paths_all, masks_all = [], [], [], []
+    cache = {}
+
+    def content(path, is_mask):
+        key = (path, is_mask)
+        if key not in cache:
+            try:
+                cache[key] = frame_bytes("raster-decoded-v1", array_record(
+                    np.asarray(_open_raster(path, mask=is_mask))))
+            except Exception:
+                cache[key] = frame_bytes("raster-invalid-v1")
+        return cache[key]
+
+    from . import source_projection
+    source_rows = source_projection.records(
+        context, manifest, frame, [empty_col] if empty_col else [],
+        normalizers=({empty_col: lambda value: {"FALSE": 0, "TRUE": 1}.get(value, value)}
+                     if empty_col else None))
+    ids = [_canonical_image_id(value) for value in frame[sample_col]]
+    records = []
+    for j in range(len(frame)):
+        image_path = resolve(images["root"], frame.iloc[j][image_col])
+        mask_value = frame.iloc[j][mask_col]
+        mask_path = resolve(masks["root"], mask_value)
+        paths_all.append(image_path)
+        masks_all.append(mask_path)
+        image_records.append(content(image_path, False))
+        mask_records.append(content(mask_path, True))
+        empty_value = frame.iloc[j][empty_col] if empty_col else 0
+        if isinstance(empty_value, str):
+            empty_value = {"FALSE": 0, "TRUE": 1}.get(empty_value, empty_value)
+        records.append(encode_row((ids[j], image_records[-1], mask_records[-1],
+                                   mask_value == "__dsflower_empty_mask__",
+                                   source_rows[j] if source_rows is not None else encode_numeric(empty_value))))
+    units = canonicalize_units(records, unit_ids=groups)
+    order = units.row_permutation
+    frame = frame.iloc[order].reset_index(drop=True)
+    groups = groups[order]
+    ids = [ids[j] for j in order]
+    paths_all = [paths_all[j] for j in order]
+    masks_all = [masks_all[j] for j in order]
+    image_records = [image_records[j] for j in order]
+    subjects = units.unit_ids
+    X = np.zeros((len(subjects), FEATURE_DIM), np.float32)
+    y = np.zeros((len(subjects), 2, 128, 128), np.float32)
     encoder.eval()
     with torch.no_grad():
         for i, subject in enumerate(subjects):
@@ -296,11 +342,14 @@ def load_subject_tensors(context, cfg, encoder, device):
             if not chosen:
                 continue
             selected = [j for j in rows if ids[j] == chosen]
-            paths = [resolve(images["root"], frame.iloc[j][image_col]) for j in selected]
-            if paths[0] is None or any(path != paths[0] for path in paths):
+            paths = [paths_all[j] for j in selected]
+            # Repeated selected IDs may name relocated/repacked aliases of one
+            # image; decoded contents, rather than local path strings, decide.
+            if paths[0] is None or any(image_records[j] != image_records[selected[0]]
+                                       for j in selected):
                 continue
             mask_values = [frame.iloc[j][mask_col] for j in selected]
-            mask_paths = [resolve(masks["root"], value) for value in mask_values]
+            mask_paths = [masks_all[j] for j in selected]
             empty = [frame.iloc[j][empty_col] if empty_col else 0 for j in selected]
             if any(path is None and value != "__dsflower_empty_mask__"
                    for path, value in zip(mask_paths, mask_values)):
@@ -313,7 +362,8 @@ def load_subject_tensors(context, cfg, encoder, device):
                 X[i] = features.cpu().numpy()[0]
                 y[i, :1] = mask
                 y[i, 1] = 1.0
-    return X, y, np.asarray(subjects), len(frame)
+    result = (attach_units(X, units), attach_units(y, units), np.asarray(subjects), len(frame))
+    return result + (units,) if include_canonical_units else result
 
 
 def channel_b_metrics(probabilities, masks):

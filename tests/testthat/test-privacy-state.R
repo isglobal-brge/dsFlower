@@ -192,9 +192,8 @@ test_that("bootstrap persists only one custodial noise root", {
   expect_identical(file.info(paste0(secret, ".lock"))$size[[1L]], 0)
 
   writeLines("malformed", secret)
-  repaired <- flowerPrivacyBootstrap()
-  expect_identical(repaired$key_action, "rotated")
-  expect_match(readLines(secret, warn = FALSE), "^[0-9a-f]{64}$")
+  expect_error(flowerPrivacyBootstrap(), "Custodian action required")
+  expect_identical(readLines(secret, warn = FALSE), "malformed")
   expect_setequal(list.files(root), c("noise_root", "noise_root.lock"))
 })
 
@@ -238,4 +237,18 @@ test_that("public privacy status reports only the per-training contract", {
     "per_training_delta", "dp_unit", "patient_column",
     "unit_canonicalization", "adjacency", "public_initialisation"
   ))
+})
+
+
+test_that("an existing wrong-mode secret is never silently rotated", {
+  skip_on_os("windows")
+  root <- local_stateless_privacy()
+  secret <- file.path(root, "noise_root")
+  flowerPrivacyBootstrap()
+  original <- readBin(secret, "raw", file.info(secret)$size)
+  Sys.chmod(secret, "0644")
+  expect_error(flowerPrivacyBootstrap(), "Custodian action required")
+  expect_identical(readBin(secret, "raw", file.info(secret)$size), original)
+  Sys.chmod(secret, "0600")
+  expect_identical(flowerPrivacyBootstrap()$key_action, "reused")
 })

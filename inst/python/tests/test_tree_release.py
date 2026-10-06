@@ -1,6 +1,12 @@
 """Tests for the common sufficient-vector Gaussian tree release."""
 
 import hashlib
+import importlib
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import tempfile
 import math
 import os
 import sys
@@ -14,7 +20,11 @@ FLOWER_APP = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "..", "..", "flower_app")
 sys.path.insert(0, FLOWER_APP)
 
-from dsflower_runner import tree_release
+from dsflower_runner import tree_release, seeding
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_forest_adapter import _manifest
+from tree_release_kat_support import (CONTRACT, EXECUTION, capture_record,
+                                      environment_key, release, request)
 
 
 class JointGaussianReleaseTests(unittest.TestCase):
@@ -23,16 +33,8 @@ class JointGaussianReleaseTests(unittest.TestCase):
                  sensitivity=math.sqrt(2.0),
                  mechanism="test-tree-gaussian/v1",
                  execution="test-tree-release-v1"):
-        with mock.patch(
-                "dsflower_runner.seeding._node_secret",
-                return_value=bytes(range(32))):
-            return tree_release.joint_gaussian_release(
-                value, mechanism=mechanism,
-                layout=({"cells": 4, "release_index": 0}
-                        if layout is None else layout),
-                epsilon=epsilon, delta=delta, sensitivity=sensitivity,
-                num_releases=releases,
-                execution_fingerprint=execution)
+        return release(value, layout, releases, epsilon, delta, sensitivity,
+                       mechanism, execution)
 
     def test_replay_and_canonical_layout_are_exact(self):
         raw = np.asarray([[1, 2], [3, 4]], dtype=np.int64)
@@ -60,7 +62,7 @@ class JointGaussianReleaseTests(unittest.TestCase):
         self.assertFalse(np.array_equal(first, composed))
         self.assertGreater(composed_sigma, sigma)
 
-    def test_calibration_inputs_are_not_reroll_axes_when_sigma_is_equal(self):
+    def test_raw_calibration_policy_rekeys_even_when_sigma_is_equal(self):
         raw = np.asarray([4.0, 3.0, 2.0, 1.0])
         with mock.patch.object(
                 tree_release.dp_harness, "compute_output_sigma",
@@ -73,46 +75,104 @@ class JointGaussianReleaseTests(unittest.TestCase):
                 sensitivity=8.0, releases=17)
         self.assertEqual(calibrate.call_count, 2)
         self.assertEqual(sigma, replay_sigma)
-        self.assertEqual(first.tobytes(), replay.tobytes())
-        self.assertEqual((first - raw).tobytes(), (replay - raw).tobytes())
+        self.assertNotEqual(first.tobytes(), replay.tobytes())
+        self.assertNotEqual((first - raw).tobytes(), (replay - raw).tobytes())
 
-    def test_raw_policy_nextafter_is_not_a_reroll_axis_when_sigma_is_equal(self):
+    def test_raw_policy_nextafter_rekeys_even_when_sigma_is_equal(self):
         raw = np.asarray([4.0, 3.0, 2.0, 1.0])
         first, sigma = self._release(raw, delta=1.0e-6)
         adjacent_delta = math.nextafter(1.0e-6, math.inf)
         replay, replay_sigma = self._release(raw, delta=adjacent_delta)
         self.assertEqual(sigma, replay_sigma)
-        np.testing.assert_array_equal(first, replay)
+        self.assertNotEqual(first.tobytes(), replay.tobytes())
 
     def test_numeric_profile_known_answer_for_supported_matrix(self):
-        expected = {
-            ("darwin", "arm64", "2.4.6"):
-                "f74ae8755633fa5139f9a23ac8a4b573a472fbacbf65ba4fddb81749bbbfbf62",
-            ("darwin", "x86_64", "2.4.6"):
-                "e17344046bc8080601b41b15ceb820005e00e78aee5ac16bb03c98deadc76051",
-            ("linux", "x86_64", "2.4.6"):
-                "aedc807f04db85228317651cde5e8d67e9684d074864e83b1c153fa77937d67b",
-            ("windows", "amd64", "2.4.6"):
-                "158a2d2375c02349ed8b14a490880609f71e16548912172c235f5b4d52086df7",
-        }
-        profile = tree_release.numeric_execution_profile()
-        key = (profile["system"], profile["machine"], profile["numpy"])
-        if key not in expected:
-            self.skipTest("numeric profile is not in the release matrix: %r" % (key,))
-        with mock.patch(
-                "dsflower_runner.seeding._node_secret",
-                return_value=bytes(range(32))):
-            released, sigma = tree_release.joint_gaussian_release(
-                np.asarray([0.0, 1.0, 2.0, 3.0]),
-                mechanism="tree-release-kat/v1",
-                layout={"coordinates": 4, "release_index": 0},
-                epsilon=1.0, delta=1.0e-6,
-                sensitivity=math.sqrt(2.0), num_releases=1,
-                execution_fingerprint="tree-release-kat-adapter-v1")
-        digest = hashlib.sha256(np.ascontiguousarray(
-            released, dtype="<f8").tobytes()).hexdigest()
-        self.assertEqual(sigma.hex(), "0x1.e439944d8cd2fp+2")
-        self.assertEqual(digest, expected[key])
+        path = Path(__file__).parent / "fixtures/tree-release-kat-v3.json"
+        self.assertTrue(path.is_file(),
+                        "Missing final v3 KAT fixture; run tools/generate-tree-release-kat.py after source freeze")
+        fixture = json.loads(path.read_text())
+        self.assertEqual(fixture["contract"], CONTRACT)
+        identity = request()
+        runtime = json.loads(identity.canonical_json)["runtime"]
+        numeric = tree_release.numeric_execution_profile()
+        key = environment_key(runtime, numeric)
+        matches = [record for record in fixture["profiles"]
+                   if environment_key(record["runtime"], record["numeric_profile"]) == key]
+        if not matches:
+            self.skipTest("actual full runtime has not been verified for this KAT: " + key)
+        self.assertEqual(len(matches), 1, "duplicate verified runtime profiles")
+        expected = matches[0]
+        self.assertEqual(runtime, expected["runtime"],
+                         "Runner source changed; deliberately regenerate the v3 KAT after review")
+        actual = capture_record()
+        # Calibration is unchanged by the identity migration; retain its
+        # independent pre-v3 known answer as well as the recorded profile.
+        self.assertEqual(actual["sigma_hex"], "0x1.e439944d8cd2fp+2")
+        self.assertEqual(actual, expected)
+
+    def test_actual_complete_runner_hash_is_bound_and_source_changes_rekey(self):
+        def complete_hash(directory):
+            digest = hashlib.sha256()
+            paths = [path for path in directory.rglob("*") if path.is_file()
+                     and "__pycache__" not in path.relative_to(directory).parts
+                     and path.suffix not in (".pyc", ".pyo")]
+            for path in sorted(paths, key=lambda item: item.relative_to(directory).as_posix()):
+                digest.update(path.relative_to(directory).as_posix().encode() + b"\n")
+                digest.update(path.read_bytes())
+                digest.update(b"\x00")
+            return digest.hexdigest()
+
+        actual = json.loads(request().canonical_json)["runtime"]
+        directory = Path(seeding.__file__).resolve().parent
+        self.assertEqual(actual["runner_sha256"], complete_hash(directory))
+        self.assertEqual(actual["runner_sha256"], seeding._runtime_fingerprint(False)["runner_sha256"])
+        # Execute an isolated real copy, then alter a non-Python runner file.
+        # This tests the complete hash without mocking any runtime fact or
+        # writing into either package's trusted production directory.
+        name = "_tree_kat_runner_copy"
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = Path(temporary) / "runner"
+            shutil.copytree(directory, copied, ignore=shutil.ignore_patterns("__pycache__"))
+            spec = importlib.util.spec_from_file_location(
+                name, copied / "__init__.py", submodule_search_locations=[str(copied)])
+            package = importlib.util.module_from_spec(spec)
+            sys.modules[name] = package
+            try:
+                spec.loader.exec_module(package)
+                copied_release = importlib.import_module(name + ".tree_release")
+                copied_seeding = importlib.import_module(name + ".seeding")
+                manifest = _manifest(trees=2, depth=1)
+                first = copied_release.native_request_identity(manifest, execution_fingerprint=EXECUTION)
+                self.assertEqual(json.loads(first.canonical_json)["runtime"]["runner_sha256"],
+                                 complete_hash(copied))
+                (copied / "kat-source-witness.txt").write_bytes(b"public runner source change")
+                copied_seeding._runtime_fingerprint.cache_clear()
+                changed = copied_release.native_request_identity(manifest, execution_fingerprint=EXECUTION)
+                self.assertEqual(json.loads(changed.canonical_json)["runtime"]["runner_sha256"],
+                                 complete_hash(copied))
+                self.assertNotEqual(first.sha256, changed.sha256)
+            finally:
+                for key in list(sys.modules):
+                    if key == name or key.startswith(name + "."):
+                        del sys.modules[key]
+
+    def test_kat_environment_selection_excludes_only_the_runner_hash(self):
+        runtime = json.loads(request().canonical_json)["runtime"]
+        numeric = tree_release.numeric_execution_profile()
+        first = environment_key(runtime, numeric)
+        self.assertEqual(first, environment_key(dict(runtime, runner_sha256="0" * 64), numeric))
+        for field, value in runtime.items():
+            if field == "runner_sha256":
+                continue
+            with self.subTest(runtime_field=field):
+                changed = dict(runtime)
+                changed[field] = {"changed": value}
+                self.assertNotEqual(first, environment_key(changed, numeric))
+        for field, value in numeric.items():
+            with self.subTest(numeric_field=field):
+                changed = dict(numeric)
+                changed[field] = {"changed": value}
+                self.assertNotEqual(first, environment_key(runtime, changed))
 
     def test_malformed_or_nonfinite_vectors_fail_closed(self):
         for value in (

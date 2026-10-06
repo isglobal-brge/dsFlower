@@ -271,6 +271,21 @@ def _read_array(path):
         return np.asarray(image.convert("RGB"), dtype=np.float32)
 
 
+def canonical_image_record(path):
+    """Node-private decoded source binding, independent of asset packaging."""
+    from .canonical_units import array_record, frame
+    if path is None or (isinstance(path, str) and path == _INVALID_IMAGE):
+        return frame("image-invalid-v1")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            return frame("image-decoded-v1", array_record(_read_array(path)))
+    except Exception:
+        # The execution reader gives the same fixed zero image on decode
+        # failure; no pathname or failure reason becomes a release field.
+        return frame("image-invalid-v1")
+
+
 def _to_2d_slice(arr):
     """Reduce a 3D volume to a representative 2D slice (middle of the slice axis,
     taken as the smallest-extent axis, which is the slice direction for typical
@@ -418,6 +433,13 @@ def _load_verified_backbone(net, backbone, checkpoint):
 
 
 def build_backbone(backbone):
+    """Build the established encoder without changing caller RNG state."""
+    from .initialisation import isolated_public_rng
+    with isolated_public_rng(0):
+        return _build_backbone(backbone)
+
+
+def _build_backbone(backbone):
     """Build a FROZEN (eval, no-grad) feature extractor. Deterministic weights so
     every node shares the same feature space (FedAvg over heads is then valid)."""
     import torch
@@ -427,7 +449,6 @@ def build_backbone(backbone):
     if name == "resnet18_layer2":
         raise ValueError("spatial encoder requires the full segmentation contract")
     feat_dim, is3d = _BACKBONES[name]
-    torch.manual_seed(0)  # fixed construction, including the MONAI seed-0 profile
 
     if is3d:
         # MONAI is a required dep for volumetric runs. If it is missing we must NOT

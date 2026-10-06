@@ -19,6 +19,17 @@ sys.path.insert(0, FLOWER_APP)
 from dsflower_runner import epi_association, seeding
 
 
+_TEST_UNIT_KEY = mock.patch("dsflower_runner.seeding._node_secret", return_value=b"unit-order-test-secret-v3........"[:32])
+
+
+def setUpModule():
+    _TEST_UNIT_KEY.start()
+
+
+def tearDownModule():
+    _TEST_UNIT_KEY.stop()
+
+
 class AssociationSufficientVectorTests(unittest.TestCase):
     def test_contract_and_exhaustive_replace_one_sensitivity(self):
         row = epi_association.association_layout("row")
@@ -149,9 +160,18 @@ class AssociationReleaseTests(unittest.TestCase):
         with mock.patch(
                 "dsflower_runner.seeding._node_secret",
                 return_value=secret):
+            from dsflower_runner import canonical_units
+            units = canonical_units.source_units(vector)
+            if units is None:
+                raw = epi_association._canonical_sufficient_vector(vector)
+                # Synthetic source rows witness this test-only supplied count vector.
+                cells = np.repeat(np.arange(9), raw.astype(int))
+                units = canonical_units.canonicalize_arrays(
+                    (cells // 3).reshape(-1, 1), cells % 3,
+                    unit_ids=[str(i) for i in range(len(cells))] if unit == "patient" else None)
             return epi_association.private_association_vector(
                 vector, privacy_unit=unit, epsilon=1.0, delta=1.0e-6,
-                request_selection=request_selection)
+                request_selection=request_selection, source_units=units)
 
     def test_effective_vector_replay_is_byte_exact(self):
         first_raw = epi_association.association_sufficient_vector(
@@ -168,6 +188,18 @@ class AssociationReleaseTests(unittest.TestCase):
         replay, replay_sigma = self._release(replay_raw.astype(">f8"))
         np.testing.assert_array_equal(first, replay)
         self.assertEqual(sigma, replay_sigma)
+
+    def test_equal_crosstabs_different_source_units_change_noise(self):
+        for unit, ids in (("row", None), ("patient", ["a", "a", "b"])):
+            left = epi_association.association_sufficient_vector(
+                [0, 1, 2], [0, 1, 1], outcome_levels=(0, 1),
+                exposure_levels=(0, 1), privacy_unit=unit, unit_ids=ids)
+            right = epi_association.association_sufficient_vector(
+                [0, 1, 9], [0, 1, 1], outcome_levels=(0, 1),
+                exposure_levels=(0, 1), privacy_unit=unit, unit_ids=ids)
+            self.assertEqual(left.tobytes(), right.tobytes())
+            self.assertNotEqual(self._release(left, unit=unit)[0].tobytes(),
+                                self._release(right, unit=unit)[0].tobytes())
 
     def test_data_secret_and_unit_semantics_bind_noise(self):
         raw = np.asarray([2, 1, 0, 3, 4, 0, 0, 0, 1], dtype=np.float64)
