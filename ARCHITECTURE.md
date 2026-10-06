@@ -359,10 +359,10 @@ negative assertions for the key. If runtime storage is unavailable, Rock
 remains up for operational repair, while private entry points retry and remain
 fail-closed.
 
-A missing key is provisioned as before. An existing malformed, wrong-owner or
-wrong-mode file fails closed with a custodian recovery instruction. It is never
-silently regenerated. There is no initialization marker. Persistent deployment
-state is required for replay: explicit key rotation or loss creates a new domain.
+A missing key is provisioned only before neighbourhood state is established.
+A retained store, UUID pin, initialization lock or external UUID requires the
+original key. Malformed, wrong-owner or wrong-mode state fails closed; no secret
+is silently regenerated to recover an established release domain.
 
 The v3 public request R is built from validated public semantics before private
 access. Its closed schema binds selected roles, canonical model and initial/current
@@ -411,6 +411,73 @@ separate adjacency issue. Small-subset controls and exact dimension releases
 have their own DataSHIELD contracts. The equality residual is documented rather
 than described as solved by those controls.
 
+Version 0.7.2 mitigates the equality oracle described in
+[isglobal-brge/dsFlower#7](https://github.com/isglobal-brge/dsFlower/issues/7)
+with immutable neighbourhood anchors. For each public request R (including its
+incoming model and round), the node scans **all** retained anchors and returns
+the complete stored payload of the **oldest** anchor at distance `d < k`. If none
+is eligible, it computes the unchanged v3 content-bound release and appends one
+new anchor. Near inputs never become anchors. Newer anchors cannot displace an
+older eligible anchor, so replay is stable without per-input bindings.
+
+Distance counts unordered canonical privacy units with multiplicity:
+`d = max(|M| - c, |N| - c)`, where `c = sum(min(M[t], N[t]))`. One insertion,
+deletion or replacement counts once; in patient mode a patient's complete
+selected records form one unit. The default `k` is the node's `nfilter.subset`
+(or its `default.` option), otherwise 3, with a floor of 2. Custodians can set
+`dsflower.neighbourhood_k` (or `default.dsflower.neighbourhood_k`); the effective
+value is frozen per R. Analysts cannot change it or force refresh.
+
+An analyst can no longer test a one-unit difference against an existing release
+by obtaining a fresh answer inside that anchor's neighbourhood. This is a
+**mitigation, not transcript DP**: the hard `k-1`/`k` boundary and boundaries
+between anchors still distinguish some one-unit neighbours. An input must be
+at least k from **every** anchor to receive a fresh release. Small updates can
+therefore return stale models or statistics; uncertainty intervals do not
+include this staleness. No hit/near/fresh status, distance or anchor identifier is
+returned. Timing and availability remain outside the guarantee.
+
+The rule covers every neural DP-SGD round, gated Hook release, all five native
+tree engines, private validation, holdout, CV fold training and OOF output, and
+association. Each round/fold/evaluation has its own R. Completed federation
+trajectories replay when the same incoming public models and eligible anchor
+choices recur; this is not a universal neighbouring-world transcript claim.
+Calibration, sensitivities, accounting, FedProx and the fresh R/B/K identity
+remain unchanged. Conditional DP mechanisms compose under their existing
+assumptions; no lifetime privacy budget is introduced.
+
+The permanent node-local store defaults to `<node-secret-path>.neighbourhood`.
+First release initializes it automatically and pins its random UUID at
+`<node-secret-path>.neighbourhood-id`, beside the secret rather than inside the
+store. The store uses owner-only directories/files (`0700`/`0600`), keyed unit
+fingerprints, MAC-authenticated records and complete payload bytes; it never
+stores raw source records or noise seeds. Records are verified before decoding,
+and a per-R lock serializes selection and durable anchor commit before release.
+There is no eviction, expiry or per-attempt ticket.
+
+The default limits are 256 anchors per R and 64 GiB of store capacity. Fresh
+commits must fit both logical retained bytes (payloads, fingerprints and record
+overhead) and SQLite allocated pages plus fixed state headroom. Provision extra
+physical disk space for transient SQLite journals and filesystem allocation slack. Only an
+input that would create a new anchor is refused at a limit, with one stable
+error; exact and near replays remain available. A refusal substitutes for a
+fresh release and reveals the same fact that the input is far from every anchor.
+The shared byte cap also exposes a weak cross-user aggregate signal about prior
+store growth. These resource settings are not privacy parameters. Increase
+capacity with all retained state intact; never delete anchors to make space.
+
+Missing or corrupt established state, missing original keys, unsafe permissions
+or a mismatched UUID fail closed. Optional `dsflower.neighbourhood_store_id`
+externally pins the UUID and detects loss of both the store and its local pin;
+without that external pin, losing both can resemble first use. Stop all workers
+before restoring a consistent backup of the secret, store, UUID pin, permanent
+locks and retained Hook cache. MACs do not detect rollback to an older complete
+valid snapshot: avoiding rollback remains a custodian/storage assumption.
+Runtime upgrades create new public request domains, so drain jobs and upgrade
+both packages together; retain old state and treat new domains as additional
+releases. Existing per-release DP does not prove the private anchor-selection
+transcript DP.
+
 See [the v3 randomness contract](inst/flower_app/dsflower_runner/SEEDING.md)
 for migration, identity fields and replay scope.
 
@@ -426,15 +493,18 @@ release without executing the application; current Flower transport metadata is
 reconstructed for the current request. Declarative tracks retain their existing
 deterministic kernels and do not use this cache.
 
-Cache capacity is reserved from public bounds before private work. Concurrent
+R admission validates cache settings without reserving capacity. Neighbourhood
+anchors decide after source admission/canonicalization; only a would-be-fresh
+anchor reserves the complete public round horizon before Hook child execution.
+Exact and near replays bypass inner-cache capacity admission. Concurrent
 identical requests serialize, and entries are pinned throughout every active
 run that uses them. Only authoritative run closure releases those pins; crash
 recovery retains uncertain pins. Eviction removes only unpinned entries, oldest
 first. Exact retry thus applies to every Hook application throughout its active
-run and across runs while its release remains retained. Evicted nondeterministic
-releases cannot be reconstructed, so indefinite cross-run replay is not claimed.
-Changed private data or request selections miss even after an in-memory reply,
-and a committed coordinate cannot authorize a second release under another key.
+run. The outer permanent neighbourhood store serves exact and near inputs
+before consulting this cache and retains whole payloads after inner-cache eviction.
+Fresh-path changes to private data or request selections miss the exact cache;
+a committed coordinate cannot authorize a second release under another key.
 
 Replay is deterministic post-processing of the first mechanism output, without
 another observation from application randomness. It does not change clipping,
@@ -460,7 +530,7 @@ The client can request a valid declarative computation but cannot set or weaken:
 - number of rounds in the current training;
 - DP unit, patient column and identifier canonicalisation;
 - HookApp enablement, sandbox attestation, timeout or timing envelope;
-- gated-release cache directory or byte capacity;
+- gated-release cache or neighbourhood directory, capacity, threshold or UUID;
 - exact metrics, counts, logs or feature statistics.
 
 Server-owned structural manifest fields cannot be duplicated or overridden by
@@ -479,7 +549,7 @@ verified, but may never claim another key for that coordinate. Authoritative
 cleanup closes cache admission for the run before removing inputs and the
 per-run ledger and releasing cache pins. The durable cache lives separately from
 staging. An equivalent new declarative training reconstructs the same semantic
-PRF input; an equivalent new Hook training replays while its entry is retained.
+PRF input; an equivalent new Hook training replays its retained neighbourhood anchor.
 
 The node pins the recursive runner hash. The client's bundled runner must be
 byte-identical. The coordinated release check
@@ -556,7 +626,8 @@ The supplied Rock runtime performs early bootstrap when the deployment provides
 `DSFLOWER_NODE_SECRET_FILE`. Otherwise it defers to the first session because
 Opal/Armadillo inject profile R options only after that session exists. The
 environment path takes precedence over a stale key-path option. A missing key
-is provisioned; an existing invalid key requires custodian repair. Policy options such as epsilon and delta remain
+is provisioned only before neighbourhood state is established; lost or invalid
+established keys require custodian recovery. Policy options such as epsilon and delta remain
 session/profile options.
 
 | Option | Default | Meaning |
@@ -571,8 +642,13 @@ session/profile options.
 | `checkpoint_cache_dir` | `checkpoints` under `tools::R_user_dir("dsFlower", "data")` | Protected service-owned cache outside staging, Hook mounts and node-secret storage. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound |
 | `node_secret_path` | Unix: `/var/lib/dsflower/privacy/noise_root`; Windows: `%LOCALAPPDATA%/dsflower/privacy/noise_root` | Runtime-generated key; deployment ENV takes precedence when it selects another path |
+| `neighbourhood_k` | subset filter, otherwise `3` | Positive exact integer, floor `2`; frozen per R |
+| `neighbourhood_max_anchors` | `256` | Per-R anchor cap, refusing only would-be-fresh inputs |
+| `neighbourhood_store_bytes` | `68719476736` | Logical/page-allocation permanent-store cap; replays consume no tickets |
+| `neighbourhood_state_dir` | `<node-secret-path>.neighbourhood` | Protected persistent anchor store outside staging and Hook mounts |
+| `neighbourhood_store_id` | unset | Optional external lowercase UUID pin for established state |
 | `release_cache_dir` | `release-cache` beside the node secret | Persistent gated-Hook release cache, outside private staging and Hook mounts, with protected ownership and permissions |
-| `release_cache_bytes` | `1073741824` | Administrator-owned logical cache capacity; reserves the complete public worst-case run before private work and never evicts active-run pins |
+| `release_cache_bytes` | `1073741824` | Administrator-owned logical cache capacity; would-be-fresh anchors reserve the complete public worst-case run before Hook child execution; exact/near anchors bypass this admission; never evicts active-run pins |
 | `tunnel_chunk_bytes` | `524288` | Per-exchange decoded tunnel payload cap (16--512 KiB); larger streams use multiple exact chunks below DSI's expression-parser limit |
 | `tunnel_spool_max_bytes` | `1073741824` | Per-direction tunnel spool cap; TCP backpressure when full |
 | `tunnel_loss_tolerance` | `180` | Relay-heartbeat timeout in seconds (`5`--`86400`) |
@@ -671,12 +747,13 @@ image default.
 
 The node secret is runtime state, never image content. Container deployments
 should persist `/var/lib/dsflower/privacy/noise_root` when stable deterministic
-noise across replacements is desired, together with the gated-Hook cache
+noise across replacements is desired, together with the permanent neighbourhood
+store, its local UUID pin and lock files, and the gated-Hook cache
 (default `/var/lib/dsflower/privacy/release-cache`) for exact replay of retained
 releases. Cache directories and files require service ownership, modes `0700`
-and `0600` respectively, and no symlinks. A missing seed is recoverable and creates
-an independent noise domain; an invalid existing secret fails closed pending
-custodian repair. Do not clone one secret to concurrent nodes.
+and `0600` respectively, and no symlinks. Missing established keys or state fail
+closed until a consistent backup is restored; do not replace them to retry an
+analysis. Do not clone one secret to concurrent nodes.
 Mounting all of `/var/lib/dsflower` would hide the baked `venvs/` and is therefore
 not recommended. The package intentionally leaves volume wiring to the Rock or
 cluster orchestrator.

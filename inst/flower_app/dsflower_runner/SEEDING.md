@@ -1,4 +1,4 @@
-# Deterministic release identity in 0.7.1
+# Deterministic release identity and neighbourhood replay in 0.7.2
 
 Version `dsflower-semantic-randomness-v3` separates a public semantic request
 identity R from a node-private content binding B. The trusted runner validates
@@ -66,7 +66,7 @@ Hook `initial_arrays` executes on the server inside an isolated Python/NumPy/Tor
 RNG context seeded from its public initialization contract. Arbitrary code can
 still use OS entropy or other nondeterministic inputs: a changed initializer
 output creates a new release per run because incoming array contents remain in
-R. No node-side initializer sandbox or initialization cache is added in 0.7.1.
+R. No node-side initializer sandbox or initialization cache is added.
 
 ## Assignments and replay
 
@@ -93,9 +93,13 @@ Each admitted Hook uses its existing durable first-release cache, now keyed in
 the v3 domain. The final validated/clipped update remains separately bound to its
 noise substream. Stored entries contain final released arrays/constant metrics;
 no master or noise key is persisted. Active entries stay pinned; concurrent
-requests serialize. Cross-run replay lasts only while an entry is retained.
-Eviction/tombstone policy is unchanged in 0.7.1; no indefinite replay claim is made.
-A cache hit returns final bytes, including any already-applied Hook FedProx step.
+requests serialize. R admission freezes the custodian cache settings without
+reserving capacity; only would-be-fresh anchors reserve the complete public run
+horizon before Hook execution. Exact/near replays bypass inner-cache capacity
+admission. The exact Hook cache's eviction/tombstone policy is unchanged.
+The outer neighbourhood store decides first and permanently retains the complete
+released payload, including any already-applied Hook FedProx step. A near match
+never calls the Hook or applies FedProx a second time.
 
 FedProx uses public `mu` in `[0,1]`. Positive neural mu requires every scheduled
 `learning_rate * mu <= 1`; its proximal step follows the DP optimizer and L1 prox.
@@ -104,26 +108,88 @@ arbitrary Hook optimizers. Zero is normalized to FedAvg with no extra arithmetic
 on supported neural/Hook paths. Trees (all five engines), association and
 standalone validation reject raw FedProx, including zero.
 
-## Migration and residual scope
+## Neighbourhood replay
 
-Drain active jobs and upgrade both packages/runners together. Restage requests
-under v3: there is no mixed v2/v3 fallback. Preserve the node secret and retained
-Hook cache on persistent storage. Missing secrets are provisioned as before;
-existing malformed, wrong-owner or wrong-mode secret files fail closed with a
-custodian recovery instruction. There is no new initialization marker. Deliberate
-secret replacement/loss starts a new release domain and is not a free replay.
+Version 0.7.2 mitigates the equality oracle described in
+[isglobal-brge/dsFlower#7](https://github.com/isglobal-brge/dsFlower/issues/7)
+with immutable neighbourhood anchors. For each public request R (including its
+incoming model and round), the node scans **all** retained anchors and returns
+the complete stored payload of the **oldest** anchor at distance `d < k`. If none
+is eligible, it computes the unchanged v3 content-bound release and appends one
+new anchor. Near inputs never become anchors. Newer anchors cannot displace an
+older eligible anchor, so replay is stable without per-input bindings.
 
-Secret-keyed, domain-separated streams reproduce the same release for an exact
-semantic replay. Incoming model contents and all effective private inputs remain
-bound. Omitting either would allow different exact updates to share noise and
-can make differencing cancel that noise.
+Distance counts unordered canonical privacy units with multiplicity:
+`d = max(|M| - c, |N| - c)`, where `c = sum(min(M[t], N[t]))`. One insertion,
+deletion or replacement counts once; in patient mode a patient's complete
+selected records form one unit. The default `k` is the node's `nfilter.subset`
+(or its `default.` option), otherwise 3, with a floor of 2. Custodians can set
+`dsflower.neighbourhood_k` (or `default.dsflower.neighbourhood_k`); the effective
+value is frozen per R. Analysts cannot change it or force refresh.
 
-Content equality also affects the joint distribution of related releases. If a
-permitted private-data transformation is a no-op, its release can coincide exactly
-with the original; otherwise the changed data select a different stream. For
-high-dimensional unrounded outputs this can provide a strong equality test.
-Finite or clamped outputs may collide, so equal bytes are not a universal proof
-that private datasets are identical. No claim of differential privacy for an
-unrestricted adaptive transcript of such equality tests is made. 0.7.1 does not
-implement neighborhood anchoring or private-data provenance admission. Changing a
-key, runtime, contract or custodial snapshot is a new release, not a free replay.
+An analyst can no longer test a one-unit difference against an existing release
+by obtaining a fresh answer inside that anchor's neighbourhood. This is a
+**mitigation, not transcript DP**: the hard `k-1`/`k` boundary and boundaries
+between anchors still distinguish some one-unit neighbours. An input must be
+at least k from **every** anchor to receive a fresh release. Small updates can
+therefore return stale models or statistics; uncertainty intervals do not
+include this staleness. No hit/near/fresh status, distance or anchor identifier is
+returned. Timing and availability remain outside the guarantee.
+
+The rule covers every neural DP-SGD round, gated Hook release, all five native
+tree engines, private validation, holdout, CV fold training and OOF output, and
+association. Each round/fold/evaluation has its own R. Completed federation
+trajectories replay when the same incoming public models and eligible anchor
+choices recur; this is not a universal neighbouring-world transcript claim.
+Calibration, sensitivities, accounting, FedProx and the fresh R/B/K identity
+remain unchanged. Conditional DP mechanisms compose under their existing
+assumptions; no lifetime privacy budget is introduced.
+
+## Migration, state and residual scope
+
+The permanent node-local store defaults to `<node-secret-path>.neighbourhood`.
+First release initializes it automatically and pins its random UUID at
+`<node-secret-path>.neighbourhood-id`, beside the secret rather than inside the
+store. The store uses owner-only directories/files (`0700`/`0600`), keyed unit
+fingerprints, MAC-authenticated records and complete payload bytes; it never
+stores raw source records or noise seeds. Records are verified before decoding,
+and a per-R lock serializes selection and durable anchor commit before release.
+There is no eviction, expiry or per-attempt ticket.
+
+The default limits are 256 anchors per R and 64 GiB of store capacity. Fresh
+commits must fit both logical retained bytes (payloads, fingerprints and record
+overhead) and SQLite allocated pages plus fixed state headroom. Provision extra
+physical disk space for transient SQLite journals and filesystem allocation slack. Only an
+input that would create a new anchor is refused at a limit, with one stable
+error; exact and near replays remain available. A refusal substitutes for a
+fresh release and reveals the same fact that the input is far from every anchor.
+The shared byte cap also exposes a weak cross-user aggregate signal about prior
+store growth. These resource settings are not privacy parameters. Increase
+capacity with all retained state intact; never delete anchors to make space.
+
+Missing or corrupt established state, missing original keys, unsafe permissions
+or a mismatched UUID fail closed. Optional `dsflower.neighbourhood_store_id`
+externally pins the UUID and detects loss of both the store and its local pin;
+without that external pin, losing both can resemble first use. Stop all workers
+before restoring a consistent backup of the secret, store, UUID pin, permanent
+locks and retained Hook cache. MACs do not detect rollback to an older complete
+valid snapshot: avoiding rollback remains a custodian/storage assumption.
+Runtime upgrades create new public request domains, so drain jobs and upgrade
+both packages together; retain old state and treat new domains as additional
+releases. Existing per-release DP does not prove the private anchor-selection
+transcript DP.
+
+Fresh computation retains the complete content binding B and v3 noise subkeys.
+The anchor selector uses separate node-private fingerprint and integrity subkeys
+and canonical source-unit records, including full parent units for holdout/CV.
+It does not derive distance from the whole-data B digest or from pooled outputs.
+With k=3, let Q remove two units from A, then let B remove three units from A.
+Q selects A; after B becomes a fresh anchor Q still selects older A even though
+B is nearer. No per-input response binding is needed and Q never becomes an
+anchor. An existing R retains its frozen k when the custodian changes the option;
+only new public identities use the new value.
+
+Equal bytes are not proof of equal private inputs: nearby inputs deliberately
+share a release, and finite/clamped outputs can also collide. A public model,
+key, runtime or contract change creates a new request domain. No provenance-only
+fast path, analyst refresh nonce or general adaptive transcript-DP claim is added.
