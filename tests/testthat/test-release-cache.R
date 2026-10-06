@@ -153,7 +153,7 @@ test_that("authoritative cleanup stops workers before close and keeps failed rec
   local_mocked_bindings(
     .release_cache_command = function(action, run_token, settings, rounds = NULL) {
       events <<- c(events, action)
-      if (identical(action, "close") && fail_close) stop("closure interrupted")
+      if (identical(action, "close-if-reserved") && fail_close) stop("closure interrupted")
       invisible(TRUE)
     },
     .supernode_stop = function(manifest_dir) {
@@ -168,7 +168,7 @@ test_that("authoritative cleanup stops workers before close and keeps failed rec
   expect_true(file.exists(file.path(staging, ".release-cache.json")))
   expect_gte(length(events), 2L)
   expect_true(all(head(events, -1L) == "stop"))
-  expect_identical(tail(events, 1L), "close")
+  expect_identical(tail(events, 1L), "close-if-reserved")
   fail_close <- FALSE
   expect_true(dsFlower:::.cleanupStaging(token))
   expect_false(dir.exists(staging))
@@ -212,5 +212,28 @@ test_that("the isolated cache CLI reserves durable state and closes exact runs",
   constrained$capacity <- 1
   expect_error(dsFlower:::.release_cache_command(
     "reserve", dsFlower:::.generate_run_token(), constrained, 1L),
+    "durable Hook release cache is unavailable")
+})
+
+
+test_that("automatic cleanup does not charge or tombstone an unreserved run", {
+  skip_on_os("windows")
+  python <- unname(Sys.which("python3"))
+  skip_if(!nzchar(python), "Python is required for the cache cleanup CLI")
+  local_release_cache_state()
+  local_mocked_bindings(
+    .resolve_framework_runtime = function(framework) list(python = python))
+  token <- dsFlower:::.generate_run_token()
+  settings <- dsFlower:::.release_cache_settings()
+  constrained <- settings
+  constrained$capacity <- 1
+  expect_true(dsFlower:::.release_cache_command(
+    "close-if-reserved", token, constrained))
+  # No close tombstone was inserted: normal reservation remains possible.
+  expect_true(dsFlower:::.release_cache_command("reserve", token, settings, 1L))
+  expect_true(dsFlower:::.release_cache_command(
+    "close-if-reserved", token, settings))
+  # A reserved run still closes permanently and refuses late re-admission.
+  expect_error(dsFlower:::.release_cache_command("reserve", token, settings, 1L),
     "durable Hook release cache is unavailable")
 })

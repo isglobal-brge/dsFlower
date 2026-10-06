@@ -151,9 +151,12 @@
   if (!length(settings)) return(invisible(TRUE))
   # Stop every possible worker before closing a reservation. If stopping or
   # closing fails, leave the receipt and staging in place for an exact retry.
+  # A replay-only run has no inner reservation: after confirmed worker shutdown,
+  # cleanup must not create a tombstone or consume fresh-release cache capacity.
+  # The administrator's unconditional close command retains its existing guard.
   for (staging_dir in staging_dirs) .supernode_stop(staging_dir)
   for (setting in settings) {
-    .release_cache_command("close", run_token, setting)
+    .release_cache_command("close-if-reserved", run_token, setting)
   }
   invisible(TRUE)
 }

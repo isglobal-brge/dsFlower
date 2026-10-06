@@ -74,7 +74,7 @@ def _metadata_bytes(rounds):
 
 
 @lru_cache(maxsize=1)
-def _acl_validator():
+def _acl_helper():
     # Load only the colocated trusted helper in both package and isolated CLI
     # contexts. This keeps shared ACL checks available to the dependency-light
     # association worker without importing the native engine package namespace.
@@ -82,7 +82,12 @@ def _acl_validator():
     spec = importlib.util.spec_from_file_location("_dsflower_cache_acl", path)
     xgboost_bundle = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(xgboost_bundle)
-    return xgboost_bundle._reject_extended_acl
+    return xgboost_bundle
+
+
+@lru_cache(maxsize=1)
+def _acl_validator():
+    return _acl_helper()._reject_extended_acl
 
 
 def _reject_unsafe_acl(path, *, parent_chain=False):
@@ -453,13 +458,21 @@ class ReleaseCache:
             if row is not None and row[0]:
                 raise RuntimeError("gated cache run is administratively closed")
 
-    def close_run(self, run_fingerprint):
-        """Authoritatively close after all in-flight releases finish; retain tombstone."""
+    def close_run(self, run_fingerprint, *, only_if_reserved=False):
+        """Close a run after in-flight releases finish.
+
+        Automatic cleanup may use only_if_reserved after confirming worker
+        termination. Replay-only runs then create no quota-charged tombstone.
+        An administrator's unconditional close still blocks late admission.
+        """
         run = _hex(run_fingerprint, "run fingerprint")
         with ExitStack() as stack:
             for shard in range(_LOCK_SHARDS):
                 stack.enter_context(self._lock(shard))
             with self._transaction() as connection:
+                if only_if_reserved and connection.execute(
+                        "SELECT 1 FROM runs WHERE run=?", (run,)).fetchone() is None:
+                    return
                 # Cleanup can race an admission whose public reservation has
                 # not yet committed. The tombstone also closes that late run.
                 inserted = connection.execute(
@@ -498,7 +511,7 @@ class _ReleaseSlot:
 
 def _main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("reserve", "close"))
+    parser.add_argument("action", choices=("reserve", "close", "close-if-reserved"))
     identity = parser.add_mutually_exclusive_group(required=True)
     identity.add_argument("--run-token")
     identity.add_argument("--run-fingerprint")
@@ -511,7 +524,7 @@ def _main():
         if args.action == "reserve":
             cache.reserve_run(run, args.rounds)
         else:
-            cache.close_run(run)
+            cache.close_run(run, only_if_reserved=args.action == "close-if-reserved")
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         parser.exit(1, "gated release cache: %s\n" % exc)
 

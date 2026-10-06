@@ -19,8 +19,9 @@ import struct
 import uuid
 
 try:
-    from . import release_cache, seeding
+    from . import neighbourhood_windows, release_cache, seeding
 except ImportError:
+    import neighbourhood_windows
     import release_cache
     import seeding
 
@@ -189,7 +190,30 @@ def decode_payload(encoded):
     return result
 
 
+def _safe_file(path, *, create=False):
+    if os.name == "nt":
+        return neighbourhood_windows.safe_file(path, create=create)
+    return release_cache._safe_file(path, create=create)
+
+
+def _safe_directory(path, forbidden_dirs):
+    if os.name == "nt":
+        return neighbourhood_windows.safe_directory(path, forbidden_dirs)
+    return release_cache._safe_directory(path, forbidden_dirs)
+
+
+def _overlaps(left, right):
+    if os.name == "nt":
+        return neighbourhood_windows.overlaps(left, right)
+    return os.path.commonpath((left, right)) in (left, right)
+
+
 def _sync_directory(path):
+    if os.name == "nt":
+        # Windows uses flushed SQLite commits and write-through UUID pin
+        # publication. It has no POSIX directory-fsync API to invoke here.
+        neighbourhood_windows.safe_parent(path, private=True)
+        return
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(fd)
@@ -198,6 +222,9 @@ def _sync_directory(path):
 
 
 def _safe_parent(path):
+    if os.name == "nt":
+        neighbourhood_windows.safe_parent(path, private=True)
+        return
     if not os.path.isabs(path) or os.path.normpath(path) != path:
         raise StateError()
     current = os.path.sep
@@ -216,24 +243,32 @@ def _check_directory(path):
     # never use that behavior, so reject absence before invoking it.
     if not os.path.isdir(path) or os.path.islink(path):
         raise StateError()
-    return release_cache._safe_directory(path, ())
+    return _safe_directory(path, ())
 
 
 @contextmanager
 def _file_lock(path, *, create=False):
-    import fcntl
+    if os.name == "nt":
+        lock, unlock = neighbourhood_windows.acquire_lock, neighbourhood_windows.release_lock
+    else:
+        import fcntl
+        lock = lambda descriptor: fcntl.flock(descriptor, fcntl.LOCK_EX)
+        unlock = lambda descriptor: fcntl.flock(descriptor, fcntl.LOCK_UN)
     try:
-        fd = release_cache._safe_file(path, create=create)
+        fd = _safe_file(path, create=create)
     except (OSError, RuntimeError) as exc:
         raise StateError() from exc
+    acquired = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock(fd)
+        acquired = True
         info, named = os.fstat(fd), os.lstat(path)
         if (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino):
             raise StateError()
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if acquired:
+            unlock(fd)
         os.close(fd)
 
 
@@ -248,6 +283,9 @@ class NeighbourhoodStore:
         self._mac_key = hmac.new(secret, _frame(_VERSION.encode(), b"records"), hashlib.sha256).digest()
         self._unit_key = hmac.new(secret, _frame(_VERSION.encode(), b"units"), hashlib.sha256).digest()
         self._index_key = hmac.new(secret, _frame(_VERSION.encode(), b"request-index"), hashlib.sha256).digest()
+        if os.name == "nt":
+            directory = neighbourhood_windows.normalize_path(directory)
+            pin_path = neighbourhood_windows.normalize_path(pin_path)
         self.directory = directory
         self.pin_path = pin_path
         self.database = os.path.join(directory, "anchors.sqlite3")
@@ -259,14 +297,14 @@ class NeighbourhoodStore:
                 raise StateError()
             if (not os.path.isabs(pin_path) or os.path.normpath(pin_path) != pin_path
                     or not os.path.isabs(directory) or os.path.normpath(directory) != directory
-                    or os.path.commonpath((directory, pin_path)) == directory):
+                    or _overlaps(directory, pin_path)):
                 raise StateError()
             # Validate the pin parent without creating it. The root secret has
             # already been validated by from_env; direct callers get the same
             # no-symlink/owner-only persistence requirement here.
             _safe_parent(os.path.dirname(pin_path))
             for forbidden in self._forbidden:
-                if forbidden and os.path.commonpath((pin_path, os.path.realpath(forbidden))) == os.path.realpath(forbidden):
+                if forbidden and _overlaps(pin_path, os.path.realpath(forbidden)):
                     raise StateError()
             lock_preexisted = os.path.lexists(self.init_lock)
             established = (lock_preexisted or os.path.lexists(pin_path)
@@ -307,7 +345,7 @@ class NeighbourhoodStore:
                    forbidden_dirs=forbidden_dirs)
 
     def _read_pin(self):
-        fd = release_cache._safe_file(self.pin_path)
+        fd = _safe_file(self.pin_path)
         try:
             raw = os.read(fd, 37)
             os.fsync(fd)
@@ -321,16 +359,19 @@ class NeighbourhoodStore:
 
     def _initialize(self):
         self.store_uuid = str(uuid.uuid4())
-        release_cache._safe_directory(self.directory, self._forbidden)
+        _safe_directory(self.directory, self._forbidden)
         for shard in range(_LOCK_SHARDS + 1):
-            os.close(release_cache._safe_file(self._lock_path(shard), create=True))
-        os.close(release_cache._safe_file(self.database, create=True))
+            os.close(_safe_file(self._lock_path(shard), create=True))
+        os.close(_safe_file(self.database, create=True))
         with self._connection() as connection:
             connection.execute("CREATE TABLE header (id INTEGER PRIMARY KEY CHECK(id=1), body BLOB NOT NULL, mac BLOB NOT NULL)")
             connection.execute("CREATE TABLE requests (request_key TEXT PRIMARY KEY, body BLOB NOT NULL, mac BLOB NOT NULL) WITHOUT ROWID")
             connection.execute("CREATE TABLE anchors (request_key TEXT NOT NULL REFERENCES requests(request_key), sequence INTEGER NOT NULL, binding BLOB NOT NULL, units BLOB NOT NULL, payload BLOB NOT NULL, mac BLOB NOT NULL, PRIMARY KEY(request_key, sequence)) WITHOUT ROWID")
             self._write_header(connection, _BASE_BYTES)
         _sync_directory(self.directory)
+        if os.name == "nt":
+            neighbourhood_windows.publish_pin(self.pin_path, self.store_uuid.encode("ascii"))
+            return
         fd = os.open(self.pin_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             os.write(fd, self.store_uuid.encode("ascii"))
@@ -344,8 +385,8 @@ class NeighbourhoodStore:
 
     def _paths(self):
         _check_directory(self.directory)
-        os.close(release_cache._safe_file(self.init_lock))
-        release_cache._safe_directory(self.directory, self._forbidden)
+        os.close(_safe_file(self.init_lock))
+        _safe_directory(self.directory, self._forbidden)
         if self._read_pin() != self.store_uuid:
             raise StateError()
         allowed = {"anchors.sqlite3", "anchors.sqlite3-journal"}
@@ -353,20 +394,22 @@ class NeighbourhoodStore:
         for name in os.listdir(self.directory):
             if name not in allowed:
                 raise StateError()
-            os.close(release_cache._safe_file(os.path.join(self.directory, name)))
+            os.close(_safe_file(os.path.join(self.directory, name)))
         for shard in range(_LOCK_SHARDS + 1):
-            os.close(release_cache._safe_file(self._lock_path(shard)))
-        os.close(release_cache._safe_file(self.database))
+            os.close(_safe_file(self._lock_path(shard)))
+        os.close(_safe_file(self.database))
 
     @contextmanager
     def _connection(self):
         # mode=rw prevents SQLite from silently recreating a deleted database.
-        os.close(release_cache._safe_file(self.database))
+        os.close(_safe_file(self.database))
         journal = self.database + "-journal"
         if os.path.lexists(journal):
-            os.close(release_cache._safe_file(journal))
+            os.close(_safe_file(journal))
         from urllib.parse import quote
-        connection = sqlite3.connect("file:" + quote(self.database) + "?mode=rw", uri=True,
+        uri = (neighbourhood_windows.sqlite_uri(self.database) if os.name == "nt"
+               else "file:" + quote(self.database) + "?mode=rw")
+        connection = sqlite3.connect(uri, uri=True,
                                      timeout=60.0, isolation_level=None)
         try:
             connection.execute("PRAGMA journal_mode=DELETE")

@@ -466,13 +466,24 @@ The shared byte cap also exposes a weak cross-user aggregate signal about prior
 store growth. These resource settings are not privacy parameters. Increase
 capacity with all retained state intact; never delete anchors to make space.
 
+On Windows, the key parent and store directory require private inheritable
+ACLs: the service identity and trusted system/administrator principals may
+access the state; other grants, including read access, are rejected. Reparse
+points and hard links fail closed. SQLite uses its Windows VFS for durable
+commits; the first UUID pin is flushed and published without replacement using
+write-through publication. POSIX nodes retain file/directory fsync and flock.
+The Windows adapter has portable contract tests; Windows service and crash
+validation remains outstanding.
+
 Missing or corrupt established state, missing original keys, unsafe permissions
-or a mismatched UUID fail closed. Optional `dsflower.neighbourhood_store_id`
-externally pins the UUID and detects loss of both the store and its local pin;
-without that external pin, losing both can resemble first use. Stop all workers
-before restoring a consistent backup of the secret, store, UUID pin, permanent
-locks and retained Hook cache. MACs do not detect rollback to an older complete
-valid snapshot: avoiding rollback remains a custodian/storage assumption.
+or a mismatched UUID fail closed. The permanent
+`<node-secret-path>.neighbourhood-id.lock` also detects loss of both the store
+and local UUID pin. Optional `dsflower.neighbourhood_store_id` externally pins
+the UUID and detects loss of all local store markers; without it, losing the
+store, UUID pin and initialization lock together can resemble first use. Stop
+all workers before restoring a consistent backup of the secret, store, UUID pin,
+permanent locks and retained Hook cache. MACs do not detect rollback to an older
+complete valid snapshot: avoiding rollback remains a custodian/storage assumption.
 Runtime upgrades create new public request domains, so drain jobs and upgrade
 both packages together; retain old state and treat new domains as additional
 releases. Existing per-release DP does not prove the private anchor-selection
@@ -499,7 +510,10 @@ anchor reserves the complete public round horizon before Hook child execution.
 Exact and near replays bypass inner-cache capacity admission. Concurrent
 identical requests serialize, and entries are pinned throughout every active
 run that uses them. Only authoritative run closure releases those pins; crash
-recovery retains uncertain pins. Eviction removes only unpinned entries, oldest
+recovery retains uncertain pins. Automatic cleanup stops every worker before
+closing an existing inner-cache reservation; an unreserved replay-only run is
+then a no-op, without a new capacity charge or tombstone. The administrator's
+explicit close command retains unconditional tombstones to block late admission. Eviction removes only unpinned entries, oldest
 first. Exact retry thus applies to every Hook application throughout its active
 run. The outer permanent neighbourhood store serves exact and near inputs
 before consulting this cache and retains whole payloads after inner-cache eviction.
@@ -784,7 +798,8 @@ or traceback. The ServerApp does not aggregate that fallback or report it as a
 trained release. This prevents direct private-value disclosure through errors,
 but does not make an invalid input or a data-dependent failure indistinguishable
 from a successful model: no-op content, process termination, availability and
-execution time remain outside the formal valid-input transcript guarantee.
+execution time remain outside the numeric mechanism guarantee. The hard
+neighbourhood boundary also prevents a general valid-input transcript-DP claim.
 Covering those channels would require total preprocessing and a fixed execution
 envelope for every declarative mechanism.
 The canonical validators and numeric gates are therefore required to make

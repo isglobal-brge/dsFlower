@@ -201,3 +201,53 @@ def test_holdout_and_oof_distance_use_parent_records_not_only_test_side():
             assert release(7).tobytes() == first.tobytes()
             assert release(5).tobytes() != first.tobytes()
             assert draws.call_count == 2
+
+
+def test_real_xgboost_neighbourhood_with_verified_bundle():
+    """Two short native fits; exact/shuffled/near requests never invoke the ABI."""
+    from dsflower_runner import xgboost_adapter, xgboost_bundle
+    from test_xgboost_adapter import _manifest
+    bundle_path = os.environ.get("DSFLOWER_XGBOOST_BUNDLE")
+    if not bundle_path:
+        pytest.skip("DSFLOWER_XGBOOST_BUNDLE is required for the real native fit")
+    bundle = xgboost_bundle.load_verified_xgboost_bundle(bundle_path)
+    manifest = _manifest()
+    manifest["engine_params"]["num_boost_round"]["value"] = 1
+    manifest["engine_params"]["max_depth"]["value"] = 1
+    X = np.column_stack((np.arange(8) * 10. + 10., np.arange(8) / 10.))
+    y = np.arange(8, dtype=float) % 2
+    ids = np.asarray(["patient-%s" % index for index in range(8)])
+    prepared_inputs = []
+    original_prepare = xgboost_adapter.prepare_xgboost_training
+    def prepare(*args, **kwargs):
+        prepared = original_prepare(*args, **kwargs)
+        assert len(prepared._noise_key) == 32
+        prepared_inputs.append(prepared)
+        return prepared
+    def release(n, order=None):
+        order = np.arange(n) if order is None else order
+        return native_tree_engine.train_model(manifest, X[:n][order], y[:n][order],
+            unit_ids=ids[:n][order], xgboost_bundle=bundle)
+    with mock.patch.object(xgboost_adapter, "prepare_xgboost_training", side_effect=prepare), \
+            mock.patch.object(xgboost_adapter, "train_xgboost_native",
+                              wraps=xgboost_adapter.train_xgboost_native) as native:
+        first = release(8)
+        assert native.call_count == 1
+        assert release(8) == first
+        assert release(8, np.arange(7, -1, -1)) == first
+        assert release(7) == first
+        assert native.call_count == 1
+        far = release(5)
+        assert native.call_count == 2
+    assert prepared_inputs[0]._data_binding.digest != prepared_inputs[-1]._data_binding.digest
+    assert len(prepared_inputs) == 5
+    assert all(value._noise_key == bytearray(32) for value in prepared_inputs)
+    # Discrete noisy models can collide, so freshness is checked by native
+    # invocation and source binding, not an assumption that artifact bits differ.
+    for artifact in (first, far):
+        sanitized, digest = xgboost_adapter.sanitize_xgboost_artifact(manifest, artifact)
+        assert sanitized == artifact
+        ensemble, _ = native_tree_engine.build_ensemble(manifest, [artifact])
+        prediction = np.asarray(native_tree_engine.parse_ensemble(manifest, ensemble).predict(X))
+        assert prediction.shape == (8,)
+        assert np.isfinite(prediction).all()

@@ -217,7 +217,7 @@ def _windows_well_known_sid(advapi, sid_type):
     return storage
 
 
-def _windows_secure_acl(path, *, require_node_owner, parent_chain=False):
+def _windows_secure_acl(path, *, require_node_owner, parent_chain=False, private=False):
     """Reject replaceable Windows paths using owner and DACL inspection."""
     try:
         advapi = ct.WinDLL("advapi32", use_last_error=True)
@@ -305,6 +305,11 @@ def _windows_secure_acl(path, *, require_node_owner, parent_chain=False):
             )
             write_rights = replacement_rights | (
                 0 if parent_chain else content_write_rights)
+            # Private release state contains secret fingerprints and payloads:
+            # reject every allow grant to an untrusted principal, including
+            # read-only grants accepted for ordinary public native bundles.
+            if private:
+                write_rights = 0xFFFFFFFF
             allowed_types = frozenset((0, 4, 5, 9, 11))
             for index in range(acl.ace_count):
                 ace = ct.c_void_p()

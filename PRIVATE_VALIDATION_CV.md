@@ -308,12 +308,14 @@ store growth. These resource settings are not privacy parameters. Increase
 capacity with all retained state intact; never delete anchors to make space.
 
 Missing or corrupt established state, missing original keys, unsafe permissions
-or a mismatched UUID fail closed. Optional `dsflower.neighbourhood_store_id`
-externally pins the UUID and detects loss of both the store and its local pin;
-without that external pin, losing both can resemble first use. Stop all workers
-before restoring a consistent backup of the secret, store, UUID pin, permanent
-locks and retained Hook cache. MACs do not detect rollback to an older complete
-valid snapshot: avoiding rollback remains a custodian/storage assumption.
+or a mismatched UUID fail closed. The permanent
+`<node-secret-path>.neighbourhood-id.lock` also detects loss of both the store
+and local UUID pin. Optional `dsflower.neighbourhood_store_id` externally pins
+the UUID and detects loss of all local store markers; without it, losing the
+store, UUID pin and initialization lock together can resemble first use. Stop
+all workers before restoring a consistent backup of the secret, store, UUID pin,
+permanent locks and retained Hook cache. MACs do not detect rollback to an older
+complete valid snapshot: avoiding rollback remains a custodian/storage assumption.
 Runtime upgrades create new public request domains, so drain jobs and upgrade
 both packages together; retain old state and treat new domains as additional
 releases. Existing per-release DP does not prove the private anchor-selection
