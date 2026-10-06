@@ -199,6 +199,18 @@ roster completes both phases. Vision paths and patient IDs are partitioned
 before pixel decode for ordinary vision. Segmentation uses its canonical patient
 assembly and excludes the opposite side from training and metric contributions.
 
+### Admitted radiomics tables
+
+A complete radiomics data frame or Arrow table retrieved through dsImaging can
+be passed to `ds.flower.fit()` by its session symbol, including an unchanged
+Parquet round trip. This requires the coordinated dsImaging companion that
+registers exports against its private admitted patient roster. Row permutations
+preserve that authority; changed values, subsets, duplicate/missing sample keys,
+unregistered generic dsHPC tables and revoked sources fail closed. Patient
+identity comes from the protected roster, never from caller-added attributes.
+The companion prerequisite also applies when the public container has no
+patient-ID column.
+
 ## Per-training privacy
 
 Privacy is server-authoritative. The client cannot set epsilon, delta, clipping
@@ -435,8 +447,9 @@ secret, installer and manifest allowlist no longer authorize initialisation.
 Both routes use a complete verified bundle, including the frozen encoder,
 checkpoint, manifest, provenance, licence, protocol and audit evidence. The node
 verifies a protected snapshot before private staging; the trusted runner verifies
-it again before private access and checks the first round's public arrays against
-its admitted tensors. Missing or altered material fails closed. Status returns
+it again before private access. Incoming training arrays retain shape, dtype and
+value admission and their actual content identity; nodes do not compare them to
+expected round-one tensors. Missing or altered bundle material fails closed. Status returns
 public identity, provenance and geometry; it never exports checkpoint bytes.
 Canonical content identity excludes resource names, session symbols, locations
 and archive packaging, so aliases and repacking do not create another noise draw.

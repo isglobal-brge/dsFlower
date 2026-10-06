@@ -324,7 +324,7 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
     from . import segmentation_checkpoints
     if (pins["loss_name"] == "segmentation_bce_dice"
             or segmentation_checkpoints.checkpoint_id(cfg) is not None):
-        checkpoint_arrays, checkpoint_summary = segmentation_checkpoints.verify_node_checkpoint(
+        checkpoint_arrays, _checkpoint_summary = segmentation_checkpoints.verify_node_checkpoint(
             cfg, task_module._load_manifest(context))
         if checkpoint_arrays is not None and pins["loss_name"] == "segmentation_bce_dice":
             from . import segmentation
@@ -332,10 +332,9 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
     # The skeleton is public; the admitted incoming weights are authoritative.
     with torch.random.fork_rng(devices=[]):
         model = load_user_model(cfg, input_dim, pins["loss_name"])
-    initial_arrays = _validate_public_neural_arrays(msg.content["arrays"], model)
-    if checkpoint_arrays is not None and int(pins["round_index"]) == 1:
-        validation.assert_checkpoint_arrays(initial_arrays, checkpoint_arrays, checkpoint_summary)
-        set_torch_params(model, checkpoint_arrays)
+    # Checkpoint integrity/provenance above does not constrain the analyst's
+    # admitted initial model bytes. Those bytes are semantic inputs bound in R.
+    _validate_public_neural_arrays(msg.content["arrays"], model)
     return model, input_dim, manifest_image
 
 

@@ -12,8 +12,13 @@ tabular profile; segmentation retains its existing contract override.
 artifacts and nodes that admit no analyst-supplied material. Both routes use the
 same complete, digest-bound bundle and the normal initial public model arrays.
 The node verifies before private staging and the trusted runner verifies again
-before private access, including equality of the first round's incoming tensors.
-The DP mechanism, training algorithm, release cache and identity v2 are unchanged.
+before private access. Incoming training arrays retain shape, dtype and value
+admission, and their actual initial/current contents remain in the release identity.
+Nodes do not recompute or compare expected round-one tensors; altered bundle
+material still fails its independent integrity and admission checks.
+Checkpoint admission leaves DP calibration and accounting unchanged. Version
+0.7.1 uses the v3 release identity and re-keys the existing Hook cache; retention
+policy is unchanged.
 
 ## Bundle and migration from 0.6.0
 
@@ -42,7 +47,7 @@ reference with the exact encoder using the trusted node Python environment:
 This offline helper validates and builds a bundle; it grants no node admission.
 The old `public:<id>` selector, secret-adjacent registry, allowlist and installer
 are retired. A native `file:` resource replaces offline installation. Canonical
-identity is versioned separately from identity v2: it binds scientific content
+identity is versioned separately from the v3 release identity: it binds scientific content
 and contract digests, excluding ZIP packaging, resource names, symbols, locations,
 credentials and administrative creation labels. Repacking identical contents
 therefore does not create a new noise draw.

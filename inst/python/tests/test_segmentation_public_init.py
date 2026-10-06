@@ -166,15 +166,66 @@ def test_verified_public_payload_initializes_server_and_node_exactly(registry):
         assert expected.tobytes() == server_value.tobytes() == node_value.tobytes()
 
 
-def test_later_round_uses_federated_arrays_and_first_round_refuses_substitution(registry):
+@pytest.mark.parametrize("round_index", [1, 2])
+def test_checkpoint_training_uses_actual_admitted_arrays_in_every_round(registry, round_index):
+    # Reviewer A: a different valid initial model is a semantic input, so the
+    # node verifies the checkpoint artifact but does not overwrite or compare
+    # the incoming training parameters to its tensor bytes.
     changed = [a + np.float32(.25) for a in registry.arrays]
     cfg = pinned(registry)
-    with pytest.raises(ValueError, match="admitted checkpoint"):
-        client_app._prepare_neural_model(message(changed), registry.context, cfg, {}, pins())
-    model, _, _ = client_app._prepare_neural_model(
-        message(changed), registry.context, cfg, {}, pins(2))
-    for expected, value in zip(changed, params.get_torch_params(model)):
+    with mock.patch.object(checkpoints, "verify_node_checkpoint",
+                           wraps=checkpoints.verify_node_checkpoint) as verify_checkpoint, \
+            mock.patch.object(seg, "verified_encoder_bytes",
+                              wraps=seg.verified_encoder_bytes) as verify_encoder:
+        model, _, _ = client_app._prepare_neural_model(
+            message(changed), registry.context, cfg, {}, pins(round_index))
+    verify_checkpoint.assert_called_once()
+    verify_encoder.assert_called_once_with(cfg)
+    actual = params.get_torch_params(model)
+    for expected, value in zip(changed, actual):
         np.testing.assert_array_equal(expected, value)
+    def identity(arrays):
+        selected, _ = client_app._neural_seed_contract(cfg, pins(round_index), {},
+                                                      manifest=registry.node)
+        selected["initial-model-sha256"] = seeding.public_array_identity(arrays)["sha256"]
+        return seeding.request_identity("neural-dpsgd/v3", selected,
+            {"epsilon": 1., "delta": 1e-6, "clipping_norm": 1.}, round_index,
+            public_arrays=arrays, manifest=registry.node)
+    before, after = identity(registry.arrays), identity(actual)
+    assert before.sha256 != after.sha256
+    assert after == identity([a.copy() for a in actual])
+    request = json.loads(after.canonical_json)
+    assert request["public_arrays"]["sha256"] == seeding.public_array_identity(changed)["sha256"]
+    assert request["initialisation"]["initial_model_sha256"] == request["public_arrays"]["sha256"]
+
+
+@pytest.mark.parametrize("kind", ["shape", "dtype", "nan", "infinity", "magnitude", "count"])
+def test_checkpoint_training_keeps_incoming_array_admission(registry, kind):
+    arrays = [a.copy() for a in registry.arrays]
+    if kind == "shape": arrays[0] = arrays[0].reshape(-1)
+    elif kind == "dtype": arrays[0] = arrays[0].astype(np.float64)
+    elif kind == "nan": arrays[0].flat[0] = np.nan
+    elif kind == "infinity": arrays[0].flat[0] = np.inf
+    elif kind == "magnitude": arrays[0].flat[0] = np.float32(1e13)
+    else: arrays.pop()
+    with mock.patch.object(seg, "load_subject_tensors") as read:
+        with pytest.raises((ValueError, RuntimeError),
+                           match="shape mismatch|dtype mismatch|finite|magnitude cap|count mismatch"):
+            client_app._prepare_neural_model(message(arrays), registry.context,
+                                             pinned(registry), {}, pins())
+    read.assert_not_called()
+
+
+def test_standalone_checkpoint_validation_still_requires_the_fixed_public_model(registry):
+    from dsflower_runner import validation
+    changed = [a + np.float32(.25) for a in registry.arrays]
+    cfg = dict(pinned(registry), **{"validation-task": "segmentation",
+                                  "validation-model-track": "neural"})
+    with mock.patch.object(seg, "load_subject_tensors") as read:
+        with pytest.raises(ValueError, match="admitted checkpoint"):
+            validation.private_model_validation(registry.context, cfg,
+                {"epsilon": 1., "delta": 1e-6}, 1, changed)
+    read.assert_not_called()
 
 
 def test_encoder_mismatch_refused_before_decoder_weights_are_loaded(registry):

@@ -292,8 +292,9 @@ secret, installer and manifest allowlist no longer authorize initialisation.
 Both routes use a complete verified bundle, including the frozen encoder,
 checkpoint, manifest, provenance, licence, protocol and audit evidence. The node
 verifies a protected snapshot before private staging; the trusted runner verifies
-it again before private access and checks the first round's public arrays against
-its admitted tensors. Missing or altered material fails closed. Status returns
+it again before private access. Incoming training arrays retain shape, dtype and
+value admission and their actual content identity; nodes do not compare them to
+expected round-one tensors. Missing or altered bundle material fails closed. Status returns
 public identity, provenance and geometry; it never exports checkpoint bytes.
 Canonical content identity excludes resource names, session symbols, locations
 and archive packaging, so aliases and repacking do not create another noise draw.

@@ -1,5 +1,10 @@
 # Private validation, public starts and patient metrics — dsFlower 0.7.0
 
+0.7.1 integration note: incoming training arrays are admitted and content-bound
+without expected round-one equality checks. Checkpoint artifact admission stays
+intact; current release identity, initialization and partitions follow SEEDING.md.
+
+
 Token: `FLOWER_VALCV_2026-09-23`. Continue `feat/public-initialisation-routes`
 in both packages at version 0.7.0. This extends `DESIGN_PUBLIC_INIT.md`; its
 closed bundle verification, two admission routes, snapshot protection and
@@ -42,13 +47,14 @@ or a `flowerCheckpointInitDS` resource handle. Resource status contains only
 public identity/provenance; the coordinator must provide its own matching local
 checkpoint. It cannot recover weights from a node.
 
-Each fold's first round checks incoming tensor geometry, hashes and equality to
-the admitted material. Release identity includes the admitted identity and fold
-coordinate. Completed folds cannot initialize later folds. Random starts retain
-their existing deterministic behavior. The custodian-secret HMAC partition
-continues to depend only on the existing resampling contract and privacy-unit
-identifier; model, hyperparameters, checkpoint digest, provenance, aliases and
-fold-training noise cannot change membership.
+In 0.7.1 each fold's first round admits incoming tensor geometry, dtype and
+values without recomputing or comparing expected initial tensors. Actual incoming
+and initial content hashes, admitted checkpoint identity and fold coordinate stay
+in the release identity. Completed folds cannot initialize later folds. Random
+starts use the same spec-seeded public model for every fold. The separate
+custodian-secret partition uses canonical patient IDs or row-content occurrence
+tokens; model, hyperparameters, checkpoint digest, provenance, aliases and
+fold-training noise cannot change membership for unchanged units.
 
 The existing privacy allocation remains 80% for training and 20% for the one
 pooled metric release. CV divides training allocation across folds, retains OOF
