@@ -74,10 +74,10 @@ class ReleaseCacheTests(unittest.TestCase):
             slot.commit(arrays, METRICS)
         return arrays
 
-    def test_key_is_the_domain_separated_v2_master_subkey(self):
+    def test_key_is_the_domain_separated_v3_master_subkey(self):
         master = bytes(range(32))
         self.assertEqual(release_cache.cache_key(master),
-                         seeding.sub_seed(master, "gated-release-cache-key/v1").hex())
+                         seeding.sub_seed(master, "gated-release-cache-key/v3").hex())
         self.assertNotEqual(release_cache.cache_key(master), master.hex())
         self.assertNotEqual(release_cache.cache_key(master),
                             seeding.sub_seed(master, "egress").hex())

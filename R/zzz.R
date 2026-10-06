@@ -441,9 +441,9 @@
 #' Ensure a dedicated per-node 256-bit secret for deterministic releases
 #'
 #' The secret is created at RUN TIME, never from `.onLoad`, so an image build
-#' cannot accidentally bake one key into every deployed node. Missing, malformed
-#' or permissively-mode'd regular files owned by the service user are replaced
-#' with fresh operating-system entropy. Unsafe paths and ownership fail closed.
+#' cannot accidentally bake one key into every deployed node. Missing secrets
+#' are provisioned with fresh operating-system entropy. Existing malformed or
+#' unsafe secrets fail closed and require custodian recovery of the original key.
 #' @keywords internal
 .ensure_node_secret <- function() {
   path <- .node_secret_path()
@@ -490,21 +490,9 @@
     }, error = function(e) e)
     if (isTRUE(valid)) return(invisible(path))
 
-    info <- file.info(path)
-    if (nrow(info) != 1L || is.na(info$isdir[[1]]) ||
-        isTRUE(info$isdir[[1]]) || !.path_is_regular_file(path)) {
-      stop(conditionMessage(valid), call. = FALSE)
-    }
-    if (.Platform$OS.type == "unix") {
-      owner <- suppressWarnings(as.integer(info$uid[[1]]))
-      if (is.na(owner) || !identical(owner, as.integer(euid))) {
-        stop(conditionMessage(valid), call. = FALSE)
-      }
-    } else if (.Platform$OS.type == "windows") {
-      # Malformed content may be rotated, but an unsafe ACL is an ownership
-      # failure and must never be papered over by replacement.
-      .windows_validate_private_acl(path)
-    }
+    stop("Existing dsFlower node secret is invalid: ", conditionMessage(valid),
+         ". Custodian action required: restore the original valid secret and its owner-only permissions from protected state; do not replace or rotate it to retry this analysis.",
+         call. = FALSE)
   }
 
   .write_node_secret_atomic(path, parent)
