@@ -1,4 +1,4 @@
-# MIT License
+MIT License
 
 Copyright (c) 2026 Barcelona Institute for Global Health (ISGlobal)
 
