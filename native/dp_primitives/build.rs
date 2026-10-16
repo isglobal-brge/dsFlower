@@ -1,5 +1,5 @@
 // Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {

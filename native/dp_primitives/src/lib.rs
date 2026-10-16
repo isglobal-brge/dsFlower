@@ -1,5 +1,5 @@
 // Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 
 use std::mem::{align_of, size_of};
 use std::panic::{AssertUnwindSafe, catch_unwind};

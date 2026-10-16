@@ -1,6 +1,7 @@
 # Licenses and provenance
 
-The dsFlower wrapper and C ABI in this directory are Apache-2.0.
+The dsFlower wrapper and C ABI in this directory are MIT, like the rest of dsFlower.
+Only the incorporated third-party work below keeps its own licence.
 
 The exact noise sampler in `src/discrete_gaussian.rs` is a minimal port of
 OpenDP 0.15.1 commit `c34d3d04a8872a51af523d9a2244be6171173b7d`.

@@ -1,6 +1,6 @@
 /*
  * Copyright 2026 Barcelona Institute for Global Health (ISGlobal)
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  */
 #ifndef DSFLOWER_DP_PRIMITIVES_H_
 #define DSFLOWER_DP_PRIMITIVES_H_
