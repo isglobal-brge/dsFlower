@@ -543,6 +543,58 @@ flowerInitDS <- function(data_symbol) {
   run_config
 }
 
+.normalizeBackboneMode <- function(run_config, track, unit_policy = NULL) {
+  mode <- run_config[["backbone-mode"]] %||% "frozen"
+  if (!is.character(mode) || length(mode) != 1L || is.na(mode) ||
+      !mode %in% c("frozen", "finetune", "scratch")) {
+    stop("backbone-mode must be 'frozen', 'finetune', or 'scratch'.", call. = FALSE)
+  }
+  if (!"backbone-mode" %in% names(run_config)) return(run_config)
+  if (!identical(track, "neural") ||
+      !identical(run_config[["data_type"]], "image") ||
+      .segmentationRequested(run_config)) {
+    stop("backbone-mode is supported only for vision classification training.", call. = FALSE)
+  }
+  if (identical(mode, "frozen")) {
+    run_config[["backbone-mode"]] <- NULL
+    return(run_config)
+  }
+  if (!.trainableBackboneAllowed()) {
+    stop("Trainable vision backbones require custodian permission: set ",
+         "dsflower.allow_trainable_backbone=TRUE on every node.", call. = FALSE)
+  }
+  if (!is.null(run_config[["user-module"]])) {
+    stop("Trainable vision backbones require the trusted neural runner without a Hook module.", call. = FALSE)
+  }
+  if (!identical(.resolvePrivacyUnitPolicy(unit_policy)$dp_unit, "patient")) {
+    stop("Trainable vision backbones require patient-level privacy.", call. = FALSE)
+  }
+  if (any(startsWith(names(run_config), "resampling-")) ||
+      any(startsWith(names(run_config), "cv-"))) {
+    stop("Trainable vision backbones do not yet support private holdout or CV.", call. = FALSE)
+  }
+  if (!run_config[["loss-name"]] %in% c("bce_logits", "cross_entropy")) {
+    stop("Trainable vision backbones require a classification loss.", call. = FALSE)
+  }
+  # Public geometry/schedule admission happens before private image access.
+  size <- run_config[["image-size"]]
+  limit <- if (endsWith(run_config[["backbone"]], "_3d")) 128L else 64L
+  schedule_ok <- function(value, cap) {
+    is.numeric(value) && !is.logical(value) && length(value) == 1L &&
+      !is.na(value) && is.finite(value) && value == floor(value) &&
+      value >= 1 && value <= cap
+  }
+  if (!schedule_ok(size, limit) ||
+      !schedule_ok(run_config[["local-epochs"]], 5L) ||
+      !schedule_ok(run_config[["num-server-rounds"]], 20L) ||
+      !schedule_ok(run_config[["batch-size"]], 8L)) {
+    stop("Trainable vision limits: image-size <=64 (2D) or <=128 (3D), ",
+         "local-epochs <=5, rounds <=20, batch-size <=8.", call. = FALSE)
+  }
+  run_config[["allow-trainable-backbone"]] <- TRUE
+  run_config
+}
+
 .normalizeValidationConfig <- function(run_config, track) {
   fields <- setdiff(names(run_config)[startsWith(tolower(names(run_config)),
                                           "validation-")],
@@ -1330,6 +1382,7 @@ flowerInitDS <- function(data_symbol) {
   run_config <- .normalizePrivateMetricConfig(run_config)
   run_config <- .normalizeAssociationConfig(run_config, track, unit_policy)
   run_config <- .normalizeValidationConfig(run_config, track)
+  run_config <- .normalizeBackboneMode(run_config, track, unit_policy)
   run_config <- .normalizeNativeTreeConfig(run_config, track)
   run_config <- .normalizeResamplingConfig(run_config, track, unit_policy)
   run_config <- .normalizeCrossValidationConfig(run_config, track, unit_policy)
@@ -2144,6 +2197,10 @@ flowerPingDS <- function() {
 #' when explicitly requested. Resampling advertises atomic holdout for tabular
 #' neural/native-tree runs and trusted neural images. Cross-validation supports
 #' tabular models and segmentation images, including patient-level survival metrics.
+#' The logical \code{allow_trainable_backbone} field reports the custodian option
+#' \code{dsflower.allow_trainable_backbone} (default FALSE). Trainable vision
+#' classification requires this permission and patient privacy; private
+#' validation, holdout and CV for trainable backbones are not supported.
 #'
 #' @param native_tree_probe Exactly \code{"none"} (the default), \code{"all"},
 #'   or one implemented native-tree engine name. This controls an operational
@@ -2209,6 +2266,7 @@ flowerGetCapabilitiesDS <- function(native_tree_probe = "none",
     native_tree         = native_tree,
     association         = association,
     max_rounds          = settings$max_rounds,
+    allow_trainable_backbone = settings$allow_trainable_backbone,
     min_samples         = .disclosure_min_rows(),
     min_clients_per_round = 1L,
     dp_required         = TRUE,
@@ -2290,12 +2348,15 @@ flowerStatusDS <- function(handle_symbol) {
 #' Query the server-owned stateless privacy policy
 #'
 #' Returns only public, administrator-pinned per-training values.
+#' Includes \code{allow_trainable_backbone}, the strict logical custodian option
+#' \code{dsflower.allow_trainable_backbone}, which defaults to FALSE.
 #' @return Named list describing the server-owned per-training privacy policy.
 #' @export
 flowerPrivacyPolicyDS <- function() {
   .dsflower_require_literal_arguments()
   policy <- .privacy_policy_status()
   policy$public_initialisation <- .public_initialisation_policy_status()
+  policy$allow_trainable_backbone <- .trainableBackboneAllowed()
   policy
 }
 

@@ -104,9 +104,19 @@
       fallback = 40L, minimum = 1L),
     # --- dsFlower-specific settings ---
     max_rounds = as.numeric(.dsf_option("max_rounds", 500)),
+    allow_trainable_backbone = .trainableBackboneAllowed(),
     allow_supernode_spawn = as.logical(.dsf_option("allow_supernode_spawn", TRUE)),
     max_concurrent_runs = as.numeric(.dsf_option("max_concurrent_runs", Inf))
   )
+}
+
+# Strict logical admission: an analyst cannot enable this through run_config.
+.trainableBackboneAllowed <- function() {
+  value <- .dsf_option("allow_trainable_backbone", FALSE)
+  if (!is.logical(value) || length(value) != 1L || is.na(value)) {
+    stop("dsflower.allow_trainable_backbone must be TRUE or FALSE.", call. = FALSE)
+  }
+  value
 }
 
 #' Minimum cell count for any returned class/event/stratum count.

@@ -11,4 +11,6 @@ Named list describing the server-owned per-training privacy policy.
 }
 \description{
 Returns only public, administrator-pinned per-training values.
+Includes \code{allow_trainable_backbone}, the strict logical custodian option
+\code{dsflower.allow_trainable_backbone}, which defaults to FALSE.
 }

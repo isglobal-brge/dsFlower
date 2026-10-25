@@ -27,4 +27,8 @@ filesystem paths. Native-tree and association availability are probed only
 when explicitly requested. Resampling advertises atomic holdout for tabular
 neural/native-tree runs and trusted neural images. Cross-validation supports
 tabular models and segmentation images, including patient-level survival metrics.
+The logical \code{allow_trainable_backbone} field reports the custodian option
+\code{dsflower.allow_trainable_backbone} (default FALSE). Trainable vision
+classification requires this permission and patient privacy; private
+validation, holdout and CV for trainable backbones are not supported.
 }

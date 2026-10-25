@@ -499,6 +499,60 @@ local metrics; local both-empty Dice is 1. Private HPO remains unsupported.
 See [private validation and CV](PRIVATE_VALIDATION_CV.md) for the distinction and
 public-initialisation calls. Local predictions use the canonical 128-by-128 grid.
 
+
+### Opt-in trainable vision backbones (0.7.4)
+
+`pytorch_resnet18` and `pytorch_densenet121` default to `backbone="frozen"`:
+only the head trains and travels, with the established extractor weights,
+BatchNorm in evaluation mode, digests and initialisation unchanged. With few
+patients this is usually the best choice. The analyst may select
+`backbone="finetune"` or `backbone="scratch"` in `ds.flower.fit()` or the model
+constructor. Every node's custodian must first set
+`options(dsflower.allow_trainable_backbone=TRUE)` (default `FALSE`, with the
+usual `default.dsflower.*` fallback). The option is a strict logical value,
+visible in capabilities and privacy policy; run configuration cannot grant it.
+
+Fine-tuning loads the existing verified ImageNet1K V1 bytes (2D) or fixed MONAI
+seed-0 initialisation (3D), then replaces BatchNorm with GroupNorm while keeping
+public affine weights. Scratch constructs the architecture with public seed 0
+and GroupNorm, without loading pretrained bytes. All parameters, including the
+head, then train. For 2D fine-tuning the pinned checkpoint must also be
+preseeded on the coordinator, which constructs the initial full model; scratch
+and prediction from a saved full state need no pretrained file.
+Public construction is isolated from private randomness; the
+mode and versioned architecture enter the public-initialisation identity. Every
+node must use compatible Torch/torchvision/MONAI runtimes.
+
+Each patient's images still contribute one mean feature vector and one target.
+A two-pass streamed chain rule computes that patient's gradient over the entire
+network while retaining one image graph at a time. Its joint L2 norm is clipped
+to the custodian's C, then Gaussian noise is added to every parameter with the
+same secure Poisson sampler and replace-one accountant. Only the resulting DP
+weights leave the node; FedAvg, model saving and prediction are post-processing.
+There are no new metrics, counts, statistics, buffers or unnoised gradients in
+the release. GroupNorm uses only each image's channels/spatial values and has
+no cross-patient running statistics.
+
+Full state replaces head-only state in each round: roughly 45 MiB for the 2D
+ResNet-18 extractor plus head and 27 MiB for DenseNet-121 plus head (the original
+1000-class ImageNet classifiers are removed). The trainable-only admission caps
+are 512 tensors, 40 million parameters and 160 MiB. Flower 1.31 uses a 2 GiB minus
+one byte gRPC limit; the DSI tunnel already chunks streams into at most 512 KiB
+pieces under its 1 GiB default spool cap. Neural releases retain their ordinary
+persistent neighbourhood encoding and replay; the separate gated Hook envelope
+and its smaller caps remain unchanged. Large final models use `model.pt`, not
+the optional small-model JSON export.
+
+Public CPU limits are image size at most 64 for 2D or 128 for 3D, batch size at
+most 8, at most 5 local epochs and 20 rounds, with at most 4 Torch threads. These
+bounds limit per-image memory and schedule size; total elapsed time still grows
+with patient/image count and CPU speed. There is deliberately no new
+private-count-dependent rejection or timeout-release channel. GroupNorm, full
+network gradients, accumulators, noise and optimiser state cost much more memory
+and time than frozen features. Private validation, holdout and CV for trainable
+vision are explicitly refused in this version; local prediction is supported.
+See [the design and privacy argument](DESIGN_TRAINABLE_VISION.md).
+
 ## Custodian options
 
 Options use the `dsflower.*` prefix, with the standard
@@ -519,6 +573,7 @@ controls remain normal DataSHIELD profile options.
 | `patient_column` | unset | Required explicit stable identifier when `dp_unit="patient"`; never auto-detected. |
 | `image_data_root` | unset | Custodian image root for direct segmentation metadata; declared paths must remain within it. |
 | `mask_data_root` | unset | Custodian PNG-mask root for direct segmentation metadata; declared paths must remain within it. |
+| `allow_trainable_backbone` | `FALSE` | Strict logical custodian permission for full-network vision DP-SGD and communication; analyst requests cannot set it. |
 | `public_initialisation` | `analyst_or_resource` | Custodian admission policy: `analyst_or_resource`, `resource_only`, or `none`; optional per-contract suffix. |
 | `checkpoint_cache_dir` | `checkpoints` under `tools::R_user_dir("dsFlower", "data")` | Protected service-owned cache outside staging, Hook mounts and node-secret storage. |
 | `dp_clipping_norm` | `1` | Server-owned clipping bound. |

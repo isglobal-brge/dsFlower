@@ -8,8 +8,8 @@ node-written, tamper-proof manifest pins the enforced-DP TRACK and all privacy +
 sampling parameters; the client run config can only request, never weaken them.
 
 Tracks, dispatched on the manifest's pinned ``dp-track``:
-  * neural — Opacus DP-SGD over a client nn.Module (tabular, or an image sub-mode
-    that trains only a head on FROZEN-backbone features). Per-sample clip + noise;
+  * neural — DP-SGD over a trusted model (tabular, or images with a frozen
+    backbone by default and opt-in full-network patient gradients). Joint clip + noise;
     the loss is harness-owned; the released state_dict is stash-gated.
   * egress — the labelled-weaker fallback: the client's own local_update, wrapped
     in output-perturbation DP (whole-update clip + Gaussian noise). Admission-gated.
@@ -55,7 +55,7 @@ _MAX_PUBLIC_ARRAY_ABS = dp_harness.MAX_RELEASE_ABS
 _NEURAL_SEED_CONFIG_KEYS = frozenset({
     "model-spec-b64", "loss-name", "num-classes", "num-labels",
     "num-features", "feature-bounds", "feature-bounds-b64",
-    "backbone", "model", "image-size", "data-kind",
+    "backbone", "backbone-mode", "model", "image-size", "data-kind",
     "target-bounds", "nb-dispersion", "gamma-shape", "huber-delta",
     "quantile-level", "survival-config",
     "mask-vocabulary",
@@ -85,6 +85,8 @@ def _reply_cache_allowed(claim):
 def _neural_seed_contract(cfg, pins, _pcfg, geometry_n_units=None, *, manifest):
     """Exact public inputs which can affect trusted neural execution."""
     run = seeding.select_config(cfg, _NEURAL_SEED_CONFIG_KEYS)
+    if run.get("backbone-mode") == "frozen":
+        run.pop("backbone-mode")
     if run.get("segmentation-decoder-init") == "random":
         run.pop("segmentation-decoder-init")
     if pins.get("loss_name") in ("aft_weibull_nll", "aft_lognormal_nll", "discrete_hazard_nll"):
@@ -182,15 +184,18 @@ def _replay_reply(context, claim, msg):
         msg, context, claim=claim, execution_unavailable=True)
 
 
-def _validate_public_egress_arrays(arrays, label="HookApp", max_elements=None):
+def _validate_public_egress_arrays(arrays, label="HookApp", max_elements=None, *,
+                                   trainable_vision=False):
     """Bound an analyst-supplied public model before any private-data read."""
-    element_cap = (_MAX_EGRESS_ELEMENTS if max_elements is None
-                   else int(max_elements))
+    element_cap = (40_000_000 if trainable_vision else
+                   _MAX_EGRESS_ELEMENTS if max_elements is None else int(max_elements))
+    array_cap = 512 if trainable_vision else _MAX_EGRESS_ARRAYS
+    byte_cap = 160 * 1024 * 1024 if trainable_vision else _MAX_EGRESS_BYTES
     if element_cap < 1:
         raise RuntimeError("public model element cap must be positive")
     if hasattr(arrays, "to_numpy_ndarrays") and hasattr(arrays, "values"):
         encoded = list(arrays.values())
-        if not (1 <= len(encoded) <= _MAX_EGRESS_ARRAYS):
+        if not (1 <= len(encoded) <= array_cap):
             raise RuntimeError("%s initial arrays exceed the public array-count cap" % label)
         serialized_bytes = 0
         metadata_elements = 0
@@ -200,7 +205,7 @@ def _validate_public_egress_arrays(arrays, label="HookApp", max_elements=None):
             if getattr(item, "stype", None) != "numpy.ndarray" or not isinstance(data, bytes):
                 raise RuntimeError("%s initial arrays need NumPy tensor encoding" % label)
             serialized_bytes += len(data)
-            if serialized_bytes > _MAX_EGRESS_BYTES + _MAX_EGRESS_ARRAYS * 4096:
+            if serialized_bytes > byte_cap + array_cap * 4096:
                 raise RuntimeError("%s initial arrays exceed the public model-size cap" % label)
             try:
                 stream = io.BytesIO(data)
@@ -226,13 +231,13 @@ def _validate_public_egress_arrays(arrays, label="HookApp", max_elements=None):
                 metadata_elements += elements
                 metadata_bytes += expected_payload
                 if (metadata_elements > element_cap
-                        or metadata_bytes > _MAX_EGRESS_BYTES):
+                        or metadata_bytes > byte_cap):
                     raise ValueError("array cap exceeded")
             except Exception as exc:
                 raise RuntimeError(
                     "%s initial array encoding is invalid or oversized" % label) from exc
         arrays = arrays.to_numpy_ndarrays()
-    if not isinstance(arrays, (list, tuple)) or not (1 <= len(arrays) <= _MAX_EGRESS_ARRAYS):
+    if not isinstance(arrays, (list, tuple)) or not (1 <= len(arrays) <= array_cap):
         raise RuntimeError("%s initial arrays exceed the public array-count cap" % label)
     total_elements = 0
     total_bytes = 0
@@ -252,7 +257,7 @@ def _validate_public_egress_arrays(arrays, label="HookApp", max_elements=None):
         total_elements += int(array.size)
         total_bytes += int(array.nbytes)
         if (total_elements > element_cap
-                or total_bytes > _MAX_EGRESS_BYTES):
+                or total_bytes > byte_cap):
             raise RuntimeError("%s initial arrays exceed the public model-size cap" % label)
         validated.append(array)
     return validated
@@ -303,7 +308,8 @@ def _validate_public_neural_arrays(arrays, model):
             "neural parameter count mismatch: expected %d, received %d"
             % (expected_count, received_count))
     arrays = _validate_public_egress_arrays(
-        arrays, label="neural global model")
+        arrays, label="neural global model",
+        trainable_vision=getattr(released, "_dsflower_trainable_vision", False))
     set_torch_params(model, arrays)
     return arrays
 
@@ -320,6 +326,14 @@ def _prepare_neural_model(msg, context, cfg, pcfg, pins):
             + ("an image collection" if manifest_image else "tabular")
             + ". Use a vision model for imaging collections, a tabular model otherwise.")
     input_dim = _neural_input_dim(context, cfg, manifest_image)
+    from . import vision
+    if vision.is_trainable(cfg):
+        manifest = task_module._load_manifest(context)
+        if manifest.get("allow-trainable-backbone") is not True:
+            raise ValueError("trainable backbone requires custodian option dsflower.allow_trainable_backbone=TRUE")
+        if manifest.get("dp-unit") != "patient":
+            raise ValueError("trainable backbone requires custodian patient privacy")
+        vision.validate_trainable_config(cfg, pins=pins)
     checkpoint_arrays = None
     from . import segmentation_checkpoints
     if (pins["loss_name"] == "segmentation_bce_dice"
@@ -791,6 +805,10 @@ def _training_subset(context, units, holdout, fold):
 
 def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
                   cv_fold=None, on_private_start=None):
+    from . import vision
+    if vision.is_trainable(cfg):
+        return _train_vision(context, cfg, pcfg, pins, model,
+                             on_private_start=on_private_start)
     if pins.get("loss_name") == "segmentation_bce_dice":
         return _train_segmentation(context, cfg, pcfg, pins, model, cv_fold=cv_fold,
                                    on_private_start=on_private_start)
@@ -914,6 +932,176 @@ def _train_neural(context, cfg, pcfg, pins, model, input_dim, manifest_image,
                 model, fit_X, fit_y, pcfg, pins, n_staged, cfg, master=master,
                 noise_multiplier=effective_privacy["noise_multiplier"],
                 geometry_n_units=geometry_n_units, **fit_options))
+        return slot.cached
+
+
+def _vision_features(model, image):
+    """Patient-local finite feature transformation, with its autograd graph."""
+    values = model.backbone(image).reshape(image.shape[0], -1)
+    return torch.nan_to_num(values, nan=0.0,
+        posinf=dp_harness.MAX_PARAMETER_ABS,
+        neginf=-dp_harness.MAX_PARAMETER_ABS).clamp(
+            -dp_harness.MAX_PARAMETER_ABS, dp_harness.MAX_PARAMETER_ABS)
+
+
+def _vision_patient_backward(model, patient_paths, target, criterion,
+                              image_size, is_3d, device):
+    """Differentiate one loss on the mean of ALL this patient's features.
+
+    First compute the pooled feature with no graph. Differentiate the head
+    once, then apply its feature derivative to a fresh graph for each image.
+    The chain rule gives the exact gradient of the pooled patient loss while
+    retaining only one image's activations. Backbones have no dropout or
+    running statistics, so the recomputed features are identical. Nothing is
+    clipped until the full patient gradient has been accumulated.
+    """
+    from . import vision
+    if not patient_paths:
+        raise RuntimeError("a patient must contain at least one image")
+    reader = vision.read_image_3d if is_3d else vision.read_image_2d
+
+    def read(path):
+        return torch.from_numpy(reader(path, image_size)).unsqueeze(0).to(device)
+
+    model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        width = vision.feature_dim_for(model._dsflower_backbone_name)
+        total = torch.zeros((1, width), dtype=torch.float64, device=device)
+        for path in patient_paths:
+            total.add_(_vision_features(model, read(path)).double())
+        pooled = (total / len(patient_paths)).float().requires_grad_(True)
+    criterion(model.head(pooled), target).backward()
+    feature_gradient = pooled.grad.detach() / len(patient_paths)
+    for path in patient_paths:
+        _vision_features(model, read(path)).backward(feature_gradient)
+
+
+def _dp_fit_vision(model, patient_paths, y, pcfg, pins, cfg, *, master,
+                    effective_privacy):
+    """Stream patient gradients through the same flat Gaussian DP-SGD mechanism."""
+    from . import vision
+    from .strategy import NONE, apply_neural_prox, validate_prox_horizon
+    from opacus.accountants import create_accountant
+    vision.configure_trainable_runtime()
+    device = vision.pick_device()
+    model = model.to(device)
+    model.train()
+    parameters = list(model.parameters())
+    optimizer = _build_optimizer(model, pins)
+    # PrivacyEngine's default PRV accountant, with the same calibrated q/sigma
+    # and exact fixed step horizon. Its state remains strictly node-internal.
+    accountant = create_accountant(mechanism="prv")
+    validate_prox_horizon(pins)
+    strategy = pins.get("strategy", NONE)
+    reference = ({id(p): p.detach().clone() for p in parameters}
+                 if strategy["mu"] else None)
+    l1_penalty = float(pins["optimizer"]["l1_penalty"])
+    criterion = dp_harness.loss_from_allowlist(pins["loss_name"], cfg)
+    targets = _prep_target(np.asarray(y), pins["loss_name"], int(pins["n_classes"])).to(device)
+    noise_rng = seeding.np_rng(seeding.sub_seed(master, "noise"))
+    sampler = dp_harness._SecurePoissonBatchSampler(
+        num_samples=len(patient_paths),
+        steps=int(effective_privacy["steps_per_epoch"]),
+        rng=seeding.np_rng(seeding.sub_seed(master, "sample")))
+    seeding.seed_torch(seeding.sub_seed(master, "train"))
+    round_index = int(pins.get("round_index", 0))
+    if not 1 <= round_index <= int(pins["num_rounds"]):
+        raise RuntimeError("neural round index is outside the pinned horizon")
+    for epoch in range(int(pins["local_epochs"])):
+        lr = _scheduled_learning_rate(pins,
+            (round_index - 1) * int(pins["local_epochs"]) + epoch)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        for selected in sampler:
+            sums = [torch.zeros_like(p) for p in parameters]
+            for index in selected:
+                _vision_patient_backward(model, patient_paths[index],
+                    targets[index:index + 1], criterion, int(cfg["image-size"]),
+                    vision.is_3d_backbone(cfg["backbone"]), device)
+                dp_harness.clip_patient_gradients(parameters, pcfg["clipping_norm"])
+                with torch.no_grad():
+                    for summed, parameter in zip(sums, parameters):
+                        summed.add_(parameter.grad)
+            # Empty Poisson draws still get a Gaussian on every parameter.
+            dp_harness.add_private_patient_gradients(parameters, sums,
+                clipping_norm=pcfg["clipping_norm"],
+                noise_multiplier=effective_privacy["noise_multiplier"],
+                expected_batch_size=int(effective_privacy["expected_batch_size"]),
+                secure_noise_rng=noise_rng)
+            optimizer.step()
+            accountant.step(noise_multiplier=effective_privacy["noise_multiplier"],
+                            sample_rate=effective_privacy["sample_rate"])
+            with torch.no_grad():
+                for parameter in parameters:
+                    parameter.nan_to_num_(nan=0.0, posinf=dp_harness.MAX_PARAMETER_ABS,
+                                          neginf=-dp_harness.MAX_PARAMETER_ABS)
+                    parameter.clamp_(-dp_harness.MAX_PARAMETER_ABS,
+                                      dp_harness.MAX_PARAMETER_ABS)
+                    if l1_penalty > 0:
+                        parameter.copy_(torch.sign(parameter) * torch.clamp(
+                            parameter.abs() - lr * l1_penalty, min=0.0))
+                if strategy["mu"]:
+                    apply_neural_prox(optimizer, reference, strategy)
+            optimizer.zero_grad(set_to_none=True)
+            del sums
+    _assert_finite_release(model)
+    dp_harness.assert_releasable(model)
+    dp_harness.assert_stock_architecture(model)
+    expected = getattr(model, "_dsflower_release_keys", None)
+    if tuple(name for name, _ in torch.nn.Module.named_parameters(model)) != expected:
+        raise RuntimeError("released vision tensor set changed during training")
+    return get_torch_params(model), len(patient_paths)
+
+
+def _train_vision(context, cfg, pcfg, pins, model, on_private_start=None):
+    """Patient-private full-network training; same release envelope as frozen."""
+    from . import vision
+    vision.validate_trainable_config(cfg, pins=pins)
+    manifest = task_module._load_manifest(context)
+    if manifest.get("allow-trainable-backbone") is not True or manifest.get("dp-unit") != "patient":
+        raise ValueError("trainable backbone requires custodian admission and patient privacy")
+    seed_config, _ = _neural_seed_contract(cfg, pins, pcfg, manifest=manifest)
+    seed_config.update(operation="train", fold=None)
+    seed_config["initial-model-sha256"] = _initial_model_hash(
+        context, get_torch_params(model), pins["round_index"])
+    request = seeding.request_identity("neural-dpsgd/v3", seed_config, pcfg,
+        int(pins["round_index"]), public_arrays=get_torch_params(model), manifest=manifest)
+    if on_private_start is not None:
+        on_private_start()
+    values, y, groups = load_image_collection(context)
+    if groups is None:
+        raise RuntimeError("trainable backbone requires patient identifiers")
+    n_staged = len(y)
+    if pcfg.get("n_samples") and int(pcfg["n_samples"]) != n_staged:
+        raise RuntimeError("staged sample count != manifest n_samples (fail closed)")
+    units = canonical_units.source_units(values, y)
+    task_module.assert_pinned_unit_count(context, n_staged, patient_ids=groups)
+    _assert_label_range(y, int(pins["n_classes"]))
+    # Reuse the existing deterministic patient target reduction and canonical
+    # first-occurrence order; retain all images in each patient's feature mean.
+    dummy = canonical_units.attach_units(np.zeros((n_staged, 1), dtype=np.float32), units)
+    _, targets = _pool_by_patient(dummy, y, groups, pins["loss_name"])
+    by_patient = {}
+    for path, patient in zip(values, groups):
+        key = task_module._canonical_patient_id(patient)
+        by_patient.setdefault(key, []).append(path)
+    patient_paths = list(by_patient.values())
+    effective = dp_harness.effective_dpsgd_mechanism(
+        epsilon=pcfg["epsilon"], delta=pcfg["delta"], clipping_norm=pcfg["clipping_norm"],
+        n_samples=len(patient_paths), batch_size=int(pins["batch_size"]),
+        local_epochs=int(pins["local_epochs"]), num_rounds=int(pins["num_rounds"]))
+    effective["privacy_unit"] = "patient"
+    # Source units bind decoded image contents; public config pins the streamed
+    # preprocessing. No cohort image tensor needs to be materialized to bind D.
+    binding = seeding.bind_private_data(request, units,
+        effective_tensors=(np.asarray(targets),),
+        geometry=_private_training_geometry(effective, n_staged, units, pins["local_epochs"]),
+        subset={"role": "all", "assignment_sha256": None})
+    master = seeding.release_key(request, binding)
+    with neighbourhood.release(request, units) as slot:
+        if slot.cached is None:
+            slot.commit(binding, _dp_fit_vision(model, patient_paths, targets, pcfg, pins, cfg,
+                master=master, effective_privacy=effective))
         return slot.cached
 
 
@@ -1286,7 +1474,10 @@ def _public_fallback_arrays(msg, context, track):
         # fake metric or replacement private release.
         return [np.zeros(1, dtype=np.float64)]
     return _validate_public_egress_arrays(
-        msg.content["arrays"], label="public fallback model")
+        msg.content["arrays"], label="public fallback model",
+        trainable_vision=(track == "neural"
+            and task_module._load_manifest(context).get("allow-trainable-backbone") is True
+            and task_module._load_manifest(context).get("backbone-mode") in ("finetune", "scratch")))
 
 
 def _safe_public_fallback_arrays(msg, context, track):

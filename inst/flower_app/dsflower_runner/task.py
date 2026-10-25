@@ -994,6 +994,33 @@ def load_pinned_run_config(context=None):
     """Overlay every node-pinned declarative field onto Flower run_config."""
     manifest = _load_manifest(context)
     cfg = _run_config(context)
+    mode = manifest.get("backbone-mode", "frozen")
+    if type(mode) is not str or mode not in ("frozen", "finetune", "scratch"):
+        raise ValueError("backbone-mode must be frozen, finetune, or scratch")
+    if cfg.get("backbone-mode", "frozen") != mode:
+        raise ValueError("Flower backbone-mode does not match manifest pin")
+    if "allow-trainable-backbone" in cfg:
+        raise ValueError("trainable backbone permission is administrator-only")
+    if mode != "frozen":
+        if manifest.get("allow-trainable-backbone") is not True:
+            raise ValueError("trainable backbone requires custodian permission")
+        if manifest.get("user-module") or cfg.get("user-module"):
+            raise ValueError("trainable backbone requires the trusted neural runner, without a Hook module")
+        if (manifest.get("dp-track") != "neural"
+                or manifest.get("data_type") != "image"
+                or manifest.get("dp-unit") != "patient"
+                or manifest.get("backbone") not in (
+                    "resnet18", "densenet121", "resnet18_3d", "densenet121_3d")
+                or manifest.get("loss-name") not in ("bce_logits", "cross_entropy")):
+            raise ValueError("trainable backbone requires patient-level vision classification")
+        if any(key.startswith(("resampling-", "cv-")) for key in manifest):
+            raise ValueError("trainable backbone does not support private holdout or CV")
+        limit = 128 if manifest["backbone"].endswith("_3d") else 64
+        for key, cap in (("image-size", limit), ("local-epochs", 5),
+                         ("num-server-rounds", 20), ("batch-size", 8)):
+            value = manifest.get(key)
+            if type(value) is not int or not 1 <= value <= cap:
+                raise ValueError("trainable vision public resource limit: %s <= %d" % (key, cap))
     for key in cfg:
         normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
         normalized = normalized.lower().replace("-", "_").replace(".", "_")
@@ -1330,7 +1357,8 @@ def load_pinned_run_config(context=None):
         "model-spec-b64", "loss-name", "num-classes", "num-labels",
         "survival-config", "survival-config-b64",
         "local-epochs", "batch-size", "num-server-rounds", "num-features",
-        "feature-bounds", "backbone", "image-size", "user-module",
+        "feature-bounds", "backbone", "backbone-mode", "allow-trainable-backbone",
+        "image-size", "user-module",
         "vision-extractor-profile",
         "task-type", "app-params-b64", "app-params-sha256",
         "target-bounds", "target-levels", "validation-model-track",

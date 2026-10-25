@@ -9,7 +9,8 @@
     "segmentation": "561a51866a10445052292a841a6cbe0deb5331ebdde1d69d987b92ff572152f9",
     "source_projection": "754e737a9fb7aaa3d79ecf5c8063a592ba43300f21e6bd3a75962d31ad1102a2",
     "survival": "915e9607b317738a6360ad8a496d47892ee8698c9fd14a9f7a24dca2a75b2a70",
-    "task": "ada45539ef49f204b77e980c58aeb2546acf1425beaa1f3214b3ab8a213d434e"
+    "task": "ada45539ef49f204b77e980c58aeb2546acf1425beaa1f3214b3ab8a213d434e",
+    "vision": "cbcf388fd229e48dd9bcfaabb93084f9a631dffde1d23aa8d42ba2c81ffe4b0f"
   },
   "dynamic_only_expansions": {
     "public-initialisation-directory": {
@@ -131,28 +132,28 @@
       "declared_field_families": [
         "public_initialisation"
       ],
-      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+      "function_sha256": "a3f365923cb840c0d860dbbb0ab7e2a0caffa0ff9a729c5834bb4c91c4f4004a"
     },
     "initialisation:canonical_initialisation_spec:cfg.get(checkpoints.ENCODER_KEY)": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
       "declared_field_families": [
         "public_initialisation"
       ],
-      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+      "function_sha256": "a3f365923cb840c0d860dbbb0ab7e2a0caffa0ff9a729c5834bb4c91c4f4004a"
     },
     "initialisation:canonical_initialisation_spec:cfg.get(checkpoints.MANIFEST_KEY)": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
       "declared_field_families": [
         "public_initialisation"
       ],
-      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+      "function_sha256": "a3f365923cb840c0d860dbbb0ab7e2a0caffa0ff9a729c5834bb4c91c4f4004a"
     },
     "initialisation:canonical_initialisation_spec:cfg.get(checkpoints.ORIGIN_KEY)": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
       "declared_field_families": [
         "public_initialisation"
       ],
-      "function_sha256": "2f8acc014e7ddcbbf9c505dc18875dcddef18599deb102ffaab0dc8c7b1b3a62"
+      "function_sha256": "a3f365923cb840c0d860dbbb0ab7e2a0caffa0ff9a729c5834bb4c91c4f4004a"
     },
     "native_tree_client_app:_node_privacy:manifest.get(key)": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
@@ -690,7 +691,7 @@
         "hook_admission_and_padding",
         "metric_postprocessing"
       ],
-      "function_sha256": "1c4a77c2f1e816c62801fb65be856a4a63cbe4e4d08e3bcd0fab5f49053cd34e"
+      "function_sha256": "701496afb6179c99db59a5c8e939d4047c990a73c07b286cdbe198c614c2d086"
     },
     "task:load_pinned_run_config:cfg[key]": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
@@ -728,7 +729,15 @@
         "hook_admission_and_padding",
         "metric_postprocessing"
       ],
-      "function_sha256": "1c4a77c2f1e816c62801fb65be856a4a63cbe4e4d08e3bcd0fab5f49053cd34e"
+      "function_sha256": "701496afb6179c99db59a5c8e939d4047c990a73c07b286cdbe198c614c2d086"
+    },
+    "task:load_pinned_run_config:manifest.get(key)": {
+      "authority": "Reviewed fixed public geometry/schedule or unsupported-resampling field tuples; no analyst-selected dynamic keys are read.",
+      "declared_field_families": [
+        "vision_profile",
+        "rounds_and_training"
+      ],
+      "function_sha256": "701496afb6179c99db59a5c8e939d4047c990a73c07b286cdbe198c614c2d086"
     },
     "task:load_pinned_run_config:manifest[key]": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
@@ -766,7 +775,7 @@
         "hook_admission_and_padding",
         "metric_postprocessing"
       ],
-      "function_sha256": "1c4a77c2f1e816c62801fb65be856a4a63cbe4e4d08e3bcd0fab5f49053cd34e"
+      "function_sha256": "701496afb6179c99db59a5c8e939d4047c990a73c07b286cdbe198c614c2d086"
     },
     "task:pinned_bool:manifest.get(key, default)": {
       "authority": "Reviewed finite local field tuples, node-owned constants or admitted helper key parameters; changes require reclassifying their expansion.",
@@ -843,6 +852,13 @@
         "metric_postprocessing"
       ],
       "function_sha256": "66ddfa60fea5a5bbc5e029a50d96cf8186c90fbf8326cd0c45a4b60847d0736e"
+    },
+    "vision:validate_trainable_config:cfg.get(key)": {
+      "authority": "Reviewed fixed public geometry/schedule or unsupported-resampling field tuples; no analyst-selected dynamic keys are read.",
+      "declared_field_families": [
+        "transport_integrity"
+      ],
+      "function_sha256": "05370bc3b28123d14902742b80b707849e5a4cd2630bab7ac90c41f370bd3904"
     }
   },
   "field_families": {
@@ -956,7 +972,8 @@
     "public_resource_guards": [
       "native-tree-artifact-size-bytes",
       "validation-artifact-size-bytes",
-      "validation-profile-size-bytes"
+      "validation-profile-size-bytes",
+      "allow-trainable-backbone"
     ],
     "release_coordinate": [
       "dsflower-operation",
@@ -1105,10 +1122,16 @@
       "image-size",
       "model",
       "vision-extractor-profile",
-      "assets"
+      "assets",
+      "backbone-mode"
     ]
   },
   "fields": {
+    "allow-trainable-backbone": {
+      "category": "operational",
+      "identity_paths": [],
+      "reason": "Strict custodian-only admission is checked before private image access; permission does not alter an admitted computation or its numerical DP mechanism."
+    },
     "amsgrad": {
       "category": "public_semantic",
       "identity_paths": [
@@ -1209,6 +1232,13 @@
         "R.initialisation"
       ],
       "reason": "Normalize the admitted frozen extractor and logical image/mask asset types; asset roots, identifiers and unused tabular image fields are excluded."
+    },
+    "backbone-mode": {
+      "category": "public_semantic",
+      "identity_paths": [
+        "R.initialisation.spec_sha256"
+      ],
+      "reason": "The admitted training mode selects the full GroupNorm architecture and public seed/weights; the canonical initializer spec binds this change, while omitted or frozen preserves the existing identity."
     },
     "batch-size": {
       "category": "public_semantic",

@@ -281,3 +281,16 @@ and [DenseNet source](https://docs.pytorch.org/vision/stable/_modules/torchvisio
 Full hashes were verified during development; a missing, changed or unpinned file
 fails closed. Public segmentation bundles always carry their own pinned encoder
 snapshot and never fall back to a separately found cache file.
+
+## Built-in trainable vision initialisation (0.7.4)
+
+Vision classification also offers opt-in `backbone="finetune"` and
+`backbone="scratch"`, gated by `dsflower.allow_trainable_backbone`. The former
+uses the existing verified public encoder; the latter uses isolated public
+seed 0 without encoder checkpoint access. Both convert BatchNorm to GroupNorm
+and train/release the complete model under patient DP-SGD. The mode and
+architecture profile enter the existing public-initialisation identity. These
+are built-in initialisers, not additional analyst checkpoint-upload routes;
+`public_initialisation` continues to govern uploaded/resource checkpoints.
+The segmentation frozen encoder contract is unchanged. See
+[trainable vision design](DESIGN_TRAINABLE_VISION.md).
