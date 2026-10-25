@@ -1,3 +1,16 @@
+# dsFlower 0.7.4
+
+* Add opt-in `finetune` and deterministic public-seed `scratch` modes for
+  ResNet-18 and DenseNet-121 vision classification, including volumetric models.
+  Custodians must enable `dsflower.allow_trainable_backbone`; frozen remains
+  the unchanged default.
+* Replace BatchNorm with GroupNorm only for trainable backbones. Stream each
+  patient's mean-feature gradient, jointly clip every parameter, and noise the
+  complete network using the existing patient DP-SGD accountant and secure RNG.
+* Admit bounded full-network updates through the release guard and transport;
+  retain unchanged Hook limits and release fields. Bound public geometry,
+  training schedule and CPU threads; reject private holdout/CV for these modes.
+
 # dsFlower 0.7.3
 
 * Use the explicit `validation-vector-v4` numeric holdout layout, subtracting

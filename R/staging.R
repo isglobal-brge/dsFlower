@@ -855,7 +855,7 @@
   c(
     .manifest_structural_fields()[.manifest_structural_fields() != "data_type"],
     "dp_enabled", "allow_per_node_metrics", "allow_exact_num_examples",
-    "fixed_client_sampling", "privacy-adjacency",
+    "fixed_client_sampling", "allow-trainable-backbone", "privacy-adjacency",
     "privacy-policy-sha256", "privacy-epsilon",
     "privacy-delta", "privacy-clipping_norm", "privacy-sample_aggregate",
     "privacy-training-epsilon", "privacy-training-delta",
@@ -882,7 +882,7 @@
     "feature-bounds", "target-bounds", "target-levels",
     "model-spec-b64", "loss-name", "local-epochs", "batch-size",
     "survival-config-b64",
-    "backbone", "image-size", "vision-extractor-profile",
+    "backbone", "backbone-mode", "image-size", "vision-extractor-profile",
     "learning-rate", "weight-decay", "l1-penalty",
     "nb-dispersion", "gamma-shape", "huber-delta", "quantile-level",
     "optimizer-name", "optimizer-momentum", "optimizer-nesterov",

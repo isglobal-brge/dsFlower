@@ -56,6 +56,13 @@ structured/sequence, vision heads, AFT/discrete-hazard survival and random
 segmentation. Python, NumPy and Torch RNG state is restored; Torch CPU construction
 uses `torch.random.fork_rng`. All CV folds start from the same model. Existing
 frozen-encoder profiles retain their established initialization semantics.
+In 0.7.4, opt-in vision `backbone-mode` is included in the initializer digest
+with `dsflower-trainable-vision-gn-seed0-v1` and public backbone seed 0. Fine-tuning
+retains the verified public weight identity; scratch omits the pretrained
+encoder digest. Omitted and explicit `frozen` retain the original projection.
+The complete DP-trained parameter set enters the ordinary public-array and
+initial-content identities. Custodian permission is admission-only, never a
+choice of private noise. See [trainable vision](../../../DESIGN_TRAINABLE_VISION.md).
 There is no node-side recomputation or expected-tensor comparison for round-one
 training arrays, including checkpoint-initialized paths: existing
 shape, dtype and value admission remains, and incoming contents remain bound in

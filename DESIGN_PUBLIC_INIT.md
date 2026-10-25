@@ -149,3 +149,16 @@ and runner sync; record exact counts, skips and limitations. Keep mirrored runne
 byte-identical. Commit ordinary messages without tags/pushes/thesis edits. Write
 `PUBLIC_INIT_CONFIRMATION.md` with recipes, implementation summary/hash and results.
 Real Opal/Armadillo procedures are documented, not represented as executed tests.
+
+## Built-in trainable vision initialisation (0.7.4)
+
+Vision classification also offers opt-in `backbone="finetune"` and
+`backbone="scratch"`, gated by `dsflower.allow_trainable_backbone`. The former
+uses the existing verified public encoder; the latter uses isolated public
+seed 0 without encoder checkpoint access. Both convert BatchNorm to GroupNorm
+and train/release the complete model under patient DP-SGD. The mode and
+architecture profile enter the existing public-initialisation identity. These
+are built-in initialisers, not additional analyst checkpoint-upload routes;
+`public_initialisation` continues to govern uploaded/resource checkpoints.
+The segmentation frozen encoder contract is unchanged. See
+[trainable vision design](DESIGN_TRAINABLE_VISION.md).

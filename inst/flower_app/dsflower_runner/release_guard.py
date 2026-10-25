@@ -178,6 +178,9 @@ def _fixed_manifest(context):
                   if cross_validation else
                   num_rounds + (1 if holdout else 0))
     return {
+        "trainable_vision": (manifest.get("dp-track") == "neural"
+                             and manifest.get("backbone-mode") in ("finetune", "scratch")
+                             and manifest.get("allow-trainable-backbone") is True),
         "gated": (bool(manifest.get("user-module"))
                   or manifest.get("dp-track") == "egress"),
         "num_rounds": num_rounds,
@@ -279,7 +282,7 @@ def _frame(digest, value):
     digest.update(raw)
 
 
-def _request_id(msg, operation, fold, round_index):
+def _request_id(msg, operation, fold, round_index, *, trainable_vision=False):
     """Hash the exact bounded public ArrayRecord and its round coordinate."""
     content = getattr(msg, "content", None)
     try:
@@ -289,7 +292,10 @@ def _request_id(msg, operation, fold, round_index):
     if not isinstance(arrays, ArrayRecord):
         raise RuntimeError("train message arrays must be an ArrayRecord")
     entries = list(arrays.items())
-    if not 1 <= len(entries) <= _MAX_ARRAYS:
+    array_cap = 512 if trainable_vision else _MAX_ARRAYS
+    byte_cap = (160 * 1024 * 1024 + array_cap * 4096
+                if trainable_vision else _MAX_SERIALIZED_ARRAY_BYTES)
+    if not 1 <= len(entries) <= array_cap:
         raise RuntimeError("train ArrayRecord exceeds the public array-count cap")
 
     digest = hashlib.sha256(b"dsflower/public-request/v1\x00")
@@ -303,7 +309,7 @@ def _request_id(msg, operation, fold, round_index):
                 or not isinstance(data, bytes)):
             raise RuntimeError("train ArrayRecord needs NumPy tensor encoding")
         total += len(data)
-        if total > _MAX_SERIALIZED_ARRAY_BYTES:
+        if total > byte_cap:
             raise RuntimeError("train ArrayRecord exceeds the public model-size cap")
         shape = getattr(item, "shape", None)
         if not isinstance(shape, (list, tuple)):
@@ -498,7 +504,8 @@ def claim_release(context, msg):
     epsilon, delta = fixed["budgets"][operation]
     round_index = _server_round(msg, num_rounds)
     fold = _fold_coordinate(msg, fixed, operation, round_index)
-    request_id = _request_id(msg, operation, fold, round_index)
+    request_id = _request_id(msg, operation, fold, round_index,
+                             trainable_vision=fixed["trainable_vision"])
     message_id = _message_id(msg)
     status = _sticky_status(
         context, fixed, message_id, operation, fold, round_index, request_id)

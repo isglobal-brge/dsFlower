@@ -111,6 +111,9 @@ def load_user_model(cfg, input_dim, loss_name):
     model = model_spec.build_from_spec(
         spec, in_dim=int(input_dim), out_dim=out_dim, num_labels=num_labels,
         output_limit=model_spec.output_limit_for_loss(loss_name), **spatial)
+    from . import vision
+    if vision.is_trainable(cfg):
+        model = vision.build_trainable_model(cfg, model)
 
     if not isinstance(model, torch.nn.Module):
         raise ValueError("build_from_spec must return a torch.nn.Module")

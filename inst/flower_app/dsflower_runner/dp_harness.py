@@ -90,6 +90,62 @@ def totalize_grad_samples(parameters, clipping_norm):
                     raise RuntimeError(
                         "DP-SGD per-sample gradient could not be totalized")
 
+
+def clip_patient_gradients(parameters, clipping_norm):
+    """Totalize and jointly clip ONE patient's complete network gradient.
+
+    The streamed vision path computes an ordinary backward for each whole
+    patient, avoiding a batch x parameter grad_sample allocation. This is the
+    same flat L2 clipping mechanism as Opacus, including finite totalization.
+    The returned norm is node-internal and must never enter a reply/metric.
+    """
+    import torch
+    parameters = list(parameters)
+    bound = float(clipping_norm)
+    if not math.isfinite(bound) or bound <= 0 or not parameters:
+        raise ValueError("patient gradient clipping requires parameters and finite C > 0")
+    with torch.no_grad():
+        norms = []
+        for parameter in parameters:
+            if not parameter.requires_grad or parameter.grad is None:
+                raise RuntimeError("every released vision parameter needs a patient gradient")
+            parameter.grad.nan_to_num_(nan=0.0, posinf=bound, neginf=-bound)
+            parameter.grad.clamp_(-bound, bound)
+            norms.append(parameter.grad.double().square().sum())
+        norm = torch.stack(norms).sum().sqrt()
+        factor = (bound / (norm + 1.0e-6)).clamp(max=1.0)
+        for parameter in parameters:
+            parameter.grad.mul_(factor.to(parameter.grad.dtype))
+    return float(norm)
+
+
+def add_private_patient_gradients(parameters, sums, *, clipping_norm,
+                                  noise_multiplier, expected_batch_size,
+                                  secure_noise_rng):
+    """Noise EVERY accumulated parameter, including an empty Poisson draw.
+
+    Only these gradients reach the optimizer. The full noised weight set is
+    post-processing of this vector mechanism; no norm, count, loss or gradient
+    is communicated. Calibration and ChaCha streams are shared with Opacus.
+    """
+    import torch
+    rng = _require_secure_rng(secure_noise_rng, "patient DP-SGD noise")
+    parameters, sums = list(parameters), list(sums)
+    sigma = float(noise_multiplier) * float(clipping_norm)
+    if (len(parameters) != len(sums) or not parameters
+            or not math.isfinite(sigma) or sigma <= 0
+            or type(expected_batch_size) is not int or expected_batch_size < 1):
+        raise ValueError("invalid patient DP-SGD noise geometry")
+    with torch.no_grad():
+        for parameter, summed in zip(parameters, sums):
+            if summed.shape != parameter.shape or not bool(torch.isfinite(summed).all()):
+                raise RuntimeError("invalid jointly clipped patient gradient sum")
+            noise = torch.as_tensor(rng.normal(0.0, sigma, size=tuple(summed.shape)),
+                                    dtype=summed.dtype, device=summed.device)
+            parameter.grad = (summed + noise) / expected_batch_size
+            if not bool(torch.isfinite(parameter.grad).all()):
+                raise RuntimeError("patient DP-SGD noise produced a non-finite gradient")
+
 class _SecurePoissonBatchSampler:
     """Poisson batches driven only by the node's ChaCha20 release stream."""
 
@@ -733,9 +789,9 @@ def assert_releasable(model):
 
 
 # Vetted NODE-OWNED classes the researcher NEVER supplies (specs are DATA, not code):
-# the model_spec graph interpreter. Since the researcher can only name allowlisted ops,
-# the only non-torch.nn class ever instantiated on the DP-SGD path is this trusted,
-# node-built interpreter. Admitted by EXACT name+module (not isinstance -> no subclass
+# the model_spec graph interpreter and the fixed public vision containers below.
+# The researcher can only name allowlisted ops or public backbone contracts.
+# Admitted by EXACT name+module (not isinstance -> no subclass
 # smuggling). The Opacus DP layers (DPLSTM/DPGRU/DPMultiheadAttention) will be added
 # here when wired, with their hook/cell_type tolerance handled explicitly.
 _VETTED_NODE_CLASSES = frozenset({"FiniteClamp", "GraphModule", "RecurrentBlock"})
@@ -750,6 +806,15 @@ _VETTED_OPACUS_CLASSES = frozenset({
     "RNNLinear", "SequenceBias",
 })
 
+# Exact installed, node-owned backbone containers. The researcher only chooses
+# one fixed public vision contract, never a class or a Python forward.
+_VETTED_VISION_CLASSES = {
+    "torchvision.models.resnet": frozenset({"ResNet", "BasicBlock"}),
+    "torchvision.models.densenet": frozenset({"DenseNet", "_DenseBlock", "_DenseLayer", "_Transition"}),
+    "monai.networks.nets.resnet": frozenset({"ResNet", "ResNetBlock"}),
+    "monai.networks.nets.densenet": frozenset({"DenseNet121", "DenseNet", "_DenseBlock", "_DenseLayer", "_Transition"}),
+}
+
 
 def _is_node_owned_class(cls):
     """True iff cls is a stock torch.nn layer, an EXACT vetted node-owned class, or an
@@ -760,6 +825,8 @@ def _is_node_owned_class(cls):
     if mod.rsplit(".", 1)[-1] == "model_spec" and cls.__name__ in _VETTED_NODE_CLASSES:
         return True
     if mod.startswith("opacus.layers") and cls.__name__ in _VETTED_OPACUS_CLASSES:
+        return True
+    if cls.__name__ in _VETTED_VISION_CLASSES.get(mod, ()):
         return True
     return False
 

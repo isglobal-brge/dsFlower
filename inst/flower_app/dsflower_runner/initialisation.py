@@ -81,9 +81,22 @@ def canonical_initialisation_spec(cfg, *, application_init_contract=None):
                 "encoder_sha256": cfg.get(checkpoints.ENCODER_KEY),
                 "origin": cfg.get(checkpoints.ORIGIN_KEY),
             }
-    return {"version": VERSION, "model": model, "extractor_profile": extractor,
+    result = {"version": VERSION, "model": model, "extractor_profile": extractor,
             "encoder_sha256": encoder, "public_checkpoint_semantics": checkpoint,
             "application_init_contract": application_init_contract}
+    # Omission, including explicit frozen, retains every v0.7.3 seed/hash.
+    if application_init_contract is None:
+        from . import vision
+        if vision.is_trainable(cfg):
+            vision.validate_trainable_config(cfg)
+            result["trainable_vision"] = {
+                "mode": vision.backbone_mode(cfg),
+                "profile": vision.TRAINABLE_PROFILE,
+                "backbone_seed": 0,
+            }
+            if vision.backbone_mode(cfg) == "scratch":
+                result["encoder_sha256"] = None
+    return result
 
 
 def initialisation_spec_sha256(cfg, *, application_init_contract=None):
@@ -127,6 +140,9 @@ def build_initial_model(cfg):
             arrays = segmentation_checkpoints.server_initialization(cfg)
             if arrays is not None:
                 set_torch_params(model, arrays)
+        from . import vision
+        if vision.is_trainable(cfg):
+            model = vision.build_trainable_model(cfg, model)
     return model
 
 

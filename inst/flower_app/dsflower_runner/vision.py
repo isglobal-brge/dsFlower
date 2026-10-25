@@ -1,6 +1,10 @@
-"""Vision support for the dsFlower Tier-1 harness — DP linear-probing on frozen features.
+"""Vision support for the dsFlower Tier-1 harness.
 
-Why this shape (see ARCHITECTURE.md + the DP/image research):
+The established frozen linear probe remains the default. Opt-in finetune and
+scratch modes release the entire buffer-free, GroupNorm network after patient
+DP-SGD. Public construction and resource admission precede private image reads.
+
+Why frozen remains the default (see ARCHITECTURE.md + the DP/image research):
   * DP-SGD noise scales ~ sigma*C*sqrt(d); a full vision net has huge d, so naive
     DP-SGD is poor. We therefore FREEZE a pretrained backbone (no gradients) and
     DP-train only a small HEAD on the extracted features -> tiny effective d, small
@@ -51,6 +55,10 @@ _MIN_BACKBONE_IMAGE_SIZE = {
     "densenet121_3d": 128,
 }
 DEFAULT_BACKBONE = "resnet18"
+TRAINABLE_PROFILE = "dsflower-trainable-vision-gn-seed0-v1"
+_TRAINABLE_BACKBONES = frozenset({
+    "resnet18", "densenet121", "resnet18_3d", "densenet121_3d"})
+_MAX_TRAINABLE_PARAMETERS = 40_000_000
 
 _VOLUME_EXTS = (".nii.gz", ".nii", ".nrrd", ".mha", ".mhd", ".dcm")
 _INVALID_IMAGE = "__dsflower_invalid_image__"
@@ -94,6 +102,56 @@ def normalize_backbone(name):
         raise ValueError(
             f"Unsupported vision backbone '{name}'. Supported: {sorted(_BACKBONES)}")
     return n
+
+
+def backbone_mode(cfg):
+    mode = cfg.get("backbone-mode", "frozen")
+    if type(mode) is not str or mode not in ("frozen", "finetune", "scratch"):
+        raise ValueError("backbone-mode must be frozen, finetune, or scratch")
+    return mode
+
+
+def is_trainable(cfg):
+    return backbone_mode(cfg) != "frozen"
+
+
+def validate_trainable_config(cfg, *, pins=None):
+    """Bound public geometry and the CPU schedule before reading images.
+
+    Work is bounded per image by geometry and the public epoch/round schedule.
+    The streaming gradient loop holds one image graph at a time.
+    No wall-clock or private-data-dependent early stopping is introduced.
+    """
+    if not is_trainable(cfg):
+        return
+    name, size, _ = require_extractor_config(
+        cfg.get("backbone", cfg.get("model", "resnet18")),
+        cfg.get("vision-extractor-profile"), cfg.get("num-features"),
+        cfg.get("image-size"))
+    if name not in _TRAINABLE_BACKBONES:
+        raise ValueError("trainable backbones support ResNet18 and DenseNet121 classification only")
+    if str(cfg.get("data-kind", "")).lower() != "image":
+        raise ValueError("trainable backbones require image data")
+    if cfg.get("loss-name", "bce_logits") not in ("bce_logits", "cross_entropy"):
+        raise ValueError("trainable backbones require a classification loss")
+    if any(cfg.get(key) is not None for key in (
+            "resampling-contract-sha256", "cv-contract-sha256")):
+        raise ValueError("trainable backbones do not yet support holdout or cross-validation")
+    limit = 128 if is_3d_backbone(name) else 64
+    if size > limit:
+        raise ValueError("trainable backbone image-size exceeds the CPU resource limit (%d); resize images" % limit)
+    pins = pins or {}
+    epochs = int(pins.get("local_epochs", cfg.get("local-epochs", 1)))
+    rounds = int(pins.get("num_rounds", cfg.get("num-server-rounds", 1)))
+    batch = int(pins.get("batch_size", cfg.get("batch-size", 8)))
+    if not 1 <= epochs <= 5 or not 1 <= rounds <= 20 or not 1 <= batch <= 8:
+        raise ValueError("trainable backbone CPU limits require local-epochs <= 5, rounds <= 20, and batch-size <= 8")
+
+
+def configure_trainable_runtime():
+    import torch
+    # Avoid oversubscribing shared, CPU-only DataSHIELD nodes.
+    torch.set_num_threads(min(4, torch.get_num_threads()))
 
 
 def feature_dim_for(backbone):
@@ -439,7 +497,7 @@ def build_backbone(backbone):
         return _build_backbone(backbone)
 
 
-def _build_backbone(backbone):
+def _build_backbone(backbone, *, public_weights=True):
     """Build a FROZEN (eval, no-grad) feature extractor. Deterministic weights so
     every node shares the same feature space (FedAvg over heads is then valid)."""
     import torch
@@ -473,14 +531,15 @@ def _build_backbone(backbone):
         model = net
     else:
         import torchvision.models as tvm
-        checkpoint = verified_backbone_bytes(name)
+        checkpoint = verified_backbone_bytes(name) if public_weights else None
         if name == "resnet18":
             net = tvm.resnet18(weights=None)
         elif name == "resnet50":
             net = tvm.resnet50(weights=None)
         else:
             net = tvm.densenet121(weights=None)
-        _load_verified_backbone(net, name, checkpoint)
+        if checkpoint is not None:
+            _load_verified_backbone(net, name, checkpoint)
         if name.startswith("resnet"):
             net.fc = nn.Identity()
         else:
@@ -493,9 +552,81 @@ def _build_backbone(backbone):
     return model, feat_dim
 
 
+def _replace_batch_norm(module):
+    """Replace only node-built BatchNorm, retaining its public affine weights.
+
+    GroupNorm has no running statistics and normalizes within each image, so
+    changing another patient's image cannot affect this patient's gradient.
+    The frozen builder never calls this function.
+    """
+    import torch
+    import torch.nn as nn
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.modules.batchnorm._BatchNorm):
+            channels = int(child.num_features)
+            groups = min(32, max(1, channels // 2))
+            while channels % groups:
+                groups -= 1
+            norm = nn.GroupNorm(groups, channels, eps=child.eps,
+                                affine=child.affine)
+            if child.affine:
+                with torch.no_grad():
+                    norm.weight.copy_(child.weight)
+                    norm.bias.copy_(child.bias)
+            setattr(module, name, norm)
+        else:
+            _replace_batch_norm(child)
+
+
+def build_trainable_model(cfg, head):
+    """The versioned public full-network architecture; no private inputs.
+
+    Seed zero fixes both scratch backbones and the established MONAI public
+    initialization. The head is constructed by the existing public spec seed.
+    """
+    from collections import OrderedDict
+    import torch
+    import torch.nn as nn
+    from .initialisation import isolated_public_rng
+    from . import dp_harness
+
+    validate_trainable_config(cfg)
+    configure_trainable_runtime()
+    mode = backbone_mode(cfg)
+    if mode == "frozen":
+        raise ValueError("build_trainable_model requires finetune or scratch")
+    with isolated_public_rng(0):
+        encoder, _ = _build_backbone(
+            cfg["backbone"], public_weights=(mode == "finetune"))
+        _replace_batch_norm(encoder)
+        # torchvision retains its constructor factory as a callable instance
+        # attribute. It is unused by forward and unnecessary after replacing
+        # normalization; remove it to retain the strict no-callable gate.
+        if type(encoder).__module__ == "torchvision.models.resnet":
+            del encoder._norm_layer
+    model = nn.Sequential(OrderedDict(backbone=encoder, head=head))
+    model._dsflower_trainable_vision = True
+    model._dsflower_backbone_name = normalize_backbone(cfg["backbone"])
+    model.requires_grad_(True)
+    model.train()
+    if sum(p.numel() for p in model.parameters()) > _MAX_TRAINABLE_PARAMETERS:
+        raise ValueError("trainable vision model exceeds the 40M-parameter node memory limit")
+    dp_harness.assert_stock_architecture(model)
+    dp_harness.assert_releasable(model)
+    # Prove the complete public input geometry before the runner can open a
+    # private image. No stochastic head layers participate in this probe.
+    with torch.no_grad():
+        shape = _image_record_shape(cfg["image-size"], is_3d_backbone(cfg["backbone"]))
+        probe = model.backbone(torch.zeros((1, *shape), dtype=torch.float32))
+        expected = (1, feature_dim_for(cfg["backbone"]))
+        if tuple(probe.shape) != expected or not bool(torch.isfinite(probe).all()):
+            raise RuntimeError("trainable vision backbone public geometry is invalid")
+    return model
+
+
 def build_head(feature_dim, n_classes):
-    """The only trainable, DP-noised, communicated module: a linear probe on
-    frozen features. Binary -> 1 logit (BCE); multiclass -> n_classes (CE)."""
+    """The frozen mode's trainable, DP-noised module: a linear probe on frozen
+    features. Binary -> 1 logit (BCE); multiclass -> n_classes (CE)."""
     import torch.nn as nn
     out = 1 if int(n_classes) <= 2 else int(n_classes)
     return nn.Linear(int(feature_dim), out)
